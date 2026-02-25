@@ -199,6 +199,14 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li><code>graphql</code> feature flag (default on) in gateway and CLI crates for compile-time opt-out</li>
 <li>Settings &gt; GraphQL page embedding GraphiQL playground at <code>/settings/graphql</code></li>
 <li>Gateway startup now seeds a built-in <code>dcg-guard</code> hook in <code>~/.moltis/hooks/dcg-guard/</code> (manifest + handler), so destructive command guarding is available out of the box once <code>dcg</code> is installed</li>
+<li>New <code>moltis-openclaw-import</code> crate for detecting OpenClaw installations and selectively importing identity, providers, skills, memory files, Telegram channels, sessions, and MCP servers</li>
+<li>New onboarding RPC methods: <code>openclaw.detect</code>, <code>openclaw.scan</code>, and <code>openclaw.import</code></li>
+<li>New <code>moltis import</code> CLI commands (<code>detect</code>, <code>all</code>, <code>select</code>) with <code>--dry-run</code> and <code>--json</code> output options</li>
+<li>Onboarding now includes a conditional OpenClaw Import step with category selection, import execution, and detailed per-category results/TODO reporting</li>
+<li>Settings now includes an OpenClaw Import section (shown only when OpenClaw is detected) for scan-and-import workflows after onboarding</li>
+<li>Microsoft Teams channel integration via new <code>moltis-msteams</code> plugin crate with webhook ingress and OAuth client-credentials outbound messaging</li>
+<li>Teams channel management in the web UI (add/edit/remove accounts, sender review, session/channel badges)</li>
+<li>Guided Teams bootstrap tooling via <code>moltis channels teams bootstrap</code> plus an in-UI endpoint generator in Settings → Channels</li>
 <li>Multi-agent personas with per-agent workspaces (<code>data_dir()/agents/&lt;id&gt;/</code>), <code>agents.*</code> RPC methods, and session-level <code>agent_id</code> binding/switching across web + Telegram flows</li>
 </ul>
 <h3 id="changed"><a class="header" href="#changed">Changed</a></h3>
@@ -214,8 +222,11 @@ onboarding-ready configs.</li>
 <li>GraphQL gateway now builds its schema once at startup and reuses it for HTTP and WebSocket requests</li>
 <li>GraphQL resolvers now share common RPC helper macros and use typed response objects for <code>node.describe</code>, <code>voice.config</code>, <code>voice.voxtral_requirements</code>, <code>skills.security_status</code>, <code>skills.security_scan</code>, and <code>memory.config</code></li>
 <li>GraphQL <code>logs.ack</code> mutation now matches backend behavior and no longer takes an <code>ids</code> argument</li>
+<li>Gateway startup diagnostics now report OpenClaw detection status and pass detection state to web gon data for conditional UI rendering</li>
+<li>Gateway and CLI now enable the <code>openclaw-import</code> feature in default builds</li>
 <li>Providers now support <code>stream_transport = "sse" | "websocket" | "auto"</code> in config. OpenAI can stream via Responses API WebSocket mode, and <code>auto</code> falls back to SSE when WebSocket setup is unavailable.</li>
 <li>Agent Identity emoji picker now includes 🐰 🐹 🦀 🦞 🦝 🦭 🧠 🧭 options</li>
+<li>Channel persistence and message-log queries are now channel-type scoped (<code>channel_type + account_id</code>) so Telegram and Teams accounts can share the same account IDs safely</li>
 <li>Chat/system prompt resolution is now agent-aware, loading <code>IDENTITY.md</code>, <code>SOUL.md</code>, <code>MEMORY.md</code>, <code>AGENTS.md</code>, and <code>TOOLS.md</code> from the active session agent workspace with backward-compatible fallbacks</li>
 <li>Memory tool operations and compaction memory writes are now agent-scoped, preventing cross-agent memory leakage during search/read/write flows</li>
 <li>Default sandbox package set now includes <code>golang-go</code>, and pre-built sandbox images install the latest <code>gog</code> (<code>steipete/gogcli</code>) as <code>gog</code> and <code>gogcli</code></li>
