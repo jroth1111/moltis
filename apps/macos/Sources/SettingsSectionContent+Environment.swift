@@ -25,6 +25,8 @@ extension SettingsSectionContent {
                                     .font(.system(.caption, design: .monospaced))
                                 environmentBadge(encrypted: item.encrypted)
                                 SecureField("New value", text: $settings.updatingEnvValue)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(minWidth: 220)
                                     .onSubmit {
                                         settings.confirmEnvironmentVariableUpdate(key: item.key)
                                     }
@@ -69,18 +71,27 @@ extension SettingsSectionContent {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Add Variable")
                         .font(.subheadline)
-                    HStack(spacing: 8) {
-                        TextField("KEY_NAME", text: $settings.newEnvKey)
+                    LabeledContent("Key") {
+                        TextField("ENV_NAME", text: $settings.newEnvKey)
                             .font(.system(.body, design: .monospaced))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 300)
                             .onSubmit {
                                 settings.addEnvironmentVariable()
                             }
                             .accessibilityIdentifier("settings-env-add-key")
-                        SecureField("Value", text: $settings.newEnvValue)
+                    }
+                    LabeledContent("Value") {
+                        SecureField("Type secret value", text: $settings.newEnvValue)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 300)
                             .onSubmit {
                                 settings.addEnvironmentVariable()
                             }
                             .accessibilityIdentifier("settings-env-add-value")
+                    }
+                    HStack {
+                        Spacer()
                         Button(settings.environmentBusy ? "Saving..." : "Add") {
                             settings.addEnvironmentVariable()
                         }

@@ -27,11 +27,13 @@ final class MoltisUITests: XCTestCase {
         XCTAssertTrue(openSettingsButton.waitForExistence(timeout: 20))
         openSettingsButton.click()
 
-        let settingsWindow = app.windows["Settings"]
+        let settingsWindow = app.windows["Settings"].firstMatch
         XCTAssertTrue(settingsWindow.waitForExistence(timeout: 20))
 
         let environmentSection = settingsWindow
-            .descendants(matching: .any)["settings-section-environment"]
+            .descendants(matching: .any)
+            .matching(identifier: "settings-section-environment")
+            .firstMatch
         XCTAssertTrue(environmentSection.waitForExistence(timeout: 10))
         environmentSection.click()
 
