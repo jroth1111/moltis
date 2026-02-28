@@ -122,7 +122,6 @@
 
 "No environment variables set." = "Aucune variable d'environnement définie.";
 "Environment Variables" = "Variables d'environnement";
-"Add Variable" = "Ajouter une variable";
 "Key" = "Clé";
 "Value" = "Valeur";
 "Save" = "Enregistrer";

@@ -60,8 +60,6 @@ extension SettingsSectionContent {
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Add Variable")
-                        .font(.subheadline)
                     LabeledContent("Key") {
                         TextField("", text: $settings.newEnvKey)
                             .font(.system(.body, design: .monospaced))

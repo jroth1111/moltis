@@ -23,13 +23,7 @@ final class MoltisUITests: XCTestCase {
         app.launchEnvironment["MOLTIS_DATA_DIR"] = dataDir.path
         app.launch()
 
-        let openSettingsButton = app.buttons["open-settings-button"]
-        XCTAssertTrue(openSettingsButton.waitForExistence(timeout: 20))
-        openSettingsButton.click()
-
-        let settingsWindow = app.windows
-            .matching(NSPredicate(format: "identifier CONTAINS %@", "settings-AppWindow"))
-            .firstMatch
+        let settingsWindow = openSettingsWindow(in: app)
         XCTAssertTrue(settingsWindow.waitForExistence(timeout: 20))
 
         let environmentSection = settingsWindow
@@ -59,9 +53,80 @@ final class MoltisUITests: XCTestCase {
         let addedKeyLabel = settingsWindow.staticTexts[envKey]
         XCTAssertTrue(addedKeyLabel.waitForExistence(timeout: 20))
     }
+
+    func testSettingsShortcutDoesNotOpenMultipleWindows() throws {
+        let runtimeRoot = try makeRuntimeRoot()
+        defer {
+            try? FileManager.default.removeItem(at: runtimeRoot)
+        }
+
+        let configDir = runtimeRoot.appendingPathComponent("config", isDirectory: true)
+        let dataDir = runtimeRoot.appendingPathComponent("data", isDirectory: true)
+        try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+
+        let app = XCUIApplication()
+        app.launchEnvironment["MOLTIS_UI_TEST_SKIP_ONBOARDING"] = "1"
+        app.launchEnvironment["MOLTIS_CONFIG_DIR"] = configDir.path
+        app.launchEnvironment["MOLTIS_DATA_DIR"] = dataDir.path
+        app.launch()
+
+        let settingsWindow = openSettingsWindow(in: app)
+        XCTAssertTrue(settingsWindow.waitForExistence(timeout: 20))
+        assertSingleSettingsWindow(in: app, timeout: 20)
+
+        app.typeKey(",", modifierFlags: .command)
+        assertSingleSettingsWindow(in: app, timeout: 10)
+
+        app.typeKey(",", modifierFlags: .command)
+        assertSingleSettingsWindow(in: app, timeout: 10)
+    }
 }
 
 private extension MoltisUITests {
+    func openSettingsWindow(in app: XCUIApplication) -> XCUIElement {
+        let settingsWindow = settingsWindow(in: app)
+        if settingsWindow.exists {
+            return settingsWindow
+        }
+
+        app.activate()
+        let openSettingsButton = app.buttons["open-settings-button"]
+        if openSettingsButton.waitForExistence(timeout: 5) {
+            openSettingsButton.click()
+        } else {
+            app.typeKey(",", modifierFlags: .command)
+        }
+        return settingsWindow
+    }
+
+    func settingsWindows(in app: XCUIApplication) -> XCUIElementQuery {
+        app.windows.containing(.any, identifier: "settings-section-environment")
+    }
+
+    func settingsWindow(in app: XCUIApplication) -> XCUIElement {
+        settingsWindows(in: app).firstMatch
+    }
+
+    func assertSingleSettingsWindow(
+        in app: XCUIApplication,
+        timeout: TimeInterval,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let settingsWindows = settingsWindows(in: app)
+        let predicate = NSPredicate(format: "count == 1")
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: settingsWindows)
+        let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
+        XCTAssertEqual(
+            result,
+            .completed,
+            "Expected exactly one Settings window, found \(settingsWindows.count)",
+            file: file,
+            line: line
+        )
+    }
+
     func makeRuntimeRoot() throws -> URL {
         let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("moltis-ui-tests-\(UUID().uuidString)", isDirectory: true)
