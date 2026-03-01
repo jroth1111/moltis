@@ -7,6 +7,7 @@ use {
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Per-tool rate limiter with a sliding-window reset every 60 seconds.
+#[derive(Clone)]
 pub struct RateLimit {
     pub max_per_minute: u32,
     remaining: Arc<AtomicU32>,
@@ -493,5 +494,39 @@ mod tests {
         let mut names = filtered.list_names();
         names.sort();
         assert_eq!(names, vec!["exec".to_string(), "web_fetch".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_clone_without_preserves_rate_limit() {
+        let mut registry = ToolRegistry::new();
+        registry.register_with_limit(
+            Box::new(DummyTool {
+                name: "limited".to_string(),
+            }),
+            Some(RateLimit::new(1)),
+        );
+
+        let cloned = registry.clone_without(&[]);
+        assert!(cloned.call("limited", serde_json::json!({})).await.is_ok());
+        let err = cloned.call("limited", serde_json::json!({})).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_clone_allowed_by_preserves_rate_limit() {
+        let mut registry = ToolRegistry::new();
+        registry.register_with_limit(
+            Box::new(DummyTool {
+                name: "limited".to_string(),
+            }),
+            Some(RateLimit::new(1)),
+        );
+
+        let cloned = registry.clone_allowed_by(|name| name == "limited");
+        assert!(cloned.call("limited", serde_json::json!({})).await.is_ok());
+        let err = cloned.call("limited", serde_json::json!({})).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("rate limit exceeded"));
     }
 }
