@@ -1865,11 +1865,11 @@ pub async fn prepare_gateway(
                 _ => format!("cron:{}", uuid::Uuid::new_v4()),
             };
 
-            // Clear session history for named cron sessions before execution
-            // so the run starts fresh but the history remains readable for debugging.
+            // Only clear heartbeat named sessions before execution.
+            // Other named cron sessions should preserve history continuity.
             if matches!(
                 req.session_target,
-                moltis_cron::types::SessionTarget::Named(_)
+                moltis_cron::types::SessionTarget::Named(ref name) if name == "heartbeat"
             ) {
                 let _ = chat
                     .clear(serde_json::json!({ "_session_key": session_key }))
