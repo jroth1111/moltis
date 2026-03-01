@@ -11,11 +11,12 @@ use crate::{
 
 use {
     moltis_agents::{
+        AgentRunError,
         model::LlmProvider,
         runner::{RunnerEvent, run_agent_loop_with_context},
         tool_registry::{AgentTool, ToolRegistry},
     },
-    moltis_config::schema::{AgentPresetConfig, AgentsConfig},
+    moltis_config::schema::{AgentPreset, AgentsConfig},
     moltis_providers::ProviderRegistry,
 };
 
@@ -140,7 +141,7 @@ impl SpawnAgentTool {
     async fn resolve_preset(
         &self,
         params: &serde_json::Value,
-    ) -> crate::Result<(Option<String>, Option<AgentPresetConfig>)> {
+    ) -> crate::Result<(Option<String>, Option<AgentPreset>)> {
         let explicit_name = str_param(params, "preset").map(String::from);
 
         let Some(ref agents_config) = self.agents_config else {
@@ -164,6 +165,51 @@ impl SpawnAgentTool {
         })?;
         Ok((Some(preset_name), Some(preset)))
     }
+}
+
+/// Build the system prompt for a sub-agent, incorporating preset customizations.
+fn build_sub_agent_prompt(task: &str, context: &str, preset: Option<&AgentPreset>) -> String {
+    let mut prompt = String::new();
+
+    // Add preset identity if available.
+    if let Some(p) = preset {
+        if let Some(ref name) = p.identity.name {
+            prompt.push_str(&format!("You are {name}"));
+            if let Some(ref emoji) = p.identity.emoji {
+                prompt.push_str(&format!(" ({emoji})"));
+            }
+            prompt.push_str(". ");
+        }
+        if let Some(ref theme) = p.identity.theme {
+            prompt.push_str(&format!("Your style is {theme}. "));
+        }
+    }
+
+    // Add base instruction.
+    if prompt.is_empty() {
+        prompt.push_str("You are a sub-agent spawned to handle a specific task. ");
+    }
+    prompt.push_str("Complete the task thoroughly and return a clear result.\n\n");
+
+    // Add task.
+    prompt.push_str(&format!("Task: {task}"));
+
+    // Add context if provided.
+    if !context.is_empty() {
+        prompt.push_str(&format!("\n\nContext: {context}"));
+    }
+
+    // Add preset system prompt suffix.
+    if let Some(extra) = preset
+        .and_then(|p| p.system_prompt_suffix.as_ref())
+        .map(|s| s.trim())
+        .filter(|v| !v.is_empty())
+    {
+        prompt.push_str("\n\n");
+        prompt.push_str(extra);
+    }
+
+    prompt
 }
 
 #[async_trait]
@@ -193,11 +239,11 @@ impl AgentTool for SpawnAgentTool {
                 },
                 "preset": {
                     "type": "string",
-                    "description": "Optional spawn preset from config.agents.presets."
+                    "description": "Agent preset name (e.g. 'researcher', 'coder'). Presets define model, tool policies, and behavior."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model ID to use (e.g. a cheaper model). If not specified, uses the parent's current model."
+                    "description": "Model ID to use (e.g. a cheaper model). If not specified, uses preset model or parent's model."
                 },
                 "allow_tools": {
                     "type": "array",
@@ -232,7 +278,7 @@ impl AgentTool for SpawnAgentTool {
         let allow_tools = if explicit_allow_tools.is_empty() {
             preset
                 .as_ref()
-                .map(|p| p.allow_tools.clone())
+                .map(|p| p.tools.allow.clone())
                 .unwrap_or_default()
         } else {
             explicit_allow_tools
@@ -242,7 +288,7 @@ impl AgentTool for SpawnAgentTool {
         let deny_tools = if explicit_deny_tools.is_empty() {
             preset
                 .as_ref()
-                .map(|p| p.deny_tools.clone())
+                .map(|p| p.tools.deny.clone())
                 .unwrap_or_default()
         } else {
             explicit_deny_tools
@@ -292,29 +338,8 @@ impl AgentTool for SpawnAgentTool {
         // Build filtered tool registry from policy knobs.
         let sub_tools = self.build_sub_tools(&allow_tools, &deny_tools, delegate_only);
 
-        // Build system prompt.
-        let mut system_prompt = if context.is_empty() {
-            format!(
-                "You are a sub-agent spawned to handle a specific task. \
-                 Complete the task thoroughly and return a clear result.\n\n\
-                 Task: {task}"
-            )
-        } else {
-            format!(
-                "You are a sub-agent spawned to handle a specific task. \
-                 Complete the task thoroughly and return a clear result.\n\n\
-                Task: {task}\n\nContext: {context}"
-            )
-        };
-        if let Some(extra) = preset
-            .as_ref()
-            .and_then(|p| p.system_prompt_suffix.as_ref())
-            .map(|suffix| suffix.trim())
-            .filter(|v| !v.is_empty())
-        {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(extra);
-        }
+        // Build system prompt with identity injection.
+        let system_prompt = build_sub_agent_prompt(task, context, preset.as_ref());
 
         // Build tool context with incremented depth and propagated session key.
         let mut tool_context = serde_json::json!({
@@ -324,9 +349,9 @@ impl AgentTool for SpawnAgentTool {
             tool_context["_session_key"] = session_key.clone();
         }
 
-        // Run the sub-agent loop (no event forwarding, no hooks, no history).
+        // Run the sub-agent loop, optionally with a timeout.
         let user_content = moltis_agents::UserContent::text(task);
-        let result = run_agent_loop_with_context(
+        let agent_future = run_agent_loop_with_context(
             provider,
             &sub_tools,
             &system_prompt,
@@ -335,8 +360,19 @@ impl AgentTool for SpawnAgentTool {
             None, // no history
             Some(tool_context),
             None, // no hooks for sub-agents
-        )
-        .await;
+        );
+
+        let result = if let Some(timeout_secs) = preset.as_ref().and_then(|p| p.timeout_secs) {
+            let duration = std::time::Duration::from_secs(timeout_secs);
+            match tokio::time::timeout(duration, agent_future).await {
+                Ok(r) => r,
+                Err(_) => Err(AgentRunError::Other(anyhow::anyhow!(
+                    "sub-agent timed out after {timeout_secs}s"
+                ))),
+            }
+        } else {
+            agent_future.await
+        };
 
         // Emit SubAgentEnd regardless of success/failure.
         let (iterations, tool_calls_made) = match &result {
@@ -358,6 +394,7 @@ impl AgentTool for SpawnAgentTool {
             depth = depth,
             iterations = result.iterations,
             tool_calls = result.tool_calls_made,
+            preset = ?preset_name,
             "sub-agent completed"
         );
 
@@ -366,6 +403,7 @@ impl AgentTool for SpawnAgentTool {
             "iterations": result.iterations,
             "tool_calls_made": result.tool_calls_made,
             "model": model_id,
+            "preset": preset_name,
         }))
     }
 }
@@ -376,6 +414,7 @@ mod tests {
     use {
         super::*,
         moltis_agents::model::{ChatMessage, CompletionResponse, StreamEvent, Usage},
+        moltis_config::schema::{AgentIdentity, PresetToolPolicy},
         std::pin::Pin,
         tokio_stream::Stream,
     };
@@ -461,7 +500,7 @@ mod tests {
 
     fn agents_config_with_presets(
         default_preset: Option<&str>,
-        presets: &[(&str, AgentPresetConfig)],
+        presets: &[(&str, AgentPreset)],
     ) -> Arc<tokio::sync::RwLock<AgentsConfig>> {
         let mut cfg = AgentsConfig {
             default_preset: default_preset.map(String::from),
@@ -694,7 +733,7 @@ mod tests {
         )
         .with_agents_config(agents_config_with_presets(Some("default"), &[(
             "research",
-            AgentPresetConfig {
+            AgentPreset {
                 delegate_only: true,
                 ..Default::default()
             },
@@ -721,8 +760,11 @@ mod tests {
         )
         .with_agents_config(agents_config_with_presets(Some("default"), &[(
             "default",
-            AgentPresetConfig {
-                allow_tools: vec!["task_list".to_string()],
+            AgentPreset {
+                tools: PresetToolPolicy {
+                    allow: vec!["task_list".to_string()],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )]));
@@ -735,7 +777,7 @@ mod tests {
         assert_eq!(
             preset
                 .as_ref()
-                .map(|p| p.allow_tools.clone())
+                .map(|p| p.tools.allow.clone())
                 .unwrap_or_default(),
             vec!["task_list".to_string()]
         );
@@ -764,5 +806,91 @@ mod tests {
                 .map(|e| e.to_string().contains("not found"))
                 .unwrap_or(false)
         );
+    }
+
+    #[test]
+    fn test_identity_injected_into_system_prompt() {
+        let preset = AgentPreset {
+            identity: AgentIdentity {
+                name: Some("scout".into()),
+                emoji: Some("🔍".into()),
+                theme: Some("thorough".into()),
+            },
+            system_prompt_suffix: Some("Focus on accuracy.".into()),
+            ..Default::default()
+        };
+
+        let prompt = build_sub_agent_prompt("find bugs", "in main.rs", Some(&preset));
+
+        assert!(prompt.contains("You are scout (🔍)"));
+        assert!(prompt.contains("Your style is thorough"));
+        assert!(prompt.contains("Task: find bugs"));
+        assert!(prompt.contains("Context: in main.rs"));
+        assert!(prompt.contains("Focus on accuracy."));
+    }
+
+    #[test]
+    fn test_no_identity_uses_default_prompt() {
+        let prompt = build_sub_agent_prompt("do work", "", None);
+
+        assert!(prompt.contains("You are a sub-agent"));
+        assert!(prompt.contains("Task: do work"));
+        assert!(!prompt.contains("Context:"));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_cancels_long_running_agent() {
+        // Mock provider with a slow response.
+        struct SlowProvider;
+
+        #[async_trait]
+        impl LlmProvider for SlowProvider {
+            fn name(&self) -> &str {
+                "slow"
+            }
+
+            fn id(&self) -> &str {
+                "slow-model"
+            }
+
+            async fn complete(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[serde_json::Value],
+            ) -> anyhow::Result<CompletionResponse> {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                Ok(CompletionResponse {
+                    text: Some("too late".into()),
+                    tool_calls: vec![],
+                    usage: Usage::default(),
+                })
+            }
+
+            fn stream(
+                &self,
+                _messages: Vec<ChatMessage>,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+                Box::pin(tokio_stream::empty())
+            }
+        }
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(SlowProvider);
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_agents_config(agents_config_with_presets(None, &[("slow", AgentPreset {
+            timeout_secs: Some(1),
+            ..Default::default()
+        })]));
+
+        let params = serde_json::json!({
+            "task": "do something slowly",
+            "preset": "slow",
+        });
+        let result = spawn_tool.execute(params).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 }
