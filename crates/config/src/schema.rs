@@ -247,6 +247,38 @@ pub struct PresetToolPolicy {
     pub deny: Vec<String>,
 }
 
+/// Scope for per-agent persistent memory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryScope {
+    /// User-global: `~/.moltis/agent-memory/<preset>/`
+    #[default]
+    User,
+    /// Project-local: `.moltis/agent-memory/<preset>/`
+    Project,
+    /// Untracked local: `.moltis/agent-memory-local/<preset>/`
+    Local,
+}
+
+/// Persistent memory configuration for a preset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PresetMemoryConfig {
+    /// Memory scope: where the MEMORY.md is stored.
+    pub scope: MemoryScope,
+    /// Maximum lines to load from MEMORY.md (default: 200).
+    pub max_lines: usize,
+}
+
+impl Default for PresetMemoryConfig {
+    fn default() -> Self {
+        Self {
+            scope: MemoryScope::default(),
+            max_lines: 200,
+        }
+    }
+}
+
 /// Session access policy configuration for a preset.
 ///
 /// Controls which sessions an agent can see and interact with via
@@ -303,6 +335,8 @@ pub struct AgentPreset {
     pub timeout_secs: Option<u64>,
     /// Session access policy for inter-agent communication.
     pub sessions: Option<SessionAccessPolicyConfig>,
+    /// Persistent per-agent memory configuration.
+    pub memory: Option<PresetMemoryConfig>,
 }
 
 /// Voice configuration (TTS and STT).

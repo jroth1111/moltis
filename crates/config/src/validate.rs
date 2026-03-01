@@ -330,6 +330,10 @@ fn build_schema_map() -> KnownKeys {
                     ("cross_agent", Leaf),
                 ])),
             ),
+            (
+                "memory",
+                Struct(HashMap::from([("scope", Leaf), ("max_lines", Leaf)])),
+            ),
         ]))
     };
 

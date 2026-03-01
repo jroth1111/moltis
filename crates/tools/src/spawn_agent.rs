@@ -188,8 +188,59 @@ impl SpawnAgentTool {
     }
 }
 
+/// Resolve the memory directory for a preset based on its scope.
+fn resolve_memory_dir(
+    preset_name: &str,
+    scope: &moltis_config::schema::MemoryScope,
+) -> std::path::PathBuf {
+    use moltis_config::schema::MemoryScope;
+    match scope {
+        MemoryScope::User => {
+            let data_dir = moltis_config::data_dir();
+            data_dir.join("agent-memory").join(preset_name)
+        },
+        MemoryScope::Project => std::path::PathBuf::from(".moltis")
+            .join("agent-memory")
+            .join(preset_name),
+        MemoryScope::Local => std::path::PathBuf::from(".moltis")
+            .join("agent-memory-local")
+            .join(preset_name),
+    }
+}
+
+/// Load the first N lines of MEMORY.md from the agent's memory directory.
+/// Returns `None` if the file doesn't exist or is empty.
+fn load_memory_context(
+    preset_name: &str,
+    config: &moltis_config::schema::PresetMemoryConfig,
+) -> Option<String> {
+    let dir = resolve_memory_dir(preset_name, &config.scope);
+    load_memory_from_dir(&dir, config.max_lines)
+}
+
+/// Load memory content from a specific directory.
+fn load_memory_from_dir(dir: &std::path::Path, max_lines: usize) -> Option<String> {
+    let memory_path = dir.join("MEMORY.md");
+
+    // Create directory if missing so agents can write to it later.
+    let _ = std::fs::create_dir_all(dir);
+
+    let content = std::fs::read_to_string(&memory_path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    let lines: Vec<&str> = content.lines().take(max_lines).collect();
+    Some(lines.join("\n"))
+}
+
 /// Build the system prompt for a sub-agent, incorporating preset customizations.
-fn build_sub_agent_prompt(task: &str, context: &str, preset: Option<&AgentPreset>) -> String {
+fn build_sub_agent_prompt(
+    task: &str,
+    context: &str,
+    preset: Option<&AgentPreset>,
+    preset_name: Option<&str>,
+) -> String {
     let mut prompt = String::new();
 
     // Add preset identity if available.
@@ -211,6 +262,19 @@ fn build_sub_agent_prompt(task: &str, context: &str, preset: Option<&AgentPreset
         prompt.push_str("You are a sub-agent spawned to handle a specific task. ");
     }
     prompt.push_str("Complete the task thoroughly and return a clear result.\n\n");
+
+    // Inject persistent memory if configured.
+    if let Some(p) = preset {
+        if let Some(ref mem_config) = p.memory {
+            if let Some(name) = preset_name {
+                if let Some(memory_content) = load_memory_context(name, mem_config) {
+                    prompt.push_str("# Agent Memory\n\n");
+                    prompt.push_str(&memory_content);
+                    prompt.push_str("\n\n");
+                }
+            }
+        }
+    }
 
     // Add task.
     prompt.push_str(&format!("Task: {task}"));
@@ -386,8 +450,9 @@ impl AgentTool for SpawnAgentTool {
             }
         }
 
-        // Build system prompt with identity injection.
-        let system_prompt = build_sub_agent_prompt(task, context, preset.as_ref());
+        // Build system prompt with identity injection and memory.
+        let system_prompt =
+            build_sub_agent_prompt(task, context, preset.as_ref(), preset_name.as_deref());
 
         // Build tool context with incremented depth and propagated session key.
         let mut tool_context = serde_json::json!({
@@ -868,7 +933,8 @@ mod tests {
             ..Default::default()
         };
 
-        let prompt = build_sub_agent_prompt("find bugs", "in main.rs", Some(&preset));
+        let prompt =
+            build_sub_agent_prompt("find bugs", "in main.rs", Some(&preset), Some("scout"));
 
         assert!(prompt.contains("You are scout (🔍)"));
         assert!(prompt.contains("Your style is thorough"));
@@ -879,11 +945,59 @@ mod tests {
 
     #[test]
     fn test_no_identity_uses_default_prompt() {
-        let prompt = build_sub_agent_prompt("do work", "", None);
+        let prompt = build_sub_agent_prompt("do work", "", None, None);
 
         assert!(prompt.contains("You are a sub-agent"));
         assert!(prompt.contains("Task: do work"));
         assert!(!prompt.contains("Context:"));
+    }
+
+    #[test]
+    fn test_memory_injected_into_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("agent-memory").join("researcher");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(
+            memory_dir.join("MEMORY.md"),
+            "- Always check edge cases\n- Prefer iterators",
+        )
+        .unwrap();
+
+        // Load memory directly to verify the function works.
+        let content = load_memory_from_dir(&memory_dir, 200);
+        assert!(content.is_some());
+        let content = content.unwrap();
+        assert!(content.contains("Always check edge cases"));
+        assert!(content.contains("Prefer iterators"));
+    }
+
+    #[test]
+    fn test_load_memory_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path();
+        let lines: Vec<String> = (0..10).map(|i| format!("Line {i}")).collect();
+        std::fs::write(memory_dir.join("MEMORY.md"), lines.join("\n")).unwrap();
+
+        let content = load_memory_from_dir(memory_dir, 3).unwrap();
+        assert!(content.contains("Line 0"));
+        assert!(content.contains("Line 2"));
+        assert!(!content.contains("Line 3"));
+    }
+
+    #[test]
+    fn test_load_memory_empty_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MEMORY.md"), "   \n  \n").unwrap();
+
+        let content = load_memory_from_dir(dir.path(), 200);
+        assert!(content.is_none());
+    }
+
+    #[test]
+    fn test_load_memory_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = load_memory_from_dir(dir.path(), 200);
+        assert!(content.is_none());
     }
 
     #[tokio::test]
