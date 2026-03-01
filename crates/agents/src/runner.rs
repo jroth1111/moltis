@@ -942,7 +942,6 @@ pub async fn run_agent_loop_with_context(
             .tool_calls
             .iter()
             .map(|tc| {
-                let tool = tools.get(&tc.name);
                 let mut args = tc.arguments.clone();
 
                 // Dispatch BeforeToolCall hook — may block or modify arguments.
@@ -986,69 +985,60 @@ pub async fn run_agent_loop_with_context(
                         }
                     }
 
-                    if let Some(tool) = tool {
-                        match tool.execute(args).await {
-                            Ok(val) => {
-                                // Check if the result indicates a logical failure
-                                // (e.g., BrowserResponse with success: false)
-                                let has_error = val.get("error").is_some()
-                                    || val.get("success") == Some(&serde_json::json!(false));
-                                let error_msg = if has_error {
-                                    val.get("error")
-                                        .and_then(|e| e.as_str())
-                                        .map(String::from)
-                                } else {
-                                    None
+                    match tools.call(&tc_name, args).await {
+                        Ok(val) => {
+                            // Check if the result indicates a logical failure
+                            // (e.g., BrowserResponse with success: false)
+                            let has_error = val.get("error").is_some()
+                                || val.get("success") == Some(&serde_json::json!(false));
+                            let error_msg = if has_error {
+                                val.get("error")
+                                    .and_then(|e| e.as_str())
+                                    .map(String::from)
+                            } else {
+                                None
+                            };
+
+                            // Dispatch AfterToolCall hook.
+                            if let Some(ref hooks) = hook_registry {
+                                let payload = HookPayload::AfterToolCall {
+                                    session_key: session_key.clone(),
+                                    tool_name: tc_name.clone(),
+                                    success: !has_error,
+                                    result: Some(val.clone()),
                                 };
+                                if let Err(e) = hooks.dispatch(&payload).await {
+                                    warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
+                                }
+                            }
 
-                                // Dispatch AfterToolCall hook.
-                                if let Some(ref hooks) = hook_registry {
-                                    let payload = HookPayload::AfterToolCall {
-                                        session_key: session_key.clone(),
-                                        tool_name: tc_name.clone(),
-                                        success: !has_error,
-                                        result: Some(val.clone()),
-                                    };
-                                    if let Err(e) = hooks.dispatch(&payload).await {
-                                        warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
-                                    }
+                            if has_error {
+                                // Tool executed but returned an error in the result
+                                (false, serde_json::json!({ "result": val }), error_msg)
+                            } else {
+                                (true, serde_json::json!({ "result": val }), None)
+                            }
+                        },
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            // Dispatch AfterToolCall hook on failure.
+                            if let Some(ref hooks) = hook_registry {
+                                let payload = HookPayload::AfterToolCall {
+                                    session_key: session_key.clone(),
+                                    tool_name: tc_name.clone(),
+                                    success: false,
+                                    result: None,
+                                };
+                                if let Err(e) = hooks.dispatch(&payload).await {
+                                    warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
                                 }
-
-                                if has_error {
-                                    // Tool executed but returned an error in the result
-                                    (false, serde_json::json!({ "result": val }), error_msg)
-                                } else {
-                                    (true, serde_json::json!({ "result": val }), None)
-                                }
-                            },
-                            Err(e) => {
-                                let err_str = e.to_string();
-                                // Dispatch AfterToolCall hook on failure.
-                                if let Some(ref hooks) = hook_registry {
-                                    let payload = HookPayload::AfterToolCall {
-                                        session_key: session_key.clone(),
-                                        tool_name: tc_name.clone(),
-                                        success: false,
-                                        result: None,
-                                    };
-                                    if let Err(e) = hooks.dispatch(&payload).await {
-                                        warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
-                                    }
-                                }
-                                (
-                                    false,
-                                    serde_json::json!({ "error": err_str }),
-                                    Some(err_str),
-                                )
-                            },
-                        }
-                    } else {
-                        let err_str = format!("unknown tool: {tc_name}");
-                        (
-                            false,
-                            serde_json::json!({ "error": err_str }),
-                            Some(err_str),
-                        )
+                            }
+                            (
+                                false,
+                                serde_json::json!({ "error": err_str }),
+                                Some(err_str),
+                            )
+                        },
                     }
                 }
             })
@@ -1603,7 +1593,6 @@ pub async fn run_agent_loop_streaming(
         let tool_futures: Vec<_> = tool_calls
             .iter()
             .map(|tc| {
-                let tool = tools.get(&tc.name);
                 let mut args = tc.arguments.clone();
 
                 let hook_registry = hook_registry.clone();
@@ -1645,66 +1634,57 @@ pub async fn run_agent_loop_streaming(
                         }
                     }
 
-                    if let Some(tool) = tool {
-                        match tool.execute(args).await {
-                            Ok(val) => {
-                                // Check if the result indicates a logical failure
-                                // (e.g., BrowserResponse with success: false)
-                                let has_error = val.get("error").is_some()
-                                    || val.get("success") == Some(&serde_json::json!(false));
-                                let error_msg = if has_error {
-                                    val.get("error")
-                                        .and_then(|e| e.as_str())
-                                        .map(String::from)
-                                } else {
-                                    None
+                    match tools.call(&tc_name, args).await {
+                        Ok(val) => {
+                            // Check if the result indicates a logical failure
+                            // (e.g., BrowserResponse with success: false)
+                            let has_error = val.get("error").is_some()
+                                || val.get("success") == Some(&serde_json::json!(false));
+                            let error_msg = if has_error {
+                                val.get("error")
+                                    .and_then(|e| e.as_str())
+                                    .map(String::from)
+                            } else {
+                                None
+                            };
+
+                            if let Some(ref hooks) = hook_registry {
+                                let payload = HookPayload::AfterToolCall {
+                                    session_key: session_key.clone(),
+                                    tool_name: tc_name.clone(),
+                                    success: !has_error,
+                                    result: Some(val.clone()),
                                 };
-
-                                if let Some(ref hooks) = hook_registry {
-                                    let payload = HookPayload::AfterToolCall {
-                                        session_key: session_key.clone(),
-                                        tool_name: tc_name.clone(),
-                                        success: !has_error,
-                                        result: Some(val.clone()),
-                                    };
-                                    if let Err(e) = hooks.dispatch(&payload).await {
-                                        warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
-                                    }
-                                }
-
-                                if has_error {
-                                    (false, serde_json::json!({ "result": val }), error_msg)
-                                } else {
-                                    (true, serde_json::json!({ "result": val }), None)
+                                if let Err(e) = hooks.dispatch(&payload).await {
+                                    warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
                                 }
                             }
-                            Err(e) => {
-                                let err_str = e.to_string();
-                                if let Some(ref hooks) = hook_registry {
-                                    let payload = HookPayload::AfterToolCall {
-                                        session_key: session_key.clone(),
-                                        tool_name: tc_name.clone(),
-                                        success: false,
-                                        result: None,
-                                    };
-                                    if let Err(e) = hooks.dispatch(&payload).await {
-                                        warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
-                                    }
-                                }
-                                (
-                                    false,
-                                    serde_json::json!({ "error": err_str }),
-                                    Some(err_str),
-                                )
+
+                            if has_error {
+                                (false, serde_json::json!({ "result": val }), error_msg)
+                            } else {
+                                (true, serde_json::json!({ "result": val }), None)
                             }
                         }
-                    } else {
-                        let err_str = format!("unknown tool: {tc_name}");
-                        (
-                            false,
-                            serde_json::json!({ "error": err_str }),
-                            Some(err_str),
-                        )
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if let Some(ref hooks) = hook_registry {
+                                let payload = HookPayload::AfterToolCall {
+                                    session_key: session_key.clone(),
+                                    tool_name: tc_name.clone(),
+                                    success: false,
+                                    result: None,
+                                };
+                                if let Err(e) = hooks.dispatch(&payload).await {
+                                    warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
+                                }
+                            }
+                            (
+                                false,
+                                serde_json::json!({ "error": err_str }),
+                                Some(err_str),
+                            )
+                        }
                     }
                 }
             })
