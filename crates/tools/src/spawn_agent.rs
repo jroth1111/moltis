@@ -264,16 +264,14 @@ fn build_sub_agent_prompt(
     prompt.push_str("Complete the task thoroughly and return a clear result.\n\n");
 
     // Inject persistent memory if configured.
-    if let Some(p) = preset {
-        if let Some(ref mem_config) = p.memory {
-            if let Some(name) = preset_name {
-                if let Some(memory_content) = load_memory_context(name, mem_config) {
-                    prompt.push_str("# Agent Memory\n\n");
-                    prompt.push_str(&memory_content);
-                    prompt.push_str("\n\n");
-                }
-            }
-        }
+    if let Some(p) = preset
+        && let Some(ref mem_config) = p.memory
+        && let Some(name) = preset_name
+        && let Some(memory_content) = load_memory_context(name, mem_config)
+    {
+        prompt.push_str("# Agent Memory\n\n");
+        prompt.push_str(&memory_content);
+        prompt.push_str("\n\n");
     }
 
     // Add task.
@@ -424,30 +422,29 @@ impl AgentTool for SpawnAgentTool {
         let mut sub_tools = self.build_sub_tools(&allow_tools, &deny_tools, delegate_only);
 
         // Apply session access policy if the preset configures one.
-        if let Some(ref p) = preset {
-            if let Some(ref session_config) = p.sessions {
-                if let Some(ref deps) = self.session_deps {
-                    let policy = SessionAccessPolicy::from(session_config);
-                    sub_tools.replace(Box::new(
-                        SessionsListTool::new(Arc::clone(&deps.session_metadata))
-                            .with_policy(policy.clone()),
-                    ));
-                    sub_tools.replace(Box::new(
-                        SessionsHistoryTool::new(
-                            Arc::clone(&deps.session_store),
-                            Arc::clone(&deps.session_metadata),
-                        )
-                        .with_policy(policy.clone()),
-                    ));
-                    sub_tools.replace(Box::new(
-                        SessionsSendTool::new(
-                            Arc::clone(&deps.session_metadata),
-                            Arc::clone(&deps.send_to_session),
-                        )
-                        .with_policy(policy),
-                    ));
-                }
-            }
+        if let Some(ref p) = preset
+            && let Some(ref session_config) = p.sessions
+            && let Some(ref deps) = self.session_deps
+        {
+            let policy = SessionAccessPolicy::from(session_config);
+            sub_tools.replace(Box::new(
+                SessionsListTool::new(Arc::clone(&deps.session_metadata))
+                    .with_policy(policy.clone()),
+            ));
+            sub_tools.replace(Box::new(
+                SessionsHistoryTool::new(
+                    Arc::clone(&deps.session_store),
+                    Arc::clone(&deps.session_metadata),
+                )
+                .with_policy(policy.clone()),
+            ));
+            sub_tools.replace(Box::new(
+                SessionsSendTool::new(
+                    Arc::clone(&deps.session_metadata),
+                    Arc::clone(&deps.send_to_session),
+                )
+                .with_policy(policy),
+            ));
         }
 
         // Build system prompt with identity injection and memory.

@@ -178,10 +178,10 @@ impl AgentTool for SessionsListTool {
             .into_iter()
             .filter(|entry| {
                 // Apply session access policy.
-                if let Some(ref policy) = self.policy {
-                    if !policy.can_access(&entry.key) {
-                        return false;
-                    }
+                if let Some(ref policy) = self.policy
+                    && !policy.can_access(&entry.key)
+                {
+                    return false;
                 }
                 filter.as_ref().is_none_or(|needle| {
                     let key_match = entry.key.to_lowercase().contains(needle);
@@ -254,10 +254,10 @@ impl AgentTool for SessionsHistoryTool {
         let key = require_str(&params, "key")?;
 
         // Enforce session access policy.
-        if let Some(ref policy) = self.policy {
-            if !policy.can_access(key) {
-                return Err(Error::message(format!("session access denied: {key}")).into());
-            }
+        if let Some(ref policy) = self.policy
+            && !policy.can_access(key)
+        {
+            return Err(Error::message(format!("session access denied: {key}")).into());
         }
 
         let limit = u64_param(&params, "limit", 20).min(100) as usize;
@@ -380,6 +380,7 @@ impl AgentTool for SessionsSendTool {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -617,8 +618,8 @@ mod tests {
             }))
             .await;
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denies sending"));
+        let err = result.expect_err("should deny sending");
+        assert!(err.to_string().contains("denies sending"));
         Ok(())
     }
 
