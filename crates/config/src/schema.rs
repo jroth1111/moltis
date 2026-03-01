@@ -247,6 +247,37 @@ pub struct PresetToolPolicy {
     pub deny: Vec<String>,
 }
 
+/// Session access policy configuration for a preset.
+///
+/// Controls which sessions an agent can see and interact with via
+/// the `sessions_list`, `sessions_history`, and `sessions_send` tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionAccessPolicyConfig {
+    /// Only see sessions with keys matching this prefix.
+    pub key_prefix: Option<String>,
+    /// Explicit session keys this agent can access (in addition to prefix).
+    #[serde(default)]
+    pub allowed_keys: Vec<String>,
+    /// Whether the agent can send messages to sessions.
+    #[serde(default = "default_true")]
+    pub can_send: bool,
+    /// Whether the agent can access sessions from other agents.
+    #[serde(default)]
+    pub cross_agent: bool,
+}
+
+impl Default for SessionAccessPolicyConfig {
+    fn default() -> Self {
+        Self {
+            key_prefix: None,
+            allowed_keys: Vec::new(),
+            can_send: true,
+            cross_agent: false,
+        }
+    }
+}
+
 /// Spawn policy preset for sub-agents.
 ///
 /// Presets allow defining specialized agent configurations that can be
@@ -270,6 +301,8 @@ pub struct AgentPreset {
     pub max_iterations: Option<u64>,
     /// Timeout in seconds for the sub-agent.
     pub timeout_secs: Option<u64>,
+    /// Session access policy for inter-agent communication.
+    pub sessions: Option<SessionAccessPolicyConfig>,
 }
 
 /// Voice configuration (TTS and STT).

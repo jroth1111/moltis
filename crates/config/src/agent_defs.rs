@@ -76,6 +76,7 @@ pub fn parse_agent_md(content: &str) -> anyhow::Result<(String, AgentPreset)> {
         delegate_only: fm.delegate_only,
         max_iterations: fm.max_iterations,
         timeout_secs: fm.timeout_secs,
+        ..Default::default()
     };
 
     Ok((name, preset))

@@ -321,6 +321,15 @@ fn build_schema_map() -> KnownKeys {
             ("system_prompt_suffix", Leaf),
             ("max_iterations", Leaf),
             ("timeout_secs", Leaf),
+            (
+                "sessions",
+                Struct(HashMap::from([
+                    ("key_prefix", Leaf),
+                    ("allowed_keys", Leaf),
+                    ("can_send", Leaf),
+                    ("cross_agent", Leaf),
+                ])),
+            ),
         ]))
     };
 

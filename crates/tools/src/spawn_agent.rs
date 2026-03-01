@@ -18,6 +18,11 @@ use {
     },
     moltis_config::schema::{AgentPreset, AgentsConfig},
     moltis_providers::ProviderRegistry,
+    moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore},
+};
+
+use crate::sessions_communicate::{
+    SendToSessionFn, SessionAccessPolicy, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
 
 /// Maximum nesting depth for sub-agents (prevents infinite recursion).
@@ -44,12 +49,21 @@ const DELEGATE_TOOLS: &[&str] = &[
 /// Callback for emitting events from the sub-agent back to the parent UI.
 pub type OnSpawnEvent = Arc<dyn Fn(RunnerEvent) + Send + Sync>;
 
+/// Dependencies for building policy-aware session tools in sub-agents.
+#[derive(Clone)]
+pub struct SessionDeps {
+    pub session_metadata: Arc<SqliteSessionMetadata>,
+    pub session_store: Arc<SessionStore>,
+    pub send_to_session: SendToSessionFn,
+}
+
 pub struct SpawnAgentTool {
     provider_registry: Arc<tokio::sync::RwLock<ProviderRegistry>>,
     default_provider: Arc<dyn LlmProvider>,
     tool_registry: Arc<ToolRegistry>,
     agents_config: Option<Arc<tokio::sync::RwLock<AgentsConfig>>>,
     on_event: Option<OnSpawnEvent>,
+    session_deps: Option<SessionDeps>,
 }
 
 impl SpawnAgentTool {
@@ -64,6 +78,7 @@ impl SpawnAgentTool {
             tool_registry,
             agents_config: None,
             on_event: None,
+            session_deps: None,
         }
     }
 
@@ -79,6 +94,12 @@ impl SpawnAgentTool {
         agents_config: Arc<tokio::sync::RwLock<AgentsConfig>>,
     ) -> Self {
         self.agents_config = Some(agents_config);
+        self
+    }
+
+    /// Provide session dependencies so sub-agents can get policy-aware session tools.
+    pub fn with_session_deps(mut self, deps: SessionDeps) -> Self {
+        self.session_deps = Some(deps);
         self
     }
 
@@ -336,7 +357,34 @@ impl AgentTool for SpawnAgentTool {
         });
 
         // Build filtered tool registry from policy knobs.
-        let sub_tools = self.build_sub_tools(&allow_tools, &deny_tools, delegate_only);
+        let mut sub_tools = self.build_sub_tools(&allow_tools, &deny_tools, delegate_only);
+
+        // Apply session access policy if the preset configures one.
+        if let Some(ref p) = preset {
+            if let Some(ref session_config) = p.sessions {
+                if let Some(ref deps) = self.session_deps {
+                    let policy = SessionAccessPolicy::from(session_config);
+                    sub_tools.replace(Box::new(
+                        SessionsListTool::new(Arc::clone(&deps.session_metadata))
+                            .with_policy(policy.clone()),
+                    ));
+                    sub_tools.replace(Box::new(
+                        SessionsHistoryTool::new(
+                            Arc::clone(&deps.session_store),
+                            Arc::clone(&deps.session_metadata),
+                        )
+                        .with_policy(policy.clone()),
+                    ));
+                    sub_tools.replace(Box::new(
+                        SessionsSendTool::new(
+                            Arc::clone(&deps.session_metadata),
+                            Arc::clone(&deps.send_to_session),
+                        )
+                        .with_policy(policy),
+                    ));
+                }
+            }
+        }
 
         // Build system prompt with identity injection.
         let system_prompt = build_sub_agent_prompt(task, context, preset.as_ref());
