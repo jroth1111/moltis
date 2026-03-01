@@ -33,7 +33,9 @@ pub struct ExecCompletionEvent {
 pub type ExecCompletionFn = Arc<dyn Fn(ExecCompletionEvent) + Send + Sync>;
 
 use crate::{
-    approval::{ApprovalAction, ApprovalDecision, ApprovalManager},
+    approval::{
+        ApprovalAction, ApprovalDecision, ApprovalManager, cleanup_approval, persist_approval,
+    },
     sandbox::{NoSandbox, Sandbox, SandboxId, SandboxRouter},
 };
 
@@ -177,6 +179,7 @@ pub struct ExecTool {
     pub max_output_bytes: usize,
     pub working_dir: Option<PathBuf>,
     approval_manager: Option<Arc<ApprovalManager>>,
+    approval_store: Option<Arc<sqlx::SqlitePool>>,
     broadcaster: Option<Arc<dyn ApprovalBroadcaster>>,
     sandbox: Arc<dyn Sandbox>,
     sandbox_id: Option<SandboxId>,
@@ -192,6 +195,7 @@ impl Default for ExecTool {
             max_output_bytes: 200 * 1024,
             working_dir: None,
             approval_manager: None,
+            approval_store: None,
             broadcaster: None,
             sandbox: Arc::new(NoSandbox),
             sandbox_id: None,
@@ -211,6 +215,12 @@ impl ExecTool {
     ) -> Self {
         self.approval_manager = Some(manager);
         self.broadcaster = Some(broadcaster);
+        self
+    }
+
+    /// Attach a database pool used to persist pending approvals.
+    pub fn with_approval_store(mut self, pool: Arc<sqlx::SqlitePool>) -> Self {
+        self.approval_store = Some(pool);
         self
     }
 
@@ -398,6 +408,20 @@ impl AgentTool for ExecTool {
             if action == ApprovalAction::NeedsApproval {
                 info!(command, "command needs approval, waiting...");
                 let (req_id, rx) = mgr.create_request(command).await;
+                if let Some(pool) = self.approval_store.as_ref() {
+                    let session = session_key.unwrap_or("main");
+                    if let Err(e) = persist_approval(
+                        pool.as_ref(),
+                        &req_id,
+                        session,
+                        "exec",
+                        &serde_json::json!({ "command": command }).to_string(),
+                    )
+                    .await
+                    {
+                        warn!(error = %e, id = %req_id, "failed to persist approval request");
+                    }
+                }
 
                 // Broadcast to connected clients.
                 if let Some(ref bc) = self.broadcaster
@@ -407,6 +431,11 @@ impl AgentTool for ExecTool {
                 }
 
                 let decision = mgr.wait_for_decision(rx).await;
+                if let Some(pool) = self.approval_store.as_ref()
+                    && let Err(e) = cleanup_approval(pool.as_ref(), &req_id).await
+                {
+                    warn!(error = %e, id = %req_id, "failed to cleanup approval request");
+                }
                 match decision {
                     ApprovalDecision::Approved => {
                         info!(command, "command approved");

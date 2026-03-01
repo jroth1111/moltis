@@ -5,7 +5,7 @@ use std::sync::Arc;
 use {async_trait::async_trait, serde_json::Value, tracing::info};
 
 use moltis_tools::{
-    approval::{ApprovalDecision, ApprovalManager},
+    approval::{ApprovalDecision, ApprovalManager, cleanup_approval},
     exec::ApprovalBroadcaster,
 };
 
@@ -18,11 +18,12 @@ use crate::{
 /// Live approval service backed by an `ApprovalManager`.
 pub struct LiveExecApprovalService {
     manager: Arc<ApprovalManager>,
+    pool: Option<Arc<sqlx::SqlitePool>>,
 }
 
 impl LiveExecApprovalService {
-    pub fn new(manager: Arc<ApprovalManager>) -> Self {
-        Self { manager }
+    pub fn new(manager: Arc<ApprovalManager>, pool: Option<Arc<sqlx::SqlitePool>>) -> Self {
+        Self { manager, pool }
     }
 }
 
@@ -74,6 +75,11 @@ impl ExecApprovalService for LiveExecApprovalService {
 
         info!(id, ?decision, "resolving approval request");
         self.manager.resolve(id, decision, command).await;
+        if let Some(pool) = self.pool.as_ref()
+            && let Err(e) = cleanup_approval(pool.as_ref(), id).await
+        {
+            tracing::warn!(id, error = %e, "failed to cleanup persisted approval row");
+        }
 
         Ok(serde_json::json!({ "ok": true }))
     }
@@ -115,7 +121,7 @@ mod tests {
     #[tokio::test]
     async fn test_live_service_resolve() {
         let mgr = Arc::new(ApprovalManager::default());
-        let svc = LiveExecApprovalService::new(Arc::clone(&mgr));
+        let svc = LiveExecApprovalService::new(Arc::clone(&mgr), None);
 
         // Create a pending request.
         let (id, mut rx) = mgr.create_request("rm -rf /").await;
@@ -137,7 +143,7 @@ mod tests {
     #[tokio::test]
     async fn test_live_service_get() {
         let mgr = Arc::new(ApprovalManager::default());
-        let svc = LiveExecApprovalService::new(mgr);
+        let svc = LiveExecApprovalService::new(mgr, None);
         let result = svc.get().await.unwrap();
         // Default mode is on-miss.
         assert_eq!(result["mode"], "on-miss");

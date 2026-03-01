@@ -4336,7 +4336,7 @@ async fn reload_hooks(state: &Arc<crate::state::GatewayState>) {
     let disabled = state.inner.read().await.disabled_hooks.clone();
     let session_store = state.services.session_store.as_ref();
     let (new_registry, new_info) =
-        crate::server::discover_and_build_hooks(&disabled, session_store).await;
+        crate::server::discover_and_build_hooks(&disabled, session_store, None, None).await;
 
     {
         let mut inner = state.inner.write().await;

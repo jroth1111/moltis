@@ -88,6 +88,11 @@ pub struct TailscaleOpts {
     pub reset_on_exit: bool,
 }
 
+static HOOK_DB_POOL: once_cell::sync::OnceCell<Arc<sqlx::SqlitePool>> =
+    once_cell::sync::OnceCell::new();
+static HOOK_ESTOP_FLAG: once_cell::sync::OnceCell<Arc<std::sync::atomic::AtomicBool>> =
+    once_cell::sync::OnceCell::new();
+
 // ── Location requester ───────────────────────────────────────────────────────
 
 /// Gateway implementation of [`moltis_tools::location::LocationRequester`].
@@ -136,11 +141,14 @@ impl moltis_tools::location::LocationRequester for GatewayLocationRequester {
         {
             let mut inner_w = self.state.inner.write().await;
             let invokes = &mut inner_w.pending_invokes;
-            invokes.insert(request_id.clone(), crate::state::PendingInvoke {
-                request_id: request_id.clone(),
-                sender: tx,
-                created_at: std::time::Instant::now(),
-            });
+            invokes.insert(
+                request_id.clone(),
+                crate::state::PendingInvoke {
+                    request_id: request_id.clone(),
+                    sender: tx,
+                    created_at: std::time::Instant::now(),
+                },
+            );
         }
 
         // Wait up to 30 seconds for the user to grant/deny permission.
@@ -254,13 +262,14 @@ impl moltis_tools::location::LocationRequester for GatewayLocationRequester {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut inner = self.state.inner.write().await;
-            inner
-                .pending_invokes
-                .insert(pending_key.clone(), crate::state::PendingInvoke {
+            inner.pending_invokes.insert(
+                pending_key.clone(),
+                crate::state::PendingInvoke {
                     request_id: pending_key.clone(),
                     sender: tx,
                     created_at: std::time::Instant::now(),
-                });
+                },
+            );
         }
 
         // Wait up to 60 seconds — user needs to navigate Telegram's UI.
@@ -1197,12 +1206,12 @@ pub async fn prepare_gateway(
         );
     }
 
-    // Initialize OTLP if configured (available after feature/observability merge).
-    // TODO: available after merge of feature/observability
-    // if let Some(endpoint) = &config.otlp_endpoint {
-    //     moltis_metrics::init_otlp(endpoint, "moltis").ok();
-    //     tracing::info!(endpoint=%endpoint, "OTLP endpoint configured");
-    // }
+    // Initialize OTLP tracing exporter when configured.
+    if let Some(endpoint) = &config.metrics.otlp_endpoint
+        && let Err(e) = moltis_metrics::init_otlp(endpoint, "moltis")
+    {
+        warn!(endpoint = %endpoint, error = %e, "failed to initialize OTLP tracing");
+    }
 
     let base_provider_config = config.providers.clone();
 
@@ -1322,7 +1331,10 @@ pub async fn prepare_gateway(
         services.logs = Arc::new(crate::logs::LiveLogsService::new(buf.clone()));
     }
 
-    services.exec_approval = Arc::new(LiveExecApprovalService::new(Arc::clone(&approval_manager)));
+    services.exec_approval = Arc::new(LiveExecApprovalService::new(
+        Arc::clone(&approval_manager),
+        None,
+    ));
 
     // Wire browser service if enabled.
     if let Some(browser_svc) =
@@ -1409,9 +1421,9 @@ pub async fn prepare_gateway(
                         token_url: o.token_url.clone(),
                         scopes: o.scopes.clone(),
                     });
-                merged
-                    .servers
-                    .insert(name.clone(), moltis_mcp::McpServerConfig {
+                merged.servers.insert(
+                    name.clone(),
+                    moltis_mcp::McpServerConfig {
                         command: entry.command.clone(),
                         args: entry.args.clone(),
                         env: entry.env.clone(),
@@ -1419,7 +1431,8 @@ pub async fn prepare_gateway(
                         transport,
                         url: entry.url.clone(),
                         oauth,
-                    });
+                    },
+                );
             }
         }
         mcp_configured_count = merged.servers.values().filter(|s| s.enabled).count();
@@ -1462,13 +1475,7 @@ pub async fn prepare_gateway(
     let openclaw_startup_status = log_startup_openclaw_detection();
 
     // ── E-STOP flag ────────────────────────────────────────────────────────
-    // A shared atomic flag that, when true, causes EstopHook to abort all
-    // agent tool calls. The flag persists across connections via the `estop`
-    // sentinel file in the data directory. The HTTP endpoint at POST /api/estop
-    // toggles it at runtime; the flag is checked on every hook invocation once
-    // feature/bundled-hooks is merged.
-    //
-    // TODO: available after merge of feature/bundled-hooks (EstopHook itself)
+    // Shared atomic state used by EstopHook and /api/estop.
     let estop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let estop_path = data_dir.join("estop");
@@ -1498,6 +1505,8 @@ pub async fn prepare_gateway(
             .await
             .expect("failed to open moltis.db")
     };
+    let _ = HOOK_DB_POOL.set(Arc::new(db_pool.clone()));
+    let _ = HOOK_ESTOP_FLAG.set(Arc::clone(&estop_flag));
 
     // Run database migrations from each crate in dependency order.
     // Order matters: sessions depends on projects (FK reference).
@@ -1514,6 +1523,9 @@ pub async fn prepare_gateway(
     crate::run_migrations(&db_pool)
         .await
         .expect("failed to run gateway migrations");
+    moltis_tinder::run_migrations(&db_pool)
+        .await
+        .expect("failed to run tinder migrations");
 
     // Vault migrations (vault_metadata table).
     #[cfg(feature = "vault")]
@@ -1521,11 +1533,21 @@ pub async fn prepare_gateway(
         .await
         .expect("failed to run vault migrations");
 
-    // Recover pending approvals from last run.
-    // (available after feature/tool-hardening merge)
-    // moltis_tools::approval::recover_pending(&db_pool).await?;
-    // TODO: re-present recovered approvals via session event bus
-    // TODO: available after merge of feature/tool-hardening
+    services.exec_approval = Arc::new(LiveExecApprovalService::new(
+        Arc::clone(&approval_manager),
+        Some(Arc::new(db_pool.clone())),
+    ));
+
+    match moltis_tools::approval::recover_pending(&db_pool).await {
+        Ok(rows) if !rows.is_empty() => {
+            warn!(
+                pending = rows.len(),
+                "recovered pending approvals from previous run; commands must be re-issued"
+            );
+        },
+        Ok(_) => {},
+        Err(e) => warn!(error = %e, "failed to recover pending approvals"),
+    }
 
     // Migrate plugins data into unified skills system (idempotent, non-fatal).
     moltis_skills::migration::migrate_plugins_to_skills(&data_dir).await;
@@ -2005,10 +2027,15 @@ pub async fn prepare_gateway(
             // Spawn async broadcast in a background task since we're in a sync callback.
             let state = Arc::clone(state);
             tokio::spawn(async move {
-                broadcast(&state, event, payload, BroadcastOpts {
-                    drop_if_slow: true,
-                    ..Default::default()
-                })
+                broadcast(
+                    &state,
+                    event,
+                    payload,
+                    BroadcastOpts {
+                        drop_if_slow: true,
+                        ..Default::default()
+                    },
+                )
                 .await;
             });
         });
@@ -2618,8 +2645,13 @@ pub async fn prepare_gateway(
     seed_example_hook();
     seed_dcg_guard_hook();
     let persisted_disabled = crate::methods::load_disabled_hooks();
-    let (hook_registry, discovered_hooks_info) =
-        discover_and_build_hooks(&persisted_disabled, Some(&session_store)).await;
+    let (hook_registry, discovered_hooks_info) = discover_and_build_hooks(
+        &persisted_disabled,
+        Some(&session_store),
+        Some(Arc::new(db_pool.clone())),
+        Some(Arc::clone(&estop_flag)),
+    )
+    .await;
 
     // Wire live session service with sandbox router, project store, hooks, and browser.
     {
@@ -3150,6 +3182,7 @@ pub async fn prepare_gateway(
         });
         let exec_tool = moltis_tools::exec::ExecTool::default()
             .with_approval(Arc::clone(&approval_manager), broadcaster)
+            .with_approval_store(Arc::new(db_pool.clone()))
             .with_sandbox_router(Arc::clone(&sandbox_router))
             .with_env_provider(Arc::clone(&env_provider))
             .with_completion_callback(exec_cb);
@@ -3381,10 +3414,12 @@ pub async fn prepare_gateway(
             send_to_session,
         )));
 
-        // Register shared task coordination tool for multi-agent workflows.
-        tool_registry.register(Box::new(moltis_tools::task_list::TaskListTool::new(
-            &data_dir,
-        )));
+        // Register the session-backed task board used by autonomous workflows.
+        tool_registry.register(Box::new(
+            moltis_plugins::bundled::task_board::TaskBoardTool::new(Arc::clone(
+                &session_state_store,
+            )),
+        ));
 
         // Register built-in voice tools for explicit TTS/STT calls in agents.
         tool_registry.register(Box::new(crate::voice_agent_tools::SpeakTool::new(
@@ -3489,31 +3524,13 @@ pub async fn prepare_gateway(
             tool_registry.register(Box::new(spawn_tool));
         }
 
-        // ── TaskBoardTool (available after feature/bundled-hooks merge) ──────
-        // TODO: available after merge of feature/bundled-hooks
-        // use moltis_plugins::bundled::task_board::TaskBoardTool;
-        // tool_registry.register(Box::new(TaskBoardTool::new(Arc::clone(&session_state_store))));
-
-        // ── Tinder subsystem: tools, hooks, and cron jobs ─────────────────
-        // register_tinder_subsystem is a no-op until feature/moltis-tinder is
-        // merged; the call structure is already wired so uncommenting the body
-        // of that function is sufficient.
-        if let Some(ref hook_arc) = state.inner.read().await.hook_registry {
-            // We need a mutable HookRegistry — clone-and-replace is the correct
-            // pattern here. After feature/moltis-tinder lands, if HookRegistry
-            // gains interior mutability this can be simplified.
-            //
-            // TODO: uncomment after merge of feature/moltis-tinder
-            // let mut hooks_mut = (**hook_arc).clone();
-            // crate::tinder_subsystem::register_tinder_subsystem(
-            //     &cron_service,
-            //     &mut tool_registry,
-            //     &mut hooks_mut,
-            //     Arc::clone(&db_pool),
-            //     &data_dir,
-            // ).await?;
-            let _ = hook_arc; // keep borrow checker happy until TODO is live
-        }
+        crate::tinder_subsystem::register_tinder_subsystem(
+            &cron_service,
+            &mut tool_registry,
+            Arc::new(db_pool.clone()),
+            &data_dir,
+        )
+        .await?;
 
         let shared_tool_registry = Arc::new(tokio::sync::RwLock::new(tool_registry));
         let mut chat_service = LiveChatService::new(
@@ -3744,35 +3761,33 @@ pub async fn prepare_gateway(
 
         app = app.route(
             "/api/estop",
-            axum::routing::post(
-                move |Json(payload): Json<serde_json::Value>| {
-                    let flag = Arc::clone(&estop_flag_post);
-                    let dir = data_dir_for_estop.clone();
-                    async move {
-                        let enable = payload
-                            .get("enable")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        flag.store(enable, std::sync::atomic::Ordering::Relaxed);
-                        let estop_path = dir.join("estop");
-                        if enable {
-                            if let Err(e) = std::fs::write(&estop_path, b"") {
-                                tracing::warn!("failed to write estop file: {e}");
-                            } else {
-                                tracing::warn!("E-STOP enabled — agent actions blocked");
-                            }
+            axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+                let flag = Arc::clone(&estop_flag_post);
+                let dir = data_dir_for_estop.clone();
+                async move {
+                    let enable = payload
+                        .get("enable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    flag.store(enable, std::sync::atomic::Ordering::Relaxed);
+                    let estop_path = dir.join("estop");
+                    if enable {
+                        if let Err(e) = std::fs::write(&estop_path, b"") {
+                            tracing::warn!("failed to write estop file: {e}");
                         } else {
-                            if estop_path.exists() {
-                                if let Err(e) = std::fs::remove_file(&estop_path) {
-                                    tracing::warn!("failed to remove estop file: {e}");
-                                }
-                            }
-                            tracing::info!("E-STOP cleared — agent actions unblocked");
+                            tracing::warn!("E-STOP enabled — agent actions blocked");
                         }
-                        Json(serde_json::json!({ "stopped": enable }))
+                    } else {
+                        if estop_path.exists() {
+                            if let Err(e) = std::fs::remove_file(&estop_path) {
+                                tracing::warn!("failed to remove estop file: {e}");
+                            }
+                        }
+                        tracing::info!("E-STOP cleared — agent actions unblocked");
                     }
-                },
-            )
+                    Json(serde_json::json!({ "stopped": enable }))
+                }
+            })
             .get(move || {
                 let flag = Arc::clone(&estop_flag_get);
                 async move {
@@ -3973,10 +3988,15 @@ pub async fn prepare_gateway(
                         }
                     };
                     if changed && let Ok(payload) = serde_json::to_value(&next) {
-                        broadcast(&update_state, "update.available", payload, BroadcastOpts {
-                            drop_if_slow: true,
-                            ..Default::default()
-                        })
+                        broadcast(
+                            &update_state,
+                            "update.available",
+                            payload,
+                            BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            },
+                        )
                         .await;
                     }
                 },
@@ -4075,12 +4095,15 @@ pub async fn prepare_gateway(
                         .by_provider
                         .iter()
                         .map(|(name, metrics)| {
-                            (name.clone(), moltis_metrics::ProviderTokens {
-                                input_tokens: metrics.input_tokens,
-                                output_tokens: metrics.output_tokens,
-                                completions: metrics.completions,
-                                errors: metrics.errors,
-                            })
+                            (
+                                name.clone(),
+                                moltis_metrics::ProviderTokens {
+                                    input_tokens: metrics.input_tokens,
+                                    output_tokens: metrics.output_tokens,
+                                    completions: metrics.completions,
+                                    errors: metrics.errors,
+                                },
+                            )
                         })
                         .collect();
 
@@ -4235,10 +4258,15 @@ pub async fn prepare_gateway(
                                 }),
                             ),
                         };
-                        broadcast(&event_state, event_name, payload, BroadcastOpts {
-                            drop_if_slow: true,
-                            ..Default::default()
-                        })
+                        broadcast(
+                            &event_state,
+                            event_name,
+                            payload,
+                            BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            },
+                        )
                         .await;
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -4286,10 +4314,15 @@ pub async fn prepare_gateway(
                 match rx.recv().await {
                     Ok(entry) => {
                         if let Ok(payload) = serde_json::to_value(&entry) {
-                            broadcast(&log_state, "logs.entry", payload, BroadcastOpts {
-                                drop_if_slow: true,
-                                ..Default::default()
-                            })
+                            broadcast(
+                                &log_state,
+                                "logs.entry",
+                                payload,
+                                BroadcastOpts {
+                                    drop_if_slow: true,
+                                    ..Default::default()
+                                },
+                            )
                             .await;
                         }
                     },
@@ -5134,6 +5167,54 @@ fn builtin_hook_metadata() -> Vec<(
             vec![HookEvent::Command],
             "crates/plugins/src/bundled/session_memory.rs",
         ),
+        (
+            "estop",
+            "Blocks agent starts and LLM calls when the emergency stop flag is active.",
+            vec![HookEvent::BeforeAgentStart, HookEvent::BeforeLLMCall],
+            "crates/plugins/src/bundled/estop.rs",
+        ),
+        (
+            "prompt-guard",
+            "Blocks likely prompt-injection payloads in LLM messages and tool arguments.",
+            vec![HookEvent::BeforeLLMCall, HookEvent::BeforeToolCall],
+            "crates/plugins/src/bundled/prompt_guard.rs",
+        ),
+        (
+            "leak-detector",
+            "Blocks tool calls when arguments appear to contain secrets or credentials.",
+            vec![HookEvent::BeforeToolCall],
+            "crates/plugins/src/bundled/leak_detector.rs",
+        ),
+        (
+            "circuit-breaker",
+            "Blocks unstable providers after repeated failures until the reset timeout elapses.",
+            vec![HookEvent::BeforeLLMCall, HookEvent::AfterLLMCall],
+            "crates/plugins/src/bundled/circuit_breaker.rs",
+        ),
+        (
+            "cost-tracker",
+            "Records per-call model spend in SQLite using token usage from AfterLLMCall.",
+            vec![HookEvent::AfterLLMCall],
+            "crates/plugins/src/bundled/cost_guard.rs",
+        ),
+        (
+            "cost-guard",
+            "Blocks new agent starts after the configured daily spend cap is exceeded.",
+            vec![HookEvent::BeforeAgentStart],
+            "crates/plugins/src/bundled/cost_guard.rs",
+        ),
+        (
+            "screenshot-resolver",
+            "Scans pre-LLM history for screenshot references and prepares image resolution.",
+            vec![HookEvent::BeforeLLMCall],
+            "crates/plugins/src/bundled/screenshot_resolver.rs",
+        ),
+        (
+            "funnel_guard",
+            "Enforces Tinder funnel state transitions and blocks premature contact sharing.",
+            vec![HookEvent::BeforeToolCall],
+            "crates/moltis-tinder/src/hooks.rs",
+        ),
     ]
 }
 
@@ -5582,19 +5663,32 @@ Cost guard:
 pub(crate) async fn discover_and_build_hooks(
     disabled: &HashSet<String>,
     session_store: Option<&Arc<SessionStore>>,
+    db_pool: Option<Arc<sqlx::SqlitePool>>,
+    estop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> (
     Option<Arc<moltis_common::hooks::HookRegistry>>,
     Vec<crate::state::DiscoveredHookInfo>,
 ) {
     use moltis_plugins::{
         bundled::{
-            boot_md::BootMdHook, command_logger::CommandLoggerHook,
+            boot_md::BootMdHook,
+            circuit_breaker::CircuitBreakerHook,
+            command_logger::CommandLoggerHook,
+            cost_guard::{CostGuardHook, CostTrackerHook},
+            estop::EstopHook,
+            leak_detector::LeakDetectorHook,
+            prompt_guard::PromptGuardHook,
+            screenshot_resolver::ScreenshotResolverHook,
             session_memory::SessionMemoryHook,
         },
         hook_discovery::{FsHookDiscoverer, HookDiscoverer, HookSource},
         hook_eligibility::check_hook_eligibility,
         shell_hook::ShellHookHandler,
     };
+    use moltis_tinder::FunnelGuardHook;
+
+    let db_pool = db_pool.or_else(|| HOOK_DB_POOL.get().cloned());
+    let estop_flag = estop_flag.or_else(|| HOOK_ESTOP_FLAG.get().cloned());
 
     let discoverer = FsHookDiscoverer::new(FsHookDiscoverer::default_paths());
     let discovered = discoverer.discover().await.unwrap_or_default();
@@ -5684,43 +5778,26 @@ pub(crate) async fn discover_and_build_hooks(
             let memory_hook = SessionMemoryHook::new(data.clone(), Arc::clone(store));
             registry.register(Arc::new(memory_hook));
         }
+        let estop_hook = match estop_flag.clone() {
+            Some(flag) => EstopHook::new(flag),
+            None => EstopHook::from_file(),
+        };
+        registry.register(Arc::new(estop_hook));
+        registry.register(Arc::new(PromptGuardHook::new()));
+        registry.register(Arc::new(LeakDetectorHook::new()));
+        registry.register(Arc::new(CircuitBreakerHook::new(3, 60)));
+        registry.register(Arc::new(ScreenshotResolverHook::new()));
 
-        // ── Bundled safety & cost hooks (available after feature/bundled-hooks merge) ──
-        // TODO: available after merge of feature/bundled-hooks
-        // use moltis_plugins::bundled::{
-        //     estop::EstopHook,
-        //     cost_guard::{CostTrackerHook, CostGuardHook},
-        //     circuit_breaker::CircuitBreakerHook,
-        //     prompt_guard::PromptGuardHook,
-        //     leak_detector::LeakDetectorHook,
-        //     screenshot_resolver::ScreenshotResolverHook,
-        // };
-        //
-        // // E-STOP: block all agent actions when the stop flag is set.
-        // // The flag and its file path are wired in prepare_gateway and shared here
-        // // through the ESTOP_FLAG lazy static (see prepare_gateway for details).
-        // hooks.register(Arc::new(EstopHook::new(Arc::clone(&crate::estop::ESTOP_FLAG))));
-        //
-        // // Cost tracking + guard: record token spend per run, abort when daily
-        // // limit (config.cost_guard.daily_limit_usd) is exceeded.
-        // hooks.register(Arc::new(CostTrackerHook::new(Arc::clone(&pool))));
-        // hooks.register(Arc::new(CostGuardHook::new(
-        //     Arc::clone(&pool),
-        //     config.cost_guard.daily_limit_usd,
-        // )));
-        //
-        // // Circuit breaker: open after 3 consecutive failures; reset after 60 s.
-        // hooks.register(Arc::new(CircuitBreakerHook::new(3, 60)));
-        //
-        // // Prompt guard: strip/redact dangerous prompt-injection patterns.
-        // hooks.register(Arc::new(PromptGuardHook::new()));
-        //
-        // // Leak detector: warn when PII patterns appear in agent output.
-        // hooks.register(Arc::new(LeakDetectorHook::new()));
-        //
-        // // Screenshot resolver: rewrite blob: URLs in tool output to served paths.
-        // // Requires a MediaStore handle; wire once moltis-media is initialised.
-        // // hooks.register(Arc::new(ScreenshotResolverHook::new(Arc::clone(&media_store))));
+        if let Some(pool) = db_pool.as_ref() {
+            registry.register(Arc::new(CostTrackerHook::new(Arc::clone(pool))));
+            let limit_usd = std::env::var("MOLTIS_COST_GUARD_DAILY_LIMIT_USD")
+                .ok()
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(f64::MAX);
+            registry.register(Arc::new(CostGuardHook::new(Arc::clone(pool), limit_usd)));
+            registry.register(Arc::new(FunnelGuardHook::new(Arc::clone(pool))));
+        }
     }
 
     for (name, description, events, source_file) in builtin_hook_metadata() {
@@ -5830,7 +5907,7 @@ mod tests {
         let session_store = Arc::new(SessionStore::new(sessions_dir));
 
         let (registry, info) =
-            discover_and_build_hooks(&HashSet::new(), Some(&session_store)).await;
+            discover_and_build_hooks(&HashSet::new(), Some(&session_store), None, None).await;
         let registry = registry.expect("expected hook registry to be created");
         let handler_names = registry.handler_names();
 
@@ -6140,21 +6217,27 @@ mod tests {
             "https://localhost:49494".to_string(),
             "https://m4max.local:49494".to_string(),
         ]);
-        assert_eq!(lines, vec![
-            "passkey origin: https://localhost:49494",
-            "passkey origin: https://m4max.local:49494",
-        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "passkey origin: https://localhost:49494",
+                "passkey origin: https://m4max.local:49494",
+            ]
+        );
     }
 
     #[test]
     fn startup_setup_code_lines_adds_spacers() {
         let lines = startup_setup_code_lines("493413");
-        assert_eq!(lines, vec![
-            "",
-            "setup code: 493413",
-            "enter this code to set your password or register a passkey",
-            "",
-        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "",
+                "setup code: 493413",
+                "enter this code to set your password or register a passkey",
+                "",
+            ]
+        );
     }
 
     #[test]
@@ -6182,13 +6265,16 @@ mod tests {
             ("OPENAI_API_KEY".to_string(), "config-openai".to_string()),
             ("BRAVE_API_KEY".to_string(), "config-brave".to_string()),
         ]);
-        let merged = merge_env_overrides(&base, vec![
-            ("OPENAI_API_KEY".to_string(), "db-openai".to_string()),
-            (
-                "PERPLEXITY_API_KEY".to_string(),
-                "db-perplexity".to_string(),
-            ),
-        ]);
+        let merged = merge_env_overrides(
+            &base,
+            vec![
+                ("OPENAI_API_KEY".to_string(), "db-openai".to_string()),
+                (
+                    "PERPLEXITY_API_KEY".to_string(),
+                    "db-perplexity".to_string(),
+                ),
+            ],
+        );
         assert_eq!(
             merged.get("OPENAI_API_KEY").map(String::as_str),
             Some("config-openai")

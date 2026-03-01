@@ -60,12 +60,6 @@ impl HookHandler for LeakDetectorHook {
             ..
         } = payload
         {
-            // Only scan tools that send data externally
-            let should_scan = matches!(tool_name.as_str(), "type" | "fill" | "exec" | "web_fetch");
-            if !should_scan {
-                return Ok(HookAction::Continue);
-            }
-
             let args_str = arguments.to_string();
             if self.scanner.matches(&args_str) {
                 warn!(
@@ -94,7 +88,10 @@ mod tests {
             tool_name: "exec".into(),
             arguments: serde_json::json!({ "command": "curl -H 'api-key: sk-12345'" }),
         };
-        let result = hook.handle(HookEvent::BeforeToolCall, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeToolCall, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Block(_)));
     }
 
@@ -106,7 +103,10 @@ mod tests {
             tool_name: "exec".into(),
             arguments: serde_json::json!({ "command": "echo hello" }),
         };
-        let result = hook.handle(HookEvent::BeforeToolCall, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeToolCall, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Continue));
     }
 
@@ -118,7 +118,10 @@ mod tests {
             tool_name: "session_state".into(),
             arguments: serde_json::json!({ "key": "sk-secret-key-here" }),
         };
-        let result = hook.handle(HookEvent::BeforeToolCall, &payload).await.unwrap();
-        assert!(matches!(result, HookAction::Continue));
+        let result = hook
+            .handle(HookEvent::BeforeToolCall, &payload)
+            .await
+            .unwrap();
+        assert!(matches!(result, HookAction::Block(_)));
     }
 }

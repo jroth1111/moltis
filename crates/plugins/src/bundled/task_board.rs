@@ -14,7 +14,6 @@ pub struct TaskBoardTool {
     state_store: Arc<SessionStateStore>,
 }
 
-const GLOBAL_SESSION: &str = "_global";
 const NAMESPACE: &str = "task_board";
 
 impl TaskBoardTool {
@@ -22,7 +21,7 @@ impl TaskBoardTool {
         Self { state_store }
     }
 
-    async fn create_task(&self, subject: &str) -> anyhow::Result<Value> {
+    async fn create_task(&self, session_key: &str, subject: &str) -> anyhow::Result<Value> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -35,13 +34,13 @@ impl TaskBoardTool {
             "created_at": now,
         });
         self.state_store
-            .set(GLOBAL_SESSION, NAMESPACE, &id, &task.to_string())
+            .set(session_key, NAMESPACE, &id, &task.to_string())
             .await?;
         Ok(task)
     }
 
-    async fn list_tasks(&self) -> anyhow::Result<Value> {
-        let entries = self.state_store.list(GLOBAL_SESSION, NAMESPACE).await?;
+    async fn list_tasks(&self, session_key: &str) -> anyhow::Result<Value> {
+        let entries = self.state_store.list(session_key, NAMESPACE).await?;
         let tasks: Vec<Value> = entries
             .into_iter()
             .filter_map(|e| serde_json::from_str(&e.value).ok())
@@ -49,27 +48,26 @@ impl TaskBoardTool {
         Ok(json!({ "tasks": tasks }))
     }
 
-    async fn update_task(&self, id: &str, status: &str) -> anyhow::Result<Value> {
-        let existing = self
-            .state_store
-            .get(GLOBAL_SESSION, NAMESPACE, id)
-            .await?;
+    async fn update_task(
+        &self,
+        session_key: &str,
+        id: &str,
+        status: &str,
+    ) -> anyhow::Result<Value> {
+        let existing = self.state_store.get(session_key, NAMESPACE, id).await?;
         let Some(raw) = existing else {
             return Ok(json!({ "error": "task not found" }));
         };
         let mut task: Value = serde_json::from_str(&raw)?;
         task["status"] = json!(status);
         self.state_store
-            .set(GLOBAL_SESSION, NAMESPACE, id, &task.to_string())
+            .set(session_key, NAMESPACE, id, &task.to_string())
             .await?;
         Ok(task)
     }
 
-    async fn delete_task(&self, id: &str) -> anyhow::Result<Value> {
-        let deleted = self
-            .state_store
-            .delete(GLOBAL_SESSION, NAMESPACE, id)
-            .await?;
+    async fn delete_task(&self, session_key: &str, id: &str) -> anyhow::Result<Value> {
+        let deleted = self.state_store.delete(session_key, NAMESPACE, id).await?;
         Ok(json!({ "deleted": deleted }))
     }
 }
@@ -111,6 +109,10 @@ impl moltis_agents::tool_registry::AgentTool for TaskBoardTool {
     }
 
     async fn execute(&self, params: Value) -> anyhow::Result<Value> {
+        let session_key = params
+            .get("_session_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("main");
         let action = params
             .get("action")
             .and_then(|v| v.as_str())
@@ -122,9 +124,9 @@ impl moltis_agents::tool_registry::AgentTool for TaskBoardTool {
                     .get("subject")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("'create' requires 'subject'"))?;
-                self.create_task(subject).await
+                self.create_task(session_key, subject).await
             },
-            "list" => self.list_tasks().await,
+            "list" => self.list_tasks(session_key).await,
             "update" => {
                 let id = params
                     .get("id")
@@ -134,14 +136,14 @@ impl moltis_agents::tool_registry::AgentTool for TaskBoardTool {
                     .get("status")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("'update' requires 'status'"))?;
-                self.update_task(id, status).await
+                self.update_task(session_key, id, status).await
             },
             "delete" => {
                 let id = params
                     .get("id")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow::anyhow!("'delete' requires 'id'"))?;
-                self.delete_task(id).await
+                self.delete_task(session_key, id).await
             },
             _ => Ok(json!({ "error": format!("unknown action: {action}") })),
         }

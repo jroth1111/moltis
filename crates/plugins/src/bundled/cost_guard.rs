@@ -63,28 +63,18 @@ impl HookHandler for CostTrackerHook {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            let date = {
-                let secs = now;
-                let days = secs / 86400;
-                // Simple date: YYYY-MM-DD from epoch days
-                // Use the time crate which is already a dep
-                format!(
-                    "{:04}-{:02}-{:02}",
-                    1970 + (days / 365),
-                    ((days % 365) / 30) + 1,
-                    ((days % 365) % 30) + 1
-                )
-            };
+            let date = time::OffsetDateTime::from_unix_timestamp(now)
+                .map(|ts| ts.date().to_string())
+                .unwrap_or_else(|_| "1970-01-01".to_string());
 
-            let result = sqlx::query(
-                "INSERT INTO agent_spend (date, model, cost, ts) VALUES (?, ?, ?, ?)",
-            )
-            .bind(&date)
-            .bind(model)
-            .bind(cost)
-            .bind(now)
-            .execute(self.db.as_ref())
-            .await;
+            let result =
+                sqlx::query("INSERT INTO agent_spend (date, model, cost, ts) VALUES (?, ?, ?, ?)")
+                    .bind(&date)
+                    .bind(model)
+                    .bind(cost)
+                    .bind(now)
+                    .execute(self.db.as_ref())
+                    .await;
 
             if let Err(e) = result {
                 warn!(error = %e, "cost-tracker: failed to record spend");
@@ -134,13 +124,12 @@ impl HookHandler for CostGuardHook {
             // Get all spend from the last 24 hours
             let cutoff = now - 86400;
 
-            let total: Option<f64> = sqlx::query_scalar(
-                "SELECT SUM(cost) FROM agent_spend WHERE ts >= ?",
-            )
-            .bind(cutoff)
-            .fetch_optional(self.db.as_ref())
-            .await
-            .unwrap_or(None);
+            let total: Option<f64> =
+                sqlx::query_scalar("SELECT SUM(cost) FROM agent_spend WHERE ts >= ?")
+                    .bind(cutoff)
+                    .fetch_optional(self.db.as_ref())
+                    .await
+                    .unwrap_or(None);
 
             let total = total.unwrap_or(0.0);
             if total >= self.daily_limit_usd {
