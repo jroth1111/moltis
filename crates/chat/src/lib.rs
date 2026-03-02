@@ -6979,13 +6979,26 @@ async fn run_streaming(
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     // Keep the runtime datetime/date sentence as the final prompt line for better cache locality.
-    let system_prompt =
+    let mut system_prompt =
         apply_voice_reply_suffix(system_prompt, desired_reply_medium, runtime_context);
+
+    // Convert persisted JSON history to typed ChatMessages for the LLM provider.
+    let chat_history = values_to_chat_messages(history_raw);
+    let _ = maybe_append_research_context(
+        &mut system_prompt,
+        provider.clone(),
+        user_content,
+        &chat_history,
+        persona.config.chat.research.enabled,
+        &persona.config.chat.research.trigger,
+        &persona.config.chat.research.keywords,
+        persona.config.chat.research.max_iterations,
+    )
+    .await;
 
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage::system(system_prompt));
-    // Convert persisted JSON history to typed ChatMessages for the LLM provider.
-    messages.extend(values_to_chat_messages(history_raw));
+    messages.extend(chat_history);
     messages.push(ChatMessage::User {
         content: user_content.clone(),
     });
