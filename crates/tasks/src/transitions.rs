@@ -248,6 +248,7 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
     }
 }
 
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

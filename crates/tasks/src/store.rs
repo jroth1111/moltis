@@ -164,10 +164,10 @@ impl TaskStore {
                 r.get::<String, _>("blocked_by"),
                 r.get::<i64, _>("version"),
             )?;
-            if let Some(filter) = state_filter {
-                if task.runtime.state.name().to_lowercase() != filter.to_lowercase() {
-                    continue;
-                }
+            if let Some(filter) = state_filter
+                && task.runtime.state.name().to_lowercase() != filter.to_lowercase()
+            {
+                continue;
             }
             tasks.push(task);
         }
@@ -196,13 +196,13 @@ impl TaskStore {
             .ok_or_else(|| TransitionError::NotFound(task_id.to_string()))?;
 
         // Verify optimistic concurrency.
-        if let Some(expected) = expected_version {
-            if current.runtime.version != expected {
-                return Err(TransitionError::VersionConflict {
-                    expected,
-                    actual: current.runtime.version,
-                });
-            }
+        if let Some(expected) = expected_version
+            && current.runtime.version != expected
+        {
+            return Err(TransitionError::VersionConflict {
+                expected,
+                actual: current.runtime.version,
+            });
         }
 
         let from_state = current.runtime.state.name();
@@ -354,10 +354,10 @@ impl TaskStore {
                 r.get::<String, _>("blocked_by"),
                 r.get::<i64, _>("version"),
             )?;
-            if let RuntimeState::Retrying { retry_after, .. } = &task.runtime.state {
-                if retry_after.unix_timestamp() <= now {
-                    due.push(task);
-                }
+            if let RuntimeState::Retrying { retry_after, .. } = &task.runtime.state
+                && retry_after.unix_timestamp() <= now
+            {
+                due.push(task);
             }
         }
         Ok(due)
@@ -502,6 +502,7 @@ fn event_type_name(event: &TransitionEvent) -> &'static str {
     }
 }
 
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

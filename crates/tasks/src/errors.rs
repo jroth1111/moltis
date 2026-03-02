@@ -9,7 +9,7 @@ pub enum TransitionError {
     #[error("cannot apply {event:?} to a task in state {state}")]
     InvalidTransition {
         state: &'static str,
-        event: TransitionEvent,
+        event: Box<TransitionEvent>,
     },
 
     #[error("optimistic concurrency conflict: expected version {expected}, found {actual}")]
@@ -29,7 +29,7 @@ impl TransitionError {
     pub(crate) fn invalid(state: &RuntimeState, event: &TransitionEvent) -> Self {
         Self::InvalidTransition {
             state: state.name(),
-            event: event.clone(),
+            event: Box::new(event.clone()),
         }
     }
 }

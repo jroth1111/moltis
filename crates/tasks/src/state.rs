@@ -149,6 +149,7 @@ impl PartialEq for RuntimeState {
     }
 }
 
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

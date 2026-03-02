@@ -1693,55 +1693,54 @@ impl ProviderRegistry {
         // Anthropic extra API keys — register additional fallback providers that use
         // the same model set but different API keys, enabling key rotation before
         // failing over to a different provider.
-        if config.is_enabled("anthropic") {
-            if let Some(entry) = config.get("anthropic") {
-                let extra_keys =
-                    resolve_extra_api_keys(config, "anthropic", anthropic_primary_key.as_ref());
-                if !extra_keys.is_empty() {
-                    let base_url = entry
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.anthropic.com".into());
-                    let alias = entry.alias.clone();
-                    let base_label = alias.as_deref().unwrap_or("anthropic");
-                    let preferred = configured_models_for_provider(config, "anthropic");
-                    let discovered = if should_fetch_models(config, "anthropic") {
-                        ANTHROPIC_MODELS
-                            .iter()
-                            .map(|(id, name)| DiscoveredModel::new(*id, *name))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let model_snapshots: Vec<(String, String, Option<i64>)> =
-                        merge_preferred_and_discovered_models(preferred, discovered)
-                            .into_iter()
-                            .map(|m| (m.id, m.display_name, m.created_at))
-                            .collect();
+        if config.is_enabled("anthropic")
+            && let Some(entry) = config.get("anthropic")
+        {
+            let extra_keys =
+                resolve_extra_api_keys(config, "anthropic", anthropic_primary_key.as_ref());
+            if !extra_keys.is_empty() {
+                let base_url = entry
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.anthropic.com".into());
+                let alias = entry.alias.clone();
+                let base_label = alias.as_deref().unwrap_or("anthropic");
+                let preferred = configured_models_for_provider(config, "anthropic");
+                let discovered = if should_fetch_models(config, "anthropic") {
+                    ANTHROPIC_MODELS
+                        .iter()
+                        .map(|(id, name)| DiscoveredModel::new(*id, *name))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let model_snapshots: Vec<(String, String, Option<i64>)> =
+                    merge_preferred_and_discovered_models(preferred, discovered)
+                        .into_iter()
+                        .map(|m| (m.id, m.display_name, m.created_at))
+                        .collect();
 
-                    for (key_idx, extra_key) in extra_keys.iter().enumerate() {
-                        let extra_label = format!("{base_label}-key-{}", key_idx + 2);
-                        for (model_id, display_name, created_at) in &model_snapshots {
-                            if self.has_provider_model(&extra_label, model_id) {
-                                continue;
-                            }
-                            let provider =
-                                Arc::new(anthropic::AnthropicProvider::with_alias(
-                                    extra_key.clone(),
-                                    model_id.clone(),
-                                    base_url.clone(),
-                                    Some(extra_label.clone()),
-                                ));
-                            self.register(
-                                ModelInfo {
-                                    id: model_id.clone(),
-                                    provider: extra_label.clone(),
-                                    display_name: display_name.clone(),
-                                    created_at: *created_at,
-                                },
-                                provider,
-                            );
+                for (key_idx, extra_key) in extra_keys.iter().enumerate() {
+                    let extra_label = format!("{base_label}-key-{}", key_idx + 2);
+                    for (model_id, display_name, created_at) in &model_snapshots {
+                        if self.has_provider_model(&extra_label, model_id) {
+                            continue;
                         }
+                        let provider = Arc::new(anthropic::AnthropicProvider::with_alias(
+                            extra_key.clone(),
+                            model_id.clone(),
+                            base_url.clone(),
+                            Some(extra_label.clone()),
+                        ));
+                        self.register(
+                            ModelInfo {
+                                id: model_id.clone(),
+                                provider: extra_label.clone(),
+                                display_name: display_name.clone(),
+                                created_at: *created_at,
+                            },
+                            provider,
+                        );
                     }
                 }
             }
@@ -1802,71 +1801,71 @@ impl ProviderRegistry {
         }
 
         // OpenAI extra API keys — same pattern as Anthropic above.
-        if config.is_enabled("openai") {
-            if let Some(entry) = config.get("openai") {
-                let extra_keys =
-                    resolve_extra_api_keys(config, "openai", openai_primary_key.as_ref());
-                if !extra_keys.is_empty() {
-                    let base_url = entry
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| "https://api.openai.com/v1".into());
-                    let alias = entry.alias.clone();
-                    let base_label = alias.as_deref().unwrap_or("openai");
-                    let stream_transport = entry.stream_transport;
-                    let preferred = configured_models_for_provider(config, "openai");
-                    let discovered = if should_fetch_models(config, "openai") {
-                        let from_primary: Vec<DiscoveredModel> = self
-                            .models
-                            .iter()
-                            .filter(|model| model.provider == base_label)
-                            .map(|model| {
-                                DiscoveredModel::new(
-                                    raw_model_id(&model.id).to_string(),
-                                    model.display_name.clone(),
-                                )
-                                .with_created_at(model.created_at)
-                            })
-                            .collect();
-                        if from_primary.is_empty() {
-                            openai::default_model_catalog()
-                        } else {
-                            from_primary
-                        }
+        if config.is_enabled("openai")
+            && let Some(entry) = config.get("openai")
+        {
+            let extra_keys =
+                resolve_extra_api_keys(config, "openai", openai_primary_key.as_ref());
+            if !extra_keys.is_empty() {
+                let base_url = entry
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into());
+                let alias = entry.alias.clone();
+                let base_label = alias.as_deref().unwrap_or("openai");
+                let stream_transport = entry.stream_transport;
+                let preferred = configured_models_for_provider(config, "openai");
+                let discovered = if should_fetch_models(config, "openai") {
+                    let from_primary: Vec<DiscoveredModel> = self
+                        .models
+                        .iter()
+                        .filter(|model| model.provider == base_label)
+                        .map(|model| {
+                            DiscoveredModel::new(
+                                raw_model_id(&model.id).to_string(),
+                                model.display_name.clone(),
+                            )
+                            .with_created_at(model.created_at)
+                        })
+                        .collect();
+                    if from_primary.is_empty() {
+                        openai::default_model_catalog()
                     } else {
-                        Vec::new()
-                    };
-                    let model_snapshots: Vec<(String, String, Option<i64>)> =
-                        merge_preferred_and_discovered_models(preferred, discovered)
-                            .into_iter()
-                            .map(|m| (m.id, m.display_name, m.created_at))
-                            .collect();
+                        from_primary
+                    }
+                } else {
+                    Vec::new()
+                };
+                let model_snapshots: Vec<(String, String, Option<i64>)> =
+                    merge_preferred_and_discovered_models(preferred, discovered)
+                        .into_iter()
+                        .map(|m| (m.id, m.display_name, m.created_at))
+                        .collect();
 
-                    for (key_idx, extra_key) in extra_keys.iter().enumerate() {
-                        let extra_label = format!("{base_label}-key-{}", key_idx + 2);
-                        for (model_id, display_name, created_at) in &model_snapshots {
-                            if self.has_provider_model(&extra_label, model_id) {
-                                continue;
-                            }
-                            let provider = Arc::new(
-                                openai::OpenAiProvider::new_with_name(
-                                    extra_key.clone(),
-                                    model_id.clone(),
-                                    base_url.clone(),
-                                    extra_label.clone(),
-                                )
-                                .with_stream_transport(stream_transport),
-                            );
-                            self.register(
-                                ModelInfo {
-                                    id: model_id.clone(),
-                                    provider: extra_label.clone(),
-                                    display_name: display_name.clone(),
-                                    created_at: *created_at,
-                                },
-                                provider,
-                            );
+                for (key_idx, extra_key) in extra_keys.iter().enumerate() {
+                    let extra_label = format!("{base_label}-key-{}", key_idx + 2);
+                    for (model_id, display_name, created_at) in &model_snapshots {
+                        if self.has_provider_model(&extra_label, model_id) {
+                            continue;
                         }
+                        let provider = Arc::new(
+                            openai::OpenAiProvider::new_with_name(
+                                extra_key.clone(),
+                                model_id.clone(),
+                                base_url.clone(),
+                                extra_label.clone(),
+                            )
+                            .with_stream_transport(stream_transport),
+                        );
+                        self.register(
+                            ModelInfo {
+                                id: model_id.clone(),
+                                provider: extra_label.clone(),
+                                display_name: display_name.clone(),
+                                created_at: *created_at,
+                            },
+                            provider,
+                        );
                     }
                 }
             }
@@ -2254,7 +2253,7 @@ impl ProviderRegistry {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::field_reassign_with_default)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3054,6 +3053,11 @@ mod tests {
             extra_api_keys: vec![secret("sk-openai-1"), secret("sk-openai-2")],
             ..Default::default()
         });
+        // Disable oauth-discovered providers so stored credentials on the host
+        // machine don't affect the fallback-provider assertions below.
+        let disabled = moltis_config::schema::ProviderEntry { enabled: false, ..Default::default() };
+        config.providers.insert("openai-codex".into(), disabled.clone());
+        config.providers.insert("github-copilot".into(), disabled);
 
         let reg = ProviderRegistry::from_env_with_config(&config);
         let openai_models: Vec<_> = reg

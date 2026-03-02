@@ -616,10 +616,10 @@ impl TaskListTool {
     }
 }
 
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn tool(dir: &TempDir) -> TaskListTool {
