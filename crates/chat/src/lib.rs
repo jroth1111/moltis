@@ -38,6 +38,7 @@ use {
     moltis_sessions::{
         ContentBlock, MessageContent, PersistedMessage,
         metadata::{SessionEntry, SqliteSessionMetadata},
+        state_store::SessionStateStore,
         store::SessionStore,
     },
     moltis_skills::discover::SkillDiscoverer,
@@ -2289,6 +2290,8 @@ pub struct LiveChatService {
     /// Per-session reply medium for active runs, so the frontend can restore
     /// `voicePending` state after a page reload.
     active_reply_medium: Arc<RwLock<HashMap<String, ReplyMedium>>>,
+    /// Optional session state store for self-repair run lifecycle tracking.
+    state_store: Option<Arc<SessionStateStore>>,
     /// Failover configuration for automatic model/provider failover.
     failover_config: moltis_config::schema::FailoverConfig,
 }
@@ -2317,6 +2320,7 @@ impl LiveChatService {
             active_thinking_text: Arc::new(RwLock::new(HashMap::new())),
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
             active_reply_medium: Arc::new(RwLock::new(HashMap::new())),
+            state_store: None,
             failover_config: moltis_config::schema::FailoverConfig::default(),
         }
     }
@@ -2328,6 +2332,11 @@ impl LiveChatService {
 
     pub fn with_tools(mut self, registry: Arc<RwLock<ToolRegistry>>) -> Self {
         self.tool_registry = registry;
+        self
+    }
+
+    pub fn with_state_store(mut self, state_store: Arc<SessionStateStore>) -> Self {
+        self.state_store = Some(state_store);
         self
     }
 
@@ -2503,6 +2512,32 @@ impl LiveChatService {
             worktree_dir,
         };
         Some(ctx.to_prompt_section())
+    }
+}
+
+async fn mark_self_repair_started(state_store: Option<&SessionStateStore>, session_key: &str) {
+    if let Some(store) = state_store
+        && let Err(error) =
+            moltis_agents::self_repair::mark_session_started(store, session_key).await
+    {
+        warn!(
+            session = %session_key,
+            error = %error,
+            "failed to mark session as running for self-repair"
+        );
+    }
+}
+
+async fn mark_self_repair_finished(state_store: Option<&SessionStateStore>, session_key: &str) {
+    if let Some(store) = state_store
+        && let Err(error) =
+            moltis_agents::self_repair::mark_session_finished(store, session_key).await
+    {
+        warn!(
+            session = %session_key,
+            error = %error,
+            "failed to clear session running state for self-repair"
+        );
     }
 }
 
@@ -2808,6 +2843,7 @@ impl ChatService for LiveChatService {
             let active_reply_medium = Arc::clone(&self.active_reply_medium);
             let session_store = Arc::clone(&self.session_store);
             let session_metadata = Arc::clone(&self.session_metadata);
+            let state_store = self.state_store.clone();
             let tool_registry = Arc::clone(&self.tool_registry);
             let session_key_clone = session_key.clone();
             let message_queue = Arc::clone(&self.message_queue);
@@ -2827,6 +2863,7 @@ impl ChatService for LiveChatService {
                     .write()
                     .await
                     .insert(session_key_clone.clone(), ReplyMedium::Text);
+                mark_self_repair_started(state_store.as_deref(), &session_key_clone).await;
 
                 let assistant_output = run_explicit_shell_command(
                     &state,
@@ -2868,6 +2905,7 @@ impl ChatService for LiveChatService {
                 if let Ok(count) = session_store.count(&session_key_clone).await {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
+                mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
 
                 active_runs.write().await.remove(&run_id_clone);
                 let mut runs_by_session = active_runs_by_session.write().await;
@@ -3202,6 +3240,7 @@ impl ChatService for LiveChatService {
         let model_store = Arc::clone(&self.model_store);
         let session_store = Arc::clone(&self.session_store);
         let session_metadata = Arc::clone(&self.session_metadata);
+        let state_store = self.state_store.clone();
         let session_agent_id_clone = session_agent_id.clone();
         let session_key_clone = session_key.clone();
         let accept_language = params
@@ -3430,6 +3469,7 @@ impl ChatService for LiveChatService {
                 )
                 .await;
             }
+            mark_self_repair_started(state_store.as_deref(), &session_key_clone).await;
             let agent_fut = async {
                 if stream_only {
                     run_streaming(
@@ -3550,6 +3590,7 @@ impl ChatService for LiveChatService {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
             }
+            mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
 
             active_runs.write().await.remove(&run_id_clone);
             let mut runs_by_session = active_runs_by_session.write().await;
@@ -3751,6 +3792,7 @@ impl ChatService for LiveChatService {
 
         // send_sync is text-only (used by API calls and channels).
         let user_content = UserContent::text(&text);
+        mark_self_repair_started(self.state_store.as_deref(), &session_key).await;
         let result = if stream_only {
             run_streaming(
                 &state,
@@ -3801,6 +3843,7 @@ impl ChatService for LiveChatService {
             )
             .await
         };
+        mark_self_repair_finished(self.state_store.as_deref(), &session_key).await;
 
         // Persist assistant response (even empty ones — needed for LLM history coherence).
         if let Some(ref assistant_output) = result {
@@ -3867,17 +3910,35 @@ impl ChatService for LiveChatService {
     }
 
     async fn abort(&self, params: Value) -> ServiceResult {
-        let run_id = params.get("runId").and_then(|v| v.as_str());
-        let session_key = params.get("sessionKey").and_then(|v| v.as_str());
+        let run_id = params
+            .get("runId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let session_key = params
+            .get("sessionKey")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         if run_id.is_none() && session_key.is_none() {
             return Err("missing 'runId' or 'sessionKey'".into());
         }
 
+        let resolved_session_key = if let Some(key) = session_key.clone() {
+            Some(key)
+        } else if let Some(ref id) = run_id {
+            self.active_runs_by_session
+                .read()
+                .await
+                .iter()
+                .find_map(|(key, run)| (run == id).then(|| key.clone()))
+        } else {
+            None
+        };
+
         let (resolved_run_id, aborted) = Self::abort_run_handle(
             &self.active_runs,
             &self.active_runs_by_session,
-            run_id,
-            session_key,
+            run_id.as_deref(),
+            session_key.as_deref(),
         )
         .await;
         info!(
@@ -3888,7 +3949,8 @@ impl ChatService for LiveChatService {
             "chat.abort"
         );
 
-        if aborted && let Some(key) = session_key {
+        if aborted && let Some(ref key) = resolved_session_key {
+            mark_self_repair_finished(self.state_store.as_deref(), key).await;
             self.active_thinking_text.write().await.remove(key);
             self.active_tool_calls.write().await.remove(key);
             self.active_reply_medium.write().await.remove(key);
@@ -8153,6 +8215,9 @@ mod tests {
                     .expect("mock exec commands mutex poisoned")
                     .push(command.to_string());
             }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             Ok(serde_json::json!({
                 "stdout": "ok\n",
                 "stderr": "",
@@ -8363,6 +8428,7 @@ mod tests {
     struct MockExecTool {
         calls: Arc<AtomicUsize>,
         commands: Arc<std::sync::Mutex<Vec<String>>>,
+        delay: Duration,
     }
 
     #[test]
@@ -8767,6 +8833,23 @@ mod tests {
         pool
     }
 
+    async fn make_state_store(pool: &sqlx::SqlitePool) -> Arc<SessionStateStore> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS session_state (
+                session_key TEXT NOT NULL,
+                namespace   TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_key, namespace, key)
+            )"#,
+        )
+        .execute(pool)
+        .await
+        .expect("session_state test table");
+        Arc::new(SessionStateStore::new(pool.clone()))
+    }
+
     #[tokio::test]
     async fn deliver_channel_replies_waits_for_outbound_sends() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -9081,6 +9164,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
         let pool = sqlite_pool().await;
+        let state_store = make_state_store(&pool).await;
         let metadata = Arc::new(SqliteSessionMetadata::new(pool));
 
         let runtime = Arc::new(MockChatRuntime::new());
@@ -9095,10 +9179,12 @@ mod tests {
         registry.register(Box::new(MockExecTool {
             calls: Arc::clone(&calls),
             commands: Arc::clone(&commands),
+            delay: Duration::from_millis(0),
         }));
 
         let chat = LiveChatService::new(providers, disabled, state, Arc::clone(&store), metadata)
-            .with_tools(Arc::new(RwLock::new(registry)));
+            .with_tools(Arc::new(RwLock::new(registry)))
+            .with_state_store(Arc::clone(&state_store));
 
         let send_result = chat
             .send(serde_json::json!({ "text": "/sh df -h" }))
@@ -9141,6 +9227,74 @@ mod tests {
                 .any(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant")),
             "explicit /sh should persist an assistant turn for history coherence"
         );
+        assert!(
+            !moltis_agents::self_repair::is_session_running(&state_store, "main").await,
+            "self-repair running marker should be cleared when /sh run completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_by_run_id_clears_self_repair_running_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let state_store = make_state_store(&pool).await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        let runtime = Arc::new(MockChatRuntime::new());
+        let state: Arc<dyn ChatRuntime> = runtime;
+
+        let providers = Arc::new(RwLock::new(ProviderRegistry::empty()));
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockExecTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+            commands: Arc::new(std::sync::Mutex::new(Vec::new())),
+            delay: Duration::from_secs(5),
+        }));
+
+        let chat = LiveChatService::new(providers, disabled, state, store, metadata)
+            .with_tools(Arc::new(RwLock::new(registry)))
+            .with_state_store(Arc::clone(&state_store));
+
+        let send = chat
+            .send(serde_json::json!({ "text": "/sh long running command" }))
+            .await
+            .expect("chat.send should start /sh run");
+        let run_id = send
+            .get("runId")
+            .and_then(Value::as_str)
+            .expect("runId should be returned")
+            .to_string();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if moltis_agents::self_repair::is_session_running(&state_store, "main").await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("session should be marked running while /sh run is active");
+
+        let aborted = chat
+            .abort(serde_json::json!({ "runId": run_id }))
+            .await
+            .expect("chat.abort should succeed");
+        assert_eq!(aborted.get("aborted").and_then(Value::as_bool), Some(true));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !moltis_agents::self_repair::is_session_running(&state_store, "main").await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted run should clear self-repair running marker");
     }
 
     #[test]
@@ -10918,16 +11072,15 @@ mod tests {
         );
 
         // Pre-populate active tool calls for a session.
-        service
-            .active_tool_calls
-            .write()
-            .await
-            .insert("test-session".into(), vec![ActiveToolCall {
+        service.active_tool_calls.write().await.insert(
+            "test-session".into(),
+            vec![ActiveToolCall {
                 id: "tc_1".into(),
                 name: "bash".into(),
                 arguments: serde_json::json!({}),
                 started_at: 0,
-            }]);
+            }],
+        );
         // Pre-populate active_runs_by_session so abort can find the session.
         let run_id = "test-run".to_string();
         service

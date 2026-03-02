@@ -1326,6 +1326,14 @@ impl GatewayServices {
         self
     }
 
+    pub fn with_session_state_store(
+        mut self,
+        store: Arc<moltis_sessions::state_store::SessionStateStore>,
+    ) -> Self {
+        self.session_state_store = Some(store);
+        self
+    }
+
     pub fn with_session_share_store(mut self, store: Arc<crate::share_store::ShareStore>) -> Self {
         self.session_share_store = Some(store);
         self
@@ -1399,5 +1407,23 @@ mod tests {
     #[test]
     fn risky_install_pattern_allows_plain_package_install() {
         assert_eq!(risky_install_pattern("cargo install ripgrep"), None);
+    }
+
+    #[tokio::test]
+    async fn with_session_state_store_wires_store() -> anyhow::Result<()> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+        let expected = Arc::new(moltis_sessions::state_store::SessionStateStore::new(pool));
+
+        let services = GatewayServices::noop().with_session_state_store(Arc::clone(&expected));
+
+        assert!(services.session_state_store.is_some());
+        assert!(Arc::ptr_eq(
+            services
+                .session_state_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing state store"))?,
+            &expected,
+        ));
+        Ok(())
     }
 }
