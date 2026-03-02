@@ -189,6 +189,50 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Archive messages to a cold-store JSONL file.
+    ///
+    /// Creates `{base_dir}/archive/{session_key}.{timestamp}.jsonl` containing
+    /// the provided messages. The active session file is NOT modified; callers
+    /// are responsible for replacing the active history afterward.
+    ///
+    /// Returns the archive filename (relative to `{base_dir}/archive/`).
+    pub async fn archive_to_cold_store(
+        &self,
+        key: &str,
+        messages: &[serde_json::Value],
+    ) -> Result<String> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let safe_key = Self::key_to_filename(key);
+        let archive_filename = format!("{safe_key}.{ts}.jsonl");
+        let archive_dir = self.base_dir.join("archive");
+        let archive_path = archive_dir.join(&archive_filename);
+        let messages = messages.to_vec();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            fs::create_dir_all(&archive_dir)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&archive_path)?;
+            let mut lock = RwLock::new(file);
+            let mut guard = lock
+                .write()
+                .map_err(|e| Error::lock_failed(e.to_string()))?;
+            for msg in &messages {
+                let line = serde_json::to_string(msg)?;
+                writeln!(*guard, "{line}")?;
+            }
+            Ok(())
+        })
+        .await??;
+
+        Ok(archive_filename)
+    }
+
     /// List all session keys by scanning JSONL files in the base directory.
     pub fn list_keys(&self) -> Vec<String> {
         let Ok(entries) = fs::read_dir(&self.base_dir) else {
@@ -299,6 +343,19 @@ impl SessionStore {
         .await??;
 
         Ok(())
+    }
+
+    /// Keep only the last N messages in the session file.
+    /// Returns the number of messages that were removed.
+    pub async fn truncate_messages(&self, key: &str, keep_n: usize) -> Result<usize> {
+        let all = self.read(key).await?;
+        if all.len() <= keep_n {
+            return Ok(0);
+        }
+        let removed = all.len() - keep_n;
+        let kept = all[all.len() - keep_n..].to_vec();
+        self.replace_history(key, kept).await?;
+        Ok(removed)
     }
 
     /// Read all messages as typed [`PersistedMessage`] values.
@@ -866,5 +923,91 @@ mod tests {
             },
             _ => panic!("expected Assistant message"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_archive_to_cold_store_creates_file() {
+        let (store, dir) = temp_store();
+
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi"}),
+        ];
+
+        let filename = store
+            .archive_to_cold_store("session:abc", &messages)
+            .await
+            .unwrap();
+
+        // Filename must not be empty and must be a .jsonl file.
+        assert!(!filename.is_empty());
+        assert!(filename.ends_with(".jsonl"), "expected .jsonl, got {filename}");
+
+        // Archive file must exist under archive/.
+        let archive_path = dir.path().join("archive").join(&filename);
+        assert!(archive_path.exists(), "archive file not found: {archive_path:?}");
+
+        // Archive file must contain the same number of lines as messages.
+        let content = fs::read_to_string(&archive_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), messages.len());
+
+        // Active session must not be modified.
+        let active = store.read("session:abc").await.unwrap();
+        assert!(active.is_empty(), "archive should not touch active session");
+    }
+
+    #[tokio::test]
+    async fn test_archive_to_cold_store_colon_key_sanitized() {
+        let (store, dir) = temp_store();
+
+        let messages = vec![json!({"role": "user", "content": "msg"})];
+        let filename = store
+            .archive_to_cold_store("foo:bar", &messages)
+            .await
+            .unwrap();
+
+        // Colons must be replaced by underscores in the filename.
+        assert!(!filename.contains(':'), "filename must not contain colons: {filename}");
+        let archive_path = dir.path().join("archive").join(&filename);
+        assert!(archive_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_messages() {
+        let (store, _dir) = temp_store();
+
+        for i in 0..10 {
+            store
+                .append("main", &json!({"role": "user", "content": format!("msg-{i}")}))
+                .await
+                .unwrap();
+        }
+
+        let removed = store.truncate_messages("main", 3).await.unwrap();
+        assert_eq!(removed, 7);
+
+        let msgs = store.read("main").await.unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["content"], "msg-7");
+        assert_eq!(msgs[2]["content"], "msg-9");
+    }
+
+    #[tokio::test]
+    async fn test_truncate_messages_noop_when_short() {
+        let (store, _dir) = temp_store();
+
+        for i in 0..3 {
+            store
+                .append("main", &json!({"role": "user", "content": format!("msg-{i}")}))
+                .await
+                .unwrap();
+        }
+
+        let removed = store.truncate_messages("main", 10).await.unwrap();
+        assert_eq!(removed, 0);
+
+        let msgs = store.read("main").await.unwrap();
+        assert_eq!(msgs.len(), 3);
     }
 }

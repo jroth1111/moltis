@@ -1225,10 +1225,25 @@ pub struct ChatConfig {
     /// Enable two-pass fact extraction during compaction.
     #[serde(default)]
     pub fact_extraction: bool,
+    /// Context compaction strategy when the context window approaches its limit.
+    /// Options: "truncate" (default), "move_to_workspace"
+    #[serde(default = "default_compaction_strategy")]
+    pub context_compaction_strategy: String,
+    /// Number of recent messages to keep after compaction.
+    #[serde(default = "default_compaction_keep_recent")]
+    pub context_compaction_keep_recent: usize,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
     MessageQueueMode::Followup
+}
+
+fn default_compaction_strategy() -> String {
+    "truncate".to_string()
+}
+
+fn default_compaction_keep_recent() -> usize {
+    20
 }
 
 impl Default for ChatConfig {
@@ -1238,6 +1253,8 @@ impl Default for ChatConfig {
             priority_models: Vec::new(),
             allowed_models: Vec::new(),
             fact_extraction: false,
+            context_compaction_strategy: default_compaction_strategy(),
+            context_compaction_keep_recent: default_compaction_keep_recent(),
         }
     }
 }
