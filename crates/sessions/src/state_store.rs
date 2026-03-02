@@ -145,11 +145,7 @@ impl SessionStateStore {
     /// List all session keys that have an entry in the given namespace and key.
     ///
     /// Used by the self-repair scanner to find sessions with `running_since` set.
-    pub async fn list_sessions_with_key(
-        &self,
-        namespace: &str,
-        key: &str,
-    ) -> Result<Vec<String>> {
+    pub async fn list_sessions_with_key(&self, namespace: &str, key: &str) -> Result<Vec<String>> {
         let rows = sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT session_key FROM session_state WHERE namespace = ? AND key = ?",
         )
@@ -324,5 +320,53 @@ mod tests {
             store.get("s1", "ns-b", "key").await.unwrap().as_deref(),
             Some("val-b")
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_with_key() {
+        let pool = test_pool().await;
+        let store = SessionStateStore::new(pool);
+
+        store
+            .set("session:1", "self_repair", "running_since", "123")
+            .await
+            .unwrap();
+        store
+            .set("session:2", "self_repair", "running_since", "456")
+            .await
+            .unwrap();
+        store
+            .set("session:2", "self_repair", "repair_attempts", "1")
+            .await
+            .unwrap();
+        store
+            .set("session:3", "other", "running_since", "789")
+            .await
+            .unwrap();
+
+        let mut sessions = store
+            .list_sessions_with_key("self_repair", "running_since")
+            .await
+            .unwrap();
+        sessions.sort();
+        assert_eq!(sessions, vec!["session:1", "session:2"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_running_sessions() {
+        let pool = test_pool().await;
+        let store = SessionStateStore::new(pool);
+
+        store
+            .set("session:running", "self_repair", "running_since", "111")
+            .await
+            .unwrap();
+        store
+            .set("session:idle", "self_repair", "repair_attempts", "2")
+            .await
+            .unwrap();
+
+        let sessions = store.list_running_sessions().await.unwrap();
+        assert_eq!(sessions, vec!["session:running"]);
     }
 }
