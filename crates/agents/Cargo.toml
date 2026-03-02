@@ -16,6 +16,7 @@ moltis-common   = { workspace = true }
 moltis-config   = { workspace = true }
 moltis-sessions = { workspace = true }
 moltis-skills   = { workspace = true }
+regex           = { workspace = true }
 reqwest         = { workspace = true }
 secrecy         = { workspace = true }
 serde           = { workspace = true }
