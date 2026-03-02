@@ -24,11 +24,25 @@ pub enum ResearchTrigger {
 
 impl ResearchTrigger {
     /// Parse from a config string.
+    ///
+    /// Accepts:
+    /// - `"always"` — fire every turn
+    /// - `"keywords"` — fire when message contains any keyword from `keywords`
+    /// - `"question"` — fire when message ends with `?`
+    /// - `"length"` or `"length:N"` — fire when message exceeds N chars (default 200)
+    /// - anything else → `Never`
     pub fn from_config(s: &str, keywords: &[String]) -> Self {
         match s {
             "always" => Self::Always,
             "keywords" => Self::Keywords(keywords.to_vec()),
             "question" => Self::Question,
+            s if s == "length" || s.starts_with("length:") => {
+                let n = s
+                    .strip_prefix("length:")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(200);
+                Self::Length(n)
+            },
             _ => Self::Never,
         }
     }

@@ -341,6 +341,15 @@ fn build_schema_map() -> KnownKeys {
                 ("fact_extraction", Leaf),
                 ("context_compaction_strategy", Leaf),
                 ("context_compaction_keep_recent", Leaf),
+                (
+                    "research",
+                    Struct(HashMap::from([
+                        ("enabled", Leaf),
+                        ("trigger", Leaf),
+                        ("keywords", Leaf),
+                        ("max_iterations", Leaf),
+                    ])),
+                ),
             ])),
         ),
         (
