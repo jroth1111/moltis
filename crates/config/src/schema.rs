@@ -1232,6 +1232,9 @@ pub struct ChatConfig {
     /// Number of recent messages to keep after compaction.
     #[serde(default = "default_compaction_keep_recent")]
     pub context_compaction_keep_recent: usize,
+    /// Research phase settings.
+    #[serde(default)]
+    pub research: ResearchConfig,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1255,6 +1258,7 @@ impl Default for ChatConfig {
             fact_extraction: false,
             context_compaction_strategy: default_compaction_strategy(),
             context_compaction_keep_recent: default_compaction_keep_recent(),
+            research: ResearchConfig::default(),
         }
     }
 }
@@ -1269,6 +1273,38 @@ pub enum MessageQueueMode {
     /// Buffer messages; concatenate and process as a single message after the current run.
     Collect,
 }
+
+/// Research phase configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResearchConfig {
+    /// Whether to enable the research phase at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Trigger type: "never", "always", "question", "keywords", "length".
+    #[serde(default = "default_research_trigger")]
+    pub trigger: String,
+    /// Keywords that trigger research (when trigger = "keywords").
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Max tool calls in the research loop.
+    #[serde(default = "default_research_max_iterations")]
+    pub max_iterations: usize,
+}
+
+impl Default for ResearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trigger: "question".to_string(),
+            keywords: vec![],
+            max_iterations: 3,
+        }
+    }
+}
+
+fn default_research_trigger() -> String { "question".to_string() }
+fn default_research_max_iterations() -> usize { 3 }
 
 /// Tools configuration (exec, sandbox, policy, web, browser).
 #[derive(Debug, Clone, Serialize, Deserialize)]
