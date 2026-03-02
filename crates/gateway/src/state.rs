@@ -342,6 +342,9 @@ pub struct GatewayInner {
     /// Hostnames that were discovered after passkeys already existed.
     /// Users should sign in with password and register a fresh passkey on these hosts.
     pub passkey_host_update_pending: HashSet<String>,
+    /// Per-session undo/redo managers (session_key → manager).
+    /// Ephemeral: cleared when the session ends or the server restarts.
+    pub undo_managers: HashMap<String, moltis_sessions::undo::UndoManager>,
 }
 
 impl GatewayInner {
@@ -376,6 +379,7 @@ impl GatewayInner {
             channel_command_mode_sessions: HashSet::new(),
             channels_offered: vec!["telegram".into()],
             passkey_host_update_pending: HashSet::new(),
+            undo_managers: HashMap::new(),
         }
     }
 

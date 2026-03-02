@@ -1643,12 +1643,46 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         }
                     }
                 }
-                ctx.state
+
+                // Capture pre-turn message snapshot for undo stack.
+                let pre_turn_snapshot: Option<(String, Vec<serde_json::Value>)> = {
+                    let inner = ctx.state.inner.read().await;
+                    if let Some(session_key) = inner.active_sessions.get(&ctx.client_conn_id).cloned() {
+                        if let Some(store) = ctx.state.services.session_store.as_ref() {
+                            store.read(&session_key).await.ok().map(|msgs| (session_key, msgs))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let result = ctx.state
                     .chat()
                     .await
                     .send(params)
                     .await
-                    .map_err(ErrorShape::from)
+                    .map_err(ErrorShape::from);
+
+                // After a successful turn, push the pre-turn snapshot onto the undo stack.
+                if result.is_ok() {
+                    if let Some((session_key, snapshot)) = pre_turn_snapshot {
+                        let turn_index = {
+                            let inner = ctx.state.inner.read().await;
+                            // Use undo depth as a proxy for turn count.
+                            inner.undo_managers.get(&session_key).map_or(0, |m| m.undo_depth())
+                        };
+                        let mut inner = ctx.state.inner.write().await;
+                        let mgr = inner
+                            .undo_managers
+                            .entry(session_key)
+                            .or_insert_with(moltis_sessions::undo::UndoManager::new);
+                        mgr.push(snapshot, turn_index);
+                    }
+                }
+
+                result
             })
         }),
     );
@@ -1746,6 +1780,106 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .compact(params)
                     .await
                     .map_err(ErrorShape::from)
+            })
+        }),
+    );
+
+    reg.register(
+        "chat.undo",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                let session_key = {
+                    let inner = ctx.state.inner.read().await;
+                    inner
+                        .active_sessions
+                        .get(&ctx.client_conn_id)
+                        .cloned()
+                        .ok_or_else(|| ErrorShape::from("no active session"))?
+                };
+                let session_store = ctx
+                    .state
+                    .services
+                    .session_store
+                    .as_ref()
+                    .ok_or_else(|| ErrorShape::from("session store unavailable"))?;
+                let current_messages = session_store
+                    .read(&session_key)
+                    .await
+                    .map_err(|e| ErrorShape::from(e.to_string()))?;
+                let checkpoint = {
+                    let mut inner = ctx.state.inner.write().await;
+                    let mgr = inner
+                        .undo_managers
+                        .entry(session_key.clone())
+                        .or_insert_with(moltis_sessions::undo::UndoManager::new);
+                    mgr.undo(current_messages)
+                };
+                match checkpoint {
+                    Some(cp) => {
+                        session_store
+                            .replace_history(&session_key, cp.messages.clone())
+                            .await
+                            .map_err(|e| ErrorShape::from(e.to_string()))?;
+                        Ok(serde_json::json!({
+                            "ok": true,
+                            "sessionKey": session_key,
+                            "turnIndex": cp.turn_index,
+                            "messageCount": cp.messages.len(),
+                        }))
+                    }
+                    None => Ok(serde_json::json!({
+                        "ok": false,
+                        "reason": "nothing to undo",
+                    })),
+                }
+            })
+        }),
+    );
+
+    reg.register(
+        "chat.redo",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                let session_key = {
+                    let inner = ctx.state.inner.read().await;
+                    inner
+                        .active_sessions
+                        .get(&ctx.client_conn_id)
+                        .cloned()
+                        .ok_or_else(|| ErrorShape::from("no active session"))?
+                };
+                let session_store = ctx
+                    .state
+                    .services
+                    .session_store
+                    .as_ref()
+                    .ok_or_else(|| ErrorShape::from("session store unavailable"))?;
+                let checkpoint = {
+                    let mut inner = ctx.state.inner.write().await;
+                    inner
+                        .undo_managers
+                        .entry(session_key.clone())
+                        .or_insert_with(moltis_sessions::undo::UndoManager::new)
+                        .redo()
+                };
+                match checkpoint {
+                    Some(cp) => {
+                        session_store
+                            .replace_history(&session_key, cp.messages.clone())
+                            .await
+                            .map_err(|e| ErrorShape::from(e.to_string()))?;
+                        Ok(serde_json::json!({
+                            "ok": true,
+                            "sessionKey": session_key,
+                            "turnIndex": cp.turn_index,
+                            "messageCount": cp.messages.len(),
+                        }))
+                    }
+                    None => Ok(serde_json::json!({
+                        "ok": false,
+                        "reason": "nothing to redo",
+                    })),
+                }
             })
         }),
     );

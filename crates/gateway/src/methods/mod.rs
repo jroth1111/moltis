@@ -161,6 +161,8 @@ const WRITE_METHODS: &[&str] = &[
     "chat.cancel_queued",
     "chat.clear",
     "chat.compact",
+    "chat.undo",
+    "chat.redo",
     "browser.request",
     "logs.ack",
     "models.detect_supported",
