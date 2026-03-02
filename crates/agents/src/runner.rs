@@ -3693,6 +3693,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3851,6 +3852,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3950,6 +3952,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4033,6 +4036,7 @@ mod tests {
             "You are a test bot.",
             &user_content,
             Some(&on_event),
+            None,
             None,
             None,
             None,
@@ -4196,6 +4200,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4344,6 +4349,7 @@ mod tests {
             "You are a test bot.",
             &user_content,
             Some(&on_event),
+            None,
             None,
             None,
             None,
@@ -4629,6 +4635,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "should recover after retry: {result:?}");
@@ -4694,6 +4701,7 @@ mod tests {
             "sys",
             &UserContent::text("hello"),
             Some(&on_event),
+            None,
             None,
             None,
             None,
