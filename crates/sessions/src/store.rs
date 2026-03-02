@@ -97,7 +97,7 @@ impl SessionStore {
                 .write()
                 .map_err(|e| Error::lock_failed(e.to_string()))?;
             writeln!(*guard, "{line}")?;
-            guard.flush()?;
+            guard.sync_data()?;
             Ok(())
         })
         .await??;
@@ -235,7 +235,7 @@ impl SessionStore {
                     let line = serde_json::to_string(msg)?;
                     writeln!(*guard, "{line}")?;
                 }
-                guard.flush()?;
+                guard.sync_data()?;
                 return Ok(archive_filename);
             }
         })
@@ -349,7 +349,7 @@ impl SessionStore {
                 let line = serde_json::to_string(msg)?;
                 writeln!(*guard, "{line}")?;
             }
-            guard.flush()?;
+            guard.sync_data()?;
             Ok(())
         })
         .await??;
@@ -459,7 +459,7 @@ impl SessionStore {
                 let line = serde_json::to_string(msg)?;
                 writeln!(*guard, "{line}")?;
             }
-            guard.flush()?;
+            guard.sync_data()?;
             Ok(())
         })
         .await??;
