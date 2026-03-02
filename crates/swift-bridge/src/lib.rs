@@ -261,6 +261,7 @@ fn emit_session_event(event: &SessionEvent) {
             SessionEvent::Created { session_key } => ("created", session_key.clone()),
             SessionEvent::Deleted { session_key } => ("deleted", session_key.clone()),
             SessionEvent::Patched { session_key } => ("patched", session_key.clone()),
+            SessionEvent::Recovered { session_key, .. } => ("recovered", session_key.clone()),
         };
         let payload = BridgeSessionEvent { kind, session_key };
         if let Ok(json) = serde_json::to_string(&payload)

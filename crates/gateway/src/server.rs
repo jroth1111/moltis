@@ -3995,14 +3995,21 @@ pub async fn prepare_gateway(
                             SessionEvent::Patched { session_key } => {
                                 ("patched", session_key.as_str())
                             },
+                            SessionEvent::Recovered { session_key, .. } => {
+                                ("recovered", session_key.as_str())
+                            },
                         };
+                        let mut payload = serde_json::json!({
+                            "kind": kind,
+                            "sessionKey": session_key,
+                        });
+                        if let SessionEvent::Recovered { recovery_type, .. } = &event {
+                            payload["recoveryType"] = serde_json::json!(recovery_type);
+                        }
                         broadcast(
                             &ws_state,
                             "session",
-                            serde_json::json!({
-                                "kind": kind,
-                                "sessionKey": session_key,
-                            }),
+                            payload,
                             BroadcastOpts {
                                 drop_if_slow: true,
                                 ..Default::default()

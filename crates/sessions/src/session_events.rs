@@ -12,6 +12,12 @@ pub enum SessionEvent {
     Created { session_key: String },
     Deleted { session_key: String },
     Patched { session_key: String },
+    /// Session was recovered from a corrupt/interrupted state.
+    Recovered {
+        session_key: String,
+        /// Short description of what was recovered (e.g. "truncated_line", "orphaned_tool_call").
+        recovery_type: String,
+    },
 }
 
 /// Thin wrapper around a `broadcast::Sender<SessionEvent>`.
