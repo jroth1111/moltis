@@ -5,11 +5,15 @@ name              = "moltis-metrics"
 version.workspace = true
 
 [dependencies]
+anyhow                      = { workspace = true }
 async-trait                 = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { optional = true, workspace = true }
 metrics-tracing-context     = { optional = true, workspace = true }
 once_cell                   = { workspace = true }
+opentelemetry               = { optional = true, workspace = true }
+opentelemetry-otlp          = { features = ["grpc-tonic"], optional = true, workspace = true }
+opentelemetry_sdk           = { optional = true, workspace = true }
 serde                       = { workspace = true }
 serde_json                  = { workspace = true }
 sqlx                        = { optional = true, workspace = true }
@@ -20,6 +24,7 @@ tracing-subscriber          = { features = ["env-filter"], optional = true, work
 
 [features]
 default    = []
+otlp       = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk"]
 prometheus = ["dep:metrics-exporter-prometheus"]
 sqlite     = ["dep:sqlx"]
 tracing    = ["dep:metrics-tracing-context", "dep:tracing-subscriber"]

@@ -33,6 +33,7 @@ pub use {
     error::{Error, Result},
     recorder::{MetricsHandle, MetricsRecorderConfig, init_metrics},
     snapshot::{MetricSnapshot, MetricType, MetricsSnapshot},
+    tracing_integration::init_otlp,
 };
 
 #[cfg(feature = "sqlite")]

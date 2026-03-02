@@ -45,3 +45,36 @@ pub mod span_labels {
     /// The component/module
     pub const COMPONENT: &str = "component";
 }
+
+/// Initialize OTLP tracing exporter.
+///
+/// Requires the `otlp` feature flag and a valid endpoint URL.
+/// Typically called at startup if `config.otlp_endpoint` is set.
+#[cfg(feature = "otlp")]
+pub fn init_otlp(endpoint: &str, service_name: &str) -> anyhow::Result<()> {
+    use opentelemetry_otlp::WithExportConfig;
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()?;
+
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(service_name.to_owned())
+        .build();
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .build();
+
+    let _ = opentelemetry::global::set_tracer_provider(provider);
+    tracing::info!(endpoint = %endpoint, "OTLP tracing initialized");
+    Ok(())
+}
+
+#[cfg(not(feature = "otlp"))]
+pub fn init_otlp(_endpoint: &str, _service_name: &str) -> anyhow::Result<()> {
+    tracing::debug!("OTLP feature not enabled, skipping tracer initialization");
+    Ok(())
+}

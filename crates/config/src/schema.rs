@@ -1034,6 +1034,10 @@ pub struct MetricsConfig {
     /// Additional labels to add to all metrics.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// OTLP endpoint for distributed tracing (e.g. "http://localhost:4317").
+    /// Requires the `otlp` feature to be enabled.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
 }
 
 fn default_metrics_history_points() -> usize {
@@ -1047,6 +1051,7 @@ impl Default for MetricsConfig {
             prometheus_endpoint: true,
             history_points: default_metrics_history_points(),
             labels: HashMap::new(),
+            otlp_endpoint: None,
         }
     }
 }
