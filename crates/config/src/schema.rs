@@ -2325,6 +2325,18 @@ system_prompt_suffix = "Focus on evidence."
     }
 
     #[test]
+    fn chat_config_default_queue_max_size_is_100() {
+        let cfg = ChatConfig::default();
+        assert_eq!(cfg.message_queue_max_size, 100);
+    }
+
+    #[test]
+    fn chat_config_toml_parses_queue_max_size() {
+        let cfg: ChatConfig = toml::from_str("message_queue_max_size = 42").unwrap();
+        assert_eq!(cfg.message_queue_max_size, 42);
+    }
+
+    #[test]
     fn providers_config_local_alias_maps_local_llm_to_local() {
         let mut config = ProvidersConfig::default();
         config.providers.insert("local-llm".into(), ProviderEntry {
