@@ -337,6 +337,8 @@ fn build_schema_map() -> KnownKeys {
                 ("priority_models", Leaf),
                 ("allowed_models", Leaf),
                 ("fact_extraction", Leaf),
+                ("context_compaction_strategy", Leaf),
+                ("context_compaction_keep_recent", Leaf),
             ])),
         ),
         (
