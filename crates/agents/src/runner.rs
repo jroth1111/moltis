@@ -15,7 +15,7 @@ use crate::{
         ChatMessage, CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage, UserContent,
         values_to_chat_messages,
     },
-    response_sanitizer::{clean_response, recover_tool_calls_from_content},
+    response_sanitizer::{clean_response, recover_tool_calls_from_content, sanitize_with_leak_detection},
     tool_parsing::{
         looks_like_failed_tool_call, new_synthetic_tool_call_id, parse_tool_calls_from_text,
     },
@@ -1116,6 +1116,7 @@ pub async fn run_agent_loop_with_context(
             // multimodal content in tool results. Images are stripped but the UI
             // still receives them via ToolCallEnd event.
             let tool_result_str = sanitize_tool_result(&result.to_string(), max_tool_result_bytes);
+            let tool_result_str = sanitize_with_leak_detection(&tool_result_str, 0.5);
             debug!(
                 tool = %tc.name,
                 id = %tc.id,
@@ -1786,6 +1787,7 @@ pub async fn run_agent_loop_streaming(
             // multimodal content in tool results. Images are stripped but the UI
             // still receives them via ToolCallEnd event.
             let tool_result_str = sanitize_tool_result(&result.to_string(), max_tool_result_bytes);
+            let tool_result_str = sanitize_with_leak_detection(&tool_result_str, 0.5);
             debug!(
                 tool = %tc.name,
                 id = %tc.id,

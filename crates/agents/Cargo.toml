@@ -13,6 +13,7 @@ async-stream    = { workspace = true }
 async-trait     = { workspace = true }
 futures         = { workspace = true }
 moltis-common   = { workspace = true }
+regex           = { workspace = true }
 moltis-config   = { workspace = true }
 moltis-sessions = { workspace = true }
 moltis-skills   = { workspace = true }
