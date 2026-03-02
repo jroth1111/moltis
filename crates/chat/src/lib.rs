@@ -6238,6 +6238,21 @@ async fn run_with_tools(
         tool_context["_conn_id"] = serde_json::json!(cid);
     }
 
+    // TODO(research-phase): Before calling the runner, check research config and run:
+    // if config.chat.research.enabled {
+    //     let trigger = moltis_agents::research::ResearchTrigger::from_config(
+    //         &config.chat.research.trigger,
+    //         &config.chat.research.keywords,
+    //     );
+    //     if let Some(result) = moltis_agents::research::run_research_phase(
+    //         &trigger, &text, &chat_history, provider.clone(), config.chat.research.max_iterations,
+    //     ).await? {
+    //         // inject result.context as a system prompt suffix
+    //         system_prompt.push_str("\n\n");
+    //         system_prompt.push_str(&result.context);
+    //     }
+    // }
+
     let provider_ref = provider.clone();
     let first_result = run_agent_loop_streaming(
         provider,
