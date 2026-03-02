@@ -220,6 +220,16 @@ impl BrowserPool {
             "created new page with viewport"
         );
 
+        // Inject JS stealth evasions before first navigation
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.js_evasion {
+            if let Err(e) = crate::stealth::inject_stealth(&page, &self.config.stealth).await {
+                warn!(session_id, error = %e, "stealth injection failed, continuing without stealth");
+            } else {
+                debug!(session_id, "stealth evasions injected");
+            }
+        }
+
         inst.pages.insert("main".to_string(), page.clone());
         Ok(page)
     }
@@ -512,14 +522,29 @@ impl BrowserPool {
             })
             .request_timeout(Duration::from_millis(self.config.navigation_timeout_ms));
 
-        // User agent can be set via Chrome arg instead of builder method
-        if let Some(ref ua) = self.config.user_agent {
+        // User agent: explicit config > stealth default > none
+        let ua = self.config.user_agent.as_deref().or_else(|| {
+            #[cfg(feature = "stealth")]
+            if self.config.stealth.enabled {
+                return Some(crate::stealth::default_user_agent());
+            }
+            None
+        });
+        if let Some(ua) = ua {
             builder = builder.arg(format!("--user-agent={ua}"));
         }
         builder = builder.chrome_executable(selected.path.clone());
 
         for arg in &self.config.chrome_args {
             builder = builder.arg(arg);
+        }
+
+        // Inject stealth Chrome launch flags
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.stealth_args {
+            for arg in crate::stealth::chrome_stealth_args() {
+                builder = builder.arg(*arg);
+            }
         }
 
         // Set persistent profile directory if configured

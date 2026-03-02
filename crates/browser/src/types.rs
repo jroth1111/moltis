@@ -4,6 +4,57 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Stealth / anti-bot configuration.
+///
+/// These settings control the JS evasions injected before each navigation,
+/// the Chrome launch flags that reduce automation signals, and the
+/// behavioral (mouse/keyboard) emulation layer.
+///
+/// All fields default to enabled with sensible defaults. The struct is
+/// always compiled regardless of the `stealth` Cargo feature; the feature
+/// gate controls the injection code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StealthConfig {
+    /// Master switch — disables all stealth when false.
+    pub enabled: bool,
+    /// Inject the 16-evasion JS script via `addScriptToEvaluateOnNewDocument`.
+    pub js_evasion: bool,
+    /// Add the 21 stealth Chrome launch flags.
+    pub stealth_args: bool,
+    /// Use Bezier mouse movement and randomised keyboard timing.
+    pub behavioral: bool,
+    /// Override User-Agent (default: removes `HeadlessChrome`).
+    pub user_agent: Option<String>,
+    /// WebGL `UNMASKED_VENDOR_WEBGL` override (default: `"Intel Inc."`).
+    pub webgl_vendor: Option<String>,
+    /// WebGL `UNMASKED_RENDERER_WEBGL` override (default: `"Intel Iris OpenGL Engine"`).
+    pub webgl_renderer: Option<String>,
+    /// `navigator.languages` override (default: `["en-US", "en"]`).
+    pub languages: Option<Vec<String>>,
+    /// `navigator.hardwareConcurrency` override (default: `4`).
+    pub hardware_concurrency: Option<u32>,
+    /// `navigator.deviceMemory` override in GiB (default: `8`).
+    pub device_memory: Option<u8>,
+}
+
+impl Default for StealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            js_evasion: true,
+            stealth_args: true,
+            behavioral: true,
+            user_agent: None,
+            webgl_vendor: None,
+            webgl_renderer: None,
+            languages: None,
+            hardware_concurrency: None,
+            device_memory: None,
+        }
+    }
+}
+
 /// Browser action to perform.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -246,6 +297,15 @@ pub struct ElementRef {
     pub visible: bool,
     /// Whether the element is interactive (clickable/editable).
     pub interactive: bool,
+    /// Checked state for checkboxes and radio buttons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    /// Whether the element is disabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// Input type attribute ("text", "email", "password", "submit", etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
     /// Bounding box in viewport coordinates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<ElementBounds>,
@@ -445,6 +505,8 @@ pub struct BrowserConfig {
     pub persist_profile: bool,
     /// Custom path for the persistent Chrome profile directory.
     pub profile_dir: Option<String>,
+    /// Stealth / anti-bot-detection configuration.
+    pub stealth: StealthConfig,
 }
 
 fn default_sandbox_image() -> String {
@@ -476,6 +538,7 @@ impl Default for BrowserConfig {
             low_memory_threshold_mb: 2048,
             persist_profile: true,
             profile_dir: None,
+            stealth: StealthConfig::default(),
         }
     }
 }
@@ -518,6 +581,18 @@ impl From<&moltis_config::schema::BrowserConfig> for BrowserConfig {
             low_memory_threshold_mb: cfg.low_memory_threshold_mb,
             persist_profile: cfg.persist_profile,
             profile_dir: cfg.profile_dir.clone(),
+            stealth: StealthConfig {
+                enabled: cfg.stealth.enabled,
+                js_evasion: cfg.stealth.js_evasion,
+                stealth_args: cfg.stealth.stealth_args,
+                behavioral: cfg.stealth.behavioral,
+                user_agent: cfg.stealth.user_agent.clone(),
+                webgl_vendor: cfg.stealth.webgl_vendor.clone(),
+                webgl_renderer: cfg.stealth.webgl_renderer.clone(),
+                languages: cfg.stealth.languages.clone(),
+                hardware_concurrency: cfg.stealth.hardware_concurrency,
+                device_memory: cfg.stealth.device_memory,
+            },
         }
     }
 }

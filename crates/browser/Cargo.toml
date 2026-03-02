@@ -25,6 +25,7 @@ which          = "8.0"
 [features]
 default = []
 metrics = ["dep:moltis-metrics"]
+stealth = []
 tracing = []
 
 [lints]

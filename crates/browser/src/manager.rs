@@ -441,38 +441,39 @@ impl BrowserManager {
         // Find element center
         let (x, y) = find_element_by_ref(&page, ref_).await?;
 
-        // Dispatch mouse events
-        let press_cmd = DispatchMouseEventParams::builder()
-            .r#type(DispatchMouseEventType::MousePressed)
-            .x(x)
-            .y(y)
-            .button(MouseButton::Left)
-            .click_count(1)
-            .build()
-            .map_err(|e| Error::Cdp(e.to_string()))?;
-        page.execute(press_cmd)
-            .await
-            .map_err(|e| Error::Cdp(e.to_string()))?;
+        // Dispatch mouse events — behavioral (Bezier + timing) or instant
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            crate::stealth::behavior::realistic_click(&page, x, y).await?;
+            debug!(
+                session_id = sid,
+                ref_ = ref_,
+                x = x,
+                y = y,
+                "clicked element (behavioral)"
+            );
+        } else {
+            self.instant_click(&page, x, y).await?;
+            debug!(
+                session_id = sid,
+                ref_ = ref_,
+                x = x,
+                y = y,
+                "clicked element"
+            );
+        }
 
-        let release_cmd = DispatchMouseEventParams::builder()
-            .r#type(DispatchMouseEventType::MouseReleased)
-            .x(x)
-            .y(y)
-            .button(MouseButton::Left)
-            .click_count(1)
-            .build()
-            .map_err(|e| Error::Cdp(e.to_string()))?;
-        page.execute(release_cmd)
-            .await
-            .map_err(|e| Error::Cdp(e.to_string()))?;
-
-        debug!(
-            session_id = sid,
-            ref_ = ref_,
-            x = x,
-            y = y,
-            "clicked element"
-        );
+        #[cfg(not(feature = "stealth"))]
+        {
+            self.instant_click(&page, x, y).await?;
+            debug!(
+                session_id = sid,
+                ref_ = ref_,
+                x = x,
+                y = y,
+                "clicked element"
+            );
+        }
 
         Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
     }
@@ -492,26 +493,16 @@ impl BrowserManager {
         // Focus the element
         focus_element_by_ref(&page, ref_).await?;
 
-        // Type each character
-        for c in text.chars() {
-            let key_down = DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyDown)
-                .text(c.to_string())
-                .build()
-                .map_err(|e| Error::Cdp(e.to_string()))?;
-            page.execute(key_down)
-                .await
-                .map_err(|e| Error::Cdp(e.to_string()))?;
-
-            let key_up = DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyUp)
-                .text(c.to_string())
-                .build()
-                .map_err(|e| Error::Cdp(e.to_string()))?;
-            page.execute(key_up)
-                .await
-                .map_err(|e| Error::Cdp(e.to_string()))?;
+        // Type text — behavioral (randomised timing) or instant
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            crate::stealth::behavior::realistic_type(&page, text).await?;
+        } else {
+            self.instant_type(&page, text).await?;
         }
+
+        #[cfg(not(feature = "stealth"))]
+        self.instant_type(&page, text).await?;
 
         debug!(
             session_id = sid,
@@ -752,6 +743,59 @@ impl BrowserManager {
         info!(session_id = sid, "closed browser session");
 
         Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Click at (x, y) instantly (no movement emulation).
+    async fn instant_click(&self, page: &Page, x: f64, y: f64) -> Result<(), Error> {
+        let press_cmd = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MousePressed)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+        page.execute(press_cmd)
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        let release_cmd = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseReleased)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+        page.execute(release_cmd)
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Type `text` instantly with no per-character delay.
+    async fn instant_type(&self, page: &Page, text: &str) -> Result<(), Error> {
+        for c in text.chars() {
+            let key_down = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .text(c.to_string())
+                .build()
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            page.execute(key_down)
+                .await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+
+            let key_up = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .text(c.to_string())
+                .build()
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            page.execute(key_up)
+                .await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Highlight an element (for screenshots).

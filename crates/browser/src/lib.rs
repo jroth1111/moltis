@@ -37,11 +37,14 @@ pub mod pool;
 pub mod snapshot;
 pub mod types;
 
+#[cfg(feature = "stealth")]
+pub mod stealth;
+
 pub use {
     error::Error,
     manager::BrowserManager,
     types::{
         BrowserAction, BrowserConfig, BrowserKind, BrowserPreference, BrowserRequest,
-        BrowserResponse,
+        BrowserResponse, StealthConfig,
     },
 };
