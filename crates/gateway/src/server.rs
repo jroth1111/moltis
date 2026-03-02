@@ -3401,6 +3401,9 @@ pub async fn prepare_gateway(
                 if let Some(model) = req.model {
                     params["model"] = serde_json::json!(model);
                 }
+                if let Some(trace_id) = req.trace_id {
+                    params["_trace_id"] = serde_json::json!(trace_id);
+                }
                 let chat = state.chat().await;
                 if req.wait_for_reply {
                     chat.send_sync(params)
