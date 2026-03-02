@@ -63,7 +63,7 @@ impl SessionStore {
         key.replace(':', "_")
     }
 
-    fn path_for(&self, key: &str) -> PathBuf {
+    pub(crate) fn path_for(&self, key: &str) -> PathBuf {
         self.base_dir
             .join(format!("{}.jsonl", Self::key_to_filename(key)))
     }

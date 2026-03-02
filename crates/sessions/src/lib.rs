@@ -6,6 +6,7 @@
 
 pub mod compaction;
 pub mod error;
+pub mod integrity;
 pub mod key;
 pub mod message;
 pub mod metadata;
@@ -16,6 +17,7 @@ pub mod undo;
 
 pub use {
     error::{Error, Result},
+    integrity::IntegrityReport,
     key::SessionKey,
     message::{ContentBlock, MessageContent, PersistedMessage},
     store::SearchResult,
