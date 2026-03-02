@@ -92,6 +92,9 @@ static HOOK_DB_POOL: once_cell::sync::OnceCell<Arc<sqlx::SqlitePool>> =
     once_cell::sync::OnceCell::new();
 static HOOK_ESTOP_FLAG: once_cell::sync::OnceCell<Arc<std::sync::atomic::AtomicBool>> =
     once_cell::sync::OnceCell::new();
+static HOOK_CIRCUIT_BREAKER: once_cell::sync::OnceCell<
+    Arc<moltis_plugins::bundled::circuit_breaker::CircuitBreakerHook>,
+> = once_cell::sync::OnceCell::new();
 
 // ── Location requester ───────────────────────────────────────────────────────
 
@@ -3798,6 +3801,64 @@ pub async fn prepare_gateway(
         );
     }
 
+    // ── Circuit Breaker HTTP endpoints ────────────────────────────────────
+    // GET  /api/circuit-breaker       — inspect provider circuit states.
+    // POST /api/circuit-breaker/reset — reset one provider or all.
+    app = app.route(
+        "/api/circuit-breaker",
+        axum::routing::get(|| async move {
+            let Some(circuit) = HOOK_CIRCUIT_BREAKER.get().cloned() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        serde_json::json!({ "ok": false, "error": "circuit breaker not initialized" }),
+                    ),
+                )
+                    .into_response();
+            };
+
+            let snapshot = circuit.snapshot().await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "circuits": snapshot })),
+            )
+                .into_response()
+        }),
+    );
+    app = app.route(
+        "/api/circuit-breaker/reset",
+        axum::routing::post(|Json(payload): Json<serde_json::Value>| async move {
+            let Some(circuit) = HOOK_CIRCUIT_BREAKER.get().cloned() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(
+                        serde_json::json!({ "ok": false, "error": "circuit breaker not initialized" }),
+                    ),
+                )
+                    .into_response();
+            };
+
+            let provider = payload.get("provider").and_then(|v| v.as_str());
+            let reset_ok = if let Some(name) = provider {
+                circuit.reset_provider(name).await
+            } else {
+                circuit.reset_all().await;
+                true
+            };
+
+            let snapshot = circuit.snapshot().await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": reset_ok,
+                    "provider": provider,
+                    "circuits": snapshot
+                })),
+            )
+                .into_response()
+        }),
+    );
+
     // Resolve TLS configuration (only when compiled with the `tls` feature).
     let tls_active = tls_enabled_for_gateway;
 
@@ -5785,7 +5846,9 @@ pub(crate) async fn discover_and_build_hooks(
         registry.register(Arc::new(estop_hook));
         registry.register(Arc::new(PromptGuardHook::new()));
         registry.register(Arc::new(LeakDetectorHook::new()));
-        registry.register(Arc::new(CircuitBreakerHook::new(3, 60)));
+        let circuit_breaker_hook = Arc::new(CircuitBreakerHook::new(3, 60));
+        let _ = HOOK_CIRCUIT_BREAKER.set(Arc::clone(&circuit_breaker_hook));
+        registry.register(circuit_breaker_hook);
         registry.register(Arc::new(ScreenshotResolverHook::new()));
 
         if let Some(pool) = db_pool.as_ref() {
