@@ -1,11 +1,12 @@
 //! Metrics API routes for Prometheus scraping and internal UI.
 
-#[cfg(feature = "metrics")]
 use axum::{
     extract::State,
-    http::StatusCode,
     response::{IntoResponse, Json},
 };
+
+#[cfg(feature = "metrics")]
+use axum::http::StatusCode;
 
 #[cfg(feature = "prometheus")]
 use axum::{http::header, response::Response};
@@ -13,7 +14,6 @@ use axum::{http::header, response::Response};
 #[cfg(feature = "metrics")]
 use moltis_metrics::MetricsSnapshot;
 
-#[cfg(feature = "metrics")]
 use crate::server::AppState;
 
 #[cfg(feature = "metrics")]
@@ -138,5 +138,17 @@ pub async fn api_metrics_history_handler(State(state): State<AppState>) -> impl 
         "interval_seconds": 10,
         "max_points": 360,
         "points": points,
+    }))
+}
+
+/// Provider health dashboard endpoint.
+///
+/// Returns rolling health statistics for each provider+model pair observed
+/// in the sliding window (default 5 minutes). Includes success rate,
+/// error breakdown by class, and latency percentiles (p50/p95/p99).
+pub async fn api_provider_health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let stats = state.gateway.provider_health.snapshot();
+    Json(serde_json::json!({
+        "providers": stats,
     }))
 }

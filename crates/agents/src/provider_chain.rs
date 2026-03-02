@@ -19,7 +19,10 @@ use {async_trait::async_trait, tokio_stream::Stream, tracing::warn};
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 
-use crate::model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent};
+use crate::{
+    model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent},
+    provider_health::ProviderHealthTracker,
+};
 
 /// How a provider error should be handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +215,7 @@ pub struct ProviderChain {
     chain: Vec<ChainEntry>,
     cb_threshold: usize,
     cb_cooldown: Duration,
+    health: Arc<ProviderHealthTracker>,
 }
 
 impl ProviderChain {
@@ -228,6 +232,30 @@ impl ProviderChain {
             chain,
             cb_threshold: 3,
             cb_cooldown: Duration::from_secs(60),
+            health: Arc::new(ProviderHealthTracker::default_window()),
+        }
+    }
+
+    /// Build a chain with a shared health tracker.
+    ///
+    /// Use this when you want multiple `ProviderChain` instances to aggregate
+    /// health data into the same tracker (e.g. across sessions).
+    pub fn with_health_tracker(
+        providers: Vec<Arc<dyn LlmProvider>>,
+        health: Arc<ProviderHealthTracker>,
+    ) -> Self {
+        let chain = providers
+            .into_iter()
+            .map(|provider| ChainEntry {
+                provider,
+                state: ProviderState::new(),
+            })
+            .collect();
+        Self {
+            chain,
+            cb_threshold: 3,
+            cb_cooldown: Duration::from_secs(60),
+            health,
         }
     }
 
@@ -245,6 +273,12 @@ impl ProviderChain {
 
     fn primary(&self) -> &ChainEntry {
         &self.chain[0]
+    }
+
+    /// Get a reference to the underlying health tracker (for sharing with API routes).
+    #[must_use]
+    pub fn health_tracker(&self) -> &Arc<ProviderHealthTracker> {
+        &self.health
     }
 }
 
@@ -283,9 +317,15 @@ impl LlmProvider for ProviderChain {
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
 
+            let call_start = Instant::now();
             match entry.provider.complete(messages, tools).await {
                 Ok(resp) => {
                     entry.state.record_success();
+                    self.health.record_success(
+                        &provider_name,
+                        &model_id,
+                        call_start.elapsed().as_millis() as u64,
+                    );
 
                     // Record metrics on successful completion
                     #[cfg(feature = "metrics")]
@@ -340,6 +380,12 @@ impl LlmProvider for ProviderChain {
                 Err(e) => {
                     let kind = classify_error(&e);
                     entry.state.record_failure();
+                    self.health.record_error(
+                        &provider_name,
+                        &model_id,
+                        call_start.elapsed().as_millis() as u64,
+                        &format!("{kind:?}"),
+                    );
 
                     // Record error metrics
                     #[cfg(feature = "metrics")]
@@ -390,13 +436,45 @@ impl LlmProvider for ProviderChain {
         // For streaming, we try the first non-tripped provider.
         // If the stream yields an Error event, we can't transparently retry mid-stream,
         // so we pick the best available provider upfront.
+        let mut selected_entry = None;
         for entry in &self.chain {
             if !entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
-                return entry.provider.stream_with_tools(messages, tools);
+                selected_entry = Some(entry);
+                break;
             }
         }
-        // All tripped — try primary anyway (it may have cooled down by now).
-        self.primary().provider.stream_with_tools(messages, tools)
+        let entry = selected_entry.unwrap_or_else(|| self.primary());
+        let provider_name = entry.provider.name().to_string();
+        let model_id = entry.provider.id().to_string();
+        let inner = entry.provider.stream_with_tools(messages, tools);
+
+        let health = Arc::clone(&self.health);
+        let start = Instant::now();
+        let wrapped = {
+            use tokio_stream::StreamExt;
+            inner.map(move |event| {
+                match &event {
+                    StreamEvent::Done(_) => {
+                        health.record_success(
+                            &provider_name,
+                            &model_id,
+                            start.elapsed().as_millis() as u64,
+                        );
+                    },
+                    StreamEvent::Error(msg) => {
+                        health.record_error(
+                            &provider_name,
+                            &model_id,
+                            start.elapsed().as_millis() as u64,
+                            msg,
+                        );
+                    },
+                    _ => {},
+                }
+                event
+            })
+        };
+        Box::pin(wrapped)
     }
 }
 
@@ -979,5 +1057,70 @@ mod tests {
 
         assert_eq!(collected.len(), 2);
         assert!(matches!(&collected[1], StreamEvent::Error(msg) if msg == "something broke"));
+    }
+
+    // ── Health tracker integration tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn complete_records_health_success() {
+        let chain = ProviderChain::single(Arc::new(SuccessProvider { id: "test-model" }));
+        chain.complete(&[], &[]).await.unwrap();
+
+        let snap = chain.health_tracker().snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].provider, "success");
+        assert_eq!(snap[0].model, "test-model");
+        assert_eq!(snap[0].successes, 1);
+        assert_eq!(snap[0].errors, 0);
+    }
+
+    #[tokio::test]
+    async fn complete_records_health_error() {
+        let chain = ProviderChain::single(Arc::new(FailingProvider {
+            id: "bad-model",
+            error_msg: "context_length_exceeded",
+        }));
+        let _ = chain.complete(&[], &[]).await;
+
+        let snap = chain.health_tracker().snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].errors, 1);
+        assert_eq!(snap[0].successes, 0);
+        assert!(snap[0].errors_by_class.contains_key("ContextWindow"));
+    }
+
+    #[tokio::test]
+    async fn stream_records_health_on_done() {
+        let events = vec![
+            StreamEvent::Delta("hi".into()),
+            StreamEvent::Done(Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            }),
+        ];
+        let chain = ProviderChain::single(Arc::new(ScriptedStreamProvider { events }));
+
+        let mut stream = chain.stream(vec![]);
+        while stream.next().await.is_some() {}
+
+        let snap = chain.health_tracker().snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].successes, 1);
+        assert_eq!(snap[0].errors, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_records_health_on_error() {
+        let events = vec![StreamEvent::Error("boom".into())];
+        let chain = ProviderChain::single(Arc::new(ScriptedStreamProvider { events }));
+
+        let mut stream = chain.stream(vec![]);
+        while stream.next().await.is_some() {}
+
+        let snap = chain.health_tracker().snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].errors, 1);
+        assert_eq!(snap[0].errors_by_class.get("boom"), Some(&1));
     }
 }
