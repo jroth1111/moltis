@@ -526,11 +526,50 @@ fn resolve_api_key(
     env_key: &str,
     env_overrides: &HashMap<String, String>,
 ) -> Option<secrecy::Secret<String>> {
-    config
-        .get(provider)
-        .and_then(|e| e.api_key.clone())
+    let configured = config.get(provider).and_then(|entry| {
+        entry
+            .api_key
+            .as_ref()
+            .filter(|key| !key.expose_secret().is_empty())
+            .cloned()
+            .or_else(|| {
+                entry
+                    .extra_api_keys
+                    .iter()
+                    .find(|key| !key.expose_secret().is_empty())
+                    .cloned()
+            })
+    });
+
+    configured
         .or_else(|| env_value(env_overrides, env_key).map(secrecy::Secret::new))
         .filter(|s| !s.expose_secret().is_empty())
+}
+
+fn resolve_extra_api_keys(
+    config: &ProvidersConfig,
+    provider: &str,
+    primary_key: Option<&secrecy::Secret<String>>,
+) -> Vec<secrecy::Secret<String>> {
+    let Some(entry) = config.get(provider) else {
+        return Vec::new();
+    };
+
+    entry
+        .extra_api_keys
+        .iter()
+        .filter_map(|key| {
+            if key.expose_secret().is_empty() {
+                return None;
+            }
+            if let Some(primary) = primary_key
+                && primary.expose_secret() == key.expose_secret()
+            {
+                return None;
+            }
+            Some(key.clone())
+        })
+        .collect()
 }
 
 /// Return the known context window size (in tokens) for a model ID.
@@ -1601,9 +1640,11 @@ impl ProviderRegistry {
         env_overrides: &HashMap<String, String>,
     ) {
         // Anthropic — register all known Claude models when API key is available.
+        let anthropic_primary_key =
+            resolve_api_key(config, "anthropic", "ANTHROPIC_API_KEY", env_overrides);
+
         if config.is_enabled("anthropic")
-            && let Some(key) =
-                resolve_api_key(config, "anthropic", "ANTHROPIC_API_KEY", env_overrides)
+            && let Some(key) = anthropic_primary_key.clone()
         {
             let base_url = config
                 .get("anthropic")
@@ -1654,7 +1695,9 @@ impl ProviderRegistry {
         // failing over to a different provider.
         if config.is_enabled("anthropic") {
             if let Some(entry) = config.get("anthropic") {
-                if !entry.extra_api_keys.is_empty() {
+                let extra_keys =
+                    resolve_extra_api_keys(config, "anthropic", anthropic_primary_key.as_ref());
+                if !extra_keys.is_empty() {
                     let base_url = entry
                         .base_url
                         .clone()
@@ -1676,7 +1719,7 @@ impl ProviderRegistry {
                             .map(|m| (m.id, m.display_name, m.created_at))
                             .collect();
 
-                    for (key_idx, extra_key) in entry.extra_api_keys.iter().enumerate() {
+                    for (key_idx, extra_key) in extra_keys.iter().enumerate() {
                         let extra_label = format!("{base_label}-key-{}", key_idx + 2);
                         for (model_id, display_name, created_at) in &model_snapshots {
                             if self.has_provider_model(&extra_label, model_id) {
@@ -1705,8 +1748,10 @@ impl ProviderRegistry {
         }
 
         // OpenAI — register all known OpenAI models when API key is available.
+        let openai_primary_key = resolve_api_key(config, "openai", "OPENAI_API_KEY", env_overrides);
+
         if config.is_enabled("openai")
-            && let Some(key) = resolve_api_key(config, "openai", "OPENAI_API_KEY", env_overrides)
+            && let Some(key) = openai_primary_key.clone()
         {
             let base_url = config
                 .get("openai")
@@ -1759,7 +1804,9 @@ impl ProviderRegistry {
         // OpenAI extra API keys — same pattern as Anthropic above.
         if config.is_enabled("openai") {
             if let Some(entry) = config.get("openai") {
-                if !entry.extra_api_keys.is_empty() {
+                let extra_keys =
+                    resolve_extra_api_keys(config, "openai", openai_primary_key.as_ref());
+                if !extra_keys.is_empty() {
                     let base_url = entry
                         .base_url
                         .clone()
@@ -1768,13 +1815,34 @@ impl ProviderRegistry {
                     let base_label = alias.as_deref().unwrap_or("openai");
                     let stream_transport = entry.stream_transport;
                     let preferred = configured_models_for_provider(config, "openai");
+                    let discovered = if should_fetch_models(config, "openai") {
+                        let from_primary: Vec<DiscoveredModel> = self
+                            .models
+                            .iter()
+                            .filter(|model| model.provider == base_label)
+                            .map(|model| {
+                                DiscoveredModel::new(
+                                    raw_model_id(&model.id).to_string(),
+                                    model.display_name.clone(),
+                                )
+                                .with_created_at(model.created_at)
+                            })
+                            .collect();
+                        if from_primary.is_empty() {
+                            openai::default_model_catalog()
+                        } else {
+                            from_primary
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     let model_snapshots: Vec<(String, String, Option<i64>)> =
-                        merge_preferred_and_discovered_models(preferred, Vec::new())
+                        merge_preferred_and_discovered_models(preferred, discovered)
                             .into_iter()
                             .map(|m| (m.id, m.display_name, m.created_at))
                             .collect();
 
-                    for (key_idx, extra_key) in entry.extra_api_keys.iter().enumerate() {
+                    for (key_idx, extra_key) in extra_keys.iter().enumerate() {
                         let extra_label = format!("{base_label}-key-{}", key_idx + 2);
                         for (model_id, display_name, created_at) in &model_snapshots {
                             if self.has_provider_model(&extra_label, model_id) {
@@ -2955,6 +3023,53 @@ mod tests {
             .collect();
         assert!(!mistral_models.is_empty());
         assert_eq!(mistral_models[0], "mistral::codestral-latest");
+    }
+
+    #[test]
+    fn resolve_api_key_uses_first_extra_key_when_primary_missing() {
+        let mut config = ProvidersConfig::default();
+        config.providers.insert("mistral".into(), moltis_config::schema::ProviderEntry {
+            extra_api_keys: vec![secret("sk-extra-1"), secret("sk-extra-2")],
+            ..Default::default()
+        });
+
+        let key = resolve_api_key(
+            &config,
+            "mistral",
+            "MOLTIS_TEST_EXTRA_API_KEYS_ENV",
+            &HashMap::new(),
+        )
+        .expect("expected key from extra_api_keys");
+
+        assert_eq!(key.expose_secret(), "sk-extra-1");
+    }
+
+    #[test]
+    fn openai_extra_keys_promote_first_key_and_keep_single_fallback_slot() {
+        let mut config = ProvidersConfig::default();
+        config.offered = vec!["openai".into()];
+        config.providers.insert("openai".into(), moltis_config::schema::ProviderEntry {
+            models: vec!["gpt-5-mini".into()],
+            fetch_models: false,
+            extra_api_keys: vec![secret("sk-openai-1"), secret("sk-openai-2")],
+            ..Default::default()
+        });
+
+        let reg = ProviderRegistry::from_env_with_config(&config);
+        let openai_models: Vec<_> = reg
+            .list_models()
+            .iter()
+            .filter(|m| raw_model_id(&m.id) == "gpt-5-mini")
+            .collect();
+        let providers: Vec<&str> = openai_models.iter().map(|m| m.provider.as_str()).collect();
+
+        assert!(providers.contains(&"openai"));
+        assert!(providers.contains(&"openai-key-2"));
+        assert!(!providers.contains(&"openai-key-3"));
+
+        let fallbacks = reg.fallback_providers_for("openai::gpt-5-mini", "openai");
+        let ids: Vec<&str> = fallbacks.iter().map(|p| p.id()).collect();
+        assert_eq!(ids, vec!["openai-key-2::gpt-5-mini"]);
     }
 
     #[test]
