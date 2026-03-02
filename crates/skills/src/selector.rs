@@ -107,4 +107,27 @@ mod tests {
         let selected = select_skills(&skills, msg, 300);
         assert!(selected.len() <= 1);
     }
+
+    #[test]
+    fn select_skills_skips_oversized_top_skill_and_keeps_scanning() {
+        let skills = vec![
+            mock_skill(
+                "oversized",
+                &format!(
+                    "{} {} {} {}",
+                    "oversized-description",
+                    "keywordalpha",
+                    "keywordbeta",
+                    "x".repeat(2200)
+                ),
+            ),
+            mock_skill("compact", "short description"),
+        ];
+        let msg = "use oversized keywordalpha keywordbeta and compact";
+
+        let selected = select_skills(&skills, msg, 120);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "compact");
+    }
 }
