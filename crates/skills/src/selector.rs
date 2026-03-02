@@ -55,7 +55,7 @@ pub fn select_skills<'a>(
         // Estimate ~4 bytes per token, skill prompt ~= description length
         let estimated_tokens = (skill.description.len() / 4).max(50);
         if used_tokens + estimated_tokens > token_budget {
-            break;
+            continue; // skip over-budget skill; a smaller one later may still fit
         }
         used_tokens += estimated_tokens;
         result.push(skill);
