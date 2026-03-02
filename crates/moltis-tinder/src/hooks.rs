@@ -9,11 +9,12 @@ use tracing::{info, warn};
 use crate::funnel::{self, FunnelState};
 
 /// Regex that matches phone numbers, social handles, and contact-sharing patterns.
+#[allow(clippy::expect_used)]
 static CONTACT_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|@\w+|whatsapp|snapchat|instagram",
     )
-    .unwrap_or_else(|_| Regex::new("$^").unwrap_or_else(|_| unreachable!()))
+    .expect("CONTACT_PATTERN regex must compile")
 });
 
 pub struct FunnelGuardHook {
