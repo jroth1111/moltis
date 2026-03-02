@@ -1,11 +1,13 @@
 //! Research phase: run a tool-calling loop *before* the main agent response
 //! to gather relevant context. Triggered by configurable rules.
 
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::model::{ChatMessage, LlmProvider};
+
+const DEFAULT_LENGTH_TRIGGER_CHARS: usize = 200;
 
 /// What triggers the research phase.
 #[derive(Debug, Clone)]
@@ -32,18 +34,32 @@ impl ResearchTrigger {
     /// - `"length"` or `"length:N"` — fire when message exceeds N chars (default 200)
     /// - anything else → `Never`
     pub fn from_config(s: &str, keywords: &[String]) -> Self {
-        match s {
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
             "always" => Self::Always,
-            "keywords" => Self::Keywords(keywords.to_vec()),
+            "keywords" => Self::Keywords(
+                keywords
+                    .iter()
+                    .map(|kw| kw.trim().to_ascii_lowercase())
+                    .filter(|kw| !kw.is_empty())
+                    .collect(),
+            ),
             "question" => Self::Question,
-            s if s == "length" || s.starts_with("length:") => {
-                let n = s
-                    .strip_prefix("length:")
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(200);
-                Self::Length(n)
+            "never" => Self::Never,
+            "length" => Self::Length(DEFAULT_LENGTH_TRIGGER_CHARS),
+            _ => {
+                if let Some((kind, raw_threshold)) = normalized.split_once(':')
+                    && kind.trim() == "length"
+                {
+                    let threshold = raw_threshold
+                        .trim()
+                        .parse()
+                        .ok()
+                        .unwrap_or(DEFAULT_LENGTH_TRIGGER_CHARS);
+                    return Self::Length(threshold);
+                }
+                Self::Never
             },
-            _ => Self::Never,
         }
     }
 
@@ -54,8 +70,8 @@ impl ResearchTrigger {
             Self::Always => true,
             Self::Keywords(kws) => {
                 let lower = message.to_lowercase();
-                kws.iter().any(|kw| lower.contains(kw.as_str()))
-            }
+                kws.iter().any(|kw| lower.contains(kw))
+            },
             Self::Question => message.trim_end().ends_with('?'),
             Self::Length(n) => message.len() > *n,
         }
@@ -109,7 +125,11 @@ pub async fn run_research_phase(
          Query type: {}\n\
          Suggested approach: Look for relevant information in conversation history and workspace.",
         message.chars().take(200).collect::<String>(),
-        if message.trim_end().ends_with('?') { "question" } else { "statement" }
+        if message.trim_end().ends_with('?') {
+            "question"
+        } else {
+            "statement"
+        }
     );
 
     Ok(Some(ResearchResult {
@@ -150,6 +170,16 @@ mod tests {
     }
 
     #[test]
+    fn trigger_keywords_case_insensitive_from_config() {
+        let t = ResearchTrigger::from_config(
+            "keywords",
+            &["Billing".to_string(), "INVOICE".to_string()],
+        );
+        assert!(t.should_run("i need billing help"));
+        assert!(t.should_run("what is my invoice status"));
+    }
+
+    #[test]
     fn trigger_length() {
         let t = ResearchTrigger::Length(100);
         assert!(!t.should_run("short message"));
@@ -158,8 +188,33 @@ mod tests {
 
     #[test]
     fn trigger_from_config() {
-        assert!(matches!(ResearchTrigger::from_config("always", &[]), ResearchTrigger::Always));
-        assert!(matches!(ResearchTrigger::from_config("question", &[]), ResearchTrigger::Question));
-        assert!(matches!(ResearchTrigger::from_config("never", &[]), ResearchTrigger::Never));
+        assert!(matches!(
+            ResearchTrigger::from_config("always", &[]),
+            ResearchTrigger::Always
+        ));
+        assert!(matches!(
+            ResearchTrigger::from_config("question", &[]),
+            ResearchTrigger::Question
+        ));
+        assert!(matches!(
+            ResearchTrigger::from_config("never", &[]),
+            ResearchTrigger::Never
+        ));
+    }
+
+    #[test]
+    fn trigger_from_config_length_parsing() {
+        assert!(matches!(
+            ResearchTrigger::from_config("length", &[]),
+            ResearchTrigger::Length(200)
+        ));
+        assert!(matches!(
+            ResearchTrigger::from_config("length:512", &[]),
+            ResearchTrigger::Length(512)
+        ));
+        assert!(matches!(
+            ResearchTrigger::from_config(" LENGTH : 42 ", &[]),
+            ResearchTrigger::Length(42)
+        ));
     }
 }
