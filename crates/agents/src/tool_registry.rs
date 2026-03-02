@@ -1,50 +1,50 @@
 use {
     anyhow::Result,
     async_trait::async_trait,
-    std::{collections::HashMap, sync::Arc},
+    std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    },
 };
 
-use std::sync::atomic::{AtomicU32, Ordering};
+struct RateLimitState {
+    window_started_at: Instant,
+    used: u32,
+}
 
 /// Per-tool rate limiter with a sliding-window reset every 60 seconds.
 #[derive(Clone)]
 pub struct RateLimit {
     pub max_per_minute: u32,
-    remaining: Arc<AtomicU32>,
+    state: Arc<Mutex<RateLimitState>>,
 }
 
 impl RateLimit {
     pub fn new(max_per_minute: u32) -> Self {
-        let remaining = Arc::new(AtomicU32::new(max_per_minute));
-        let r = Arc::clone(&remaining);
-        let limit = max_per_minute;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                r.store(limit, Ordering::Relaxed);
-            }
-        });
         Self {
             max_per_minute,
-            remaining,
+            state: Arc::new(Mutex::new(RateLimitState {
+                window_started_at: Instant::now(),
+                used: 0,
+            })),
         }
     }
 
     pub fn try_acquire(&self) -> std::result::Result<(), &'static str> {
-        loop {
-            let cur = self.remaining.load(Ordering::Relaxed);
-            if cur == 0 {
-                return Err("rate limit exceeded");
-            }
-            if self
-                .remaining
-                .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(());
-            }
+        let mut state = self.state.lock().map_err(|_| "rate limit unavailable")?;
+
+        if state.window_started_at.elapsed() >= Duration::from_secs(60) {
+            state.window_started_at = Instant::now();
+            state.used = 0;
         }
+
+        if state.used >= self.max_per_minute {
+            return Err("rate limit exceeded");
+        }
+
+        state.used += 1;
+        Ok(())
     }
 }
 
