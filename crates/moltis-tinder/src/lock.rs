@@ -20,6 +20,11 @@ impl SessionLock {
 
     /// Attempt to acquire the lock. Returns `true` if acquired, `false` if held.
     pub async fn try_acquire(&self) -> Result<bool> {
+        self.try_acquire_or_expire().await
+    }
+
+    /// Attempt to acquire lock; if the current lock is expired, take it over.
+    pub async fn try_acquire_or_expire(&self) -> Result<bool> {
         let now = now_ms();
         let expires = now + LOCK_TTL_MS;
 
@@ -95,5 +100,58 @@ impl SessionLock {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn setup_db() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE session_state (
+                session_key TEXT NOT NULL,
+                namespace   TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_key, namespace, key)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn acquires_once_then_blocks_until_release() {
+        let pool = setup_db().await;
+        let lock = SessionLock::new(pool, "s1".into());
+        assert!(lock.try_acquire().await.unwrap());
+        assert!(!lock.try_acquire().await.unwrap());
+        lock.release().await.unwrap();
+        assert!(lock.try_acquire().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn acquires_expired_lock() {
+        let pool = setup_db().await;
+        sqlx::query(
+            "INSERT INTO session_state (session_key, namespace, key, value, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("s1")
+        .bind(LOCK_NAMESPACE)
+        .bind(LOCK_KEY)
+        .bind("1")
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let lock = SessionLock::new(pool, "s1".into());
+        assert!(lock.try_acquire_or_expire().await.unwrap());
     }
 }
