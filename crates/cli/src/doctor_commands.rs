@@ -267,9 +267,15 @@ fn check_security(config: &MoltisConfig, config_dir: Option<&Path>, data_dir: &P
     // Check for API keys in config file (should use env vars or credential store)
     let mut api_keys_in_config = Vec::new();
     for (name, entry) in &config.providers.providers {
-        if let Some(ref key) = entry.api_key
-            && !key.expose_secret().is_empty()
-        {
+        let has_primary_key = entry
+            .api_key
+            .as_ref()
+            .is_some_and(|key| !key.expose_secret().is_empty());
+        let has_extra_keys = entry
+            .extra_api_keys
+            .iter()
+            .any(|key| !key.expose_secret().is_empty());
+        if has_primary_key || has_extra_keys {
             api_keys_in_config.push(name.clone());
         }
     }
@@ -1029,6 +1035,29 @@ mod tests {
             .providers
             .providers
             .insert("anthropic".to_string(), entry);
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let section = check_security(&config, Some(temp.path()), temp.path());
+
+        let warn_item = section
+            .items
+            .iter()
+            .find(|i| i.message.contains("API keys found in config"));
+        assert!(warn_item.is_some());
+        assert_eq!(warn_item.unwrap().status, Status::Warn);
+    }
+
+    #[test]
+    fn check_security_extra_api_keys_in_config_warns() {
+        let mut config = MoltisConfig::default();
+        let entry = moltis_config::schema::ProviderEntry {
+            extra_api_keys: vec![secrecy::Secret::new("sk-extra-test".to_string())],
+            ..Default::default()
+        };
+        config
+            .providers
+            .providers
+            .insert("openai".to_string(), entry);
 
         let temp = tempfile::TempDir::new().unwrap();
         let section = check_security(&config, Some(temp.path()), temp.path());
