@@ -69,11 +69,9 @@ pub fn init_otlp(endpoint: &str, service_name: &str) -> anyhow::Result<()> {
         .build();
 
     let _old = opentelemetry::global::set_tracer_provider(provider);
-    // Shutdown the previous provider if one existed (no-op on first call since it's a noop provider).
-    // OTLP SDK doesn't implement Shutdown for the default noop provider so best-effort is fine.
-    if let Err(e) = _old.shutdown() {
-        tracing::debug!(error = ?e, "previous OTLP provider shutdown error (best-effort)");
-    }
+    // The previous global provider may be a no-op/global wrapper type that does not
+    // expose a stable shutdown API across opentelemetry versions.
+    let _ = _old;
     tracing::info!(endpoint = %endpoint, "OTLP tracing initialized");
     Ok(())
 }
