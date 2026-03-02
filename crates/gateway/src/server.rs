@@ -3417,6 +3417,10 @@ pub async fn prepare_gateway(
             send_to_session,
         )));
 
+        // Register shared task coordination tool for multi-agent workflows.
+        tool_registry.register(Box::new(moltis_tools::task_list::TaskListTool::new(
+            &data_dir,
+        )));
         // Register the session-backed task board used by autonomous workflows.
         tool_registry.register(Box::new(
             moltis_plugins::bundled::task_board::TaskBoardTool::new(Arc::clone(
@@ -5236,37 +5240,37 @@ fn builtin_hook_metadata() -> Vec<(
         ),
         (
             "prompt-guard",
-            "Blocks likely prompt-injection payloads in LLM messages and tool arguments.",
+            "Blocks known prompt-injection phrases in LLM messages and tool arguments.",
             vec![HookEvent::BeforeLLMCall, HookEvent::BeforeToolCall],
             "crates/plugins/src/bundled/prompt_guard.rs",
         ),
         (
             "leak-detector",
-            "Blocks tool calls when arguments appear to contain secrets or credentials.",
+            "Blocks likely secrets and credentials in tool arguments before execution.",
             vec![HookEvent::BeforeToolCall],
             "crates/plugins/src/bundled/leak_detector.rs",
         ),
         (
             "circuit-breaker",
-            "Blocks unstable providers after repeated failures until the reset timeout elapses.",
+            "Temporarily blocks providers with repeated failures and allows timed recovery probes.",
             vec![HookEvent::BeforeLLMCall, HookEvent::AfterLLMCall],
             "crates/plugins/src/bundled/circuit_breaker.rs",
         ),
         (
             "cost-tracker",
-            "Records per-call model spend in SQLite using token usage from AfterLLMCall.",
+            "Records estimated LLM call spend in the `agent_spend` table.",
             vec![HookEvent::AfterLLMCall],
             "crates/plugins/src/bundled/cost_guard.rs",
         ),
         (
             "cost-guard",
-            "Blocks new agent starts after the configured daily spend cap is exceeded.",
+            "Blocks new agents when rolling daily spend exceeds the configured limit.",
             vec![HookEvent::BeforeAgentStart],
             "crates/plugins/src/bundled/cost_guard.rs",
         ),
         (
             "screenshot-resolver",
-            "Scans pre-LLM history for screenshot references and prepares image resolution.",
+            "Injects screenshots referenced by tool results as multimodal image inputs.",
             vec![HookEvent::BeforeLLMCall],
             "crates/plugins/src/bundled/screenshot_resolver.rs",
         ),

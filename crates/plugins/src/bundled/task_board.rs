@@ -149,3 +149,80 @@ impl moltis_agents::tool_registry::AgentTool for TaskBoardTool {
         }
     }
 }
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moltis_agents::tool_registry::AgentTool;
+
+    async fn test_store() -> Arc<SessionStateStore> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS session_state (
+                session_key TEXT NOT NULL,
+                namespace   TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_key, namespace, key)
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        Arc::new(SessionStateStore::new(pool))
+    }
+
+    #[tokio::test]
+    async fn create_and_list_tasks() {
+        let tool = TaskBoardTool::new(test_store().await);
+
+        let created = tool
+            .execute(serde_json::json!({
+                "action": "create",
+                "subject": "Ship fix",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(created["status"], "pending");
+
+        let listed = tool.execute(serde_json::json!({ "action": "list" })).await.unwrap();
+        let tasks = listed["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["subject"], "Ship fix");
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_task() {
+        let tool = TaskBoardTool::new(test_store().await);
+
+        let created = tool
+            .execute(serde_json::json!({
+                "action": "create",
+                "subject": "Review PR",
+            }))
+            .await
+            .unwrap();
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let updated = tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "done",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(updated["status"], "done");
+
+        let deleted = tool
+            .execute(serde_json::json!({
+                "action": "delete",
+                "id": updated["id"],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(deleted["deleted"], true);
+    }
+}
