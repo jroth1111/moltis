@@ -1337,6 +1337,9 @@ pub struct ToolsConfig {
     /// At > 0.5, entropy-based detection is also enabled.
     #[serde(default = "default_leak_detection_sensitivity")]
     pub leak_detection_sensitivity: f64,
+    /// Maximum wall-clock seconds for a single LLM provider call (0 = no timeout). Default 120.
+    #[serde(default = "default_provider_call_timeout_secs")]
+    pub provider_call_timeout_secs: u64,
 }
 
 impl Default for ToolsConfig {
@@ -1351,6 +1354,7 @@ impl Default for ToolsConfig {
             agent_max_iterations: default_agent_max_iterations(),
             max_tool_result_bytes: default_max_tool_result_bytes(),
             leak_detection_sensitivity: default_leak_detection_sensitivity(),
+            provider_call_timeout_secs: default_provider_call_timeout_secs(),
         }
     }
 }
@@ -1369,6 +1373,10 @@ fn default_max_tool_result_bytes() -> usize {
 
 fn default_leak_detection_sensitivity() -> f64 {
     0.5_f64
+}
+
+fn default_provider_call_timeout_secs() -> u64 {
+    120
 }
 
 /// Map tools configuration.

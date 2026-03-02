@@ -253,6 +253,7 @@ fn build_schema_map() -> KnownKeys {
             ("agent_max_iterations", Leaf),
             ("max_tool_result_bytes", Leaf),
             ("leak_detection_sensitivity", Leaf),
+            ("provider_call_timeout_secs", Leaf),
         ]))
     };
 
