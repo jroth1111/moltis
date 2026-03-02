@@ -8,7 +8,7 @@ use moltis_common::{
     hooks::{HookAction, HookEvent, HookHandler, HookPayload},
 };
 
-use crate::bundled::pattern_scanner::PatternScanner;
+use crate::bundled::pattern_scanner::{PatternScanner, strip_image_data_uris};
 
 pub struct LeakDetectorHook {
     scanner: PatternScanner,
@@ -60,8 +60,12 @@ impl HookHandler for LeakDetectorHook {
             ..
         } = payload
         {
-            let args_str = arguments.to_string();
-            if self.scanner.matches(&args_str) {
+            let Some(scan_text) = extract_scan_text(tool_name, arguments) else {
+                return Ok(HookAction::Continue);
+            };
+
+            let normalized = strip_image_data_uris(&scan_text);
+            if self.scanner.matches(&normalized) {
                 warn!(
                     tool = %tool_name,
                     "leak-detector: potential secret detected in tool arguments"
@@ -75,6 +79,39 @@ impl HookHandler for LeakDetectorHook {
     }
 }
 
+fn extract_scan_text(tool_name: &str, arguments: &serde_json::Value) -> Option<String> {
+    let command = arguments
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    // Browser screenshot/snapshot payloads can contain large base64 data; skip.
+    if matches!(command, "screenshot" | "snapshot") {
+        return None;
+    }
+
+    if tool_name == "tinder_browser" {
+        // For tinder browser actions, only scan outbound message text.
+        if !matches!(command, "type" | "fill") {
+            return None;
+        }
+        return arguments
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+    }
+
+    if tool_name == "exec" {
+        return arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+    }
+
+    Some(arguments.to_string())
+}
+
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
@@ -85,8 +122,8 @@ mod tests {
         let hook = LeakDetectorHook::new();
         let payload = HookPayload::BeforeToolCall {
             session_key: "s1".into(),
-            tool_name: "exec".into(),
-            arguments: serde_json::json!({ "command": "curl -H 'api-key: sk-12345'" }),
+            tool_name: "tinder_browser".into(),
+            arguments: serde_json::json!({ "command": "type", "text": "api-key: sk-12345" }),
         };
         let result = hook
             .handle(HookEvent::BeforeToolCall, &payload)
@@ -96,12 +133,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allows_safe_args() {
+    async fn allows_screenshot_with_base64_payload() {
         let hook = LeakDetectorHook::new();
         let payload = HookPayload::BeforeToolCall {
             session_key: "s1".into(),
-            tool_name: "exec".into(),
-            arguments: serde_json::json!({ "command": "echo hello" }),
+            tool_name: "tinder_browser".into(),
+            arguments: serde_json::json!({
+                "command": "screenshot",
+                "image": "data:image/png;base64,ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+            }),
         };
         let result = hook
             .handle(HookEvent::BeforeToolCall, &payload)
@@ -111,12 +151,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_non_external_tools() {
+    async fn blocks_exec_command_secrets() {
         let hook = LeakDetectorHook::new();
         let payload = HookPayload::BeforeToolCall {
             session_key: "s1".into(),
-            tool_name: "session_state".into(),
-            arguments: serde_json::json!({ "key": "sk-secret-key-here" }),
+            tool_name: "exec".into(),
+            arguments: serde_json::json!({ "command": "echo sk-secret-key-here" }),
         };
         let result = hook
             .handle(HookEvent::BeforeToolCall, &payload)
