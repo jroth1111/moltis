@@ -413,10 +413,12 @@ pub async fn recover_pending(
         .unwrap_or_default()
         .as_secs() as i64;
     let mut tx = pool.begin().await?;
+    // Clean expired.
     sqlx::query("DELETE FROM pending_approvals WHERE expires_at < ?")
         .bind(now)
         .execute(&mut *tx)
         .await?;
+    // Return remaining.
     let rows = sqlx::query_as::<_, (String, String, String, String)>(
         "SELECT id, session_key, tool_name, arguments FROM pending_approvals",
     )
@@ -480,6 +482,59 @@ mod tests {
         assert_eq!(SecurityLevel::parse("strict"), Some(SecurityLevel::Deny));
         assert_eq!(SecurityLevel::parse("deny"), Some(SecurityLevel::Deny));
         assert_eq!(SecurityLevel::parse("bogus"), None);
+    }
+
+    #[tokio::test]
+    async fn test_recover_pending_cleans_expired_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE pending_approvals (
+                id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                arguments TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        sqlx::query(
+            "INSERT INTO pending_approvals (id, session_key, tool_name, arguments, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("expired")
+        .bind("s1")
+        .bind("exec")
+        .bind("{}")
+        .bind(now - 100)
+        .bind(now - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO pending_approvals (id, session_key, tool_name, arguments, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("active")
+        .bind("s1")
+        .bind("exec")
+        .bind("{}")
+        .bind(now - 10)
+        .bind(now + 3600)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = recover_pending(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "active");
     }
 
     #[tokio::test]
