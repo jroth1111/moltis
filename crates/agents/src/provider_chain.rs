@@ -893,4 +893,86 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
     }
+
+    // ── Streaming metrics wrapper tests ──────────────────────────────
+
+    /// A provider that emits a configurable sequence of stream events.
+    struct ScriptedStreamProvider {
+        events: Vec<StreamEvent>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedStreamProvider {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+
+        fn id(&self) -> &str {
+            "scripted-model"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> anyhow::Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+                usage: Usage::default(),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::iter(self.events.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_with_tools_preserves_all_events() {
+        let events = vec![
+            StreamEvent::Delta("hello ".into()),
+            StreamEvent::Delta("world".into()),
+            StreamEvent::Done(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+        ];
+        let chain = ProviderChain::single(Arc::new(ScriptedStreamProvider {
+            events: events.clone(),
+        }));
+
+        let mut stream = chain.stream(vec![]);
+        let mut collected = Vec::new();
+        while let Some(ev) = stream.next().await {
+            collected.push(ev);
+        }
+
+        assert_eq!(collected.len(), 3, "all events should pass through");
+        assert!(matches!(&collected[0], StreamEvent::Delta(t) if t == "hello "));
+        assert!(matches!(&collected[1], StreamEvent::Delta(t) if t == "world"));
+        assert!(matches!(&collected[2], StreamEvent::Done(_)));
+    }
+
+    #[tokio::test]
+    async fn stream_with_tools_passes_error_events() {
+        let events = vec![
+            StreamEvent::Delta("partial".into()),
+            StreamEvent::Error("something broke".into()),
+        ];
+        let chain = ProviderChain::single(Arc::new(ScriptedStreamProvider { events }));
+
+        let mut stream = chain.stream(vec![]);
+        let mut collected = Vec::new();
+        while let Some(ev) = stream.next().await {
+            collected.push(ev);
+        }
+
+        assert_eq!(collected.len(), 2);
+        assert!(matches!(&collected[1], StreamEvent::Error(msg) if msg == "something broke"));
+    }
 }
