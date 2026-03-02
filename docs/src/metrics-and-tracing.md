@@ -245,6 +245,7 @@ This allows you to:
 | `moltis_sessions_created_total` | Counter | — | Sessions created |
 | `moltis_sessions_active` | Gauge | — | Currently active sessions |
 | `moltis_session_messages_total` | Counter | role | Messages by role |
+| `moltis_session_recovery_total` | Counter | recovery_type | Session recovery operations |
 
 ### Cron Job Metrics
 

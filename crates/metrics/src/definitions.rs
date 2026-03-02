@@ -68,7 +68,7 @@ pub mod session {
     pub const MESSAGES_TOTAL: &str = "moltis_session_messages_total";
     /// Session duration in seconds
     pub const DURATION_SECONDS: &str = "moltis_session_duration_seconds";
-    /// Session recoveries performed after self-repair detected interrupted runs
+    /// Total session recovery operations (label: recovery_type)
     pub const RECOVERY_TOTAL: &str = "moltis_session_recovery_total";
     /// Malformed JSONL lines skipped while loading session history.
     pub const JSONL_LINES_SKIPPED: &str = "moltis_session_jsonl_lines_skipped_total";
