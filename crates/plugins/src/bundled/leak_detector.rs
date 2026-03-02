@@ -124,6 +124,7 @@ mod tests {
             session_key: "s1".into(),
             tool_name: "tinder_browser".into(),
             arguments: serde_json::json!({ "command": "type", "text": "api-key: sk-12345" }),
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeToolCall, &payload)
@@ -142,6 +143,7 @@ mod tests {
                 "command": "screenshot",
                 "image": "data:image/png;base64,ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
             }),
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeToolCall, &payload)
@@ -157,6 +159,7 @@ mod tests {
             session_key: "s1".into(),
             tool_name: "exec".into(),
             arguments: serde_json::json!({ "command": "echo sk-secret-key-here" }),
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeToolCall, &payload)

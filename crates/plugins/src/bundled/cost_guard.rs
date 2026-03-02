@@ -187,6 +187,7 @@ mod tests {
         let payload = HookPayload::BeforeAgentStart {
             session_key: "s1".into(),
             model: "m".into(),
+            trace_id: None,
         };
         let result = hook.handle(HookEvent::BeforeAgentStart, &payload).await.unwrap();
         assert!(matches!(result, HookAction::Block(_)));
@@ -199,6 +200,7 @@ mod tests {
         let payload = HookPayload::BeforeAgentStart {
             session_key: "s1".into(),
             model: "m".into(),
+            trace_id: None,
         };
         let result = hook.handle(HookEvent::BeforeAgentStart, &payload).await.unwrap();
         assert!(matches!(result, HookAction::Block(msg) if msg.contains("cost guard unavailable")));
