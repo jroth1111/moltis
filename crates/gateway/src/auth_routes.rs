@@ -481,19 +481,24 @@ async fn create_api_key_handler(
         return (StatusCode::BAD_REQUEST, "label is required").into_response();
     }
 
-    // Validate scopes if provided
-    if let Some(ref scopes) = body.scopes {
-        for scope in scopes {
-            if !crate::auth::VALID_SCOPES.contains(&scope.as_str()) {
-                return (StatusCode::BAD_REQUEST, format!("invalid scope: {scope}"))
-                    .into_response();
-            }
+    // Require at least one scope — keys without scopes silently fail at connect time.
+    let scopes = match body.scopes {
+        Some(ref s) if !s.is_empty() => s,
+        _ => {
+            return (StatusCode::BAD_REQUEST, "at least one scope is required").into_response();
+        }
+    };
+
+    // Validate each scope value.
+    for scope in scopes {
+        if !crate::auth::VALID_SCOPES.contains(&scope.as_str()) {
+            return (StatusCode::BAD_REQUEST, format!("invalid scope: {scope}")).into_response();
         }
     }
 
     match state
         .credential_store
-        .create_api_key(body.label.trim(), body.scopes.as_deref())
+        .create_api_key(body.label.trim(), Some(scopes.as_slice()))
         .await
     {
         Ok((id, key)) => Json(serde_json::json!({ "id": id, "key": key })).into_response(),
