@@ -133,6 +133,10 @@ pub enum HookPayload {
         iteration: usize,
         #[serde(default)]
         trace_id: Option<String>,
+        /// Error message from the provider, if the call failed.
+        /// Used by circuit breaker to classify the error kind.
+        #[serde(default)]
+        error_message: Option<String>,
     },
     BeforeCompaction {
         session_key: String,
@@ -892,6 +896,7 @@ mod tests {
             output_tokens: 50,
             iteration: 2,
             trace_id: None,
+            error_message: None,
         };
         assert_eq!(payload.event(), HookEvent::AfterLLMCall);
     }
@@ -928,6 +933,7 @@ mod tests {
             output_tokens: 0,
             iteration: 1,
             trace_id: None,
+            error_message: None,
         };
         let json = serde_json::to_string(&after).unwrap();
         let deser: HookPayload = serde_json::from_str(&json).unwrap();

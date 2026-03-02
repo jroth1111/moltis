@@ -4,7 +4,7 @@
 //! body text into actionable error kinds with routing decisions.
 
 /// How a provider error should be handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderErrorKind {
     /// 429 — rotate to next provider.
     RateLimit,
