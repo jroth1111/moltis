@@ -3806,7 +3806,7 @@ pub async fn prepare_gateway(
     // POST /api/circuit-breaker/reset — reset one provider or all.
     app = app.route(
         "/api/circuit-breaker",
-        axum::routing::get(|| async move {
+        get(|| async move {
             let Some(circuit) = HOOK_CIRCUIT_BREAKER.get().cloned() else {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
