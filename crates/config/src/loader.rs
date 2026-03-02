@@ -1238,6 +1238,30 @@ mod tests {
     }
 
     #[test]
+    fn apply_env_overrides_provider_rate_limit_nested_fields() {
+        let vars = vec![
+            (
+                "MOLTIS_TOOLS__PROVIDER_RATE_LIMIT__ENABLED".into(),
+                "false".into(),
+            ),
+            (
+                "MOLTIS_TOOLS__PROVIDER_RATE_LIMIT__DEFAULTS__MAX_REQUESTS_PER_WINDOW".into(),
+                "12".into(),
+            ),
+        ];
+        let config = apply_env_overrides_with(MoltisConfig::default(), vars.into_iter());
+        assert!(!config.tools.provider_rate_limit.enabled);
+        assert_eq!(
+            config
+                .tools
+                .provider_rate_limit
+                .defaults
+                .max_requests_per_window,
+            12
+        );
+    }
+
+    #[test]
     fn apply_env_overrides_tools_agent_max_iterations() {
         let vars = vec![("MOLTIS_TOOLS__AGENT_MAX_ITERATIONS".into(), "64".into())];
         let config = apply_env_overrides_with(MoltisConfig::default(), vars.into_iter());

@@ -19,7 +19,10 @@ use {async_trait::async_trait, tokio_stream::Stream, tracing::warn};
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 
-use crate::model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent};
+use crate::{
+    model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent},
+    rate_limiter::{ProviderRateLimiter, RateLimitDecision},
+};
 
 pub use crate::classify::{
     ErrorRoutingAction, ProviderErrorKind, classify_error, classify_error_message,
@@ -82,11 +85,13 @@ pub struct ProviderChain {
     chain: Vec<ChainEntry>,
     cb_threshold: usize,
     cb_cooldown: Duration,
+    rate_limiter: Option<Arc<ProviderRateLimiter>>,
 }
 
 impl ProviderChain {
     /// Build a chain from a list of providers (primary first, then fallbacks).
     pub fn new(providers: Vec<Arc<dyn LlmProvider>>) -> Self {
+        let config = moltis_config::discover_and_load();
         let chain = providers
             .into_iter()
             .map(|provider| ChainEntry {
@@ -98,6 +103,7 @@ impl ProviderChain {
             chain,
             cb_threshold: 3,
             cb_cooldown: Duration::from_secs(60),
+            rate_limiter: ProviderRateLimiter::from_config(&config.tools.provider_rate_limit),
         }
     }
 
@@ -110,6 +116,12 @@ impl ProviderChain {
     pub fn with_circuit_breaker(mut self, threshold: usize, cooldown: Duration) -> Self {
         self.cb_threshold = threshold;
         self.cb_cooldown = cooldown;
+        self
+    }
+
+    /// Override the outbound provider rate limiter.
+    pub fn with_rate_limiter(mut self, limiter: Option<Arc<ProviderRateLimiter>>) -> Self {
+        self.rate_limiter = limiter;
         self
     }
 
@@ -152,6 +164,35 @@ impl LlmProvider for ProviderChain {
 
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
+
+            if let Some(ref limiter) = self.rate_limiter {
+                match limiter.acquire(&provider_name, &model_id) {
+                    RateLimitDecision::Allowed => {},
+                    RateLimitDecision::Wait(delay) => {
+                        warn!(
+                            provider = %provider_name,
+                            model = %model_id,
+                            delay_ms = delay.as_millis() as u64,
+                            "outbound provider limiter queued request"
+                        );
+                        tokio::time::sleep(delay).await;
+                    },
+                    RateLimitDecision::Rejected(retry_after) => {
+                        warn!(
+                            provider = %provider_name,
+                            model = %model_id,
+                            retry_after_ms = retry_after.as_millis() as u64,
+                            "outbound provider limiter rejected request; trying next provider"
+                        );
+                        errors.push(format!(
+                            "{}: local provider rate limiter active (retry_after={}ms)",
+                            entry.provider.id(),
+                            retry_after.as_millis()
+                        ));
+                        continue;
+                    },
+                }
+            }
 
             match entry.provider.complete(messages, tools).await {
                 Ok(resp) => {
@@ -209,6 +250,16 @@ impl LlmProvider for ProviderChain {
                 },
                 Err(e) => {
                     let kind = classify_error(&e);
+
+                    if matches!(
+                        kind,
+                        ProviderErrorKind::RateLimit | ProviderErrorKind::NonRetryableRateLimit
+                    ) && let Some(retry_after_ms) = parse_retry_after_ms(&e.to_string())
+                        && let Some(ref limiter) = self.rate_limiter
+                    {
+                        limiter.note_retry_after_ms(&provider_name, &model_id, retry_after_ms);
+                    }
+
                     entry.state.record_failure();
 
                     // Record error metrics
@@ -471,6 +522,34 @@ mod tests {
             }),
             Arc::new(SuccessProvider { id: "fallback" }),
         ]);
+
+        let resp = chain.complete(&[], &[]).await.unwrap();
+        assert_eq!(resp.text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_rejects_primary_then_fallback_succeeds() {
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
+        cfg.enabled = true;
+        cfg.wait_on_limit = false;
+        cfg.defaults.max_requests_per_window = 0;
+        cfg.providers.insert(
+            "success".to_string(),
+            moltis_config::schema::ProviderRateLimitWindowConfig {
+                window_secs: 60,
+                max_requests_per_window: 10,
+            },
+        );
+        let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
+
+        let chain = ProviderChain::new(vec![
+            Arc::new(FailingProvider {
+                id: "primary",
+                error_msg: "500 internal server error",
+            }),
+            Arc::new(SuccessProvider { id: "fallback" }),
+        ])
+        .with_rate_limiter(Some(limiter));
 
         let resp = chain.complete(&[], &[]).await.unwrap();
         assert_eq!(resp.text.as_deref(), Some("ok"));

@@ -1312,8 +1312,12 @@ impl Default for ResearchConfig {
     }
 }
 
-fn default_research_trigger() -> String { "question".to_string() }
-fn default_research_max_iterations() -> usize { 3 }
+fn default_research_trigger() -> String {
+    "question".to_string()
+}
+fn default_research_max_iterations() -> usize {
+    3
+}
 
 /// Tools configuration (exec, sandbox, policy, web, browser).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1331,6 +1335,8 @@ pub struct ToolsConfig {
     /// Default 120.
     #[serde(default = "default_provider_call_timeout_secs")]
     pub provider_call_timeout_secs: u64,
+    /// Outbound LLM provider request throttling.
+    pub provider_rate_limit: ProviderRateLimitConfig,
     /// Maximum number of agent loop iterations before aborting. Default 25.
     #[serde(default = "default_agent_max_iterations")]
     pub agent_max_iterations: usize,
@@ -1353,6 +1359,7 @@ impl Default for ToolsConfig {
             browser: BrowserConfig::default(),
             agent_timeout_secs: default_agent_timeout_secs(),
             provider_call_timeout_secs: default_provider_call_timeout_secs(),
+            provider_rate_limit: ProviderRateLimitConfig::default(),
             agent_max_iterations: default_agent_max_iterations(),
             max_tool_result_bytes: default_max_tool_result_bytes(),
             leak_detection_sensitivity: default_leak_detection_sensitivity(),
@@ -1366,6 +1373,63 @@ fn default_agent_timeout_secs() -> u64 {
 
 fn default_provider_call_timeout_secs() -> u64 {
     120
+}
+
+/// Per-provider window settings for outbound rate limiting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderRateLimitWindowConfig {
+    /// Sliding-window length in seconds.
+    #[serde(default = "default_provider_rate_limit_window_secs")]
+    pub window_secs: u64,
+    /// Max requests permitted in each window.
+    #[serde(default = "default_provider_rate_limit_max_requests_per_window")]
+    pub max_requests_per_window: u32,
+}
+
+impl Default for ProviderRateLimitWindowConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: default_provider_rate_limit_window_secs(),
+            max_requests_per_window: default_provider_rate_limit_max_requests_per_window(),
+        }
+    }
+}
+
+/// Outbound provider rate limiter configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderRateLimitConfig {
+    /// Enable outbound throttling.
+    pub enabled: bool,
+    /// When true, wait for window drain; when false, reject and let failover handle it.
+    pub wait_on_limit: bool,
+    /// Maximum number of provider/model keys tracked in memory.
+    pub max_tracked_keys: usize,
+    /// Default limits when no provider-specific override is defined.
+    pub defaults: ProviderRateLimitWindowConfig,
+    /// Provider-specific overrides by provider name/id.
+    pub providers: HashMap<String, ProviderRateLimitWindowConfig>,
+}
+
+impl Default for ProviderRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            wait_on_limit: false,
+            max_tracked_keys: 1024,
+            defaults: ProviderRateLimitWindowConfig::default(),
+            providers: HashMap::new(),
+        }
+    }
+}
+
+fn default_provider_rate_limit_window_secs() -> u64 {
+    60
+}
+
+fn default_provider_rate_limit_max_requests_per_window() -> u32 {
+    30
 }
 
 fn default_agent_max_iterations() -> usize {
@@ -1660,26 +1724,41 @@ pub struct WasmToolLimitsConfig {
 fn default_wasm_tool_overrides() -> HashMap<String, ToolLimitOverrideConfig> {
     let mb = 1024_u64 * 1024_u64;
     HashMap::from([
-        ("calc".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(100_000),
-            memory: Some(2 * mb),
-        }),
-        ("web_fetch".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(10_000_000),
-            memory: Some(32 * mb),
-        }),
-        ("web_search".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(10_000_000),
-            memory: Some(32 * mb),
-        }),
-        ("show_map".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(10_000_000),
-            memory: Some(64 * mb),
-        }),
-        ("location".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(5_000_000),
-            memory: Some(16 * mb),
-        }),
+        (
+            "calc".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(100_000),
+                memory: Some(2 * mb),
+            },
+        ),
+        (
+            "web_fetch".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(10_000_000),
+                memory: Some(32 * mb),
+            },
+        ),
+        (
+            "web_search".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(10_000_000),
+                memory: Some(32 * mb),
+            },
+        ),
+        (
+            "show_map".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(10_000_000),
+                memory: Some(64 * mb),
+            },
+        ),
+        (
+            "location".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(5_000_000),
+                memory: Some(16 * mb),
+            },
+        ),
     ])
 }
 
@@ -2085,7 +2164,10 @@ impl std::fmt::Debug for ProviderEntry {
         f.debug_struct("ProviderEntry")
             .field("enabled", &self.enabled)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("extra_api_keys", &format!("[{} keys]", self.extra_api_keys.len()))
+            .field(
+                "extra_api_keys",
+                &format!("[{} keys]", self.extra_api_keys.len()),
+            )
             .field("base_url", &self.base_url)
             .field("models", &self.models)
             .field("fetch_models", &self.fetch_models)
@@ -2348,10 +2430,13 @@ system_prompt_suffix = "Focus on evidence."
     #[test]
     fn providers_config_local_alias_maps_local_llm_to_local() {
         let mut config = ProvidersConfig::default();
-        config.providers.insert("local-llm".into(), ProviderEntry {
-            enabled: false,
-            ..ProviderEntry::default()
-        });
+        config.providers.insert(
+            "local-llm".into(),
+            ProviderEntry {
+                enabled: false,
+                ..ProviderEntry::default()
+            },
+        );
 
         assert!(!config.is_enabled("local"));
         assert!(!config.is_enabled("local-llm"));
@@ -2361,14 +2446,20 @@ system_prompt_suffix = "Focus on evidence."
     #[test]
     fn providers_config_local_alias_prefers_exact_key() {
         let mut config = ProvidersConfig::default();
-        config.providers.insert("local".into(), ProviderEntry {
-            enabled: false,
-            ..ProviderEntry::default()
-        });
-        config.providers.insert("local-llm".into(), ProviderEntry {
-            enabled: true,
-            ..ProviderEntry::default()
-        });
+        config.providers.insert(
+            "local".into(),
+            ProviderEntry {
+                enabled: false,
+                ..ProviderEntry::default()
+            },
+        );
+        config.providers.insert(
+            "local-llm".into(),
+            ProviderEntry {
+                enabled: true,
+                ..ProviderEntry::default()
+            },
+        );
 
         assert!(!config.is_enabled("local"));
         assert!(config.is_enabled("local-llm"));
@@ -2400,10 +2491,13 @@ system_prompt_suffix = "Focus on evidence."
             offered: vec!["openai".into()],
             ..ProvidersConfig::default()
         };
-        config.providers.insert("openai".into(), ProviderEntry {
-            enabled: false,
-            ..ProviderEntry::default()
-        });
+        config.providers.insert(
+            "openai".into(),
+            ProviderEntry {
+                enabled: false,
+                ..ProviderEntry::default()
+            },
+        );
         assert!(!config.is_enabled("openai"));
     }
 
@@ -2417,29 +2511,29 @@ system_prompt_suffix = "Focus on evidence."
     #[test]
     fn channels_config_defaults_to_telegram_and_discord_offered() {
         let config = ChannelsConfig::default();
-        assert_eq!(config.offered, vec![
-            "telegram".to_string(),
-            "discord".to_string()
-        ]);
+        assert_eq!(
+            config.offered,
+            vec!["telegram".to_string(), "discord".to_string()]
+        );
     }
 
     #[test]
     fn channels_config_empty_toml_defaults_offered() {
         let config: ChannelsConfig = toml::from_str("").unwrap();
-        assert_eq!(config.offered, vec![
-            "telegram".to_string(),
-            "discord".to_string()
-        ]);
+        assert_eq!(
+            config.offered,
+            vec!["telegram".to_string(), "discord".to_string()]
+        );
     }
 
     #[test]
     fn channels_config_explicit_offered() {
         let config: ChannelsConfig =
             toml::from_str(r#"offered = ["telegram", "msteams"]"#).unwrap();
-        assert_eq!(config.offered, vec![
-            "telegram".to_string(),
-            "msteams".to_string()
-        ]);
+        assert_eq!(
+            config.offered,
+            vec!["telegram".to_string(), "msteams".to_string()]
+        );
     }
 
     #[test]
@@ -2563,7 +2657,10 @@ memory = 300
     #[test]
     fn provider_entry_extra_api_keys_round_trip() {
         let entry = ProviderEntry {
-            extra_api_keys: vec![Secret::new("sk-extra-1".into()), Secret::new("sk-extra-2".into())],
+            extra_api_keys: vec![
+                Secret::new("sk-extra-1".into()),
+                Secret::new("sk-extra-2".into()),
+            ],
             ..ProviderEntry::default()
         };
 

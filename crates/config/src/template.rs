@@ -208,6 +208,20 @@ provider_call_timeout_secs = 120  # Max seconds for a single provider call (0 = 
 agent_max_iterations = 25         # Max LLM/tool loop iterations before stopping
 max_tool_result_bytes = 50000     # Max bytes per tool result before truncation (50KB)
 
+[tools.provider_rate_limit]
+enabled = true                    # Outbound provider throttling
+wait_on_limit = false             # false=failover, true=wait for the window to drain
+max_tracked_keys = 1024           # Bounded in-memory key count (provider+model)
+
+[tools.provider_rate_limit.defaults]
+window_secs = 60                  # Sliding window duration
+max_requests_per_window = 30      # Requests allowed per provider/model per window
+
+# Optional provider-specific overrides:
+# [tools.provider_rate_limit.providers.openai]
+# window_secs = 60
+# max_requests_per_window = 20
+
 # ── Maps ─────────────────────────────────────────────────────────────────────
 
 [tools.maps]
