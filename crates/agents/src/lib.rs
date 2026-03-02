@@ -16,6 +16,7 @@ pub mod provider_chain;
 pub mod leak_detector;
 pub mod research;
 pub mod response_sanitizer;
+pub mod self_repair;
 pub mod silent_turn;
 pub mod skills;
 pub mod tool_registry;

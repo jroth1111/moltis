@@ -2,6 +2,26 @@ use crate::broadcast::{BroadcastOpts, broadcast};
 
 use super::MethodRegistry;
 
+async fn collect_stuck_agents(
+    store: Option<&std::sync::Arc<moltis_sessions::state_store::SessionStateStore>>,
+) -> Vec<moltis_agents::self_repair::StuckSessionInfo> {
+    let Some(store) = store else {
+        return Vec::new();
+    };
+
+    let keys = store.list_running_sessions().await.unwrap_or_default();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+
+    moltis_agents::self_repair::get_stuck_sessions(
+        store,
+        &keys,
+        moltis_agents::self_repair::DEFAULT_STUCK_THRESHOLD,
+    )
+    .await
+}
+
 pub(super) fn register(reg: &mut MethodRegistry) {
     // health
     reg.register(
@@ -9,10 +29,16 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         Box::new(|ctx| {
             Box::pin(async move {
                 let count = ctx.state.client_count().await;
+
+                // Surface stuck agents if the session state store is available.
+                let stuck_agents =
+                    collect_stuck_agents(ctx.state.services.session_state_store.as_ref()).await;
+
                 Ok(serde_json::json!({
                     "status": "ok",
                     "version": ctx.state.version,
                     "connections": count,
+                    "stuckAgents": stuck_agents,
                 }))
             })
         }),
@@ -200,4 +226,73 @@ fn reg_method_names() -> Vec<&'static str> {
         "channel.join",
         "channel.leave",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::collect_stuck_agents;
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    async fn make_state_store()
+    -> anyhow::Result<Arc<moltis_sessions::state_store::SessionStateStore>> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS session_state (
+                session_key TEXT NOT NULL,
+                namespace   TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_key, namespace, key)
+            )"#,
+        )
+        .execute(&pool)
+        .await?;
+        Ok(Arc::new(
+            moltis_sessions::state_store::SessionStateStore::new(pool),
+        ))
+    }
+
+    #[tokio::test]
+    async fn collect_stuck_agents_returns_empty_without_store() {
+        assert!(collect_stuck_agents(None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_stuck_agents_reports_only_stale_running_sessions() -> anyhow::Result<()> {
+        let store = make_state_store().await?;
+        store
+            .set("session:old", "self_repair", "running_since", "0")
+            .await?;
+        store
+            .set("session:old", "self_repair", "repair_attempts", "2")
+            .await?;
+
+        let fresh_since = now_ms().to_string();
+        store
+            .set(
+                "session:fresh",
+                "self_repair",
+                "running_since",
+                &fresh_since,
+            )
+            .await?;
+
+        let stuck = collect_stuck_agents(Some(&store)).await;
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].session_key, "session:old");
+        assert_eq!(stuck[0].repair_attempts, 2);
+        Ok(())
+    }
 }

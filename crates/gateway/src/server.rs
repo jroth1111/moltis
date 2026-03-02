@@ -2638,6 +2638,7 @@ pub async fn prepare_gateway(
 
     services = services.with_session_metadata(Arc::clone(&session_metadata));
     services = services.with_session_store(Arc::clone(&session_store));
+    services = services.with_session_state_store(Arc::clone(&session_state_store));
     services = services.with_session_share_store(Arc::clone(&session_share_store));
 
     services = services.with_agent_persona_store(Arc::clone(&agent_persona_store));
@@ -3548,6 +3549,7 @@ pub async fn prepare_gateway(
             Arc::clone(&session_metadata),
         )
         .with_tools(Arc::clone(&shared_tool_registry))
+        .with_state_store(Arc::clone(&session_state_store))
         .with_failover(config.failover.clone());
 
         if let Some(ref hooks) = state.inner.read().await.hook_registry {
@@ -3929,6 +3931,15 @@ pub async fn prepare_gateway(
             }
         });
     }
+
+    // Spawn self-repair background scanner (scans every 60s for stuck agent sessions).
+    moltis_agents::self_repair::start_background_task(
+        Arc::clone(&session_state_store),
+        std::time::Duration::from_secs(60),
+        moltis_agents::self_repair::DEFAULT_STUCK_THRESHOLD,
+        moltis_agents::self_repair::DEFAULT_MAX_REPAIR_ATTEMPTS,
+        None,
+    );
 
     // Spawn tick timer.
     let tick_state = Arc::clone(&state);

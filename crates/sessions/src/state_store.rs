@@ -141,6 +141,46 @@ impl SessionStateStore {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// List all session keys that have an entry in the given namespace and key.
+    ///
+    /// Used by the self-repair scanner to find sessions with `running_since` set.
+    pub async fn list_sessions_with_key(&self, namespace: &str, key: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT session_key FROM session_state WHERE namespace = ? AND key = ?",
+        )
+        .bind(namespace)
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// List all sessions that are currently marked as running (have `running_since` set).
+    ///
+    /// Convenience wrapper for `list_sessions_with_key("self_repair", "running_since")`.
+    pub async fn list_running_sessions(&self) -> Result<Vec<String>> {
+        self.list_sessions_with_key("self_repair", "running_since")
+            .await
+    }
+
+    /// Run migrations for tests (creates the session_state table in an in-memory DB).
+    #[cfg(test)]
+    pub async fn run_migrations_for_tests(pool: &sqlx::SqlitePool) -> Result<()> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS session_state (
+                session_key TEXT NOT NULL,
+                namespace   TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_key, namespace, key)
+            )"#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -280,5 +320,53 @@ mod tests {
             store.get("s1", "ns-b", "key").await.unwrap().as_deref(),
             Some("val-b")
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_with_key() {
+        let pool = test_pool().await;
+        let store = SessionStateStore::new(pool);
+
+        store
+            .set("session:1", "self_repair", "running_since", "123")
+            .await
+            .unwrap();
+        store
+            .set("session:2", "self_repair", "running_since", "456")
+            .await
+            .unwrap();
+        store
+            .set("session:2", "self_repair", "repair_attempts", "1")
+            .await
+            .unwrap();
+        store
+            .set("session:3", "other", "running_since", "789")
+            .await
+            .unwrap();
+
+        let mut sessions = store
+            .list_sessions_with_key("self_repair", "running_since")
+            .await
+            .unwrap();
+        sessions.sort();
+        assert_eq!(sessions, vec!["session:1", "session:2"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_running_sessions() {
+        let pool = test_pool().await;
+        let store = SessionStateStore::new(pool);
+
+        store
+            .set("session:running", "self_repair", "running_since", "111")
+            .await
+            .unwrap();
+        store
+            .set("session:idle", "self_repair", "repair_attempts", "2")
+            .await
+            .unwrap();
+
+        let sessions = store.list_running_sessions().await.unwrap();
+        assert_eq!(sessions, vec!["session:running"]);
     }
 }
