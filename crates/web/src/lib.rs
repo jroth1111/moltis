@@ -170,6 +170,12 @@ fn build_api_routes() -> Router<AppState> {
             get(moltis_gateway::metrics_routes::api_metrics_history_handler),
         );
 
+    // Provider health dashboard (always available, not gated on metrics feature).
+    let protected = protected.route(
+        "/api/metrics/provider-health",
+        get(moltis_gateway::metrics_routes::api_provider_health_handler),
+    );
+
     protected
 }
 

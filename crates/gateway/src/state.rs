@@ -454,6 +454,8 @@ pub struct GatewayState {
     /// Encryption-at-rest vault for environment variables.
     #[cfg(feature = "vault")]
     pub vault: Option<Arc<moltis_vault::Vault>>,
+    /// Shared provider health tracker — aggregates call outcomes across all sessions.
+    pub provider_health: Arc<moltis_agents::provider_health::ProviderHealthTracker>,
 
     // ── Atomics (lock-free) ─────────────────────────────────────────────────
     /// Monotonically increasing sequence counter for broadcast events.
@@ -542,6 +544,9 @@ impl GatewayState {
             metrics_store,
             #[cfg(feature = "vault")]
             vault,
+            provider_health: Arc::new(
+                moltis_agents::provider_health::ProviderHealthTracker::default_window(),
+            ),
             seq: AtomicU64::new(0),
             tts_phrase_counter: AtomicUsize::new(0),
             shutting_down: AtomicBool::new(false),

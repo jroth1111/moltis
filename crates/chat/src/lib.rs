@@ -2379,6 +2379,8 @@ pub struct LiveChatService {
     state_store: Option<Arc<SessionStateStore>>,
     /// Failover configuration for automatic model/provider failover.
     failover_config: moltis_config::schema::FailoverConfig,
+    /// Shared provider health tracker for aggregating call outcomes across sessions.
+    provider_health: Arc<moltis_agents::provider_health::ProviderHealthTracker>,
 }
 
 impl LiveChatService {
@@ -2407,11 +2409,22 @@ impl LiveChatService {
             active_reply_medium: Arc::new(RwLock::new(HashMap::new())),
             state_store: None,
             failover_config: moltis_config::schema::FailoverConfig::default(),
+            provider_health: Arc::new(
+                moltis_agents::provider_health::ProviderHealthTracker::default_window(),
+            ),
         }
     }
 
     pub fn with_failover(mut self, config: moltis_config::schema::FailoverConfig) -> Self {
         self.failover_config = config;
+        self
+    }
+
+    pub fn with_provider_health(
+        mut self,
+        health: Arc<moltis_agents::provider_health::ProviderHealthTracker>,
+    ) -> Self {
+        self.provider_health = health;
         self
     }
 
@@ -3129,7 +3142,12 @@ impl ChatService for LiveChatService {
                 } else {
                     let mut chain = vec![primary];
                     chain.extend(fallbacks);
-                    Arc::new(moltis_agents::provider_chain::ProviderChain::new(chain))
+                    Arc::new(
+                        moltis_agents::provider_chain::ProviderChain::with_health_tracker(
+                            chain,
+                            Arc::clone(&self.provider_health),
+                        ),
+                    )
                 }
             } else {
                 primary

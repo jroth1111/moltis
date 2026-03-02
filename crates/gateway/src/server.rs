@@ -3553,7 +3553,8 @@ pub async fn prepare_gateway(
         )
         .with_tools(Arc::clone(&shared_tool_registry))
         .with_state_store(Arc::clone(&session_state_store))
-        .with_failover(config.failover.clone());
+        .with_failover(config.failover.clone())
+        .with_provider_health(Arc::clone(&state.provider_health));
 
         if let Some(ref hooks) = state.inner.read().await.hook_registry {
             chat_service = chat_service.with_hooks_arc(Arc::clone(hooks));
@@ -5051,8 +5052,8 @@ async fn ws_upgrade_handler(
     let remote_ip = extract_ws_client_ip(&headers, addr).filter(|ip| is_public_ip(ip));
 
     let is_local = is_local_connection(&headers, addr, state.gateway.behind_proxy);
-    let header_authenticated =
-        websocket_header_authenticated(&headers, state.gateway.credential_store.as_ref(), is_local)
+    let header_auth =
+        websocket_header_auth_context(&headers, state.gateway.credential_store.as_ref(), is_local)
             .await;
     ws.on_upgrade(move |socket| {
         handle_connection(
@@ -5062,7 +5063,8 @@ async fn ws_upgrade_handler(
             addr,
             accept_language,
             remote_ip,
-            header_authenticated,
+            header_auth.authenticated,
+            header_auth.api_key_scopes,
             is_local,
         )
     })
@@ -5160,14 +5162,56 @@ async fn websocket_header_authenticated(
     credential_store: Option<&Arc<auth::CredentialStore>>,
     is_local: bool,
 ) -> bool {
+    websocket_header_auth_context(headers, credential_store, is_local)
+        .await
+        .authenticated
+}
+
+#[derive(Debug, Default)]
+struct WsHeaderAuthContext {
+    authenticated: bool,
+    api_key_scopes: Option<Vec<String>>,
+}
+
+async fn websocket_header_auth_context(
+    headers: &axum::http::HeaderMap,
+    credential_store: Option<&Arc<auth::CredentialStore>>,
+    is_local: bool,
+) -> WsHeaderAuthContext {
     let Some(store) = credential_store else {
-        return false;
+        return WsHeaderAuthContext::default();
     };
 
-    matches!(
-        crate::auth_middleware::check_auth(store, headers, is_local).await,
-        crate::auth_middleware::AuthResult::Allowed(_)
-    )
+    match crate::auth_middleware::check_auth(store, headers, is_local).await {
+        crate::auth_middleware::AuthResult::Allowed(identity)
+            if identity.method == auth::AuthMethod::ApiKey =>
+        {
+            let Some(api_key) = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+            else {
+                return WsHeaderAuthContext::default();
+            };
+
+            let Some(verification) = store.verify_api_key(api_key).await.ok().flatten() else {
+                return WsHeaderAuthContext::default();
+            };
+            if verification.scopes.is_empty() {
+                return WsHeaderAuthContext::default();
+            }
+            WsHeaderAuthContext {
+                authenticated: true,
+                api_key_scopes: Some(verification.scopes),
+            }
+        },
+        crate::auth_middleware::AuthResult::Allowed(_) => WsHeaderAuthContext {
+            authenticated: true,
+            api_key_scopes: None,
+        },
+        crate::auth_middleware::AuthResult::SetupRequired
+        | crate::auth_middleware::AuthResult::Unauthorized => WsHeaderAuthContext::default(),
+    }
 }
 
 /// Resolve the machine's primary outbound IP address.
@@ -6132,7 +6176,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_header_auth_accepts_valid_bearer_api_key() {
+    async fn websocket_header_auth_accepts_valid_scoped_bearer_api_key() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = Arc::new(
+            auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
+                .await
+                .unwrap(),
+        );
+        store.set_initial_password("supersecret").await.unwrap();
+        let scopes = vec!["operator.read".to_string(), "operator.write".to_string()];
+        let (_id, raw_key) = store.create_api_key("ws", Some(&scopes)).await.unwrap();
+
+        let mut headers = axum::http::HeaderMap::new();
+        let auth_value = format!("Bearer {raw_key}");
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            auth_value.parse().unwrap(),
+        );
+
+        let ctx = websocket_header_auth_context(&headers, Some(&store), false).await;
+        assert!(ctx.authenticated);
+        assert_eq!(ctx.api_key_scopes, Some(scopes));
+    }
+
+    #[tokio::test]
+    async fn websocket_header_auth_rejects_unscoped_bearer_api_key() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = Arc::new(
             auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
@@ -6149,7 +6217,9 @@ mod tests {
             auth_value.parse().unwrap(),
         );
 
-        assert!(websocket_header_authenticated(&headers, Some(&store), false).await);
+        let ctx = websocket_header_auth_context(&headers, Some(&store), false).await;
+        assert!(!ctx.authenticated);
+        assert!(ctx.api_key_scopes.is_none());
     }
 
     #[tokio::test]
