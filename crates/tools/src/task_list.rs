@@ -44,6 +44,11 @@ impl TaskListTool {
     pub fn new(store: Arc<TaskStore>) -> Self {
         Self { store }
     }
+
+    /// Return the underlying `Arc<TaskStore>` for sharing with other tools.
+    pub fn store(&self) -> Arc<TaskStore> {
+        Arc::clone(&self.store)
+    }
 }
 
 // ── View helpers ──────────────────────────────────────────────────────────────

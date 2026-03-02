@@ -328,10 +328,13 @@ fn build_schema_map() -> KnownKeys {
                 ("update_repository_url", Leaf),
             ])),
         ),
-        ("providers", MapWithFields {
-            value: Box::new(provider_entry()),
-            fields: HashMap::from([("offered", Array(Box::new(Leaf)))]),
-        }),
+        (
+            "providers",
+            MapWithFields {
+                value: Box::new(provider_entry()),
+                fields: HashMap::from([("offered", Array(Box::new(Leaf)))]),
+            },
+        ),
         (
             "chat",
             Struct(HashMap::from([
@@ -474,6 +477,13 @@ fn build_schema_map() -> KnownKeys {
             Struct(HashMap::from([
                 ("rate_limit_max", Leaf),
                 ("rate_limit_window_secs", Leaf),
+            ])),
+        ),
+        (
+            "tasks",
+            Struct(HashMap::from([
+                ("retry_poll_interval_secs", Leaf),
+                ("max_attempts_override", Leaf),
             ])),
         ),
         ("env", Map(Box::new(Leaf))),

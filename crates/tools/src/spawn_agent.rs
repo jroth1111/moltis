@@ -8,6 +8,7 @@ use crate::{
     error::Error,
     params::{bool_param, str_param, u64_param},
 };
+use moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent};
 
 use {
     moltis_agents::{
@@ -49,6 +50,8 @@ pub struct SpawnAgentTool {
     tool_registry: Arc<ToolRegistry>,
     agents_config: Option<Arc<tokio::sync::RwLock<AgentsConfig>>>,
     on_event: Option<OnSpawnEvent>,
+    /// Optional task store for lifecycle management when `task_id` is provided.
+    task_store: Option<Arc<TaskStore>>,
 }
 
 impl SpawnAgentTool {
@@ -63,6 +66,7 @@ impl SpawnAgentTool {
             tool_registry,
             agents_config: None,
             on_event: None,
+            task_store: None,
         }
     }
 
@@ -78,6 +82,13 @@ impl SpawnAgentTool {
         agents_config: Arc<tokio::sync::RwLock<AgentsConfig>>,
     ) -> Self {
         self.agents_config = Some(agents_config);
+        self
+    }
+
+    /// Attach a task store so sub-agents linked to a `task_id` receive
+    /// automatic lifecycle transitions (Complete / Fail) on exit.
+    pub fn with_task_store(mut self, store: Arc<TaskStore>) -> Self {
+        self.task_store = Some(store);
         self
     }
 
@@ -212,6 +223,14 @@ impl AgentTool for SpawnAgentTool {
                 "delegate_only": {
                     "type": "boolean",
                     "description": "If true, sub-agent is restricted to delegation/session/task tools."
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Optional task ID to link this sub-agent to a task. When provided with list_id, the task is automatically marked Complete on success or Fail on error."
+                },
+                "list_id": {
+                    "type": "string",
+                    "description": "Task list ID required when task_id is provided."
                 }
             },
             "required": ["task"]
@@ -222,6 +241,23 @@ impl AgentTool for SpawnAgentTool {
         let task = str_param(&params, "task")
             .ok_or_else(|| Error::message("missing required parameter: task"))?;
         let context = str_param(&params, "context").unwrap_or("");
+
+        // Task lifecycle: resolve linked task (if any) before building the prompt.
+        let task_id: Option<TaskId> = str_param(&params, "task_id").map(TaskId::from);
+        let list_id: Option<String> = str_param(&params, "list_id").map(str::to_string);
+
+        // Fetch prior HandoffContext so dead_ends are injected into the sub-agent prompt.
+        let prior_handoff: Option<HandoffContext> =
+            if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
+                store
+                    .get(lid, &tid.0)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.runtime.handoff)
+            } else {
+                None
+            };
         let (preset_name, preset) = self.resolve_preset(&params).await?;
         let explicit_model = str_param(&params, "model").map(String::from);
         let model_id = explicit_model
@@ -316,6 +352,16 @@ impl AgentTool for SpawnAgentTool {
             system_prompt.push_str(extra);
         }
 
+        // Inject prior HandoffContext (dead-ends, last failure) into the system prompt
+        // so this attempt knows what has already been tried.
+        if let Some(ref handoff) = prior_handoff {
+            let ctx = handoff.as_prompt_context();
+            if !ctx.is_empty() {
+                system_prompt.push_str("\n\n---\n\n");
+                system_prompt.push_str(&ctx);
+            }
+        }
+
         // Build tool context with incremented depth and propagated session key.
         let mut tool_context = serde_json::json!({
             SPAWN_DEPTH_KEY: depth + 1,
@@ -350,6 +396,34 @@ impl AgentTool for SpawnAgentTool {
             iterations,
             tool_calls_made,
         });
+
+        // Apply task lifecycle transition for linked tasks.
+        if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
+            match &result {
+                Ok(_) => {
+                    let _ = store
+                        .apply_transition(lid, &tid.0, None, &TransitionEvent::Complete)
+                        .await;
+                },
+                Err(err) => {
+                    let class = moltis_agents::runner::classify_error(&err.to_string());
+                    let mut handoff = prior_handoff.clone().unwrap_or_default();
+                    handoff.observed_error = err.to_string();
+                    let _ = store
+                        .apply_transition(
+                            lid,
+                            &tid.0,
+                            None,
+                            &TransitionEvent::Fail {
+                                class,
+                                handoff,
+                                retry_after: None,
+                            },
+                        )
+                        .await;
+                },
+            }
+        }
 
         let result = result?;
 
@@ -769,6 +843,62 @@ mod tests {
                 .err()
                 .map(|e| e.to_string().contains("not found"))
                 .unwrap_or(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_lifecycle_completes_on_success() {
+        use moltis_tasks::{RuntimeState, TaskSpec, TaskStore, TransitionEvent};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("tasks.db");
+        let store = Arc::new(TaskStore::open(&db_path).await.unwrap());
+
+        // Create a task and claim it so it's Active.
+        let spec = TaskSpec::new("test task", "");
+        let task = store.create("default", spec, vec![]).await.unwrap();
+        let task = store
+            .apply_transition(
+                "default",
+                &task.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".to_string(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(task.runtime.state.is_active());
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "done".into(),
+            model_id: "mock".into(),
+        });
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_task_store(Arc::clone(&store));
+
+        let params = serde_json::json!({
+            "task": "do work",
+            "task_id": task.id.0,
+            "list_id": "default",
+        });
+        spawn_tool.execute(params).await.unwrap();
+
+        let updated = store.get("default", &task.id.0).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                updated.runtime.state,
+                RuntimeState::Terminal(moltis_tasks::TerminalState::Completed)
+            ),
+            "expected Completed, got {:?}",
+            updated.runtime.state
         );
     }
 }

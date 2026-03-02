@@ -3421,6 +3421,7 @@ pub async fn prepare_gateway(
         // Register shared task coordination tool for multi-agent workflows.
         let task_list_tool =
             moltis_tools::task_list::TaskListTool::from_data_dir(&data_dir).await?;
+        let task_store = task_list_tool.store();
         tool_registry.register(Box::new(task_list_tool));
         // Register the session-backed task board used by autonomous workflows.
         tool_registry.register(Box::new(
@@ -3528,7 +3529,8 @@ pub async fn prepare_gateway(
                 base_tools,
             )
             .with_on_event(on_spawn_event)
-            .with_agents_config(agents_config);
+            .with_agents_config(agents_config)
+            .with_task_store(Arc::clone(&task_store));
             tool_registry.register(Box::new(spawn_tool));
         }
 
