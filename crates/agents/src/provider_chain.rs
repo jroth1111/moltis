@@ -258,15 +258,80 @@ impl LlmProvider for ProviderChain {
         tools: Vec<serde_json::Value>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
         // For streaming, we try the first non-tripped provider.
-        // If the stream yields an Error event, we can't transparently retry mid-stream,
-        // so we pick the best available provider upfront.
+        // If the stream yields an Error event, we can't transparently retry
+        // mid-stream, so we pick the best available provider upfront.
+        let mut selected = self.primary();
         for entry in &self.chain {
             if !entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
-                return entry.provider.stream_with_tools(messages, tools);
+                selected = entry;
+                break;
             }
         }
-        // All tripped — try primary anyway (it may have cooled down by now).
-        self.primary().provider.stream_with_tools(messages, tools)
+
+        let provider_name = selected.provider.name().to_string();
+        let model_id = selected.provider.id().to_string();
+        let state = &selected.state;
+        let start = Instant::now();
+        let mut first_delta_recorded = false;
+        let inner = selected.provider.stream_with_tools(messages, tools);
+
+        let wrapped = {
+            use tokio_stream::StreamExt;
+            inner.map(move |event| {
+                match &event {
+                    StreamEvent::Delta(_) if !first_delta_recorded => {
+                        first_delta_recorded = true;
+                        #[cfg(feature = "metrics")]
+                        histogram!(
+                            llm_metrics::TIME_TO_FIRST_TOKEN_SECONDS,
+                            labels::PROVIDER => provider_name.clone(),
+                            labels::MODEL => model_id.clone()
+                        )
+                        .record(start.elapsed().as_secs_f64());
+                    },
+                    StreamEvent::Done(usage) => {
+                        state.record_success();
+                        #[cfg(feature = "metrics")]
+                        {
+                            let duration_secs = start.elapsed().as_secs_f64();
+                            histogram!(
+                                llm_metrics::COMPLETION_DURATION_SECONDS,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .record(duration_secs);
+
+                            if duration_secs > 0.0 {
+                                let tps = usage.output_tokens as f64 / duration_secs;
+                                histogram!(
+                                    llm_metrics::TOKENS_PER_SECOND,
+                                    labels::PROVIDER => provider_name.clone(),
+                                    labels::MODEL => model_id.clone()
+                                )
+                                .record(tps);
+                            }
+                        }
+                    },
+                    StreamEvent::Error(msg) => {
+                        state.record_failure();
+                        #[cfg(feature = "metrics")]
+                        {
+                            let kind = classify_error_message(msg);
+                            counter!(
+                                llm_metrics::COMPLETION_ERRORS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone(),
+                                labels::ERROR_TYPE => format!("{kind:?}")
+                            )
+                            .increment(1);
+                        }
+                    },
+                    _ => {},
+                }
+                event
+            })
+        };
+        Box::pin(wrapped)
     }
 }
 
