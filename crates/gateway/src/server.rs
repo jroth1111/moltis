@@ -1829,7 +1829,8 @@ pub async fn prepare_gateway(
         tokio::spawn(async move {
             if let Some(state) = st.get() {
                 let chat = state.chat().await;
-                let params = serde_json::json!({ "text": text });
+                // Cron/scheduled events are Maintenance-class (lowest priority = -100).
+                let params = serde_json::json!({ "text": text, "_priority": -100i32 });
                 if let Err(e) = chat.send(params).await {
                     tracing::error!("cron system event failed: {e}");
                 }
@@ -3288,6 +3289,12 @@ pub async fn prepare_gateway(
             tool_registry.register(Box::new(moltis_memory::tools::MemorySaveTool::new(
                 Arc::clone(mm),
             )));
+            tool_registry.register(Box::new(moltis_memory::tools::MemoryLearnFailureTool::new(
+                Arc::clone(mm),
+            )));
+            tool_registry.register(Box::new(
+                moltis_memory::tools::MemoryRecallFailuresTool::new(Arc::clone(mm)),
+            ));
         }
 
         // Register session state tool for per-session persistent KV store.
@@ -3394,9 +3401,12 @@ pub async fn prepare_gateway(
         let send_to_session: SendToSessionFn = Arc::new(move |req: SendToSessionRequest| {
             let state = Arc::clone(&state_for_session_send);
             Box::pin(async move {
+                // Inter-session sends are Background-class (priority = -50) so
+                // user-initiated Interactive messages (priority = 0) are served first.
                 let mut params = serde_json::json!({
                     "text": req.message,
                     "_session_key": req.key,
+                    "_priority": -50i32,
                 });
                 if let Some(model) = req.model {
                     params["model"] = serde_json::json!(model);
