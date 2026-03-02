@@ -1235,6 +1235,10 @@ pub struct ChatConfig {
     /// Research phase settings.
     #[serde(default)]
     pub research: ResearchConfig,
+    /// Maximum number of messages that can be queued per session while a run is active.
+    /// When the queue is full, new messages are rejected with an error.
+    #[serde(default = "default_message_queue_max_size")]
+    pub message_queue_max_size: usize,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1249,6 +1253,10 @@ fn default_compaction_keep_recent() -> usize {
     20
 }
 
+fn default_message_queue_max_size() -> usize {
+    100
+}
+
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
@@ -1259,6 +1267,7 @@ impl Default for ChatConfig {
             context_compaction_strategy: default_compaction_strategy(),
             context_compaction_keep_recent: default_compaction_keep_recent(),
             research: ResearchConfig::default(),
+            message_queue_max_size: default_message_queue_max_size(),
         }
     }
 }
