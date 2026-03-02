@@ -67,6 +67,15 @@ pub struct Task {
     pub blocked_by: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Evidence artifact attached when a task is marked completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+    /// Epoch seconds when the task was marked completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    /// Trace ID of the last mutation (for audit traceability).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_trace_id: Option<String>,
 }
 
 /// File-backed store for one logical task list.
@@ -188,6 +197,9 @@ impl TaskStore {
             blocked_by: Vec::new(),
             created_at: now,
             updated_at: now,
+            proof: None,
+            completed_at: None,
+            last_trace_id: None,
         };
         list.tasks.insert(id, task.clone());
         drop(lists);
@@ -225,6 +237,7 @@ impl TaskStore {
         Ok(list.tasks.get(task_id).cloned())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         &self,
         list_id: &str,
@@ -234,6 +247,10 @@ impl TaskStore {
         description: Option<String>,
         owner: Option<String>,
         blocked_by: Option<Vec<String>>,
+        proof: Option<String>,
+        caller_identity: Option<&str>,
+        trace_id: Option<&str>,
+        force: bool,
     ) -> crate::Result<Task> {
         self.ensure_list(list_id).await?;
         let mut lists = self.lists.write().await;
@@ -247,6 +264,20 @@ impl TaskStore {
                 .tasks
                 .get(task_id)
                 .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
+
+            // Ownership enforcement: when the task has an owner and a caller is
+            // identified, only the owner (or force=true) may change status or owner.
+            if !force {
+                if let (Some(current_owner), Some(caller)) = (&task.owner, caller_identity) {
+                    let is_owner_mutation = status.is_some() || owner.is_some();
+                    if is_owner_mutation && current_owner != caller {
+                        return Err(Error::message(format!(
+                            "task {task_id} is owned by '{current_owner}'; \
+                             caller '{caller}' cannot modify status or owner"
+                        )));
+                    }
+                }
+            }
 
             // Status transition: Pending → Completed is forbidden (must pass through InProgress).
             if let Some(TaskStatus::Completed) = &status {
@@ -308,6 +339,7 @@ impl TaskStore {
             .get_mut(task_id)
             .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
 
+        let completing = matches!(&status, Some(TaskStatus::Completed));
         if let Some(status) = status {
             task.status = status;
         }
@@ -323,6 +355,17 @@ impl TaskStore {
         if let Some(blocked_by) = blocked_by {
             task.blocked_by = blocked_by;
         }
+        if completing {
+            task.completed_at = Some(Self::now());
+            if let Some(proof) = proof {
+                task.proof = Some(proof);
+            } else {
+                tracing::debug!(task_id, "task completed without proof artifact");
+            }
+        }
+        if let Some(trace_id) = trace_id {
+            task.last_trace_id = Some(trace_id.to_string());
+        }
         task.updated_at = Self::now();
 
         let updated = task.clone();
@@ -332,7 +375,13 @@ impl TaskStore {
     }
 
     /// Atomically claim a pending task and set it to in-progress.
-    pub async fn claim(&self, list_id: &str, task_id: &str, owner: &str) -> crate::Result<Task> {
+    pub async fn claim(
+        &self,
+        list_id: &str,
+        task_id: &str,
+        owner: &str,
+        trace_id: Option<&str>,
+    ) -> crate::Result<Task> {
         self.ensure_list(list_id).await?;
         let mut lists = self.lists.write().await;
         let list = lists
@@ -376,6 +425,9 @@ impl TaskStore {
             .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
         task.owner = Some(owner.to_string());
         task.status = TaskStatus::InProgress;
+        if let Some(trace_id) = trace_id {
+            task.last_trace_id = Some(trace_id.to_string());
+        }
         task.updated_at = Self::now();
 
         let claimed = task.clone();
@@ -447,6 +499,14 @@ impl AgentTool for TaskListTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "List of task IDs that block this task."
+                },
+                "proof": {
+                    "type": "string",
+                    "description": "Evidence artifact for task completion."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Override ownership checks (admin escape hatch)."
                 }
             },
             "required": ["action"]
@@ -503,9 +563,28 @@ impl AgentTool for TaskListTool {
                             .map(String::from)
                             .collect::<Vec<_>>()
                     });
+                let proof = str_param(&params, "proof").map(String::from);
+                let caller_identity = str_param_any(&params, &["_session_key"]);
+                let trace_id = str_param_any(&params, &["_trace_id"]);
+                let force = params
+                    .get("force")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
                 let task = self
                     .store
-                    .update(list_id, id, status, subject, description, owner, blocked_by)
+                    .update(
+                        list_id,
+                        id,
+                        status,
+                        subject,
+                        description,
+                        owner,
+                        blocked_by,
+                        proof,
+                        caller_identity,
+                        trace_id,
+                        force,
+                    )
                     .await?;
                 Ok(serde_json::json!({
                     "ok": true,
@@ -517,7 +596,8 @@ impl AgentTool for TaskListTool {
                 let owner = str_param_any(&params, &["owner", "_session_key"])
                     .unwrap_or("agent")
                     .to_string();
-                let task = self.store.claim(list_id, id, &owner).await?;
+                let trace_id = str_param_any(&params, &["_trace_id"]);
+                let task = self.store.claim(list_id, id, &owner, trace_id).await?;
                 Ok(serde_json::json!({
                     "ok": true,
                     "task": task,
@@ -771,12 +851,16 @@ mod tests {
         let a = task_tool
             .execute(serde_json::json!({"action": "create", "subject": "A"}))
             .await?;
-        let a_id = a["task"]["id"].as_str().ok_or_else(|| std::io::Error::other("missing id"))?;
+        let a_id = a["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing id"))?;
 
         let b = task_tool
             .execute(serde_json::json!({"action": "create", "subject": "B"}))
             .await?;
-        let b_id = b["task"]["id"].as_str().ok_or_else(|| std::io::Error::other("missing id"))?;
+        let b_id = b["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing id"))?;
 
         // Set A blocked_by B (valid)
         task_tool
@@ -824,6 +908,320 @@ mod tests {
             .execute(serde_json::json!({"action": "update", "id": id, "status": "completed"}))
             .await?;
         assert_eq!(result["task"]["status"], "completed");
+        Ok(())
+    }
+
+    // ── Ownership enforcement tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_rejects_foreign_owner_status_change() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        // Claim as owner-a.
+        store.claim("default", &task.id, "owner-a", None).await?;
+
+        // owner-b tries to change status → rejected.
+        let result = store
+            .update(
+                "default",
+                &task.id,
+                Some(TaskStatus::Completed),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("owner-b"),
+                None,
+                false,
+            )
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("owned by 'owner-a'"));
+        assert!(err.to_string().contains("owner-b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_allows_owner_status_change() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        store.claim("default", &task.id, "owner-a", None).await?;
+
+        // owner-a changes status → allowed.
+        let updated = store
+            .update(
+                "default",
+                &task.id,
+                Some(TaskStatus::Completed),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("owner-a"),
+                None,
+                false,
+            )
+            .await?;
+        assert_eq!(updated.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_allows_metadata_from_non_owner() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        store.claim("default", &task.id, "owner-a", None).await?;
+
+        // owner-b updates subject (metadata) → allowed.
+        let updated = store
+            .update(
+                "default",
+                &task.id,
+                None,
+                Some("updated subject".into()),
+                None,
+                None,
+                None,
+                None,
+                Some("owner-b"),
+                None,
+                false,
+            )
+            .await?;
+        assert_eq!(updated.subject, "updated subject");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_unrestricted_for_unowned_tasks() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        // No owner set — any caller can change status.
+        let updated = store
+            .update(
+                "default",
+                &task.id,
+                Some(TaskStatus::InProgress),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("anyone"),
+                None,
+                false,
+            )
+            .await?;
+        assert_eq!(updated.status, TaskStatus::InProgress);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_force_overrides_ownership() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        store.claim("default", &task.id, "owner-a", None).await?;
+
+        // owner-b with force=true → allowed.
+        let updated = store
+            .update(
+                "default",
+                &task.id,
+                Some(TaskStatus::Completed),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("owner-b"),
+                None,
+                true,
+            )
+            .await?;
+        assert_eq!(updated.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    // ── Completion proof tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn completion_stores_proof_and_completed_at() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        store.claim("default", &task.id, "worker", None).await?;
+
+        let updated = store
+            .update(
+                "default",
+                &task.id,
+                Some(TaskStatus::Completed),
+                None,
+                None,
+                None,
+                None,
+                Some("tests passed, coverage 95%".into()),
+                Some("worker"),
+                None,
+                false,
+            )
+            .await?;
+        assert_eq!(updated.proof.as_deref(), Some("tests passed, coverage 95%"));
+        assert!(updated.completed_at.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_without_proof_still_allowed() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        store.claim("default", &task.id, "worker", None).await?;
+
+        let updated = store
+            .update(
+                "default",
+                &task.id,
+                Some(TaskStatus::Completed),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("worker"),
+                None,
+                false,
+            )
+            .await?;
+        assert_eq!(updated.status, TaskStatus::Completed);
+        assert!(updated.proof.is_none());
+        assert!(updated.completed_at.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proof_visible_in_get_response() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let task_tool = tool(&tmp);
+        let created = task_tool
+            .execute(serde_json::json!({"action": "create", "subject": "work"}))
+            .await?;
+        let id = created["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+
+        task_tool
+            .execute(serde_json::json!({"action": "update", "id": id, "status": "in_progress"}))
+            .await?;
+        task_tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "completed",
+                "proof": "all tests pass"
+            }))
+            .await?;
+
+        let result = task_tool
+            .execute(serde_json::json!({"action": "get", "id": id}))
+            .await?;
+        assert_eq!(result["task"]["proof"], "all tests pass");
+        assert!(result["task"]["completed_at"].is_number());
+        Ok(())
+    }
+
+    // ── Trace ID tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_stores_trace_id() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        let updated = store
+            .update(
+                "default",
+                &task.id,
+                Some(TaskStatus::InProgress),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("trace-abc-123"),
+                false,
+            )
+            .await?;
+        assert_eq!(updated.last_trace_id.as_deref(), Some("trace-abc-123"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_stores_trace_id() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        let claimed = store
+            .claim("default", &task.id, "worker", Some("trace-xyz-789"))
+            .await?;
+        assert_eq!(claimed.last_trace_id.as_deref(), Some("trace-xyz-789"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trace_id_threaded_via_tool_params() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let task_tool = tool(&tmp);
+        let created = task_tool
+            .execute(serde_json::json!({"action": "create", "subject": "work"}))
+            .await?;
+        let id = created["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+
+        let result = task_tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "in_progress",
+                "_trace_id": "tool-trace-456"
+            }))
+            .await?;
+        assert_eq!(result["task"]["last_trace_id"], "tool-trace-456");
         Ok(())
     }
 }
