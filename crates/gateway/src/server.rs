@@ -5840,7 +5840,7 @@ pub(crate) async fn discover_and_build_hooks(
             registry.register(Arc::new(memory_hook));
         }
         let estop_hook = match estop_flag.clone() {
-            Some(flag) => EstopHook::new(flag),
+            Some(flag) => EstopHook::with_sentinel(flag, data.join("estop")),
             None => EstopHook::from_file(),
         };
         registry.register(Arc::new(estop_hook));

@@ -15,19 +15,34 @@ use moltis_common::{
 
 pub struct EstopHook {
     pub stopped: Arc<AtomicBool>,
+    sentinel_file: Option<std::path::PathBuf>,
 }
 
 impl EstopHook {
     pub fn new(stopped: Arc<AtomicBool>) -> Self {
-        Self { stopped }
+        Self {
+            stopped,
+            sentinel_file: None,
+        }
+    }
+
+    pub fn with_sentinel(stopped: Arc<AtomicBool>, sentinel_file: std::path::PathBuf) -> Self {
+        Self {
+            stopped,
+            sentinel_file: Some(sentinel_file),
+        }
     }
 
     pub fn from_file() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
         let sentinel = std::path::Path::new(&home).join(".moltis/estop");
         let stopped = sentinel.exists();
-        Self {
-            stopped: Arc::new(AtomicBool::new(stopped)),
+        Self::with_sentinel(Arc::new(AtomicBool::new(stopped)), sentinel)
+    }
+
+    fn refresh_from_sentinel(&self) {
+        if let Some(path) = &self.sentinel_file {
+            self.stopped.store(path.exists(), Ordering::Relaxed);
         }
     }
 }
@@ -47,6 +62,7 @@ impl HookHandler for EstopHook {
     }
 
     async fn handle(&self, _event: HookEvent, _payload: &HookPayload) -> Result<HookAction> {
+        self.refresh_from_sentinel();
         if self.stopped.load(Ordering::Relaxed) {
             return Ok(HookAction::Block("EMERGENCY STOP active".to_string()));
         }
@@ -54,6 +70,7 @@ impl HookHandler for EstopHook {
     }
 
     fn handle_sync(&self, _event: HookEvent, _payload: &HookPayload) -> Result<HookAction> {
+        self.refresh_from_sentinel();
         if self.stopped.load(Ordering::Relaxed) {
             return Ok(HookAction::Block("EMERGENCY STOP active".to_string()));
         }
