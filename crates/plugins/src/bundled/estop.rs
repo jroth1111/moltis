@@ -1,7 +1,7 @@
 //! Emergency stop hook.
 //!
-//! Checks an atomic flag (and optionally a sentinel file at `~/.moltis/estop`)
-//! and blocks all agent starts and LLM calls when activated.
+//! Checks an atomic flag (and optionally a sentinel file at the moltis data
+//! directory) and blocks all agent starts and LLM calls when activated.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,8 +34,7 @@ impl EstopHook {
     }
 
     pub fn from_file() -> Self {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let sentinel = std::path::Path::new(&home).join(".moltis/estop");
+        let sentinel = moltis_config::data_dir().join("estop");
         let stopped = sentinel.exists();
         Self::with_sentinel(Arc::new(AtomicBool::new(stopped)), sentinel)
     }
