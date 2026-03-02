@@ -391,6 +391,73 @@ impl TaskStore {
             .collect())
     }
 
+    /// Sweep all lists for overdue `Retrying` tasks and promote them to `Pending`.
+    ///
+    /// Called by the background retry-promotion poll. Returns the count of tasks
+    /// that were successfully promoted.
+    pub async fn promote_due_retries_all(&self) -> Result<usize, TransitionError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        let rows = sqlx::query(
+            "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
+             FROM tasks",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        let mut due: Vec<Task> = rows
+            .into_iter()
+            .filter_map(|r| {
+                Self::row_to_task(
+                    r.get::<String, _>("id"),
+                    r.get::<String, _>("list_id"),
+                    r.get::<String, _>("spec_json"),
+                    r.get::<String, _>("runtime_json"),
+                    r.get::<String, _>("blocked_by"),
+                    r.get::<i64, _>("version"),
+                )
+                .ok()
+            })
+            .filter(|t| {
+                matches!(&t.runtime.state, RuntimeState::Retrying { retry_after, .. } if retry_after.unix_timestamp() <= now)
+            })
+            .collect();
+
+        let mut promoted = 0usize;
+        for task in due.drain(..) {
+            let list_id = task.list_id.clone();
+            let task_id = task.id.0.clone();
+            let version = task.runtime.version;
+            match self
+                .apply_transition(
+                    &list_id,
+                    &task_id,
+                    Some(version),
+                    &TransitionEvent::PromoteRetry,
+                )
+                .await
+            {
+                Ok(_) => promoted += 1,
+                Err(TransitionError::VersionConflict { .. }) => {
+                    // Another writer raced us; skip — will be picked up next sweep.
+                },
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        list_id = %list_id,
+                        task_id = %task_id,
+                        error = %e,
+                        "retry promotion failed"
+                    );
+                    let _ = e;
+                },
+            }
+        }
+
+        Ok(promoted)
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn row_to_task(
@@ -625,5 +692,97 @@ mod tests {
         let due = store.due_retries("r").await.expect("due_retries");
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].id, task.id);
+    }
+
+    #[tokio::test]
+    async fn promote_due_retries_all_across_lists() {
+        let (store, _dir) = test_store().await;
+
+        // Two tasks in different lists, both overdue.
+        let past = OffsetDateTime::now_utc() - time::Duration::seconds(30);
+        for list in ["list-a", "list-b"] {
+            let spec = TaskSpec::new("retry-me", "");
+            let t = store.create(list, spec, vec![]).await.expect("create");
+            // Claim → Active
+            let t = store
+                .apply_transition(
+                    list,
+                    &t.id.0,
+                    None,
+                    &TransitionEvent::Claim {
+                        owner: "agent".into(),
+                        lease_duration_secs: None,
+                    },
+                )
+                .await
+                .expect("claim");
+            // Fail → Retrying (with past retry_after)
+            store
+                .apply_transition(
+                    list,
+                    &t.id.0,
+                    None,
+                    &TransitionEvent::Fail {
+                        class: FailureClass::AgentError,
+                        handoff: HandoffContext::default(),
+                        retry_after: Some(past),
+                    },
+                )
+                .await
+                .expect("fail");
+        }
+
+        // One task with a future retry_after — should NOT be promoted.
+        let future = OffsetDateTime::now_utc() + time::Duration::seconds(300);
+        let spec = TaskSpec::new("not-yet", "");
+        let t = store
+            .create("list-a", spec, vec![])
+            .await
+            .expect("create future");
+        let t = store
+            .apply_transition(
+                "list-a",
+                &t.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim future");
+        store
+            .apply_transition(
+                "list-a",
+                &t.id.0,
+                None,
+                &TransitionEvent::Fail {
+                    class: FailureClass::AgentError,
+                    handoff: HandoffContext::default(),
+                    retry_after: Some(future),
+                },
+            )
+            .await
+            .expect("fail future");
+
+        let promoted = store.promote_due_retries_all().await.expect("promote");
+        assert_eq!(promoted, 2, "only the two overdue tasks should be promoted");
+
+        // Verify both overdue tasks are now Pending.
+        for list in ["list-a", "list-b"] {
+            let pending = store.list(list, Some("Pending")).await.expect("list");
+            assert!(
+                pending.iter().any(|t| t.spec.subject == "retry-me"),
+                "{list}: expected retry-me to be Pending"
+            );
+        }
+
+        // Verify the not-yet task is still Retrying.
+        let retrying_a = store
+            .list("list-a", Some("Retrying"))
+            .await
+            .expect("retrying");
+        assert_eq!(retrying_a.len(), 1);
+        assert_eq!(retrying_a[0].spec.subject, "not-yet");
     }
 }

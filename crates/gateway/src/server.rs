@@ -3423,6 +3423,29 @@ pub async fn prepare_gateway(
             moltis_tools::task_list::TaskListTool::from_data_dir(&data_dir).await?;
         let task_store = task_list_tool.store();
         tool_registry.register(Box::new(task_list_tool));
+
+        // Background: promote overdue Retrying tasks back to Pending.
+        {
+            let store_for_retry = Arc::clone(&task_store);
+            let poll_secs = config.tasks.retry_poll_interval_secs;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(1)));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    match store_for_retry.promote_due_retries_all().await {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "promoted overdue retrying tasks to pending")
+                        },
+                        Ok(_) => {},
+                        Err(e) => {
+                            tracing::warn!(error = %e, "retry promotion sweep failed")
+                        },
+                    }
+                }
+            });
+        }
         // Register the session-backed task board used by autonomous workflows.
         tool_registry.register(Box::new(
             moltis_plugins::bundled::task_board::TaskBoardTool::new(Arc::clone(
