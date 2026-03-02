@@ -285,7 +285,21 @@ mod tests {
             .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
             .await
             .unwrap();
-        SessionStateStore::run_migrations_for_tests(&pool).await.unwrap();
+        // Create the session_state table inline (avoids depending on a #[cfg(test)]
+        // helper defined in moltis-sessions, which is not visible across crate boundaries).
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS session_state (
+                session_key TEXT NOT NULL,
+                namespace   TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_key, namespace, key)
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let store = SessionStateStore::new(pool.clone());
         (store, pool, dir)
     }
