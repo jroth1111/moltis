@@ -136,10 +136,19 @@ fn parse_before_llm_modified_messages(modified: serde_json::Value) -> Option<Vec
 }
 
 fn next_rate_limit_retry_ms(previous_ms: Option<u64>) -> u64 {
-    previous_ms
+    let base = previous_ms
         .map(|ms| ms.saturating_mul(2))
         .unwrap_or(RATE_LIMIT_INITIAL_RETRY_MS)
-        .clamp(RATE_LIMIT_INITIAL_RETRY_MS, RATE_LIMIT_MAX_RETRY_MS)
+        .clamp(RATE_LIMIT_INITIAL_RETRY_MS, RATE_LIMIT_MAX_RETRY_MS);
+    apply_jitter(base, RATE_LIMIT_MAX_RETRY_MS)
+}
+
+/// Apply ±25% jitter to a delay value, clamped to [1, max_ms].
+fn apply_jitter(base_ms: u64, max_ms: u64) -> u64 {
+    // rand::random::<f64>() is in [0.0, 1.0). Map to [-0.25, +0.25].
+    let jitter_factor = (rand::random::<f64>() - 0.5) * 0.5; // [-0.25, +0.25]
+    let jittered = (base_ms as f64 * (1.0 + jitter_factor)) as u64;
+    jittered.clamp(1, max_ms)
 }
 
 fn parse_retry_delay_ms_from_fragment(
@@ -232,7 +241,7 @@ fn next_retry_delay_ms(
             return None;
         }
         *server_retries_remaining -= 1;
-        return Some(SERVER_RETRY_DELAY.as_millis() as u64);
+        return Some(apply_jitter(SERVER_RETRY_DELAY.as_millis() as u64, RATE_LIMIT_MAX_RETRY_MS));
     }
 
     None
@@ -4445,10 +4454,26 @@ mod tests {
 
     #[test]
     fn test_next_rate_limit_retry_ms_doubles_and_caps() {
-        assert_eq!(next_rate_limit_retry_ms(None), 2_000);
-        assert_eq!(next_rate_limit_retry_ms(Some(2_000)), 4_000);
-        assert_eq!(next_rate_limit_retry_ms(Some(30_000)), 60_000);
-        assert_eq!(next_rate_limit_retry_ms(Some(60_000)), 60_000);
+        // With ±25% jitter the output is non-deterministic, so we verify that
+        // results stay within the expected jittered range rather than checking
+        // exact values.
+        for _ in 0..20 {
+            // None → base 2_000; jitter range [1_500, 2_500].
+            let v = next_rate_limit_retry_ms(None);
+            assert!(v >= 1_500 && v <= 2_500, "None case out of range: {v}");
+
+            // Some(2_000) → base 4_000; jitter range [3_000, 5_000].
+            let v = next_rate_limit_retry_ms(Some(2_000));
+            assert!(v >= 3_000 && v <= 5_000, "Some(2_000) case out of range: {v}");
+
+            // Some(30_000) → base clamped to 60_000; jitter range [45_000, 60_000].
+            let v = next_rate_limit_retry_ms(Some(30_000));
+            assert!(v >= 45_000 && v <= 60_000, "Some(30_000) case out of range: {v}");
+
+            // Some(60_000) → base clamped to 60_000; jitter range [45_000, 60_000].
+            let v = next_rate_limit_retry_ms(Some(60_000));
+            assert!(v >= 45_000 && v <= 60_000, "Some(60_000) case out of range: {v}");
+        }
     }
 
     /// Provider that fails with a 500 on the first call, succeeds on the second.
@@ -4688,5 +4713,25 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(retry_events.len(), 2, "expected two retry events");
         assert!(retry_events.iter().all(|delay| *delay >= 1));
+    }
+
+    #[test]
+    fn jitter_varies_across_calls() {
+        // Run next_rate_limit_retry_ms many times; results should vary.
+        let mut results = std::collections::HashSet::new();
+        for _ in 0..20 {
+            results.insert(next_rate_limit_retry_ms(Some(10_000)));
+        }
+        // With ±25% jitter on 10_000ms, we should get varied results.
+        assert!(results.len() > 1, "jitter should produce varied delays");
+    }
+
+    #[test]
+    fn jitter_stays_within_bounds() {
+        for _ in 0..100 {
+            let v = next_rate_limit_retry_ms(Some(RATE_LIMIT_MAX_RETRY_MS));
+            assert!(v >= 1);
+            assert!(v <= RATE_LIMIT_MAX_RETRY_MS);
+        }
     }
 }
