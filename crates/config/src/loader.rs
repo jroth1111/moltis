@@ -1410,6 +1410,48 @@ name = "Rex"
     }
 
     #[test]
+    fn save_config_to_path_persists_provider_extra_api_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("moltis.toml");
+        std::fs::write(&path, crate::template::default_config_template(18789))
+            .expect("write template");
+
+        let mut config = load_config(&path).expect("load template config");
+        config.providers.providers.insert(
+            "openai".into(),
+            crate::schema::ProviderEntry {
+                api_key: Some(secrecy::Secret::new("sk-openai-primary".into())),
+                extra_api_keys: vec![
+                    secrecy::Secret::new("sk-openai-extra-1".into()),
+                    secrecy::Secret::new("sk-openai-extra-2".into()),
+                ],
+                ..Default::default()
+            },
+        );
+
+        save_config_to_path(&path, &config).expect("save config");
+
+        let saved = std::fs::read_to_string(&path).expect("read saved file");
+        assert!(
+            saved.contains("extra_api_keys"),
+            "expected extra_api_keys to be persisted: {saved}"
+        );
+
+        let reloaded = load_config(&path).expect("reload config");
+        let entry = reloaded
+            .providers
+            .providers
+            .get("openai")
+            .expect("openai provider entry");
+        let extra_values: Vec<&str> = entry
+            .extra_api_keys
+            .iter()
+            .map(|secret| secrecy::ExposeSecret::expose_secret(secret).as_str())
+            .collect();
+        assert_eq!(extra_values, vec!["sk-openai-extra-1", "sk-openai-extra-2"]);
+    }
+
+    #[test]
     fn server_config_default_port_is_zero() {
         // Default port should be 0 (to be replaced with random port on config creation)
         let config = crate::schema::ServerConfig::default();
