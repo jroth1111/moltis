@@ -31,6 +31,14 @@ pub enum CronSchedule {
         #[serde(skip_serializing_if = "Option::is_none")]
         tz: Option<String>,
     },
+    /// Fire when an incoming message matches a regex pattern.
+    EventTrigger {
+        /// Regex pattern to match against the message content.
+        pattern: String,
+        /// Optional channel filter (None = any channel).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel_filter: Option<String>,
+    },
 }
 
 /// What happens when a job fires.

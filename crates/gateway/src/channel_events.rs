@@ -352,6 +352,12 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 let _ = done_tx.send(());
             }
 
+            // TODO(event-triggers): After agent turn completes, check EventMatcher:
+            // let matched_jobs = event_matcher.match_message(channel.as_deref(), &user_message).await;
+            // for job_id in matched_jobs {
+            //     cron_service.enqueue_job(job_id).await?;
+            // }
+
             if let Err(e) = send_result {
                 error!("channel dispatch_to_chat failed: {e}");
                 // Send the error back to the originating channel so the user
