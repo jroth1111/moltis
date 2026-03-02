@@ -42,7 +42,7 @@ impl EstopHook {
 
     fn refresh_from_sentinel(&self) {
         if let Some(path) = &self.sentinel_file {
-            self.stopped.store(path.exists(), Ordering::Relaxed);
+            self.stopped.store(path.exists(), Ordering::SeqCst);
         }
     }
 }
@@ -63,7 +63,7 @@ impl HookHandler for EstopHook {
 
     async fn handle(&self, _event: HookEvent, _payload: &HookPayload) -> Result<HookAction> {
         self.refresh_from_sentinel();
-        if self.stopped.load(Ordering::Relaxed) {
+        if self.stopped.load(Ordering::Acquire) {
             return Ok(HookAction::Block("EMERGENCY STOP active".to_string()));
         }
         Ok(HookAction::Continue)
@@ -71,7 +71,7 @@ impl HookHandler for EstopHook {
 
     fn handle_sync(&self, _event: HookEvent, _payload: &HookPayload) -> Result<HookAction> {
         self.refresh_from_sentinel();
-        if self.stopped.load(Ordering::Relaxed) {
+        if self.stopped.load(Ordering::Acquire) {
             return Ok(HookAction::Block("EMERGENCY STOP active".to_string()));
         }
         Ok(HookAction::Continue)

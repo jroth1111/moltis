@@ -1483,7 +1483,7 @@ pub async fn prepare_gateway(
     {
         let estop_path = data_dir.join("estop");
         if estop_path.exists() {
-            estop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            estop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             tracing::warn!("E-STOP file found at startup — agent actions blocked");
         }
     }
@@ -3772,7 +3772,7 @@ pub async fn prepare_gateway(
                         .get("enable")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    flag.store(enable, std::sync::atomic::Ordering::Relaxed);
+                    flag.store(enable, std::sync::atomic::Ordering::SeqCst);
                     let estop_path = dir.join("estop");
                     if enable {
                         if let Err(e) = std::fs::write(&estop_path, b"") {
@@ -3794,7 +3794,7 @@ pub async fn prepare_gateway(
             .get(move || {
                 let flag = Arc::clone(&estop_flag_get);
                 async move {
-                    let stopped = flag.load(std::sync::atomic::Ordering::Relaxed);
+                    let stopped = flag.load(std::sync::atomic::Ordering::Acquire);
                     Json(serde_json::json!({ "stopped": stopped }))
                 }
             }),
