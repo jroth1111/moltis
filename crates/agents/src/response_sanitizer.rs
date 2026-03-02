@@ -7,7 +7,7 @@
 //! The stripping is done with hand-rolled string scanning (no regex) to match
 //! the existing `strip_base64_blobs` pattern in `runner.rs`.
 
-use crate::leak_detector::LeakDetector;
+use crate::leak_detector::{LeakAction, LeakDetector};
 use crate::model::ToolCall;
 
 /// Known internal XML tags that should be stripped from LLM responses.
@@ -251,17 +251,36 @@ fn parse_tool_call_json(content: &str) -> Option<ToolCall> {
     })
 }
 
-/// Clean a response and then scan for credential leaks.
+/// Scan content for credential leaks and sanitize/block as needed.
 ///
-/// Calls [`clean_response`] first, then runs [`LeakDetector::apply`].
-/// If a `Block`-level credential is detected, logs a warning and returns
-/// `"[BLOCKED: potential credential leak]"`.
+/// This intentionally does not call [`clean_response`], because tool output may
+/// legitimately contain XML-like tags that should not be stripped.
+///
+/// - `Warn` detections are logged but the content is still returned.
+/// - `Redact` detections are replaced in-place.
+/// - `Block` detections return `"[BLOCKED: potential credential leak]"`.
 #[must_use]
 pub fn sanitize_with_leak_detection(text: &str, sensitivity: f64) -> String {
-    let cleaned = clean_response(text);
     let detector = LeakDetector::new(sensitivity);
-    match detector.apply(&cleaned) {
-        Ok(s) => s,
+    let mut warn_patterns: Vec<&'static str> = Vec::new();
+    for leak_match in detector.scan(text) {
+        if leak_match.action == LeakAction::Warn
+            && !warn_patterns.contains(&leak_match.pattern_name)
+        {
+            warn_patterns.push(leak_match.pattern_name);
+        }
+    }
+
+    match detector.apply(text) {
+        Ok(s) => {
+            for pattern in warn_patterns {
+                tracing::warn!(
+                    pattern = %pattern,
+                    "potential credential leak detected (warn-only)"
+                );
+            }
+            s
+        },
         Err(pattern) => {
             tracing::warn!(
                 pattern = %pattern,
@@ -427,5 +446,28 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+
+    // ── sanitize_with_leak_detection ───────────────────────────────
+
+    #[test]
+    fn sanitize_with_leak_detection_preserves_tool_tag_content() {
+        let input = r#"{"result":"<thinking>model diagnostics</thinking>","status":"ok"}"#;
+        let output = sanitize_with_leak_detection(input, 0.0);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn sanitize_with_leak_detection_warn_does_not_block_content() {
+        let input = "-----BEGIN CERTIFICATE-----\nMIIBxTCCAW...";
+        let output = sanitize_with_leak_detection(input, 1.0);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn sanitize_with_leak_detection_blocks_block_patterns() {
+        let input = "creds: AKIAIOSFODNN7EXAMPLE";
+        let output = sanitize_with_leak_detection(input, 1.0);
+        assert_eq!(output, "[BLOCKED: potential credential leak]");
     }
 }
