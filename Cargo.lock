@@ -5722,6 +5722,7 @@ dependencies = [
  "secrecy 0.8.0",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -6558,7 +6559,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-tinder"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "anyhow",
  "async-trait",
