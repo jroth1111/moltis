@@ -508,6 +508,7 @@ pub async fn run_agent_loop_with_context(
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
     let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
+    let provider_call_timeout_secs = config.tools.provider_call_timeout_secs;
     let tool_schemas = tools.list_schemas();
 
     let is_multimodal = matches!(user_content, UserContent::Multimodal(_));
@@ -517,6 +518,7 @@ pub async fn run_agent_loop_with_context(
         native_tools,
         tools_count = tool_schemas.len(),
         is_multimodal,
+        provider_call_timeout_secs,
         "starting agent loop"
     );
 
@@ -620,8 +622,29 @@ pub async fn run_agent_loop_with_context(
             cb(RunnerEvent::Thinking);
         }
 
-        let mut response: CompletionResponse =
-            match provider.complete(&messages, schemas_for_api).await {
+        let completion_result = if provider_call_timeout_secs > 0 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(provider_call_timeout_secs),
+                provider.complete(&messages, schemas_for_api),
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    warn!(
+                        timeout_secs = provider_call_timeout_secs,
+                        "provider call timed out"
+                    );
+                    Err(anyhow::anyhow!(
+                        "provider call timed out after {provider_call_timeout_secs}s"
+                    ))
+                },
+            }
+        } else {
+            provider.complete(&messages, schemas_for_api).await
+        };
+
+        let mut response: CompletionResponse = match completion_result {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
@@ -641,9 +664,9 @@ pub async fn run_agent_loop_with_context(
                             warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
                         }
                     }
-                if classify_error_message(&msg) == ProviderErrorKind::ContextWindow {
-                    return Err(AgentRunError::ContextWindowExceeded(msg));
-                }
+                    if classify_error_message(&msg) == ProviderErrorKind::ContextWindow {
+                        return Err(AgentRunError::ContextWindowExceeded(msg));
+                    }
                     if let Some(delay_ms) = next_retry_delay_ms(
                         &msg,
                         &mut server_retries_remaining,

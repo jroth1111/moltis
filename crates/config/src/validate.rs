@@ -250,6 +250,7 @@ fn build_schema_map() -> KnownKeys {
             ),
             ("maps", Struct(HashMap::from([("provider", Leaf)]))),
             ("agent_timeout_secs", Leaf),
+            ("provider_call_timeout_secs", Leaf),
             ("agent_max_iterations", Leaf),
             ("max_tool_result_bytes", Leaf),
             ("leak_detection_sensitivity", Leaf),

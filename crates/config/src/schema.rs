@@ -1327,6 +1327,10 @@ pub struct ToolsConfig {
     /// Maximum wall-clock seconds for an agent run (0 = no timeout). Default 600.
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
+    /// Maximum wall-clock seconds for a single provider completion call (0 = no timeout).
+    /// Default 120.
+    #[serde(default = "default_provider_call_timeout_secs")]
+    pub provider_call_timeout_secs: u64,
     /// Maximum number of agent loop iterations before aborting. Default 25.
     #[serde(default = "default_agent_max_iterations")]
     pub agent_max_iterations: usize,
@@ -1348,6 +1352,7 @@ impl Default for ToolsConfig {
             maps: MapsConfig::default(),
             browser: BrowserConfig::default(),
             agent_timeout_secs: default_agent_timeout_secs(),
+            provider_call_timeout_secs: default_provider_call_timeout_secs(),
             agent_max_iterations: default_agent_max_iterations(),
             max_tool_result_bytes: default_max_tool_result_bytes(),
             leak_detection_sensitivity: default_leak_detection_sensitivity(),
@@ -1357,6 +1362,10 @@ impl Default for ToolsConfig {
 
 fn default_agent_timeout_secs() -> u64 {
     600
+}
+
+fn default_provider_call_timeout_secs() -> u64 {
+    120
 }
 
 fn default_agent_max_iterations() -> usize {

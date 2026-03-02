@@ -1228,6 +1228,16 @@ mod tests {
     }
 
     #[test]
+    fn apply_env_overrides_tools_provider_call_timeout() {
+        let vars = vec![(
+            "MOLTIS_TOOLS__PROVIDER_CALL_TIMEOUT_SECS".into(),
+            "45".into(),
+        )];
+        let config = apply_env_overrides_with(MoltisConfig::default(), vars.into_iter());
+        assert_eq!(config.tools.provider_call_timeout_secs, 45);
+    }
+
+    #[test]
     fn apply_env_overrides_tools_agent_max_iterations() {
         let vars = vec![("MOLTIS_TOOLS__AGENT_MAX_ITERATIONS".into(), "64".into())];
         let config = apply_env_overrides_with(MoltisConfig::default(), vars.into_iter());
