@@ -7,6 +7,7 @@
 //! The stripping is done with hand-rolled string scanning (no regex) to match
 //! the existing `strip_base64_blobs` pattern in `runner.rs`.
 
+use crate::leak_detector::LeakDetector;
 use crate::model::ToolCall;
 
 /// Known internal XML tags that should be stripped from LLM responses.
@@ -248,6 +249,27 @@ fn parse_tool_call_json(content: &str) -> Option<ToolCall> {
         name,
         arguments,
     })
+}
+
+/// Clean a response and then scan for credential leaks.
+///
+/// Calls [`clean_response`] first, then runs [`LeakDetector::apply`].
+/// If a `Block`-level credential is detected, logs a warning and returns
+/// `"[BLOCKED: potential credential leak]"`.
+#[must_use]
+pub fn sanitize_with_leak_detection(text: &str, sensitivity: f64) -> String {
+    let cleaned = clean_response(text);
+    let detector = LeakDetector::new(sensitivity);
+    match detector.apply(&cleaned) {
+        Ok(s) => s,
+        Err(pattern) => {
+            tracing::warn!(
+                pattern = %pattern,
+                "blocked content due to potential credential leak"
+            );
+            "[BLOCKED: potential credential leak]".to_string()
+        }
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]

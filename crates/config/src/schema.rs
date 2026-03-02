@@ -1271,6 +1271,10 @@ pub struct ToolsConfig {
     /// Maximum bytes for a single tool result before truncation. Default 50KB.
     #[serde(default = "default_max_tool_result_bytes")]
     pub max_tool_result_bytes: usize,
+    /// Sensitivity for credential leak detection (0.0 = off, 1.0 = maximum).
+    /// At > 0.5, entropy-based detection is also enabled.
+    #[serde(default = "default_leak_detection_sensitivity")]
+    pub leak_detection_sensitivity: f64,
 }
 
 impl Default for ToolsConfig {
@@ -1284,6 +1288,7 @@ impl Default for ToolsConfig {
             agent_timeout_secs: default_agent_timeout_secs(),
             agent_max_iterations: default_agent_max_iterations(),
             max_tool_result_bytes: default_max_tool_result_bytes(),
+            leak_detection_sensitivity: default_leak_detection_sensitivity(),
         }
     }
 }
@@ -1298,6 +1303,10 @@ fn default_agent_max_iterations() -> usize {
 
 fn default_max_tool_result_bytes() -> usize {
     50_000
+}
+
+fn default_leak_detection_sensitivity() -> f64 {
+    0.5_f64
 }
 
 /// Map tools configuration.
