@@ -4,12 +4,7 @@ use tracing::debug;
 /// Time-to-live for a session lock in milliseconds (5 minutes).
 const LOCK_TTL_MS: i64 = 5 * 60 * 1000;
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
+use crate::util::now_ms;
 
 /// Advisory lock using the session_state table to prevent concurrent
 /// Tinder sessions from stepping on each other.

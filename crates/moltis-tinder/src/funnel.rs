@@ -73,12 +73,7 @@ pub struct TinderMatch {
     pub updated_at: i64,
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
+use crate::util::now_ms;
 
 pub async fn get_match(pool: &sqlx::SqlitePool, id: &str) -> anyhow::Result<Option<TinderMatch>> {
     let row = sqlx::query_as::<_, MatchRow>(

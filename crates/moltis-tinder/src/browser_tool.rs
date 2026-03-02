@@ -111,13 +111,17 @@ impl AgentTool for TinderBrowserTool {
         }
 
         // On successful "type" command, increment exchange count.
-        if command == "type" {
+        let exchange_synced = if command == "type" {
             if let Some(match_id) = params["match_id"].as_str() {
-                if let Err(e) = funnel::increment_exchange(&self.pool, match_id).await {
-                    warn!(match_id = %match_id, error = %e, "failed to increment exchange count");
+                match funnel::increment_exchange(&self.pool, match_id).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        warn!(match_id = %match_id, error = %e, "failed to increment exchange count");
+                        false
+                    }
                 }
-            }
-        }
+            } else { true }
+        } else { true };
 
         // Handle screenshots: detect base64 image data in output.
         let mut screenshot_path: Option<String> = None;
@@ -132,7 +136,8 @@ impl AgentTool for TinderBrowserTool {
 
         let mut result = json!({
             "status": "ok",
-            "output": stdout
+            "output": stdout,
+            "exchange_count_synced": exchange_synced
         });
         if let Some(path) = screenshot_path {
             result["screenshot_path"] = json!(path);
