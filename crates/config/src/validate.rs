@@ -455,6 +455,13 @@ fn build_schema_map() -> KnownKeys {
             ])),
         ),
         (
+            "provider_rate_limits",
+            Map(Box::new(Struct(HashMap::from([(
+                "requests_per_minute",
+                Leaf,
+            )])))),
+        ),
+        (
             "heartbeat",
             Struct(HashMap::from([
                 ("enabled", Leaf),

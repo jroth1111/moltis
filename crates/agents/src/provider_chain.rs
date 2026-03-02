@@ -22,6 +22,7 @@ use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 use crate::{
     classify,
     model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent},
+    rate_limiter::{ProviderRateLimiter, RateLimitDecision},
 };
 
 // ── Circuit breaker (same pattern as embeddings_fallback.rs) ─────────────
@@ -73,6 +74,9 @@ struct ChainEntry {
     state: ProviderState,
 }
 
+/// Maximum time to wait for a rate limit slot before trying failover.
+const RATE_LIMIT_WAIT_CAP: Duration = Duration::from_secs(10);
+
 /// Failover chain that tries providers in order, with circuit breakers.
 ///
 /// Implements `LlmProvider` itself so callers don't need to know about failover.
@@ -80,6 +84,7 @@ pub struct ProviderChain {
     chain: Vec<ChainEntry>,
     cb_threshold: usize,
     cb_cooldown: Duration,
+    rate_limiter: Option<Arc<ProviderRateLimiter>>,
 }
 
 impl ProviderChain {
@@ -96,6 +101,7 @@ impl ProviderChain {
             chain,
             cb_threshold: 3,
             cb_cooldown: Duration::from_secs(60),
+            rate_limiter: None,
         }
     }
 
@@ -108,6 +114,12 @@ impl ProviderChain {
     pub fn with_circuit_breaker(mut self, threshold: usize, cooldown: Duration) -> Self {
         self.cb_threshold = threshold;
         self.cb_cooldown = cooldown;
+        self
+    }
+
+    /// Attach a shared outbound rate limiter.
+    pub fn with_rate_limiter(mut self, limiter: Arc<ProviderRateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -151,9 +163,53 @@ impl LlmProvider for ProviderChain {
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
 
+            // Check outbound rate limit before calling the provider.
+            if let Some(ref rl) = self.rate_limiter {
+                match rl.check(&provider_name, &model_id) {
+                    RateLimitDecision::Wait(wait) => {
+                        if wait > RATE_LIMIT_WAIT_CAP {
+                            // Too long to wait — skip to next provider.
+                            #[cfg(feature = "metrics")]
+                            counter!("moltis_provider_rate_limit_rejected").increment(1);
+
+                            warn!(
+                                provider = %provider_name,
+                                model = %model_id,
+                                wait_ms = wait.as_millis() as u64,
+                                "rate limit wait exceeds cap, trying next provider"
+                            );
+                            errors.push(format!(
+                                "{}: rate limited (wait {}ms > cap {}ms)",
+                                model_id,
+                                wait.as_millis(),
+                                RATE_LIMIT_WAIT_CAP.as_millis()
+                            ));
+                            continue;
+                        }
+                        // Wait within the cap.
+                        #[cfg(feature = "metrics")]
+                        counter!("moltis_provider_rate_limit_queued").increment(1);
+
+                        tracing::debug!(
+                            provider = %provider_name,
+                            model = %model_id,
+                            wait_ms = wait.as_millis() as u64,
+                            "waiting for rate limit slot"
+                        );
+                        tokio::time::sleep(wait).await;
+                    },
+                    RateLimitDecision::Allowed => {},
+                }
+            }
+
             match entry.provider.complete(messages, tools).await {
                 Ok(resp) => {
                     entry.state.record_success();
+
+                    // Record the call for rate limiting.
+                    if let Some(ref rl) = self.rate_limiter {
+                        rl.record(&provider_name, &model_id);
+                    }
 
                     // Record metrics on successful completion
                     #[cfg(feature = "metrics")]
@@ -209,6 +265,22 @@ impl LlmProvider for ProviderChain {
                     let kind = classify::classify_anyhow(&e);
                     entry.state.record_failure();
 
+                    // Record the call for rate limiting even on failure.
+                    if let Some(ref rl) = self.rate_limiter {
+                        rl.record(&provider_name, &model_id);
+
+                        // If it was a rate limit error, apply retry-after hint.
+                        if kind == classify::ProviderErrorKind::RateLimit {
+                            let wait_ms = classify::extract_retry_after_ms(&e.to_string(), 60_000)
+                                .unwrap_or(10_000);
+                            rl.apply_retry_after(
+                                &provider_name,
+                                &model_id,
+                                Duration::from_millis(wait_ms),
+                            );
+                        }
+                    }
+
                     // Record error metrics
                     #[cfg(feature = "metrics")]
                     {
@@ -255,15 +327,36 @@ impl LlmProvider for ProviderChain {
         messages: Vec<ChatMessage>,
         tools: Vec<serde_json::Value>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
-        // For streaming, we try the first non-tripped provider.
+        // For streaming, we try the first non-tripped, non-rate-limited provider.
         // If the stream yields an Error event, we can't transparently retry mid-stream,
         // so we pick the best available provider upfront.
         for entry in &self.chain {
-            if !entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
-                return entry.provider.stream_with_tools(messages, tools);
+            if entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
+                continue;
             }
+
+            // Check rate limiter — skip providers that would require waiting
+            // longer than the cap.
+            if let Some(ref rl) = self.rate_limiter {
+                let provider_name = entry.provider.name();
+                let model_id = entry.provider.id();
+                if let RateLimitDecision::Wait(wait) = rl.check(provider_name, model_id) {
+                    if wait > RATE_LIMIT_WAIT_CAP {
+                        #[cfg(feature = "metrics")]
+                        counter!("moltis_provider_rate_limit_rejected").increment(1);
+                        continue;
+                    }
+                }
+                rl.record(provider_name, model_id);
+            }
+
+            return entry.provider.stream_with_tools(messages, tools);
         }
-        // All tripped — try primary anyway (it may have cooled down by now).
+        // All tripped or rate limited — try primary anyway.
+        if let Some(ref rl) = self.rate_limiter {
+            let p = self.primary();
+            rl.record(p.provider.name(), p.provider.id());
+        }
         self.primary().provider.stream_with_tools(messages, tools)
     }
 }

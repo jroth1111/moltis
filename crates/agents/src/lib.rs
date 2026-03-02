@@ -15,6 +15,7 @@ pub use {
 };
 pub mod leak_detector;
 pub mod provider_chain;
+pub mod rate_limiter;
 pub mod research;
 pub mod response_sanitizer;
 pub mod self_repair;
