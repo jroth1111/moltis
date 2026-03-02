@@ -47,6 +47,16 @@ impl RateLimit {
     }
 }
 
+impl Clone for RateLimit {
+    fn clone(&self) -> Self {
+        Self {
+            max_per_minute: self.max_per_minute,
+            remaining: Arc::clone(&self.remaining),
+            // Shares the existing 60s reset task — does NOT spawn a new one
+        }
+    }
+}
+
 /// Agent-callable tool.
 #[async_trait]
 pub trait AgentTool: Send + Sync {
@@ -208,7 +218,7 @@ impl ToolRegistry {
                 (name.clone(), ToolEntry {
                     tool: Arc::clone(&entry.tool),
                     source: entry.source.clone(),
-                    rate_limit: None,
+                    rate_limit: entry.rate_limit.clone(),
                 })
             })
             .collect();
@@ -225,7 +235,7 @@ impl ToolRegistry {
                 (name.clone(), ToolEntry {
                     tool: Arc::clone(&entry.tool),
                     source: entry.source.clone(),
-                    rate_limit: None,
+                    rate_limit: entry.rate_limit.clone(),
                 })
             })
             .collect();
@@ -242,7 +252,7 @@ impl ToolRegistry {
                 (name.clone(), ToolEntry {
                     tool: Arc::clone(&entry.tool),
                     source: entry.source.clone(),
-                    rate_limit: None,
+                    rate_limit: entry.rate_limit.clone(),
                 })
             })
             .collect();
@@ -262,7 +272,7 @@ impl ToolRegistry {
                 (name.clone(), ToolEntry {
                     tool: Arc::clone(&entry.tool),
                     source: entry.source.clone(),
-                    rate_limit: None,
+                    rate_limit: entry.rate_limit.clone(),
                 })
             })
             .collect();

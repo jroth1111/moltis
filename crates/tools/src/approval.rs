@@ -412,17 +412,17 @@ pub async fn recover_pending(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    // Clean expired
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM pending_approvals WHERE expires_at < ?")
         .bind(now)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    // Return remaining
     let rows = sqlx::query_as::<_, (String, String, String, String)>(
         "SELECT id, session_key, tool_name, arguments FROM pending_approvals",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(rows)
 }
 

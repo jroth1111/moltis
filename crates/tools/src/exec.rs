@@ -102,10 +102,6 @@ pub async fn exec_command(command: &str, opts: &ExecOpts) -> Result<ExecResult> 
     if let Some(ref dir) = opts.working_dir {
         cmd.current_dir(dir);
     }
-    for (k, v) in &opts.env {
-        cmd.env(k, v);
-    }
-
     // Scrub the inherited environment to avoid leaking secrets to child processes.
     const SAFE_ENV_VARS: &[&str] = &["PATH", "HOME", "USER", "LANG", "TMPDIR", "TERM", "DISPLAY"];
     cmd.env_clear();
@@ -113,6 +109,10 @@ pub async fn exec_command(command: &str, opts: &ExecOpts) -> Result<ExecResult> 
         if let Ok(val) = std::env::var(v) {
             cmd.env(v, val);
         }
+    }
+    // Apply caller-provided env vars AFTER clearing — these intentionally override/augment
+    for (k, v) in &opts.env {
+        cmd.env(k, v);
     }
 
     cmd.stdout(std::process::Stdio::piped());
