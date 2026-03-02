@@ -222,3 +222,18 @@ pub struct SkillContent {
     pub metadata: SkillMetadata,
     pub body: String,
 }
+
+/// Trust level for an active skill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillTrust {
+    /// Shipped with or explicitly trusted by the user.
+    Trusted,
+    /// Installed from an external source, not yet trusted.
+    Installed,
+}
+
+impl From<bool> for SkillTrust {
+    fn from(trusted: bool) -> Self {
+        if trusted { Self::Trusted } else { Self::Installed }
+    }
+}
