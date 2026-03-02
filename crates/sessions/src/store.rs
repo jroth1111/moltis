@@ -19,6 +19,14 @@ pub struct SearchResult {
     pub message_index: usize,
 }
 
+/// Result of reading a session file, including skip statistics.
+#[derive(Debug, Clone)]
+pub struct ReadResult<T> {
+    pub messages: Vec<T>,
+    pub skipped_lines: usize,
+    pub total_lines: usize,
+}
+
 /// Append-only JSONL session storage with file locking.
 pub struct SessionStore {
     pub base_dir: PathBuf,
@@ -105,33 +113,59 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Read all messages from a session file.
-    pub async fn read(&self, key: &str) -> Result<Vec<serde_json::Value>> {
+    /// Read all messages from a session file with skip statistics.
+    pub async fn read_with_stats(&self, key: &str) -> Result<ReadResult<serde_json::Value>> {
         let path = self.path_for(key);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>> {
+        tokio::task::spawn_blocking(move || -> Result<ReadResult<serde_json::Value>> {
             if !path.exists() {
-                return Ok(vec![]);
+                return Ok(ReadResult {
+                    messages: vec![],
+                    skipped_lines: 0,
+                    total_lines: 0,
+                });
             }
             let file = File::open(&path)?;
             let reader = BufReader::new(file);
             let mut messages = Vec::new();
+            let mut total_lines = 0usize;
+            let mut skipped_lines = 0usize;
             for line in reader.lines() {
                 let line = line?;
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
+                total_lines += 1;
                 match serde_json::from_str(trimmed) {
                     Ok(val) => messages.push(val),
                     Err(e) => {
+                        skipped_lines += 1;
                         tracing::warn!("skipping malformed JSONL line: {e}");
                     },
                 }
             }
-            Ok(messages)
+            Ok(ReadResult {
+                messages,
+                skipped_lines,
+                total_lines,
+            })
         })
         .await?
+    }
+
+    /// Read all messages from a session file.
+    pub async fn read(&self, key: &str) -> Result<Vec<serde_json::Value>> {
+        let result = self.read_with_stats(key).await?;
+        if result.skipped_lines > 0 {
+            tracing::warn!(
+                session = key,
+                skipped = result.skipped_lines,
+                total = result.total_lines,
+                "session file contained malformed lines"
+            );
+        }
+        Ok(result.messages)
     }
 
     /// Read all messages from a session that match a given `run_id`.
@@ -492,6 +526,66 @@ impl SessionStore {
                 .filter(|l| !l.trim().is_empty())
                 .count();
             Ok(count as u32)
+        })
+        .await?
+    }
+
+    /// Repair a session file by removing malformed JSONL lines.
+    ///
+    /// Reads the raw file, writes only valid JSON lines to a temp file,
+    /// then atomically renames it over the original. Returns the count
+    /// of removed lines.
+    pub async fn repair(&self, key: &str) -> Result<usize> {
+        let path = self.path_for(key);
+
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            if !path.exists() {
+                return Ok(0);
+            }
+            let file = File::open(&path)?;
+            let reader = BufReader::new(file);
+
+            let mut valid_lines = Vec::new();
+            let mut removed = 0usize;
+
+            for line in reader.lines() {
+                let line = line?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(_) => valid_lines.push(line),
+                    Err(e) => {
+                        removed += 1;
+                        tracing::warn!("repair: removing malformed line: {e}");
+                    },
+                }
+            }
+
+            if removed > 0 {
+                // Write valid lines to a temp file in the same directory, then rename.
+                let parent = path.parent().unwrap_or(std::path::Path::new("."));
+                let tmp_path = parent.join(format!(".repair-{}.tmp", uuid::Uuid::new_v4()));
+                {
+                    let file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&tmp_path)?;
+                    let mut lock = RwLock::new(file);
+                    let mut guard = lock
+                        .write()
+                        .map_err(|e| Error::lock_failed(e.to_string()))?;
+                    for line in &valid_lines {
+                        writeln!(*guard, "{line}")?;
+                    }
+                    guard.sync_data()?;
+                }
+                fs::rename(&tmp_path, &path)?;
+            }
+
+            Ok(removed)
         })
         .await?
     }
@@ -954,11 +1048,17 @@ mod tests {
 
         // Filename must not be empty and must be a .jsonl file.
         assert!(!filename.is_empty());
-        assert!(filename.ends_with(".jsonl"), "expected .jsonl, got {filename}");
+        assert!(
+            filename.ends_with(".jsonl"),
+            "expected .jsonl, got {filename}"
+        );
 
         // Archive file must exist under archive/.
         let archive_path = dir.path().join("archive").join(&filename);
-        assert!(archive_path.exists(), "archive file not found: {archive_path:?}");
+        assert!(
+            archive_path.exists(),
+            "archive file not found: {archive_path:?}"
+        );
 
         // Archive file must contain the same number of lines as messages.
         let content = fs::read_to_string(&archive_path).unwrap();
@@ -981,7 +1081,10 @@ mod tests {
             .unwrap();
 
         // Colons must be replaced by underscores in the filename.
-        assert!(!filename.contains(':'), "filename must not contain colons: {filename}");
+        assert!(
+            !filename.contains(':'),
+            "filename must not contain colons: {filename}"
+        );
         let archive_path = dir.path().join("archive").join(&filename);
         assert!(archive_path.exists());
     }
@@ -1000,7 +1103,10 @@ mod tests {
         let mut same_second_pair: Option<(String, String)> = None;
         for _ in 0..32 {
             let first = store
-                .archive_to_cold_store("session:abc", &[json!({"role": "user", "content": "first"})])
+                .archive_to_cold_store(
+                    "session:abc",
+                    &[json!({"role": "user", "content": "first"})],
+                )
                 .await
                 .unwrap();
             let second = store
@@ -1041,7 +1147,10 @@ mod tests {
 
         for i in 0..10 {
             store
-                .append("main", &json!({"role": "user", "content": format!("msg-{i}")}))
+                .append(
+                    "main",
+                    &json!({"role": "user", "content": format!("msg-{i}")}),
+                )
                 .await
                 .unwrap();
         }
@@ -1061,7 +1170,10 @@ mod tests {
 
         for i in 0..3 {
             store
-                .append("main", &json!({"role": "user", "content": format!("msg-{i}")}))
+                .append(
+                    "main",
+                    &json!({"role": "user", "content": format!("msg-{i}")}),
+                )
                 .await
                 .unwrap();
         }
@@ -1071,5 +1183,85 @@ mod tests {
 
         let msgs = store.read("main").await.unwrap();
         assert_eq!(msgs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_read_with_stats_counts_skipped() {
+        let (store, dir) = temp_store();
+        let path = dir.path().join("main.jsonl");
+        // Write a mix of valid and invalid lines.
+        fs::write(
+            &path,
+            r#"{"role":"user","content":"hello"}
+not valid json
+{"role":"assistant","content":"hi"}
+also broken {{{
+"#,
+        )
+        .unwrap();
+
+        let result = store.read_with_stats("main").await.unwrap();
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.skipped_lines, 2);
+        assert_eq!(result.total_lines, 4);
+    }
+
+    #[tokio::test]
+    async fn test_read_with_stats_empty_file() {
+        let (store, _dir) = temp_store();
+        let result = store.read_with_stats("nonexistent").await.unwrap();
+        assert_eq!(result.messages.len(), 0);
+        assert_eq!(result.skipped_lines, 0);
+        assert_eq!(result.total_lines, 0);
+    }
+
+    #[tokio::test]
+    async fn test_repair_removes_bad_lines() {
+        let (store, dir) = temp_store();
+        let path = dir.path().join("main.jsonl");
+        fs::write(
+            &path,
+            r#"{"role":"user","content":"hello"}
+not valid json
+{"role":"assistant","content":"hi"}
+"#,
+        )
+        .unwrap();
+
+        let removed = store.repair("main").await.unwrap();
+        assert_eq!(removed, 1);
+
+        // After repair, all lines should be valid.
+        let result = store.read_with_stats("main").await.unwrap();
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.skipped_lines, 0);
+    }
+
+    #[tokio::test]
+    async fn test_repair_preserves_valid_data() {
+        let (store, _dir) = temp_store();
+        store
+            .append("main", &json!({"role": "user", "content": "hello"}))
+            .await
+            .unwrap();
+        store
+            .append("main", &json!({"role": "assistant", "content": "hi"}))
+            .await
+            .unwrap();
+
+        let removed = store.repair("main").await.unwrap();
+        assert_eq!(removed, 0);
+
+        let msgs = store.read("main").await.unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "hello");
+        assert_eq!(msgs[1]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn test_repair_nonexistent_file() {
+        let (store, _dir) = temp_store();
+        let removed = store.repair("nonexistent").await.unwrap();
+        assert_eq!(removed, 0);
     }
 }
