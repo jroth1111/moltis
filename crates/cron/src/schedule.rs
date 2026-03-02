@@ -186,4 +186,13 @@ mod tests {
         };
         assert!(compute_next_run(&s, 1000).is_err());
     }
+
+    #[test]
+    fn test_event_trigger_has_no_scheduled_next_run() {
+        let s = CronSchedule::EventTrigger {
+            pattern: "billing".into(),
+            channel_filter: None,
+        };
+        assert_eq!(compute_next_run(&s, 1000).unwrap(), None);
+    }
 }

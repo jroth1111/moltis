@@ -113,6 +113,7 @@ fn normalize_schedule_kind(raw: &str) -> Option<&'static str> {
         "at" | "once" | "oneshot" | "one-shot" => Some("at"),
         "every" | "interval" | "recurring" => Some("every"),
         "cron" => Some("cron"),
+        "eventtrigger" | "event_trigger" | "event-trigger" | "event" => Some("eventTrigger"),
         _ => None,
     }
 }
@@ -161,6 +162,8 @@ fn normalize_schedule_value(schedule: &mut Value) -> Result<()> {
                 "expression",
                 "cron",
             ]);
+            take_alias(obj, "pattern", &["regex", "match", "messagePattern", "message_pattern"]);
+            take_alias(obj, "channel_filter", &["channelFilter", "channelType", "channel_type"]);
 
             if let Some(kind_val) = obj.get_mut("kind") {
                 let kind_raw = kind_val
@@ -168,7 +171,7 @@ fn normalize_schedule_value(schedule: &mut Value) -> Result<()> {
                     .ok_or_else(|| Error::message("schedule.kind must be a string"))?;
                 let kind_norm = normalize_schedule_kind(kind_raw).ok_or_else(|| {
                     Error::message(format!(
-                        "invalid schedule kind `{kind_raw}` (expected `at`, `every`, or `cron`)"
+                        "invalid schedule kind `{kind_raw}` (expected `at`, `every`, `cron`, or `eventTrigger`)"
                     ))
                 })?;
                 *kind_val = Value::String(kind_norm.to_string());
@@ -176,7 +179,8 @@ fn normalize_schedule_value(schedule: &mut Value) -> Result<()> {
                 let has_at = obj.contains_key("at_ms");
                 let has_every = obj.contains_key("every_ms");
                 let has_expr = obj.contains_key("expr");
-                let count = [has_at, has_every, has_expr]
+                let has_pattern = obj.contains_key("pattern");
+                let count = [has_at, has_every, has_expr, has_pattern]
                     .into_iter()
                     .filter(|has| *has)
                     .count();
@@ -185,14 +189,15 @@ fn normalize_schedule_value(schedule: &mut Value) -> Result<()> {
                     1 if has_at => "at",
                     1 if has_every => "every",
                     1 if has_expr => "cron",
+                    1 if has_pattern => "eventTrigger",
                     0 => {
                         return Err(Error::message(
-                            "invalid schedule: missing `kind` and no recognizable fields (expected one of `at_ms`, `every_ms`, `expr`)",
+                            "invalid schedule: missing `kind` and no recognizable fields (expected one of `at_ms`, `every_ms`, `expr`, `pattern`)",
                         ));
                     },
                     _ => {
                         return Err(Error::message(
-                            "invalid schedule: ambiguous fields, specify `kind` explicitly (`at`, `every`, or `cron`)",
+                            "invalid schedule: ambiguous fields, specify `kind` explicitly (`at`, `every`, `cron`, or `eventTrigger`)",
                         ));
                     },
                 };
@@ -230,6 +235,41 @@ fn normalize_schedule_value(schedule: &mut Value) -> Result<()> {
                         .filter(|expr| !expr.is_empty())
                         .ok_or_else(|| Error::message("schedule kind `cron` requires `expr`"))?;
                     obj.insert("expr".to_string(), Value::String(expr.to_string()));
+                },
+                "eventTrigger" => {
+                    let pattern = obj
+                        .get("pattern")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|pattern| !pattern.is_empty())
+                        .ok_or_else(|| {
+                            Error::message("schedule kind `eventTrigger` requires `pattern`")
+                        })?;
+                    obj.insert("pattern".to_string(), Value::String(pattern.to_string()));
+
+                    if let Some(channel_raw) = obj.get("channel_filter") {
+                        match channel_raw {
+                            Value::Null => {
+                                obj.remove("channel_filter");
+                            },
+                            Value::String(channel) => {
+                                let channel = channel.trim();
+                                if channel.is_empty() {
+                                    obj.remove("channel_filter");
+                                } else {
+                                    obj.insert(
+                                        "channel_filter".to_string(),
+                                        Value::String(channel.to_string()),
+                                    );
+                                }
+                            },
+                            _ => {
+                                return Err(Error::message(
+                                    "schedule.channel_filter must be a string when provided",
+                                ));
+                            },
+                        }
+                    }
                 },
                 _ => unreachable!("schedule kind normalized above"),
             }
@@ -649,14 +689,16 @@ impl AgentTool for CronTool {
                         "name": { "type": "string", "description": "Human-readable job name" },
                         "schedule": {
                             "type": "object",
-                            "description": "Schedule object. Use {kind:'at', at_ms}, {kind:'every', every_ms, anchor_ms?}, or {kind:'cron', expr, tz?}. This tool also accepts shorthand schedule strings/numbers at runtime.",
+                            "description": "Schedule object. Use {kind:'at', at_ms}, {kind:'every', every_ms, anchor_ms?}, {kind:'cron', expr, tz?}, or {kind:'eventTrigger', pattern, channel_filter?}. This tool also accepts shorthand schedule strings/numbers at runtime.",
                             "properties": {
-                                "kind": { "type": "string", "enum": ["at", "every", "cron"] },
+                                "kind": { "type": "string", "enum": ["at", "every", "cron", "eventTrigger"] },
                                 "at_ms": { "type": "integer", "description": "Used when kind='at'" },
                                 "every_ms": { "type": "integer", "description": "Used when kind='every'" },
                                 "anchor_ms": { "type": "integer", "description": "Optional anchor when kind='every'" },
                                 "expr": { "type": "string", "description": "Cron expression used when kind='cron'" },
-                                "tz": { "type": "string", "description": "Optional timezone used when kind='cron'" }
+                                "tz": { "type": "string", "description": "Optional timezone used when kind='cron'" },
+                                "pattern": { "type": "string", "description": "Regex pattern used when kind='eventTrigger'" },
+                                "channel_filter": { "type": "string", "description": "Optional channel type filter used when kind='eventTrigger'" }
                             },
                             "required": ["kind"]
                         },
@@ -941,6 +983,31 @@ mod tests {
 
         assert_eq!(add_result["schedule"]["kind"], "cron");
         assert_eq!(add_result["schedule"]["expr"], "0 9 * * *");
+    }
+
+    #[tokio::test]
+    async fn test_add_accepts_event_trigger_schedule() {
+        let tool = make_tool();
+        let add_result = tool
+            .execute(json!({
+                "action": "add",
+                "job": {
+                    "name": "billing escalation",
+                    "schedule": {
+                        "kind": "eventTrigger",
+                        "pattern": "(?i)billing|invoice",
+                        "channelFilter": "telegram"
+                    },
+                    "payload": { "kind": "agentTurn", "message": "triage billing request" },
+                    "sessionTarget": "isolated"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(add_result["schedule"]["kind"], "eventTrigger");
+        assert_eq!(add_result["schedule"]["pattern"], "(?i)billing|invoice");
+        assert_eq!(add_result["schedule"]["channel_filter"], "telegram");
     }
 
     #[tokio::test]
