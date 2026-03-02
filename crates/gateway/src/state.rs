@@ -2,13 +2,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
-
-#[cfg(feature = "graphql")]
-use std::sync::atomic::AtomicBool;
 
 #[cfg(feature = "metrics")]
 use moltis_metrics::MetricsHandle;
@@ -463,6 +460,9 @@ pub struct GatewayState {
     pub seq: AtomicU64,
     /// Sequential counter for TTS test phrase round-robin picking.
     pub tts_phrase_counter: AtomicUsize,
+    /// Set to `true` during graceful shutdown. New WebSocket upgrades are
+    /// rejected with 503 when this flag is set.
+    pub shutting_down: AtomicBool,
 
     // ── Mutable runtime state (single lock) ─────────────────────────────────
     /// All mutable runtime state, behind a single lock.
@@ -544,6 +544,7 @@ impl GatewayState {
             vault,
             seq: AtomicU64::new(0),
             tts_phrase_counter: AtomicUsize::new(0),
+            shutting_down: AtomicBool::new(false),
             #[cfg(feature = "graphql")]
             graphql_broadcast: {
                 let (tx, _) = tokio::sync::broadcast::channel(256);
@@ -856,6 +857,45 @@ impl GatewayState {
         removed
     }
 
+    /// Check whether the gateway is shutting down.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+
+    /// Notify all connected WebSocket clients that the gateway is shutting
+    /// down, then drain all connection state. Clients receive a
+    /// `gateway.shutdown` event before being disconnected.
+    pub async fn notify_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+
+        let mut inner = self.inner.write().await;
+
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let frame = EventFrame::new(
+            "gateway.shutdown",
+            serde_json::json!({ "reason": "server shutting down" }),
+            seq,
+        );
+        if let Ok(json) = serde_json::to_string(&frame) {
+            for client in inner.clients.values() {
+                let _ = client.send(&json);
+            }
+        }
+
+        // Drain all state keyed by connection.
+        inner.nodes.clear();
+        inner.clients.clear();
+        inner.active_sessions.clear();
+        inner.active_projects.clear();
+
+        drop(inner);
+
+        #[cfg(feature = "metrics")]
+        moltis_metrics::gauge!(moltis_metrics::system::CONNECTED_CLIENTS).set(0.0);
+
+        tracing::info!("notified all WebSocket clients of shutdown");
+    }
+
     /// Disconnect all WebSocket clients: send an `auth.credentials_changed`
     /// event so browsers can redirect to login, then drain every connection.
     pub async fn disconnect_all_clients(&self, reason: &str) {
@@ -1139,5 +1179,91 @@ mod tests {
 
         // Client 2 should NOT receive it
         assert!(rx2.try_recv().is_err());
+    }
+
+    // ── Graceful shutdown tests ────────────────────────────────────────
+
+    #[test]
+    fn shutting_down_default_false() {
+        let state = test_state();
+        assert!(!state.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn notify_shutdown_sets_flag_and_notifies_clients() {
+        let state = test_state();
+
+        let (c1, mut rx1) = mock_client("conn-1");
+        let (c2, mut rx2) = mock_client("conn-2");
+        state.register_client(c1).await;
+        state.register_client(c2).await;
+
+        // Set up active sessions/projects to verify they are drained.
+        {
+            let mut inner = state.inner.write().await;
+            inner
+                .active_sessions
+                .insert("conn-1".into(), "session-a".into());
+            inner
+                .active_projects
+                .insert("conn-2".into(), "project-b".into());
+        }
+
+        assert_eq!(state.client_count().await, 2);
+        assert!(!state.is_shutting_down());
+
+        state.notify_shutdown().await;
+
+        // Flag is set.
+        assert!(state.is_shutting_down());
+
+        // All clients are removed.
+        assert_eq!(state.client_count().await, 0);
+
+        // active_sessions and active_projects are cleared.
+        {
+            let inner = state.inner.read().await;
+            assert!(inner.active_sessions.is_empty());
+            assert!(inner.active_projects.is_empty());
+        }
+
+        // Both receivers got the shutdown event.
+        let msg1 = rx1.recv().await.expect("should receive event");
+        let msg2 = rx2.recv().await.expect("should receive event");
+
+        let frame1: serde_json::Value = serde_json::from_str(&msg1).unwrap();
+        assert_eq!(frame1["event"], "gateway.shutdown");
+        assert_eq!(frame1["payload"]["reason"], "server shutting down");
+
+        let frame2: serde_json::Value = serde_json::from_str(&msg2).unwrap();
+        assert_eq!(frame2["event"], "gateway.shutdown");
+
+        // Channels are closed (all senders dropped).
+        assert!(rx1.recv().await.is_none());
+        assert!(rx2.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn notify_shutdown_is_noop_when_empty() {
+        let state = test_state();
+        assert_eq!(state.client_count().await, 0);
+        state.notify_shutdown().await;
+        assert!(state.is_shutting_down());
+        assert_eq!(state.client_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn notify_shutdown_is_idempotent() {
+        let state = test_state();
+        let (c1, _rx1) = mock_client("conn-1");
+        state.register_client(c1).await;
+
+        state.notify_shutdown().await;
+        assert!(state.is_shutting_down());
+        assert_eq!(state.client_count().await, 0);
+
+        // Second call should not panic.
+        state.notify_shutdown().await;
+        assert!(state.is_shutting_down());
     }
 }

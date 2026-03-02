@@ -4855,11 +4855,14 @@ pub async fn start_gateway(
     }
 
     // Spawn shutdown handler:
-    // - unregister mDNS service (when configured)
-    // - reset tailscale state on exit (when configured)
-    // - give browser pool 5s to shut down gracefully
-    // - force process exit to avoid hanging after ctrl-c
+    // 1. Stop accepting new WS connections (shutting_down flag)
+    // 2. Notify connected clients with `gateway.shutdown` event
+    // 3. Drain in-flight agent runs (up to 30s)
+    // 4. Dispatch GatewayStop hook
+    // 5. Unregister mDNS / reset tailscale / shut down browser pool
+    // 6. Force process exit
     {
+        let shutdown_state = Arc::clone(state);
         let browser_for_shutdown = Arc::clone(&banner.browser_for_lifecycle);
         #[cfg(feature = "tailscale")]
         let reset_tailscale_on_exit =
@@ -4871,6 +4874,46 @@ pub async fn start_gateway(
                 return;
             }
 
+            info!("graceful shutdown initiated");
+
+            // 1+2. Set shutting_down flag and notify all connected clients.
+            shutdown_state.notify_shutdown().await;
+
+            // 3. Drain in-flight agent runs (up to 30s).
+            if let Some(ref state_store) = shutdown_state.services.session_state_store {
+                let drain_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let running = state_store
+                        .list_running_sessions()
+                        .await
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    if running == 0 || tokio::time::Instant::now() >= drain_deadline {
+                        if running > 0 {
+                            warn!(
+                                running,
+                                "shutdown drain deadline exceeded, proceeding with exit"
+                            );
+                        } else {
+                            info!("all in-flight agent runs drained");
+                        }
+                        break;
+                    }
+                    debug!(running, "waiting for in-flight agent runs to complete");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+
+            // 4. Dispatch GatewayStop hook.
+            if let Some(ref hooks) = shutdown_state.inner.read().await.hook_registry {
+                let payload = moltis_common::hooks::HookPayload::GatewayStop;
+                if let Err(e) = hooks.dispatch(&payload).await {
+                    warn!("GatewayStop hook dispatch failed: {e}");
+                }
+            }
+
+            // 5. Infrastructure cleanup.
             #[cfg(feature = "mdns")]
             if let Some(ref daemon) = _mdns_daemon {
                 crate::mdns::shutdown(daemon);
@@ -4905,6 +4948,7 @@ pub async fn start_gateway(
                 );
             }
 
+            // 6. Exit.
             std::process::exit(0);
         });
     }
@@ -4963,6 +5007,15 @@ async fn ws_upgrade_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // Reject new connections during graceful shutdown.
+    if state.gateway.is_shutting_down() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is shutting down",
+        )
+            .into_response();
+    }
+
     // ── CSWSH protection ────────────────────────────────────────────────
     // Reject cross-origin WebSocket upgrades.  Browsers always send an
     // Origin header on cross-origin requests; non-browser clients (CLI,
