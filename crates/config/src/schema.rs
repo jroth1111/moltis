@@ -2004,6 +2004,17 @@ pub struct ProviderEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
 
+    /// Additional API keys to rotate through when the primary key hits rate limits.
+    /// Keys are tried in order before failing over to the next provider.
+    #[serde(
+        default,
+        alias = "api_keys",
+        serialize_with = "serialize_secret_vec",
+        deserialize_with = "deserialize_secret_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub extra_api_keys: Vec<Secret<String>>,
+
     /// How tool calling is handled for this provider.
     ///
     /// - `auto` (default): use native tool API if the provider supports it,
@@ -2020,6 +2031,7 @@ impl std::fmt::Debug for ProviderEntry {
         f.debug_struct("ProviderEntry")
             .field("enabled", &self.enabled)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("extra_api_keys", &format!("[{} keys]", self.extra_api_keys.len()))
             .field("base_url", &self.base_url)
             .field("models", &self.models)
             .field("fetch_models", &self.fetch_models)
@@ -2040,6 +2052,7 @@ impl Default for ProviderEntry {
             fetch_models: true,
             stream_transport: ProviderStreamTransport::Sse,
             alias: None,
+            extra_api_keys: Vec::new(),
             tool_mode: ToolMode::Auto,
         }
     }
@@ -2063,6 +2076,25 @@ where
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
     Ok(opt.map(Secret::new))
+}
+
+fn serialize_secret_vec<S: serde::Serializer>(
+    secrets: &[Secret<String>],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let values: Vec<&str> = secrets
+        .iter()
+        .map(|secret| secret.expose_secret().as_str())
+        .collect();
+    values.serialize(serializer)
+}
+
+fn deserialize_secret_vec<'de, D>(deserializer: D) -> Result<Vec<Secret<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values: Vec<String> = Vec::deserialize(deserializer)?;
+    Ok(values.into_iter().map(Secret::new).collect())
 }
 
 const fn is_true(value: &bool) -> bool {
@@ -2460,6 +2492,39 @@ memory = 300
         );
         let parsed: ProviderEntry = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.tool_mode, ToolMode::Text);
+    }
+
+    #[test]
+    fn provider_entry_extra_api_keys_round_trip() {
+        let entry = ProviderEntry {
+            extra_api_keys: vec![Secret::new("sk-extra-1".into()), Secret::new("sk-extra-2".into())],
+            ..ProviderEntry::default()
+        };
+
+        let toml_str = toml::to_string(&entry).unwrap();
+        assert!(
+            toml_str.contains("extra_api_keys"),
+            "extra_api_keys should be serialized: {toml_str}"
+        );
+
+        let parsed: ProviderEntry = toml::from_str(&toml_str).unwrap();
+        let values: Vec<&str> = parsed
+            .extra_api_keys
+            .iter()
+            .map(|secret| secret.expose_secret().as_str())
+            .collect();
+        assert_eq!(values, vec!["sk-extra-1", "sk-extra-2"]);
+    }
+
+    #[test]
+    fn provider_entry_extra_api_keys_supports_legacy_alias() {
+        let parsed: ProviderEntry = toml::from_str(r#"api_keys = ["sk-legacy-1"]"#).unwrap();
+        let values: Vec<&str> = parsed
+            .extra_api_keys
+            .iter()
+            .map(|secret| secret.expose_secret().as_str())
+            .collect();
+        assert_eq!(values, vec!["sk-legacy-1"]);
     }
 
     #[test]

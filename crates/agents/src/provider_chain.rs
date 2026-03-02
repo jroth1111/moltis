@@ -32,6 +32,10 @@ pub enum ProviderErrorKind {
     ServerError,
     /// Billing/usage limit exhausted — rotate.
     BillingExhausted,
+    /// Plan/model does not support this request — different from billing exhaustion.
+    /// Example: "Your plan doesn't include access to this model."
+    /// Should skip the entire provider, not just the key.
+    NonRetryableRateLimit,
     /// Context window exceeded — don't rotate, caller should compact.
     ContextWindow,
     /// 400, bad format — don't rotate, it'll fail everywhere.
@@ -50,6 +54,7 @@ impl ProviderErrorKind {
                 | Self::AuthError
                 | Self::ServerError
                 | Self::BillingExhausted
+                | Self::NonRetryableRateLimit
                 | Self::Unknown
         )
     }
@@ -76,6 +81,17 @@ pub fn classify_error(err: &anyhow::Error) -> ProviderErrorKind {
     // Context window — must check first since "request too large" overlaps.
     if CONTEXT_WINDOW_PATTERNS.iter().any(|p| msg.contains(p)) {
         return ProviderErrorKind::ContextWindow;
+    }
+
+    // Plan/model access errors — non-retryable with key rotation.
+    // Must check before the general rate limit check.
+    if msg.contains("your plan does not include")
+        || msg.contains("model not available")
+        || msg.contains("not available on your plan")
+        || msg.contains("upgrade your plan")
+        || msg.contains("organization does not have access")
+    {
+        return ProviderErrorKind::NonRetryableRateLimit;
     }
 
     // Rate limiting.
@@ -128,6 +144,16 @@ pub fn classify_error(err: &anyhow::Error) -> ProviderErrorKind {
     }
 
     ProviderErrorKind::Unknown
+}
+
+/// Parse a retry-after duration (in milliseconds) from an error message.
+/// Looks for patterns like "retry after 30", "retry-after: 5.5", "Retry-After: 60".
+#[must_use]
+pub fn parse_retry_after_ms(msg: &str) -> Option<u64> {
+    let re = regex::Regex::new(r"(?i)retry.?after[:\s]+(\d+\.?\d*)").ok()?;
+    let cap = re.captures(msg)?;
+    let secs: f64 = cap.get(1)?.as_str().parse().ok()?;
+    Some((secs * 1000.0) as u64)
 }
 
 // ── Circuit breaker (same pattern as embeddings_fallback.rs) ─────────────
@@ -761,5 +787,64 @@ mod tests {
         while stream.next().await.is_some() {}
 
         assert_eq!(tracker.received_tools_count(), 0);
+    }
+
+    #[test]
+    fn classify_non_retryable_rate_limit() {
+        let err = anyhow::anyhow!("Your plan does not include access to this model");
+        assert_eq!(
+            classify_error(&err),
+            ProviderErrorKind::NonRetryableRateLimit
+        );
+    }
+
+    #[test]
+    fn classify_non_retryable_model_not_available() {
+        let err = anyhow::anyhow!("model not available for your account");
+        assert_eq!(
+            classify_error(&err),
+            ProviderErrorKind::NonRetryableRateLimit
+        );
+    }
+
+    #[test]
+    fn classify_non_retryable_upgrade_plan() {
+        let err = anyhow::anyhow!("Please upgrade your plan to access this feature");
+        assert_eq!(
+            classify_error(&err),
+            ProviderErrorKind::NonRetryableRateLimit
+        );
+    }
+
+    #[test]
+    fn classify_non_retryable_org_access() {
+        let err = anyhow::anyhow!("Your organization does not have access to this model");
+        assert_eq!(
+            classify_error(&err),
+            ProviderErrorKind::NonRetryableRateLimit
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_seconds() {
+        assert_eq!(
+            parse_retry_after_ms("rate limited, retry after 30"),
+            Some(30_000)
+        );
+        assert_eq!(parse_retry_after_ms("Retry-After: 5.5"), Some(5_500));
+        assert_eq!(parse_retry_after_ms("no hint here"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_integer() {
+        assert_eq!(
+            parse_retry_after_ms("retry-after: 60"),
+            Some(60_000)
+        );
+    }
+
+    #[test]
+    fn non_retryable_rate_limit_should_failover() {
+        assert!(ProviderErrorKind::NonRetryableRateLimit.should_failover());
     }
 }
