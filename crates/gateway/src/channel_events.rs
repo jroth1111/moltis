@@ -352,11 +352,32 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 let _ = done_tx.send(());
             }
 
-            // TODO(event-triggers): After agent turn completes, check EventMatcher:
-            // let matched_jobs = event_matcher.match_message(channel.as_deref(), &user_message).await;
-            // for job_id in matched_jobs {
-            //     cron_service.enqueue_job(job_id).await?;
-            // }
+            // Fire any event-triggered cron jobs whose patterns match the user message.
+            if let Ok(jobs_val) = state.services.cron.list().await {
+                if let Ok(jobs) =
+                    serde_json::from_value::<Vec<moltis_cron::types::CronJob>>(jobs_val)
+                {
+                    let pairs: Vec<(String, moltis_cron::types::CronSchedule)> = jobs
+                        .into_iter()
+                        .filter(|j| j.enabled)
+                        .map(|j| (j.id, j.schedule))
+                        .collect();
+                    let matcher = moltis_cron::event_matcher::EventMatcher::new();
+                    matcher.reload(pairs).await;
+                    let channel_name = Some(meta.channel_type.as_str());
+                    let matched = matcher.match_message(channel_name, &effective_text).await;
+                    for job_id in matched {
+                        if let Err(e) = state
+                            .services
+                            .cron
+                            .run(serde_json::json!({ "id": job_id }))
+                            .await
+                        {
+                            warn!(%job_id, error = %e, "event trigger: failed to fire cron job");
+                        }
+                    }
+                }
+            }
 
             if let Err(e) = send_result {
                 error!("channel dispatch_to_chat failed: {e}");

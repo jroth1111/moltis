@@ -76,6 +76,8 @@ pub fn compute_next_run(schedule: &CronSchedule, now_ms: u64) -> Result<Option<u
 
             Ok(next)
         },
+        // Event-triggered jobs have no scheduled next-run time; they fire on matching messages.
+        CronSchedule::EventTrigger { .. } => Ok(None),
     }
 }
 

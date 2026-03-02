@@ -12,7 +12,7 @@ use crate::types::CronSchedule;
 
 /// A compiled event trigger entry.
 struct EventEntry {
-    job_id: i64,
+    job_id: String,
     pattern: Regex,
     channel_filter: Option<String>,
 }
@@ -30,7 +30,7 @@ impl EventMatcher {
     }
 
     /// Reload event entries from the given list of (job_id, schedule) pairs.
-    pub async fn reload(&self, jobs: Vec<(i64, CronSchedule)>) {
+    pub async fn reload(&self, jobs: Vec<(String, CronSchedule)>) {
         let mut new_entries = Vec::new();
         for (job_id, schedule) in jobs {
             if let CronSchedule::EventTrigger { pattern, channel_filter } = schedule {
@@ -41,7 +41,7 @@ impl EventMatcher {
                         channel_filter,
                     }),
                     Err(e) => {
-                        warn!(job_id, pattern, error = %e, "invalid event trigger regex, skipping");
+                        warn!(%job_id, pattern, error = %e, "invalid event trigger regex, skipping");
                     }
                 }
             }
@@ -51,7 +51,7 @@ impl EventMatcher {
     }
 
     /// Returns the job IDs whose patterns match the given message.
-    pub async fn match_message(&self, channel: Option<&str>, text: &str) -> Vec<i64> {
+    pub async fn match_message(&self, channel: Option<&str>, text: &str) -> Vec<String> {
         let entries = self.entries.read().await;
         entries
             .iter()
@@ -64,12 +64,12 @@ impl EventMatcher {
                 }
                 e.pattern.is_match(text)
             })
-            .map(|e| e.job_id)
+            .map(|e| e.job_id.clone())
             .collect()
     }
 
     /// Invalidate and rebuild from a fresh job list.
-    pub async fn invalidate(&self, jobs: Vec<(i64, CronSchedule)>) {
+    pub async fn invalidate(&self, jobs: Vec<(String, CronSchedule)>) {
         self.reload(jobs).await;
     }
 }
@@ -84,12 +84,12 @@ impl Default for EventMatcher {
 mod tests {
     use super::*;
 
-    fn make_jobs(patterns: &[(&str, Option<&str>)]) -> Vec<(i64, CronSchedule)> {
+    fn make_jobs(patterns: &[(&str, Option<&str>)]) -> Vec<(String, CronSchedule)> {
         patterns
             .iter()
             .enumerate()
             .map(|(i, (pat, ch))| (
-                i as i64,
+                format!("job-{i}"),
                 CronSchedule::EventTrigger {
                     pattern: pat.to_string(),
                     channel_filter: ch.map(str::to_string),
@@ -103,7 +103,7 @@ mod tests {
         let matcher = EventMatcher::new();
         matcher.reload(make_jobs(&[("billing", None)])).await;
         let ids = matcher.match_message(None, "I have a billing question").await;
-        assert_eq!(ids, vec![0]);
+        assert_eq!(ids, vec!["job-0"]);
     }
 
     #[tokio::test]
@@ -123,14 +123,14 @@ mod tests {
         assert!(ids.is_empty());
         // Right channel — match
         let ids = matcher.match_message(Some("general"), "hello world").await;
-        assert_eq!(ids, vec![0]);
+        assert_eq!(ids, vec!["job-0"]);
     }
 
     #[tokio::test]
     async fn invalid_regex_skipped() {
         let matcher = EventMatcher::new();
         // "[invalid" is not a valid regex
-        let jobs = vec![(0i64, CronSchedule::EventTrigger {
+        let jobs = vec![("job-bad".to_string(), CronSchedule::EventTrigger {
             pattern: "[invalid".to_string(),
             channel_filter: None,
         })];
