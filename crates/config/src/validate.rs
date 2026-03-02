@@ -112,6 +112,8 @@ fn build_schema_map() -> KnownKeys {
         Struct(HashMap::from([
             ("enabled", Leaf),
             ("api_key", Leaf),
+            ("extra_api_keys", Leaf),
+            ("api_keys", Leaf),
             ("base_url", Leaf),
             ("models", Leaf),
             ("fetch_models", Leaf),

@@ -2004,6 +2004,11 @@ pub struct ProviderEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
 
+    /// Additional API keys to rotate through when the primary key hits rate limits.
+    /// Keys are tried in order before failing over to the next provider.
+    #[serde(default, alias = "api_keys", skip_serializing)]
+    pub extra_api_keys: Vec<Secret<String>>,
+
     /// How tool calling is handled for this provider.
     ///
     /// - `auto` (default): use native tool API if the provider supports it,
@@ -2020,6 +2025,7 @@ impl std::fmt::Debug for ProviderEntry {
         f.debug_struct("ProviderEntry")
             .field("enabled", &self.enabled)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("extra_api_keys", &format!("[{} keys]", self.extra_api_keys.len()))
             .field("base_url", &self.base_url)
             .field("models", &self.models)
             .field("fetch_models", &self.fetch_models)
@@ -2040,6 +2046,7 @@ impl Default for ProviderEntry {
             fetch_models: true,
             stream_transport: ProviderStreamTransport::Sse,
             alias: None,
+            extra_api_keys: Vec::new(),
             tool_mode: ToolMode::Auto,
         }
     }
