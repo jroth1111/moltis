@@ -141,6 +141,50 @@ impl SessionStateStore {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// List all session keys that have an entry in the given namespace and key.
+    ///
+    /// Used by the self-repair scanner to find sessions with `running_since` set.
+    pub async fn list_sessions_with_key(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT session_key FROM session_state WHERE namespace = ? AND key = ?",
+        )
+        .bind(namespace)
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// List all sessions that are currently marked as running (have `running_since` set).
+    ///
+    /// Convenience wrapper for `list_sessions_with_key("self_repair", "running_since")`.
+    pub async fn list_running_sessions(&self) -> Result<Vec<String>> {
+        self.list_sessions_with_key("self_repair", "running_since")
+            .await
+    }
+
+    /// Run migrations for tests (creates the session_state table in an in-memory DB).
+    #[cfg(test)]
+    pub async fn run_migrations_for_tests(pool: &sqlx::SqlitePool) -> Result<()> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS session_state (
+                session_key TEXT NOT NULL,
+                namespace   TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_key, namespace, key)
+            )"#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
