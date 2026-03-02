@@ -485,7 +485,6 @@ async fn create_api_key_handler(
         Some(scopes) if !scopes.is_empty() => scopes,
         _ => return (StatusCode::BAD_REQUEST, "at least one scope is required").into_response(),
     };
-
     for scope in scopes {
         if !crate::auth::VALID_SCOPES.contains(&scope.as_str()) {
             return (StatusCode::BAD_REQUEST, format!("invalid scope: {scope}")).into_response();
