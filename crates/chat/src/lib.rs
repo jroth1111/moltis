@@ -5743,6 +5743,55 @@ fn effective_tool_mode(provider: &dyn moltis_agents::model::LlmProvider) -> Tool
     }
 }
 
+fn research_text_from_user_content(user_content: &UserContent) -> &str {
+    match user_content {
+        UserContent::Text(text) => text.as_str(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .find_map(|part| {
+                if let ContentPart::Text(text) = part {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(""),
+    }
+}
+
+async fn maybe_append_research_context(
+    system_prompt: &mut String,
+    provider: Arc<dyn moltis_agents::model::LlmProvider>,
+    user_content: &UserContent,
+    history: &[ChatMessage],
+    enabled: bool,
+    trigger: &str,
+    keywords: &[String],
+    max_iterations: usize,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+
+    let research_trigger = moltis_agents::research::ResearchTrigger::from_config(trigger, keywords);
+    let research_text = research_text_from_user_content(user_content);
+    if let Ok(Some(result)) = moltis_agents::research::run_research_phase(
+        &research_trigger,
+        research_text,
+        history,
+        provider,
+        max_iterations,
+    )
+    .await
+    {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&result.context);
+        return true;
+    }
+
+    false
+}
+
 async fn run_with_tools(
     state: &Arc<dyn ChatRuntime>,
     model_store: &Arc<RwLock<DisabledModelsStore>>,
@@ -6239,33 +6288,17 @@ async fn run_with_tools(
     }
 
     // Research phase: gather context before the main agent turn when enabled.
-    if persona.config.chat.research.enabled {
-        let research_trigger = moltis_agents::research::ResearchTrigger::from_config(
-            &persona.config.chat.research.trigger,
-            &persona.config.chat.research.keywords,
-        );
-        let research_text: &str = match user_content {
-            UserContent::Text(t) => t.as_str(),
-            UserContent::Multimodal(parts) => parts
-                .iter()
-                .find_map(|p| {
-                    if let ContentPart::Text(t) = p { Some(t.as_str()) } else { None }
-                })
-                .unwrap_or(""),
-        };
-        if let Ok(Some(result)) = moltis_agents::research::run_research_phase(
-            &research_trigger,
-            research_text,
-            hist.as_deref().unwrap_or(&[]),
-            provider.clone(),
-            persona.config.chat.research.max_iterations,
-        )
-        .await
-        {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&result.context);
-        }
-    }
+    let _ = maybe_append_research_context(
+        &mut system_prompt,
+        provider.clone(),
+        user_content,
+        hist.as_deref().unwrap_or(&[]),
+        persona.config.chat.research.enabled,
+        &persona.config.chat.research.trigger,
+        &persona.config.chat.research.keywords,
+        persona.config.chat.research.max_iterations,
+    )
+    .await;
 
     let provider_ref = provider.clone();
     let first_result = run_agent_loop_streaming(
@@ -8619,6 +8652,70 @@ mod tests {
     }
 
     #[test]
+    fn research_text_from_user_content_prefers_first_text_part() {
+        let text_only = UserContent::text("plain");
+        assert_eq!(research_text_from_user_content(&text_only), "plain");
+
+        let multimodal = UserContent::Multimodal(vec![
+            ContentPart::Image {
+                media_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            },
+            ContentPart::Text("first".to_string()),
+            ContentPart::Text("second".to_string()),
+        ]);
+        assert_eq!(research_text_from_user_content(&multimodal), "first");
+    }
+
+    #[tokio::test]
+    async fn maybe_append_research_context_respects_enabled_flag() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(StaticProvider {
+            name: "test".to_string(),
+            id: "test-model".to_string(),
+        });
+        let mut prompt = "base prompt".to_string();
+
+        let appended = maybe_append_research_context(
+            &mut prompt,
+            provider,
+            &UserContent::text("What is Rust?"),
+            &[],
+            false,
+            "always",
+            &[],
+            3,
+        )
+        .await;
+
+        assert!(!appended);
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[tokio::test]
+    async fn maybe_append_research_context_appends_when_trigger_fires() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(StaticProvider {
+            name: "test".to_string(),
+            id: "test-model".to_string(),
+        });
+        let mut prompt = "base prompt".to_string();
+
+        let appended = maybe_append_research_context(
+            &mut prompt,
+            provider,
+            &UserContent::text("What is Rust?"),
+            &[],
+            true,
+            "question",
+            &[],
+            3,
+        )
+        .await;
+
+        assert!(appended);
+        assert!(prompt.starts_with("base prompt\n\nResearch context for query"));
+    }
+
+    #[test]
     fn format_tool_status_message_calc_uses_expression() {
         let message =
             format_tool_status_message("calc", &serde_json::json!({ "expression": "2 + 2 * 3" }));
@@ -10947,16 +11044,15 @@ mod tests {
         );
 
         // Pre-populate active tool calls for a session.
-        service
-            .active_tool_calls
-            .write()
-            .await
-            .insert("test-session".into(), vec![ActiveToolCall {
+        service.active_tool_calls.write().await.insert(
+            "test-session".into(),
+            vec![ActiveToolCall {
                 id: "tc_1".into(),
                 name: "bash".into(),
                 arguments: serde_json::json!({}),
                 started_at: 0,
-            }]);
+            }],
+        );
         // Pre-populate active_runs_by_session so abort can find the session.
         let run_id = "test-run".to_string();
         service
