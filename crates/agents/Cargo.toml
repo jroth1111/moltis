@@ -32,7 +32,9 @@ moltis-metrics = { optional = true, workspace = true }
 [dev-dependencies]
 axum     = { workspace = true }
 http     = { workspace = true }
+sqlx     = { workspace = true }
 tempfile = { workspace = true }
+tokio    = { workspace = true }
 
 [lints]
 workspace = true

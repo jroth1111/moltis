@@ -2639,6 +2639,7 @@ pub async fn prepare_gateway(
     services = services.with_session_metadata(Arc::clone(&session_metadata));
     services = services.with_session_store(Arc::clone(&session_store));
     services = services.with_session_share_store(Arc::clone(&session_share_store));
+    services.session_state_store = Some(Arc::clone(&session_state_store));
 
     services = services.with_agent_persona_store(Arc::clone(&agent_persona_store));
 
@@ -3929,6 +3930,15 @@ pub async fn prepare_gateway(
             }
         });
     }
+
+    // Spawn self-repair background scanner (scans every 60s for stuck agent sessions).
+    moltis_agents::self_repair::start_background_task(
+        Arc::clone(&session_state_store),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(10 * 60),
+        3,
+        None,
+    );
 
     // Spawn tick timer.
     let tick_state = Arc::clone(&state);
