@@ -11,6 +11,7 @@ use {async_trait::async_trait, futures::future::BoxFuture, serde_json::Value};
 
 use {
     moltis_agents::tool_registry::AgentTool,
+    moltis_common::handoff::HandoffContext,
     moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore},
 };
 
@@ -28,6 +29,8 @@ pub struct SendToSessionRequest {
     pub model: Option<String>,
     /// Trace identifier from the originating request, for log correlation.
     pub trace_id: Option<String>,
+    /// Structured handoff context from the sending session.
+    pub handoff: Option<HandoffContext>,
 }
 
 /// Callback used by `sessions_send`.
@@ -238,6 +241,10 @@ impl AgentTool for SessionsSendTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model override for the target session turn."
+                },
+                "handoff": {
+                    "type": "object",
+                    "description": "Structured handoff context from the sending session (JSON)."
                 }
             },
             "required": ["key", "message"]
@@ -253,17 +260,28 @@ impl AgentTool for SessionsSendTool {
         let model = owned_str_param(&params, &["model"]);
         let trace_id = owned_str_param(&params, &["_trace_id"]);
 
+        // Parse optional handoff context from the parameters.
+        let handoff: Option<HandoffContext> = params
+            .get("handoff")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
         let entry = self
             .metadata
             .get(&key)
             .await
             .ok_or_else(|| Error::message(format!("session not found: {key}")))?;
 
-        let message = if let Some(ctx) = context {
-            format!("[From: {ctx}]\n\n{message}")
-        } else {
-            message
-        };
+        // Build the message with optional context prefix and dead-end constraints.
+        let mut parts = Vec::new();
+        if let Some(ctx) = context {
+            parts.push(format!("[From: {ctx}]"));
+        }
+        if let Some(constraints) = handoff.as_ref().and_then(|h| h.dead_end_constraints()) {
+            parts.push(constraints);
+        }
+        parts.push(message);
+        let message = parts.join("\n\n");
 
         let result = (self.send_fn)(SendToSessionRequest {
             key: key.clone(),
@@ -271,6 +289,7 @@ impl AgentTool for SessionsSendTool {
             wait_for_reply,
             model,
             trace_id,
+            handoff: handoff.clone(),
         })
         .await?;
 
@@ -279,6 +298,7 @@ impl AgentTool for SessionsSendTool {
             "label": entry.label,
             "sent": true,
             "waitForReply": wait_for_reply,
+            "hasHandoff": handoff.is_some(),
             "result": result,
         }))
     }
@@ -290,6 +310,8 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    use moltis_common::handoff::DeadEnd;
 
     use super::*;
 
@@ -426,6 +448,7 @@ mod tests {
                 assert!(req.message.starts_with("[From: coordinator]"));
                 assert!(req.wait_for_reply);
                 assert!(req.trace_id.is_none());
+                assert!(req.handoff.is_none());
                 Ok(serde_json::json!({
                     "text": "ok",
                     "inputTokens": 1,
@@ -446,6 +469,7 @@ mod tests {
 
         assert_eq!(result["sent"], true);
         assert_eq!(result["waitForReply"], true);
+        assert_eq!(result["hasHandoff"], false);
         assert_eq!(result["result"]["text"], "ok");
         assert!(called.load(Ordering::SeqCst));
         Ok(())
@@ -503,6 +527,49 @@ mod tests {
             .err()
             .ok_or_else(|| std::io::Error::other("expected missing target error"))?;
         assert!(err.to_string().contains("session not found"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sessions_send_with_handoff_injects_dead_ends() -> TestResult<()> {
+        let metadata = Arc::new(SqliteSessionMetadata::new(test_pool().await?));
+        metadata
+            .upsert("session:target", Some("Target".to_string()))
+            .await?;
+
+        let send_fn: SendToSessionFn = Arc::new(move |req| {
+            Box::pin(async move {
+                // Verify dead-end constraints are injected into the message.
+                assert!(req.message.contains("Dead-ends from prior session"));
+                assert!(req.message.contains("**exec**"));
+                assert!(req.message.contains("compile error"));
+                // Verify the handoff context is attached.
+                assert!(req.handoff.is_some());
+                let handoff = req.handoff.as_ref().unwrap();
+                assert_eq!(handoff.dead_ends.len(), 1);
+                assert_eq!(handoff.last_action.as_deref(), Some("building"));
+                Ok(serde_json::json!({ "text": "ok" }))
+            })
+        });
+        let tool = SessionsSendTool::new(metadata, send_fn);
+
+        let mut handoff = HandoffContext {
+            last_action: Some("building".into()),
+            ..Default::default()
+        };
+        handoff.add_dead_end(DeadEnd::new("exec", "cargo build", "compile error"));
+
+        let result = tool
+            .execute(serde_json::json!({
+                "key": "session:target",
+                "message": "Continue the work",
+                "context": "coordinator",
+                "handoff": serde_json::to_value(&handoff)?
+            }))
+            .await?;
+
+        assert_eq!(result["sent"], true);
+        assert_eq!(result["hasHandoff"], true);
         Ok(())
     }
 }
