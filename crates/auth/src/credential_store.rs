@@ -441,7 +441,7 @@ impl CredentialStore {
     /// Generate a new API key with optional scopes. Returns (id, raw_key).
     /// The raw key is only shown once — we store only its SHA-256 hash.
     ///
-    /// If `scopes` is None or empty, the key will have no access until scopes are set.
+    /// Callers must supply at least one scope; the REST layer enforces this requirement.
     pub async fn create_api_key(
         &self,
         label: &str,
