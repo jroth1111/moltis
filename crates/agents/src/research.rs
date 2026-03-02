@@ -33,6 +33,7 @@ impl ResearchTrigger {
     /// - `"question"` — fire when message ends with `?`
     /// - `"length"` or `"length:N"` — fire when message exceeds N chars (default 200)
     /// - anything else → `Never`
+    #[must_use]
     pub fn from_config(s: &str, keywords: &[String]) -> Self {
         let normalized = s.trim().to_ascii_lowercase();
         match normalized.as_str() {
@@ -64,6 +65,7 @@ impl ResearchTrigger {
     }
 
     /// Returns true if research should run for this message.
+    #[must_use]
     pub fn should_run(&self, message: &str) -> bool {
         match self {
             Self::Never => false,
