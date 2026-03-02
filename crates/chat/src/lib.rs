@@ -3208,16 +3208,59 @@ impl ChatService for LiveChatService {
             .get("_accept_language")
             .and_then(|v| v.as_str())
             .map(String::from);
-        // Auto-compact when the next request is likely to exceed 95% of the
-        // model context window.
+        // Auto-compact when the next request is likely to exceed 80% of the
+        // model context window. At 95%+, fall back to emergency truncation
+        // so degraded providers do not block progress.
         let context_window = provider.context_window() as u64;
         let token_usage = session_token_usage_from_messages(&history);
         let estimated_next_input = token_usage
             .current_request_input_tokens
             .saturating_add(estimate_text_tokens(&text));
-        let compact_threshold = (context_window * 95) / 100;
+        let compact_threshold = (context_window * 80) / 100;
+        let truncate_threshold = (context_window * 95) / 100;
 
-        if estimated_next_input >= compact_threshold {
+        if estimated_next_input >= truncate_threshold {
+            let keep_messages = 6usize;
+            let start = history.len().saturating_sub(keep_messages);
+            let truncated = history[start..].to_vec();
+
+            if let Err(error) = self
+                .session_store
+                .replace_history(&session_key, truncated.clone())
+                .await
+            {
+                warn!(
+                    session = %session_key,
+                    %error,
+                    "emergency truncate failed, continuing with full history"
+                );
+            } else {
+                history = truncated;
+                self.session_metadata
+                    .touch(&session_key, history.len() as u32)
+                    .await;
+                warn!(
+                    session = %session_key,
+                    estimated_next_input,
+                    context_window,
+                    "emergency history truncate applied at 95% context threshold"
+                );
+                broadcast(
+                    &self.state,
+                    "chat",
+                    serde_json::json!({
+                        "sessionKey": session_key,
+                        "state": "auto_compact",
+                        "phase": "truncate",
+                        "estimatedNextInputTokens": estimated_next_input,
+                        "contextWindow": context_window,
+                        "keptMessages": keep_messages,
+                    }),
+                    BroadcastOpts::default(),
+                )
+                .await;
+            }
+        } else if estimated_next_input >= compact_threshold {
             let pre_compact_msg_count = history.len();
             let pre_compact_total = token_usage
                 .current_request_input_tokens
@@ -3227,7 +3270,7 @@ impl ChatService for LiveChatService {
                 session = %session_key,
                 estimated_next_input,
                 context_window,
-                "auto-compact triggered (estimated next request over 95% threshold)"
+                "auto-compact triggered (estimated next request over 80% threshold)"
             );
             broadcast(
                 &self.state,
@@ -4033,17 +4076,31 @@ impl ChatService for LiveChatService {
             }
         }
 
-        // Build a summary prompt from the conversation using structured messages.
-        // We pass the typed ChatMessage objects directly so role boundaries are
-        // maintained via the API's message structure, preventing prompt injection
-        // where user content could mimic role prefixes in concatenated text.
-        let mut summary_messages = vec![ChatMessage::system(
-            "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
-        )];
-        summary_messages.extend(values_to_chat_messages(&history));
-        summary_messages.push(ChatMessage::user(
-            "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
-        ));
+        fn parse_compaction_facts(raw: &str) -> Vec<String> {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Vec::new();
+            }
+
+            let candidate = trimmed
+                .strip_prefix("```json")
+                .and_then(|s| s.strip_suffix("```"))
+                .map(str::trim)
+                .or_else(|| {
+                    trimmed
+                        .strip_prefix("```")
+                        .and_then(|s| s.strip_suffix("```"))
+                })
+                .map(str::trim)
+                .unwrap_or(trimmed);
+
+            serde_json::from_str::<Vec<String>>(candidate)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|fact| fact.trim().to_string())
+                .filter(|fact| !fact.is_empty())
+                .collect()
+        }
 
         // Use the session's model if available, otherwise fall back to the model
         // from the last assistant message, then to the first registered provider.
@@ -4052,11 +4109,58 @@ impl ChatService for LiveChatService {
             .await
             .map_err(ServiceError::message)?;
 
+        info!(
+            session = %session_key,
+            messages = history.len(),
+            "chat.compact: extracting facts"
+        );
+
+        // TODO(fact_extraction): if config.compaction.fact_extraction {
+        //     // Two-pass: extract facts as JSON, store as memory docs, then narrative summary
+        // }
+
+        // Pass 1: extract discrete facts as JSON for higher-quality memory retrieval.
+        let mut fact_messages = vec![ChatMessage::system(
+            "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
+        )];
+        fact_messages.extend(values_to_chat_messages(&history));
+        fact_messages.push(ChatMessage::user(
+            "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
+        ));
+
+        let mut fact_stream = provider.stream(fact_messages);
+        let mut facts_raw = String::new();
+        while let Some(event) = fact_stream.next().await {
+            match event {
+                StreamEvent::Delta(delta) => facts_raw.push_str(&delta),
+                StreamEvent::Done(_) => break,
+                StreamEvent::Error(e) => {
+                    warn!(session = %session_key, error = %e, "compact fact extraction failed");
+                    break;
+                },
+                StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgumentsDelta { .. }
+                | StreamEvent::ToolCallComplete { .. }
+                | StreamEvent::ProviderRaw(_)
+                | StreamEvent::ReasoningDelta(_) => {},
+            }
+        }
+        let facts = parse_compaction_facts(&facts_raw);
+
+        // Pass 2: concise narrative summary for conversation replacement.
+        let mut summary_messages = vec![ChatMessage::system(
+            "You are a conversation summarizer. Preserve key context while compressing aggressively.",
+        )];
+        summary_messages.extend(values_to_chat_messages(&history));
+        summary_messages.push(ChatMessage::user(
+            "Summarize the conversation into a short narrative that preserves decisions, status, and actionable context. Output only the summary.",
+        ));
+
         info!(session = %session_key, messages = history.len(), "chat.compact: summarizing");
 
-        let mut stream = provider.stream(summary_messages);
+        let mut summary_stream = provider.stream(summary_messages);
         let mut summary = String::new();
-        while let Some(event) = stream.next().await {
+        while let Some(event) = summary_stream.next().await {
             match event {
                 StreamEvent::Delta(delta) => summary.push_str(&delta),
                 StreamEvent::Done(_) => break,
@@ -4075,7 +4179,7 @@ impl ChatService for LiveChatService {
             }
         }
 
-        if summary.is_empty() {
+        if summary.trim().is_empty() {
             return Err("compact produced empty summary".into());
         }
 
@@ -4106,7 +4210,7 @@ impl ChatService for LiveChatService {
 
         self.session_metadata.touch(&session_key, 1).await;
 
-        // Save compaction summary to memory file and trigger sync.
+        // Save compaction summary and extracted facts as memory files, then sync.
         if let Some(mm) = self.state.memory_manager() {
             let memory_dir = moltis_config::agent_workspace_dir(&session_agent_id).join("memory");
             if let Err(e) = tokio::fs::create_dir_all(&memory_dir).await {
@@ -4116,14 +4220,39 @@ impl ChatService for LiveChatService {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                let filename = format!("compaction-{}-{ts}.md", session_key);
+                let safe_session_key = SessionStore::key_to_filename(&session_key);
+                let filename = format!("compaction-{safe_session_key}-{ts}.md");
                 let path = memory_dir.join(&filename);
                 let content = format!(
-                    "# Compaction Summary\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{summary}"
+                    "# Compaction Summary\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n- **Facts Extracted**: {}\n\n{}",
+                    facts.len(),
+                    summary.trim()
                 );
+                let mut wrote_files = false;
                 if let Err(e) = tokio::fs::write(&path, &content).await {
-                    warn!(error = %e, "compact: failed to write memory file");
+                    warn!(error = %e, "compact: failed to write summary memory file");
                 } else {
+                    wrote_files = true;
+                }
+
+                for (idx, fact) in facts.iter().take(128).enumerate() {
+                    let fact_filename = format!(
+                        "fact-{safe_session_key}-{ts}-{:03}.md",
+                        idx.saturating_add(1)
+                    );
+                    let fact_path = memory_dir.join(fact_filename);
+                    let fact_content = format!(
+                        "# Fact\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{}",
+                        fact.trim()
+                    );
+                    if let Err(e) = tokio::fs::write(&fact_path, &fact_content).await {
+                        warn!(error = %e, "compact: failed to write fact memory file");
+                    } else {
+                        wrote_files = true;
+                    }
+                }
+
+                if wrote_files {
                     let mm = Arc::clone(mm);
                     tokio::spawn(async move {
                         if let Err(e) = mm.sync().await {

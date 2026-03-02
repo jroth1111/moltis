@@ -1222,6 +1222,9 @@ pub struct ChatConfig {
     /// live discovery), so this field is currently ignored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
+    /// Enable two-pass fact extraction during compaction.
+    #[serde(default)]
+    pub fact_extraction: bool,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1234,6 +1237,7 @@ impl Default for ChatConfig {
             message_queue_mode: default_message_queue_mode(),
             priority_models: Vec::new(),
             allowed_models: Vec::new(),
+            fact_extraction: false,
         }
     }
 }
