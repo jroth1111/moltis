@@ -6278,19 +6278,24 @@ dependencies = [
 name = "moltis-plugins"
 version = "0.10.6"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "moltis-agents",
  "moltis-common",
  "moltis-config",
  "moltis-metrics",
  "moltis-sessions",
+ "regex",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
  "toml",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
