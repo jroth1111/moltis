@@ -29,6 +29,7 @@ pub struct Checkpoint {
 /// 2. When the user requests undo, call [`undo`] to restore the previous state.
 /// 3. After undo, the caller should replace the persisted session history with
 ///    the returned messages.
+#[derive(Clone)]
 pub struct UndoManager {
     undo_stack: VecDeque<Checkpoint>,
     redo_stack: Vec<Checkpoint>,

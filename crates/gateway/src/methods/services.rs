@@ -29,6 +29,17 @@ pub(super) fn model_probe_params(provider: Option<&str>) -> serde_json::Value {
     params
 }
 
+fn chat_send_result_is_queued(result: &serde_json::Value) -> bool {
+    result
+        .get("queued")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || result
+            .get("state")
+            .and_then(|v| v.as_str())
+            .is_some_and(|state| state.eq_ignore_ascii_case("queued"))
+}
+
 async fn active_session_key_for_ctx(ctx: &MethodContext) -> Option<String> {
     if let Some(session_key) = ctx
         .params
@@ -1024,12 +1035,17 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "sessions.clear_all",
         Box::new(|ctx| {
             Box::pin(async move {
-                ctx.state
+                let result = ctx
+                    .state
                     .services
                     .session
                     .clear_all()
                     .await
-                    .map_err(ErrorShape::from)
+                    .map_err(ErrorShape::from)?;
+                // `clear_all` removes session histories. Drop all in-memory undo
+                // checkpoints so stale snapshots cannot recreate cleared sessions.
+                ctx.state.inner.write().await.undo_managers.clear();
+                Ok(result)
             })
         }),
     );
@@ -1683,10 +1699,10 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 // After a successful turn, push the pre-turn snapshot onto the undo stack.
                 // Skip if the message was queued rather than executed synchronously: the
                 // pre-turn snapshot would be stale (the session hasn't changed yet).
-                let was_queued = result.as_ref().ok()
-                    .and_then(|v| v.get("queued"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let was_queued = result
+                    .as_ref()
+                    .ok()
+                    .is_some_and(chat_send_result_is_queued);
                 if result.is_ok() && !was_queued {
                     if let Some((session_key, snapshot)) = pre_turn_snapshot {
                         let turn_index = {
@@ -1831,20 +1847,27 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .read(&session_key)
                     .await
                     .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-                let checkpoint = {
+                let (checkpoint, manager_before) = {
                     let mut inner = ctx.state.inner.write().await;
                     let mgr = inner
                         .undo_managers
                         .entry(session_key.clone())
                         .or_insert_with(moltis_sessions::undo::UndoManager::new);
-                    mgr.undo(current_messages)
+                    let manager_before = mgr.clone();
+                    (mgr.undo(current_messages), manager_before)
                 };
                 match checkpoint {
                     Some(cp) => {
-                        session_store
+                        if let Err(e) = session_store
                             .replace_history(&session_key, cp.messages.clone())
                             .await
-                            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+                        {
+                            let mut inner = ctx.state.inner.write().await;
+                            inner
+                                .undo_managers
+                                .insert(session_key.clone(), manager_before);
+                            return Err(ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()));
+                        }
                         Ok(serde_json::json!({
                             "ok": true,
                             "sessionKey": session_key,
@@ -1883,20 +1906,27 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .ok_or_else(|| {
                         ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
                     })?;
-                let checkpoint = {
+                let (checkpoint, manager_before) = {
                     let mut inner = ctx.state.inner.write().await;
-                    inner
+                    let mgr = inner
                         .undo_managers
                         .entry(session_key.clone())
-                        .or_insert_with(moltis_sessions::undo::UndoManager::new)
-                        .redo()
+                        .or_insert_with(moltis_sessions::undo::UndoManager::new);
+                    let manager_before = mgr.clone();
+                    (mgr.redo(), manager_before)
                 };
                 match checkpoint {
                     Some(cp) => {
-                        session_store
+                        if let Err(e) = session_store
                             .replace_history(&session_key, cp.messages.clone())
                             .await
-                            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+                        {
+                            let mut inner = ctx.state.inner.write().await;
+                            inner
+                                .undo_managers
+                                .insert(session_key.clone(), manager_before);
+                            return Err(ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()));
+                        }
                         Ok(serde_json::json!({
                             "ok": true,
                             "sessionKey": session_key,
