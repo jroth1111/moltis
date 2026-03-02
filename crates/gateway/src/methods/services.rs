@@ -960,12 +960,25 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "sessions.reset",
         Box::new(|ctx| {
             Box::pin(async move {
-                ctx.state
+                let key = ctx
+                    .params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let result = ctx
+                    .state
                     .services
                     .session
                     .reset(ctx.params.clone())
                     .await
-                    .map_err(ErrorShape::from)
+                    .map_err(ErrorShape::from)?;
+                // Clear in-memory undo history so a future undo can't resurrect
+                // messages from a session that has just been cleared.
+                if !key.is_empty() {
+                    ctx.state.inner.write().await.undo_managers.remove(&key);
+                }
+                Ok(result)
             })
         }),
     );
@@ -987,6 +1000,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .await
                     .map_err(ErrorShape::from)?;
                 if !key.is_empty() {
+                    // Remove stale undo manager so deleted session can't be resurrected.
+                    ctx.state.inner.write().await.undo_managers.remove(&key);
                     broadcast(
                         &ctx.state,
                         "session",
@@ -1666,7 +1681,13 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .map_err(ErrorShape::from);
 
                 // After a successful turn, push the pre-turn snapshot onto the undo stack.
-                if result.is_ok() {
+                // Skip if the message was queued rather than executed synchronously: the
+                // pre-turn snapshot would be stale (the session hasn't changed yet).
+                let was_queued = result.as_ref().ok()
+                    .and_then(|v| v.get("queued"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if result.is_ok() && !was_queued {
                     if let Some((session_key, snapshot)) = pre_turn_snapshot {
                         let turn_index = {
                             let inner = ctx.state.inner.read().await;
@@ -1794,18 +1815,22 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         .active_sessions
                         .get(&ctx.client_conn_id)
                         .cloned()
-                        .ok_or_else(|| ErrorShape::from("no active session"))?
+                        .ok_or_else(|| {
+                            ErrorShape::new(error_codes::UNAVAILABLE, "no active session")
+                        })?
                 };
                 let session_store = ctx
                     .state
                     .services
                     .session_store
                     .as_ref()
-                    .ok_or_else(|| ErrorShape::from("session store unavailable"))?;
+                    .ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
+                    })?;
                 let current_messages = session_store
                     .read(&session_key)
                     .await
-                    .map_err(|e| ErrorShape::from(e.to_string()))?;
+                    .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
                 let checkpoint = {
                     let mut inner = ctx.state.inner.write().await;
                     let mgr = inner
@@ -1819,7 +1844,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         session_store
                             .replace_history(&session_key, cp.messages.clone())
                             .await
-                            .map_err(|e| ErrorShape::from(e.to_string()))?;
+                            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
                         Ok(serde_json::json!({
                             "ok": true,
                             "sessionKey": session_key,
@@ -1846,14 +1871,18 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         .active_sessions
                         .get(&ctx.client_conn_id)
                         .cloned()
-                        .ok_or_else(|| ErrorShape::from("no active session"))?
+                        .ok_or_else(|| {
+                            ErrorShape::new(error_codes::UNAVAILABLE, "no active session")
+                        })?
                 };
                 let session_store = ctx
                     .state
                     .services
                     .session_store
                     .as_ref()
-                    .ok_or_else(|| ErrorShape::from("session store unavailable"))?;
+                    .ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
+                    })?;
                 let checkpoint = {
                     let mut inner = ctx.state.inner.write().await;
                     inner
@@ -1867,7 +1896,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         session_store
                             .replace_history(&session_key, cp.messages.clone())
                             .await
-                            .map_err(|e| ErrorShape::from(e.to_string()))?;
+                            .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
                         Ok(serde_json::json!({
                             "ok": true,
                             "sessionKey": session_key,
