@@ -1,4 +1,8 @@
 //! Task board tool: a simple task management tool backed by the session state store.
+//!
+//! **Deprecated.** Use the `task_list` tool (backed by `moltis-tasks` with a formal
+//! state machine, CAS writes, and event logging) instead.
+//! This module will be removed in a future release.
 
 use std::sync::Arc;
 
