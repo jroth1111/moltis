@@ -3208,15 +3208,17 @@ impl ChatService for LiveChatService {
             .get("_accept_language")
             .and_then(|v| v.as_str())
             .map(String::from);
-        // Auto-compact when the next request is likely to exceed 80% of the
-        // model context window. At 95%+, fall back to emergency truncation
-        // so degraded providers do not block progress.
+        // Three-tier context management:
+        //   80% (compact)  — LLM fact-extraction + narrative summary replaces history.
+        //   90% (archive)  — cold-store full history, keep last 20 messages + notice.
+        //   95% (truncate) — emergency: keep last 6 messages, no LLM call needed.
         let context_window = provider.context_window() as u64;
         let token_usage = session_token_usage_from_messages(&history);
         let estimated_next_input = token_usage
             .current_request_input_tokens
             .saturating_add(estimate_text_tokens(&text));
         let compact_threshold = (context_window * 80) / 100;
+        let archive_threshold = (context_window * 90) / 100;
         let truncate_threshold = (context_window * 95) / 100;
 
         if estimated_next_input >= truncate_threshold {
@@ -3259,6 +3261,77 @@ impl ChatService for LiveChatService {
                     BroadcastOpts::default(),
                 )
                 .await;
+            }
+        } else if estimated_next_input >= archive_threshold {
+            // 90% tier: cold-store the full history and keep only the most
+            // recent messages so context stays usable without losing data.
+            let keep_recent = 20usize;
+            let archived_count = history.len().saturating_sub(keep_recent);
+            let recent_messages =
+                history[history.len().saturating_sub(keep_recent)..].to_vec();
+
+            match self
+                .session_store
+                .archive_to_cold_store(&session_key, &history)
+                .await
+            {
+                Ok(archive_filename) => {
+                    let notice = PersistedMessage::notice(format!(
+                        "[Context Archive] {archived_count} older message(s) archived to \
+                         cold storage ({archive_filename}). Retaining {keep_recent} most \
+                         recent messages."
+                    ));
+                    let mut new_history = vec![notice.to_value()];
+                    new_history.extend(recent_messages);
+
+                    if let Err(error) = self
+                        .session_store
+                        .replace_history(&session_key, new_history.clone())
+                        .await
+                    {
+                        warn!(
+                            session = %session_key,
+                            %error,
+                            "context archive: replace_history failed, continuing with full history"
+                        );
+                    } else {
+                        history = new_history;
+                        self.session_metadata
+                            .touch(&session_key, history.len() as u32)
+                            .await;
+                        info!(
+                            session = %session_key,
+                            estimated_next_input,
+                            context_window,
+                            archived_count,
+                            archive = %archive_filename,
+                            "context archive applied at 90% threshold"
+                        );
+                        broadcast(
+                            &self.state,
+                            "chat",
+                            serde_json::json!({
+                                "sessionKey": session_key,
+                                "state": "auto_compact",
+                                "phase": "archive",
+                                "estimatedNextInputTokens": estimated_next_input,
+                                "contextWindow": context_window,
+                                "archivedMessages": archived_count,
+                                "keptMessages": keep_recent,
+                                "archiveFile": archive_filename,
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                    }
+                },
+                Err(error) => {
+                    warn!(
+                        session = %session_key,
+                        %error,
+                        "context archive failed, continuing with full history"
+                    );
+                },
             }
         } else if estimated_next_input >= compact_threshold {
             let pre_compact_msg_count = history.len();
