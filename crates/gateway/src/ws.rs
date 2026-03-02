@@ -39,6 +39,7 @@ pub async fn handle_connection(
     accept_language: Option<String>,
     remote_ip: Option<String>,
     header_authenticated: bool,
+    header_api_key_scopes: Option<Vec<String>>,
     is_local: bool,
 ) {
     let conn_id = uuid::Uuid::new_v4().to_string();
@@ -139,16 +140,15 @@ pub async fn handle_connection(
     // See CVE-2026-25253 for the analogous OpenClaw vulnerability.
     let mut authenticated = header_authenticated;
     // Scopes from API key verification (if any).
-    let mut api_key_scopes: Option<Vec<String>> = None;
+    let mut api_key_scopes: Option<Vec<String>> = header_api_key_scopes;
 
-    if !authenticated && let Some(ref cred_store) = state.credential_store {
+    if let Some(ref cred_store) = state.credential_store {
         if cred_store.is_setup_complete() {
-            // Check API key.
-            if let Some(ref api_key) = params.auth.as_ref().and_then(|a| a.api_key.clone())
+            if api_key_scopes.is_none()
+                && let Some(ref api_key) = params.auth.as_ref().and_then(|a| a.api_key.clone())
                 && let Ok(Some(verification)) = cred_store.verify_api_key(api_key).await
             {
                 authenticated = true;
-                // Store the scopes from the API key (empty = no access)
                 api_key_scopes = Some(verification.scopes);
             }
             // Check password against DB hash.
@@ -158,7 +158,7 @@ pub async fn handle_connection(
             {
                 authenticated = true;
             }
-        } else {
+        } else if !authenticated {
             // Setup not complete yet — only allow local connections.
             // Remote connections must go through the onboarding/setup flow.
             if is_local {

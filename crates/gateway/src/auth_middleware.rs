@@ -74,8 +74,11 @@ pub async fn check_auth(
 
     // Check Bearer API key.
     if let Some(key) = bearer_token(headers)
-        && store.verify_api_key(key).await.ok().flatten().is_some()
+        && let Some(verification) = store.verify_api_key(key).await.ok().flatten()
     {
+        if verification.scopes.is_empty() {
+            return AuthResult::Unauthorized;
+        }
         return AuthResult::Allowed(AuthIdentity {
             method: AuthMethod::ApiKey,
         });
@@ -274,6 +277,9 @@ pub fn parse_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use axum::http::{HeaderMap, header};
 
     #[test]
     fn test_parse_cookie() {
@@ -305,5 +311,61 @@ mod tests {
     #[test]
     fn graphql_paths_are_not_public() {
         assert!(!is_public_path("/graphql"));
+    }
+
+    async fn test_credential_store() -> Arc<CredentialStore> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create sqlite pool");
+        let store = Arc::new(
+            CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
+                .await
+                .expect("create credential store"),
+        );
+        store
+            .set_initial_password("supersecret")
+            .await
+            .expect("set initial password");
+        store
+    }
+
+    #[tokio::test]
+    async fn check_auth_rejects_unscoped_api_key() {
+        let store = test_credential_store().await;
+        let (_id, raw_key) = store
+            .create_api_key("unscoped", None)
+            .await
+            .expect("create api key");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {raw_key}").parse().expect("valid header"),
+        );
+
+        let result = check_auth(&store, &headers, false).await;
+        assert!(matches!(result, AuthResult::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn check_auth_allows_scoped_api_key() {
+        let store = test_credential_store().await;
+        let scopes = vec!["operator.read".to_string()];
+        let (_id, raw_key) = store
+            .create_api_key("scoped", Some(&scopes))
+            .await
+            .expect("create scoped key");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {raw_key}").parse().expect("valid header"),
+        );
+
+        let result = check_auth(&store, &headers, false).await;
+        assert!(matches!(
+            result,
+            AuthResult::Allowed(AuthIdentity {
+                method: AuthMethod::ApiKey
+            })
+        ));
     }
 }
