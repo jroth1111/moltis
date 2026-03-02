@@ -3941,6 +3941,7 @@ pub async fn prepare_gateway(
         std::time::Duration::from_secs(60),
         moltis_agents::self_repair::DEFAULT_STUCK_THRESHOLD,
         moltis_agents::self_repair::DEFAULT_MAX_REPAIR_ATTEMPTS,
+        Some(Arc::clone(&session_store)),
         None,
     );
 
