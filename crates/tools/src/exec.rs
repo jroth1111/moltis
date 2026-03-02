@@ -763,6 +763,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exec_command_preserves_explicit_env_overrides() {
+        let opts = ExecOpts {
+            env: vec![("MOLTIS_TEST_ENV".to_string(), "hello".to_string())],
+            ..Default::default()
+        };
+        let result = exec_command("printf %s \"$MOLTIS_TEST_ENV\"", &opts)
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, "hello");
+    }
+
+    #[tokio::test]
     async fn test_exec_exit_code() {
         let result = exec_command("exit 42", &ExecOpts::default()).await.unwrap();
         assert_eq!(result.exit_code, 42);
