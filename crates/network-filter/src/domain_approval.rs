@@ -64,15 +64,6 @@ impl DomainApprovalManager {
         session: &str,
         domain: &str,
     ) -> (FilterAction, Option<ApprovalSource>) {
-        // Empty config allowlist means default-deny (fail-closed).
-        // Users who want the old allow-all behaviour must add `trusted_domains = ["*"]`.
-        if self.config_allowlist.is_empty() {
-            #[cfg(feature = "metrics")]
-            counter!("domain_checks_total", "result" => "needs_approval", "source" => "config")
-                .increment(1);
-            return (FilterAction::NeedsApproval, None);
-        }
-
         // Config allowlist.
         for pattern in &self.config_allowlist {
             if pattern.matches(domain) {
@@ -273,6 +264,17 @@ mod tests {
         assert_eq!(
             mgr.check_domain("sess1", "evil.org").await,
             FilterAction::NeedsApproval
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_allowlist_still_allows_session_approved_domains() {
+        let mgr = DomainApprovalManager::new(&[], Duration::from_secs(60));
+        mgr.add_trusted_domain("sess1", "example.com").await;
+
+        assert_eq!(
+            mgr.check_domain("sess1", "example.com").await,
+            FilterAction::Allow
         );
     }
 
