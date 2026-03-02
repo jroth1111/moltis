@@ -4217,7 +4217,14 @@ pub async fn prepare_gateway(
 
                     // Broadcast metrics update to all connected clients.
                     let payload = crate::state::MetricsUpdatePayload { snapshot, point };
-                    if let Ok(payload_json) = serde_json::to_value(&payload) {
+                    if let Ok(mut payload_json) = serde_json::to_value(&payload) {
+                        if let Some(obj) = payload_json.as_object_mut()
+                            && let Ok(health_json) = serde_json::to_value(
+                                moltis_agents::provider_health::global_snapshot(),
+                            )
+                        {
+                            obj.insert("providerHealth".to_string(), health_json);
+                        }
                         broadcast(
                             &metrics_state,
                             "metrics.update",

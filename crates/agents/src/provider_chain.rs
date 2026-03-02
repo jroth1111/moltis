@@ -21,6 +21,7 @@ use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 
 use crate::{
     model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent},
+    provider_health::{ProviderHealthTracker, global_tracker},
     rate_limiter::{ProviderRateLimiter, RateLimitDecision},
 };
 
@@ -86,6 +87,7 @@ pub struct ProviderChain {
     cb_threshold: usize,
     cb_cooldown: Duration,
     rate_limiter: Option<Arc<ProviderRateLimiter>>,
+    health_tracker: Arc<ProviderHealthTracker>,
 }
 
 impl ProviderChain {
@@ -104,6 +106,7 @@ impl ProviderChain {
             cb_threshold: 3,
             cb_cooldown: Duration::from_secs(60),
             rate_limiter: ProviderRateLimiter::from_config(&config.tools.provider_rate_limit),
+            health_tracker: global_tracker(),
         }
     }
 
@@ -122,6 +125,12 @@ impl ProviderChain {
     /// Override the outbound provider rate limiter.
     pub fn with_rate_limiter(mut self, limiter: Option<Arc<ProviderRateLimiter>>) -> Self {
         self.rate_limiter = limiter;
+        self
+    }
+
+    /// Override provider-health tracking sink.
+    pub fn with_health_tracker(mut self, tracker: Arc<ProviderHealthTracker>) -> Self {
+        self.health_tracker = tracker;
         self
     }
 
@@ -164,6 +173,7 @@ impl LlmProvider for ProviderChain {
 
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
+            let attempt_start = Instant::now();
 
             if let Some(ref limiter) = self.rate_limiter {
                 match limiter.acquire(&provider_name, &model_id) {
@@ -197,6 +207,11 @@ impl LlmProvider for ProviderChain {
             match entry.provider.complete(messages, tools).await {
                 Ok(resp) => {
                     entry.state.record_success();
+                    self.health_tracker.record_success(
+                        &provider_name,
+                        &model_id,
+                        attempt_start.elapsed().as_millis() as u64,
+                    );
 
                     // Record metrics on successful completion
                     #[cfg(feature = "metrics")]
@@ -250,6 +265,12 @@ impl LlmProvider for ProviderChain {
                 },
                 Err(e) => {
                     let kind = classify_error(&e);
+                    self.health_tracker.record_failure(
+                        &provider_name,
+                        &model_id,
+                        attempt_start.elapsed().as_millis() as u64,
+                        provider_error_kind_label(kind),
+                    );
 
                     if matches!(
                         kind,
@@ -322,6 +343,7 @@ impl LlmProvider for ProviderChain {
         let provider_name = selected.provider.name().to_string();
         let model_id = selected.provider.id().to_string();
         let state = &selected.state;
+        let health_tracker = Arc::clone(&self.health_tracker);
         let start = Instant::now();
         let mut first_delta_recorded = false;
         let inner = selected.provider.stream_with_tools(messages, tools);
@@ -342,6 +364,11 @@ impl LlmProvider for ProviderChain {
                     },
                     StreamEvent::Done(usage) => {
                         state.record_success();
+                        health_tracker.record_success(
+                            &provider_name,
+                            &model_id,
+                            start.elapsed().as_millis() as u64,
+                        );
                         #[cfg(feature = "metrics")]
                         {
                             let duration_secs = start.elapsed().as_secs_f64();
@@ -365,9 +392,15 @@ impl LlmProvider for ProviderChain {
                     },
                     StreamEvent::Error(msg) => {
                         state.record_failure();
+                        let kind = classify_error_message(msg);
+                        health_tracker.record_failure(
+                            &provider_name,
+                            &model_id,
+                            start.elapsed().as_millis() as u64,
+                            provider_error_kind_label(kind),
+                        );
                         #[cfg(feature = "metrics")]
                         {
-                            let kind = classify_error_message(msg);
                             counter!(
                                 llm_metrics::COMPLETION_ERRORS_TOTAL,
                                 labels::PROVIDER => provider_name.clone(),
@@ -383,6 +416,20 @@ impl LlmProvider for ProviderChain {
             })
         };
         Box::pin(wrapped)
+    }
+}
+
+fn provider_error_kind_label(kind: ProviderErrorKind) -> &'static str {
+    match kind {
+        ProviderErrorKind::RateLimit => "rate_limit",
+        ProviderErrorKind::AuthError => "auth_error",
+        ProviderErrorKind::ServerError => "server_error",
+        ProviderErrorKind::Timeout => "timeout",
+        ProviderErrorKind::BillingExhausted => "billing_exhausted",
+        ProviderErrorKind::NonRetryableRateLimit => "non_retryable_rate_limit",
+        ProviderErrorKind::ContextWindow => "context_window",
+        ProviderErrorKind::InvalidRequest => "invalid_request",
+        ProviderErrorKind::Unknown => "unknown",
     }
 }
 
@@ -701,6 +748,48 @@ mod tests {
         let chain = ProviderChain::single(Arc::new(SuccessProvider { id: "only" }));
         assert_eq!(chain.id(), "only");
         assert_eq!(chain.chain.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn records_provider_health_on_successful_completion() {
+        let tracker = Arc::new(ProviderHealthTracker::new(Duration::from_secs(60), 100));
+        let chain = ProviderChain::single(Arc::new(SuccessProvider { id: "health-model" }))
+            .with_health_tracker(Arc::clone(&tracker));
+
+        let _ = chain.complete(&[], &[]).await.unwrap();
+
+        let snapshot = tracker.snapshot();
+        let stats = snapshot
+            .providers
+            .iter()
+            .find(|item| item.provider == "success" && item.model == "health-model")
+            .unwrap();
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.success_count, 1);
+        assert_eq!(stats.error_count, 0);
+    }
+
+    #[tokio::test]
+    async fn records_provider_health_on_failed_completion() {
+        let tracker = Arc::new(ProviderHealthTracker::new(Duration::from_secs(60), 100));
+        let chain = ProviderChain::single(Arc::new(FailingProvider {
+            id: "health-model",
+            error_msg: "500 internal server error",
+        }))
+        .with_health_tracker(Arc::clone(&tracker));
+
+        let _ = chain.complete(&[], &[]).await;
+
+        let snapshot = tracker.snapshot();
+        let stats = snapshot
+            .providers
+            .iter()
+            .find(|item| item.provider == "failing" && item.model == "health-model")
+            .unwrap();
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.success_count, 0);
+        assert_eq!(stats.error_count, 1);
+        assert!(stats.error_rate_by_class.contains_key("server_error"));
     }
 
     // ── Regression: stream_with_tools must forward tools to the provider ──
