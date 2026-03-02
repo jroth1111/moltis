@@ -59,13 +59,8 @@ impl HookHandler for CostTrackerHook {
         } = payload
         {
             let cost = Self::compute_cost(model, *input_tokens, *output_tokens);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let date = time::OffsetDateTime::from_unix_timestamp(now)
-                .map(|ts| ts.date().to_string())
-                .unwrap_or_else(|_| "1970-01-01".to_string());
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let date = time::OffsetDateTime::now_utc().date().to_string();
 
             let result =
                 sqlx::query("INSERT INTO agent_spend (date, model, cost, ts) VALUES (?, ?, ?, ?)")
@@ -117,10 +112,7 @@ impl HookHandler for CostGuardHook {
 
     async fn handle(&self, _event: HookEvent, payload: &HookPayload) -> Result<HookAction> {
         if let HookPayload::BeforeAgentStart { .. } = payload {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
             // Get all spend from the last 24 hours
             let cutoff = now - 86400;
 
@@ -145,5 +137,37 @@ impl HookHandler for CostGuardHook {
             }
         }
         Ok(HookAction::Continue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_cost_claude() {
+        let cost = CostTrackerHook::compute_cost("claude-3-opus", 1000, 500);
+        // 1000 * 0.000015 + 500 * 0.000075 = 0.015 + 0.0375 = 0.0525
+        assert!((cost - 0.0525).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_compute_cost_gpt4() {
+        let cost = CostTrackerHook::compute_cost("gpt-4-turbo", 1000, 500);
+        // 1000 * 0.00003 + 500 * 0.00006 = 0.03 + 0.03 = 0.06
+        assert!((cost - 0.06).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_compute_cost_fallback() {
+        let cost = CostTrackerHook::compute_cost("unknown-model", 1000, 500);
+        // 1000 * 0.000001 + 500 * 0.000001 = 0.001 + 0.0005 = 0.0015
+        assert!((cost - 0.0015).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_compute_cost_zero_tokens() {
+        let cost = CostTrackerHook::compute_cost("claude-3-opus", 0, 0);
+        assert!((cost - 0.0).abs() < 0.0001);
     }
 }
