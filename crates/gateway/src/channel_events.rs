@@ -114,6 +114,40 @@ fn start_channel_typing_loop(
     Some(done_tx)
 }
 
+async fn dispatch_event_triggered_cron_jobs(state: &GatewayState, channel: &str, text: &str) {
+    let jobs_val = match state.services.cron.list().await {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(error = %e, "event trigger: failed to list cron jobs");
+            return;
+        },
+    };
+
+    let jobs = match serde_json::from_value::<Vec<moltis_cron::types::CronJob>>(jobs_val) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(error = %e, "event trigger: invalid cron job payload from service");
+            return;
+        },
+    };
+
+    let pairs: Vec<(moltis_cron::types::CronJobId, moltis_cron::types::CronSchedule)> = jobs
+        .into_iter()
+        .filter(|job| job.enabled)
+        .map(|job| (job.id, job.schedule))
+        .collect();
+
+    let matcher = moltis_cron::event_matcher::EventMatcher::new();
+    matcher.reload(pairs).await;
+
+    let matched = matcher.match_message(Some(channel), text).await;
+    for job_id in matched {
+        if let Err(e) = state.services.cron.run(serde_json::json!({ "id": &job_id })).await {
+            warn!(%job_id, error = %e, "event trigger: failed to fire cron job");
+        }
+    }
+}
+
 /// Broadcasts channel events over the gateway WebSocket.
 ///
 /// Uses a deferred `OnceCell` reference so the sink can be created before
@@ -351,6 +385,9 @@ impl ChannelEventSink for GatewayChannelEventSink {
             if let Some(done_tx) = typing_done {
                 let _ = done_tx.send(());
             }
+
+            // Fire any event-triggered cron jobs whose patterns match the user message.
+            dispatch_event_triggered_cron_jobs(state, meta.channel_type.as_str(), text).await;
 
             if let Err(e) = send_result {
                 error!("channel dispatch_to_chat failed: {e}");
@@ -829,6 +866,9 @@ impl ChannelEventSink for GatewayChannelEventSink {
         if let Some(done_tx) = typing_done {
             let _ = done_tx.send(());
         }
+
+        // Fire any event-triggered cron jobs whose patterns match the user message.
+        dispatch_event_triggered_cron_jobs(state, meta.channel_type.as_str(), text).await;
 
         if let Err(e) = send_result {
             error!("channel dispatch_to_chat_with_attachments failed: {e}");
@@ -1669,7 +1709,160 @@ fn format_model_list(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use {super::*, moltis_channels::ChannelType};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+    use tokio::sync::Mutex;
+
+    use {
+        super::*,
+        crate::{
+            auth::{AuthMode, ResolvedAuth},
+            services::{ChatService, CronService, GatewayServices, ServiceResult},
+            state::GatewayState,
+        },
+        moltis_channels::ChannelType,
+    };
+
+    use moltis_cron::types::{
+        CronJob, CronJobState, CronPayload, CronSandboxConfig, CronSchedule, CronWakeMode,
+        SessionTarget,
+    };
+
+    struct MockCronService {
+        jobs: Value,
+        run_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl CronService for MockCronService {
+        async fn list(&self) -> ServiceResult {
+            Ok(self.jobs.clone())
+        }
+
+        async fn status(&self) -> ServiceResult {
+            Ok(json!({ "running": true }))
+        }
+
+        async fn add(&self, _params: Value) -> ServiceResult {
+            Err("not implemented".into())
+        }
+
+        async fn update(&self, _params: Value) -> ServiceResult {
+            Err("not implemented".into())
+        }
+
+        async fn remove(&self, _params: Value) -> ServiceResult {
+            Err("not implemented".into())
+        }
+
+        async fn run(&self, params: Value) -> ServiceResult {
+            if let Some(id) = params.get("id").and_then(Value::as_str) {
+                self.run_ids.lock().await.push(id.to_string());
+            }
+            Ok(json!({ "ok": true }))
+        }
+
+        async fn runs(&self, _params: Value) -> ServiceResult {
+            Ok(json!([]))
+        }
+    }
+
+    struct MockChatService;
+
+    #[async_trait]
+    impl ChatService for MockChatService {
+        async fn send(&self, _params: Value) -> ServiceResult {
+            Ok(json!({ "ok": true }))
+        }
+
+        async fn abort(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn cancel_queued(&self, _params: Value) -> ServiceResult {
+            Ok(json!({ "cleared": 0 }))
+        }
+
+        async fn history(&self, _params: Value) -> ServiceResult {
+            Ok(json!([]))
+        }
+
+        async fn inject(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn clear(&self, _params: Value) -> ServiceResult {
+            Ok(json!({ "ok": true }))
+        }
+
+        async fn compact(&self, _params: Value) -> ServiceResult {
+            Ok(json!({ "ok": true }))
+        }
+
+        async fn context(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn raw_prompt(&self, _params: Value) -> ServiceResult {
+            Ok(json!({ "prompt": "" }))
+        }
+
+        async fn full_context(&self, _params: Value) -> ServiceResult {
+            Ok(json!([]))
+        }
+    }
+
+    fn build_event_trigger_job(id: &str, pattern: &str, channel_filter: Option<&str>) -> CronJob {
+        CronJob {
+            id: id.to_string(),
+            name: "event-trigger".to_string(),
+            enabled: true,
+            delete_after_run: false,
+            schedule: CronSchedule::EventTrigger {
+                pattern: pattern.to_string(),
+                channel_filter: channel_filter.map(str::to_string),
+            },
+            payload: CronPayload::AgentTurn {
+                message: "triage".to_string(),
+                model: None,
+                timeout_secs: None,
+                deliver: false,
+                channel: None,
+                to: None,
+            },
+            session_target: SessionTarget::Isolated,
+            state: CronJobState::default(),
+            sandbox: CronSandboxConfig::default(),
+            wake_mode: CronWakeMode::NextHeartbeat,
+            system: false,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn build_sink_with_jobs(jobs: Vec<CronJob>) -> (GatewayChannelEventSink, Arc<Mutex<Vec<String>>>) {
+        let run_ids = Arc::new(Mutex::new(Vec::new()));
+        let cron_service = Arc::new(MockCronService {
+            jobs: serde_json::to_value(jobs).unwrap(),
+            run_ids: run_ids.clone(),
+        });
+        let services = GatewayServices::noop()
+            .with_chat(Arc::new(MockChatService))
+            .with_cron(cron_service);
+        let state = GatewayState::new(
+            ResolvedAuth {
+                mode: AuthMode::Token,
+                token: None,
+                password: None,
+            },
+            services,
+        );
+        let state_cell = Arc::new(tokio::sync::OnceCell::new());
+        assert!(state_cell.set(state).is_ok());
+        (GatewayChannelEventSink::new(state_cell), run_ids)
+    }
 
     #[test]
     fn channel_event_serialization() {
@@ -1759,5 +1952,66 @@ mod tests {
     fn shell_mode_rewrite_skips_peek_and_stop() {
         assert!(rewrite_for_shell_mode("/peek").is_none());
         assert!(rewrite_for_shell_mode("/stop").is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_chat_fires_matching_event_trigger_job() {
+        let (sink, run_ids) = build_sink_with_jobs(vec![build_event_trigger_job(
+            "job-billing",
+            "(?i)billing",
+            Some("telegram"),
+        )]);
+        let reply_to = ChannelReplyTarget {
+            channel_type: ChannelType::Telegram,
+            account_id: "bot-1".to_string(),
+            chat_id: "123".to_string(),
+            message_id: None,
+        };
+        let meta = ChannelMessageMeta {
+            channel_type: ChannelType::Telegram,
+            sender_name: Some("Alice".to_string()),
+            username: Some("alice".to_string()),
+            message_kind: Some(moltis_channels::ChannelMessageKind::Text),
+            model: None,
+            audio_filename: None,
+        };
+
+        sink.dispatch_to_chat("Need BILLING support", reply_to, meta).await;
+
+        let ids = run_ids.lock().await;
+        assert_eq!(&*ids, &vec!["job-billing".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_attachments_fires_matching_event_trigger_job() {
+        let (sink, run_ids) = build_sink_with_jobs(vec![build_event_trigger_job(
+            "job-photo",
+            "(?i)invoice",
+            Some("telegram"),
+        )]);
+        let reply_to = ChannelReplyTarget {
+            channel_type: ChannelType::Telegram,
+            account_id: "bot-1".to_string(),
+            chat_id: "123".to_string(),
+            message_id: None,
+        };
+        let meta = ChannelMessageMeta {
+            channel_type: ChannelType::Telegram,
+            sender_name: Some("Alice".to_string()),
+            username: Some("alice".to_string()),
+            message_kind: Some(moltis_channels::ChannelMessageKind::Photo),
+            model: None,
+            audio_filename: None,
+        };
+        let attachments = vec![ChannelAttachment {
+            media_type: "image/png".to_string(),
+            data: vec![1, 2, 3, 4],
+        }];
+
+        sink.dispatch_to_chat_with_attachments("Invoice screenshot", attachments, reply_to, meta)
+            .await;
+
+        let ids = run_ids.lock().await;
+        assert_eq!(&*ids, &vec!["job-photo".to_string()]);
     }
 }

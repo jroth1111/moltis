@@ -3,6 +3,7 @@
 //! Isolated agent execution (no session), optional delivery to a channel.
 
 pub mod error;
+pub mod event_matcher;
 pub mod heartbeat;
 pub mod parse;
 pub mod schedule;

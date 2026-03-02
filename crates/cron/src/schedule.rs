@@ -76,6 +76,8 @@ pub fn compute_next_run(schedule: &CronSchedule, now_ms: u64) -> Result<Option<u
 
             Ok(next)
         },
+        // Event-triggered jobs have no scheduled next-run time; they fire on matching messages.
+        CronSchedule::EventTrigger { .. } => Ok(None),
     }
 }
 
@@ -183,5 +185,14 @@ mod tests {
             tz: Some("Mars/Olympus".into()),
         };
         assert!(compute_next_run(&s, 1000).is_err());
+    }
+
+    #[test]
+    fn test_event_trigger_has_no_scheduled_next_run() {
+        let s = CronSchedule::EventTrigger {
+            pattern: "billing".into(),
+            channel_filter: None,
+        };
+        assert_eq!(compute_next_run(&s, 1000).unwrap(), None);
     }
 }
