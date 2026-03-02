@@ -341,6 +341,15 @@ fn build_schema_map() -> KnownKeys {
                 ("fact_extraction", Leaf),
                 ("context_compaction_strategy", Leaf),
                 ("context_compaction_keep_recent", Leaf),
+                (
+                    "research",
+                    Struct(HashMap::from([
+                        ("enabled", Leaf),
+                        ("trigger", Leaf),
+                        ("keywords", Leaf),
+                        ("max_iterations", Leaf),
+                    ])),
+                ),
             ])),
         ),
         (
@@ -1833,6 +1842,28 @@ unknwon = "value"
         assert!(
             unknown.is_some(),
             "expected unknown-field in hooks entry, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn chat_research_fields_are_known() {
+        let toml = r#"
+[chat.research]
+enabled = true
+trigger = "length"
+keywords = ["billing", "invoice"]
+max_iterations = 4
+"#;
+        let result = validate_toml_str(toml);
+        let unknown: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.category == "unknown-field" && d.path.starts_with("chat.research"))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "chat.research keys should be known, got: {:?}",
             result.diagnostics
         );
     }

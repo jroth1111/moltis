@@ -5948,6 +5948,55 @@ fn effective_tool_mode(provider: &dyn moltis_agents::model::LlmProvider) -> Tool
     }
 }
 
+fn research_text_from_user_content(user_content: &UserContent) -> &str {
+    match user_content {
+        UserContent::Text(text) => text.as_str(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .find_map(|part| {
+                if let ContentPart::Text(text) = part {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(""),
+    }
+}
+
+async fn maybe_append_research_context(
+    system_prompt: &mut String,
+    provider: Arc<dyn moltis_agents::model::LlmProvider>,
+    user_content: &UserContent,
+    history: &[ChatMessage],
+    enabled: bool,
+    trigger: &str,
+    keywords: &[String],
+    max_iterations: usize,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+
+    let research_trigger = moltis_agents::research::ResearchTrigger::from_config(trigger, keywords);
+    let research_text = research_text_from_user_content(user_content);
+    if let Ok(Some(result)) = moltis_agents::research::run_research_phase(
+        &research_trigger,
+        research_text,
+        history,
+        provider,
+        max_iterations,
+    )
+    .await
+    {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&result.context);
+        return true;
+    }
+
+    false
+}
+
 async fn run_with_tools(
     state: &Arc<dyn ChatRuntime>,
     model_store: &Arc<RwLock<DisabledModelsStore>>,
@@ -6026,7 +6075,7 @@ async fn run_with_tools(
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     // Keep the runtime datetime/date sentence as the final prompt line for better cache locality.
-    let system_prompt =
+    let mut system_prompt =
         apply_voice_reply_suffix(system_prompt, desired_reply_medium, runtime_context);
 
     // Determine sandbox mode for this session.
@@ -6442,6 +6491,19 @@ async fn run_with_tools(
     if let Some(cid) = conn_id.as_deref() {
         tool_context["_conn_id"] = serde_json::json!(cid);
     }
+
+    // Research phase: gather context before the main agent turn when enabled.
+    let _ = maybe_append_research_context(
+        &mut system_prompt,
+        provider.clone(),
+        user_content,
+        hist.as_deref().unwrap_or(&[]),
+        persona.config.chat.research.enabled,
+        &persona.config.chat.research.trigger,
+        &persona.config.chat.research.keywords,
+        persona.config.chat.research.max_iterations,
+    )
+    .await;
 
     let provider_ref = provider.clone();
     let first_result = run_agent_loop_streaming(
@@ -6917,13 +6979,26 @@ async fn run_streaming(
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     // Keep the runtime datetime/date sentence as the final prompt line for better cache locality.
-    let system_prompt =
+    let mut system_prompt =
         apply_voice_reply_suffix(system_prompt, desired_reply_medium, runtime_context);
+
+    // Convert persisted JSON history to typed ChatMessages for the LLM provider.
+    let chat_history = values_to_chat_messages(history_raw);
+    let _ = maybe_append_research_context(
+        &mut system_prompt,
+        provider.clone(),
+        user_content,
+        &chat_history,
+        persona.config.chat.research.enabled,
+        &persona.config.chat.research.trigger,
+        &persona.config.chat.research.keywords,
+        persona.config.chat.research.max_iterations,
+    )
+    .await;
 
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage::system(system_prompt));
-    // Convert persisted JSON history to typed ChatMessages for the LLM provider.
-    messages.extend(values_to_chat_messages(history_raw));
+    messages.extend(chat_history);
     messages.push(ChatMessage::User {
         content: user_content.clone(),
     });
@@ -8842,6 +8917,70 @@ mod tests {
         let base_prompt = "You are a helpful assistant.".to_string();
         let prompt = apply_voice_reply_suffix(base_prompt.clone(), ReplyMedium::Text, None);
         assert_eq!(prompt, base_prompt);
+    }
+
+    #[test]
+    fn research_text_from_user_content_prefers_first_text_part() {
+        let text_only = UserContent::text("plain");
+        assert_eq!(research_text_from_user_content(&text_only), "plain");
+
+        let multimodal = UserContent::Multimodal(vec![
+            ContentPart::Image {
+                media_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            },
+            ContentPart::Text("first".to_string()),
+            ContentPart::Text("second".to_string()),
+        ]);
+        assert_eq!(research_text_from_user_content(&multimodal), "first");
+    }
+
+    #[tokio::test]
+    async fn maybe_append_research_context_respects_enabled_flag() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(StaticProvider {
+            name: "test".to_string(),
+            id: "test-model".to_string(),
+        });
+        let mut prompt = "base prompt".to_string();
+
+        let appended = maybe_append_research_context(
+            &mut prompt,
+            provider,
+            &UserContent::text("What is Rust?"),
+            &[],
+            false,
+            "always",
+            &[],
+            3,
+        )
+        .await;
+
+        assert!(!appended);
+        assert_eq!(prompt, "base prompt");
+    }
+
+    #[tokio::test]
+    async fn maybe_append_research_context_appends_when_trigger_fires() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(StaticProvider {
+            name: "test".to_string(),
+            id: "test-model".to_string(),
+        });
+        let mut prompt = "base prompt".to_string();
+
+        let appended = maybe_append_research_context(
+            &mut prompt,
+            provider,
+            &UserContent::text("What is Rust?"),
+            &[],
+            true,
+            "question",
+            &[],
+            3,
+        )
+        .await;
+
+        assert!(appended);
+        assert!(prompt.starts_with("base prompt\n\nResearch context for query"));
     }
 
     #[test]
@@ -11173,16 +11312,15 @@ mod tests {
         );
 
         // Pre-populate active tool calls for a session.
-        service
-            .active_tool_calls
-            .write()
-            .await
-            .insert("test-session".into(), vec![ActiveToolCall {
+        service.active_tool_calls.write().await.insert(
+            "test-session".into(),
+            vec![ActiveToolCall {
                 id: "tc_1".into(),
                 name: "bash".into(),
                 arguments: serde_json::json!({}),
                 started_at: 0,
-            }]);
+            }],
+        );
         // Pre-populate active_runs_by_session so abort can find the session.
         let run_id = "test-run".to_string();
         service
