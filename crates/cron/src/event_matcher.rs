@@ -8,11 +8,11 @@ use regex::Regex;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use crate::types::CronSchedule;
+use crate::types::{CronJobId, CronSchedule};
 
 /// A compiled event trigger entry.
 struct EventEntry {
-    job_id: String,
+    job_id: CronJobId,
     pattern: Regex,
     channel_filter: Option<String>,
 }
@@ -30,7 +30,7 @@ impl EventMatcher {
     }
 
     /// Reload event entries from the given list of (job_id, schedule) pairs.
-    pub async fn reload(&self, jobs: Vec<(String, CronSchedule)>) {
+    pub async fn reload(&self, jobs: Vec<(CronJobId, CronSchedule)>) {
         let mut new_entries = Vec::new();
         for (job_id, schedule) in jobs {
             if let CronSchedule::EventTrigger { pattern, channel_filter } = schedule {
@@ -51,7 +51,7 @@ impl EventMatcher {
     }
 
     /// Returns the job IDs whose patterns match the given message.
-    pub async fn match_message(&self, channel: Option<&str>, text: &str) -> Vec<String> {
+    pub async fn match_message(&self, channel: Option<&str>, text: &str) -> Vec<CronJobId> {
         let entries = self.entries.read().await;
         entries
             .iter()
@@ -69,7 +69,7 @@ impl EventMatcher {
     }
 
     /// Invalidate and rebuild from a fresh job list.
-    pub async fn invalidate(&self, jobs: Vec<(String, CronSchedule)>) {
+    pub async fn invalidate(&self, jobs: Vec<(CronJobId, CronSchedule)>) {
         self.reload(jobs).await;
     }
 }
@@ -84,7 +84,7 @@ impl Default for EventMatcher {
 mod tests {
     use super::*;
 
-    fn make_jobs(patterns: &[(&str, Option<&str>)]) -> Vec<(String, CronSchedule)> {
+    fn make_jobs(patterns: &[(&str, Option<&str>)]) -> Vec<(CronJobId, CronSchedule)> {
         patterns
             .iter()
             .enumerate()

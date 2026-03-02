@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Canonical ID type used by cron jobs and run records.
+pub type CronJobId = String;
+
 /// Whether to wake the heartbeat after a cron job completes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -107,7 +110,7 @@ pub struct CronJobState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CronJob {
-    pub id: String,
+    pub id: CronJobId,
     pub name: String,
     #[serde(default)]
     pub enabled: bool,
@@ -137,7 +140,7 @@ pub struct CronJob {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CronRunRecord {
-    pub job_id: String,
+    pub job_id: CronJobId,
     pub started_at_ms: u64,
     pub finished_at_ms: u64,
     pub status: RunStatus,
@@ -180,7 +183,7 @@ pub struct CronJobCreate {
     /// Optional ID for the job. If not provided, a UUID will be generated.
     /// Use a fixed ID for system jobs to preserve run history across restarts.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub id: Option<CronJobId>,
     pub name: String,
     pub schedule: CronSchedule,
     pub payload: CronPayload,
