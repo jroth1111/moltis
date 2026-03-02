@@ -27,6 +27,8 @@ pub struct MethodContext {
     pub state: Arc<GatewayState>,
     /// Optional channel context from the request frame (v4).
     pub channel: Option<String>,
+    /// Unique trace identifier generated at WebSocket ingress for request correlation.
+    pub trace_id: String,
 }
 
 /// The result a method handler produces.
@@ -682,6 +684,7 @@ mod tests {
                 GatewayServices::noop(),
             ),
             channel: None,
+            trace_id: uuid::Uuid::new_v4().to_string(),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()

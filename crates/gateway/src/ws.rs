@@ -451,6 +451,7 @@ pub async fn handle_connection(
                     client_scopes: scopes.clone(),
                     state: Arc::clone(&state),
                     channel: req.channel,
+                    trace_id: uuid::Uuid::new_v4().to_string(),
                 };
                 let response = methods.dispatch(ctx).await;
                 if state.ws_request_logs {

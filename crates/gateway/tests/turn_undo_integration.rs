@@ -87,6 +87,7 @@ async fn dispatch_method(
             client_scopes: vec!["operator.admin".to_string()],
             state: Arc::clone(state),
             channel: None,
+            trace_id: uuid::Uuid::new_v4().to_string(),
         })
         .await
 }
