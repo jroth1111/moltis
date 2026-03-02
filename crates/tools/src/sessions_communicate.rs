@@ -251,6 +251,7 @@ impl AgentTool for SessionsSendTool {
             || bool_param(&params, "waitForReply", false);
         let context = owned_str_param(&params, &["context"]);
         let model = owned_str_param(&params, &["model"]);
+        let trace_id = owned_str_param(&params, &["_trace_id"]);
 
         let entry = self
             .metadata
@@ -269,7 +270,7 @@ impl AgentTool for SessionsSendTool {
             message,
             wait_for_reply,
             model,
-            trace_id: None,
+            trace_id,
         })
         .await?;
 
@@ -424,6 +425,7 @@ mod tests {
                 assert_eq!(req.key, "session:target");
                 assert!(req.message.starts_with("[From: coordinator]"));
                 assert!(req.wait_for_reply);
+                assert!(req.trace_id.is_none());
                 Ok(serde_json::json!({
                     "text": "ok",
                     "inputTokens": 1,
@@ -446,6 +448,36 @@ mod tests {
         assert_eq!(result["waitForReply"], true);
         assert_eq!(result["result"]["text"], "ok");
         assert!(called.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sessions_send_forwards_trace_id_from_tool_context() -> TestResult<()> {
+        let metadata = Arc::new(SqliteSessionMetadata::new(test_pool().await?));
+        metadata
+            .upsert("session:target", Some("Target".to_string()))
+            .await?;
+
+        let send_fn: SendToSessionFn = Arc::new(move |req| {
+            Box::pin(async move {
+                assert_eq!(req.trace_id.as_deref(), Some("trace-123"));
+                Ok(serde_json::json!({
+                    "text": "ok"
+                }))
+            })
+        });
+        let tool = SessionsSendTool::new(metadata, send_fn);
+
+        let result = tool
+            .execute(serde_json::json!({
+                "key": "session:target",
+                "message": "Do work",
+                "_trace_id": "trace-123"
+            }))
+            .await?;
+
+        assert_eq!(result["sent"], true);
+        assert_eq!(result["result"]["text"], "ok");
         Ok(())
     }
 
