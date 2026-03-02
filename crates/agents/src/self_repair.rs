@@ -1,0 +1,361 @@
+//! Agent self-repair: detect and recover stuck agent runs.
+//!
+//! A background task scans active session state periodically. When a session
+//! has been in an "in-progress" state for more than the configured threshold
+//! without any activity update, it is considered stuck and recovery is attempted.
+//!
+//! State is tracked in the `SessionStateStore` under the `"self_repair"` namespace:
+//! - `running_since` — epoch ms when the current run started
+//! - `repair_attempts` — number of recovery attempts already made
+//!
+//! Recovery resets `running_since` to nil, allowing the next heartbeat or user
+//! message to re-trigger the agent. After `max_repair_attempts`, the session is
+//! marked failed and the caller is notified.
+
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use {
+    anyhow::Result,
+    tracing::{info, warn},
+};
+
+use moltis_sessions::state_store::SessionStateStore;
+
+/// Default threshold before a session is considered stuck.
+const DEFAULT_STUCK_THRESHOLD: Duration = Duration::from_secs(10 * 60); // 10 minutes
+
+/// Default number of repair attempts before giving up.
+const DEFAULT_MAX_REPAIR_ATTEMPTS: u32 = 3;
+
+/// Namespace used in `SessionStateStore` for self-repair tracking.
+const REPAIR_NAMESPACE: &str = "self_repair";
+
+/// Whether a session is currently marked as running.
+pub async fn is_session_running(store: &SessionStateStore, session_key: &str) -> bool {
+    store
+        .get(session_key, REPAIR_NAMESPACE, "running_since")
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Mark a session as started (begin tracking it for stuck detection).
+pub async fn mark_session_started(store: &SessionStateStore, session_key: &str) -> Result<()> {
+    let now = now_ms().to_string();
+    store
+        .set(session_key, REPAIR_NAMESPACE, "running_since", &now)
+        .await?;
+    Ok(())
+}
+
+/// Mark a session as finished (clear running state).
+pub async fn mark_session_finished(store: &SessionStateStore, session_key: &str) -> Result<()> {
+    store
+        .delete(session_key, REPAIR_NAMESPACE, "running_since")
+        .await?;
+    Ok(())
+}
+
+/// A session that has been detected as stuck.
+#[derive(Debug, Clone)]
+pub struct StuckSession {
+    pub session_key: String,
+    pub running_since_ms: u64,
+    pub elapsed: Duration,
+    pub repair_attempts: u32,
+}
+
+/// Result of a repair scan.
+#[derive(Debug, Default)]
+pub struct RepairScanResult {
+    /// Sessions that were found stuck and had recovery attempted.
+    pub recovered: Vec<String>,
+    /// Sessions that exceeded max repair attempts and were marked failed.
+    pub failed: Vec<String>,
+}
+
+/// Scan all sessions for stuck runs and attempt recovery.
+///
+/// Returns a summary of what was found and acted on.
+pub async fn scan_and_repair(
+    store: &SessionStateStore,
+    session_keys: &[String],
+    stuck_threshold: Duration,
+    max_repair_attempts: u32,
+) -> Result<RepairScanResult> {
+    let now = now_ms();
+    let threshold_ms = stuck_threshold.as_millis() as u64;
+    let mut result = RepairScanResult::default();
+
+    for key in session_keys {
+        let Some(running_since_str) = store
+            .get(key, REPAIR_NAMESPACE, "running_since")
+            .await
+            .unwrap_or(None)
+        else {
+            continue; // Not running — skip
+        };
+
+        let Ok(running_since_ms) = running_since_str.parse::<u64>() else {
+            warn!(session = %key, "could not parse running_since timestamp, clearing");
+            let _ = store.delete(key, REPAIR_NAMESPACE, "running_since").await;
+            continue;
+        };
+
+        let elapsed_ms = now.saturating_sub(running_since_ms);
+        if elapsed_ms < threshold_ms {
+            continue; // Not stuck yet
+        }
+
+        let elapsed = Duration::from_millis(elapsed_ms);
+        let attempts: u32 = store
+            .get(key, REPAIR_NAMESPACE, "repair_attempts")
+            .await
+            .unwrap_or(None)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        if attempts >= max_repair_attempts {
+            warn!(
+                session = %key,
+                elapsed_secs = elapsed.as_secs(),
+                attempts,
+                "session stuck and exceeded max repair attempts — marking failed"
+            );
+            // Clear running state so it doesn't keep alerting.
+            let _ = store.delete(key, REPAIR_NAMESPACE, "running_since").await;
+            let _ = store
+                .set(key, REPAIR_NAMESPACE, "failed", "true")
+                .await;
+            result.failed.push(key.clone());
+        } else {
+            info!(
+                session = %key,
+                elapsed_secs = elapsed.as_secs(),
+                attempts,
+                "stuck session detected — attempting recovery"
+            );
+            // Recovery: clear running_since (allows next message/heartbeat to restart).
+            let _ = store.delete(key, REPAIR_NAMESPACE, "running_since").await;
+            let next_attempts = (attempts + 1).to_string();
+            let _ = store
+                .set(key, REPAIR_NAMESPACE, "repair_attempts", &next_attempts)
+                .await;
+            result.recovered.push(key.clone());
+        }
+    }
+
+    Ok(result)
+}
+
+/// Check if a session has been permanently failed by self-repair.
+pub async fn is_session_failed(store: &SessionStateStore, session_key: &str) -> bool {
+    store
+        .get(session_key, REPAIR_NAMESPACE, "failed")
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == "true")
+}
+
+/// Information about stuck sessions for health reporting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StuckSessionInfo {
+    pub session_key: String,
+    pub running_since_ms: u64,
+    pub elapsed_secs: u64,
+    pub repair_attempts: u32,
+}
+
+/// Get a list of currently stuck sessions (for health endpoint reporting).
+pub async fn get_stuck_sessions(
+    store: &SessionStateStore,
+    session_keys: &[String],
+    stuck_threshold: Duration,
+) -> Vec<StuckSessionInfo> {
+    let now = now_ms();
+    let threshold_ms = stuck_threshold.as_millis() as u64;
+    let mut stuck = Vec::new();
+
+    for key in session_keys {
+        let Some(running_since_str) = store
+            .get(key, REPAIR_NAMESPACE, "running_since")
+            .await
+            .unwrap_or(None)
+        else {
+            continue;
+        };
+        let Ok(running_since_ms) = running_since_str.parse::<u64>() else {
+            continue;
+        };
+        let elapsed_ms = now.saturating_sub(running_since_ms);
+        if elapsed_ms < threshold_ms {
+            continue;
+        }
+        let repair_attempts = store
+            .get(key, REPAIR_NAMESPACE, "repair_attempts")
+            .await
+            .unwrap_or(None)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        stuck.push(StuckSessionInfo {
+            session_key: key.clone(),
+            running_since_ms,
+            elapsed_secs: elapsed_ms / 1000,
+            repair_attempts,
+        });
+    }
+
+    stuck
+}
+
+/// Start the self-repair background task.
+///
+/// Scans for stuck sessions every `scan_interval`, using the provided
+/// `session_keys_fn` to get the current list of active session keys.
+pub fn start_background_task(
+    store: Arc<SessionStateStore>,
+    scan_interval: Duration,
+    stuck_threshold: Duration,
+    max_repair_attempts: u32,
+    // Callback invoked when sessions are repaired or fail: (recovered, failed)
+    on_scan: Option<Arc<dyn Fn(RepairScanResult) + Send + Sync>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(scan_interval).await;
+
+            // Get all session keys from the state store.
+            // In a full integration the store would expose a method to list active sessions.
+            // For now we scan the store for any session that has running_since set.
+            // This is a simplified implementation — in production, integrate with
+            // the session metadata store to get all known session keys.
+            let keys = store
+                .list_running_sessions()
+                .await
+                .unwrap_or_default();
+
+            if keys.is_empty() {
+                continue;
+            }
+
+            match scan_and_repair(&store, &keys, stuck_threshold, max_repair_attempts).await {
+                Ok(result) => {
+                    if !result.recovered.is_empty() || !result.failed.is_empty() {
+                        info!(
+                            recovered = result.recovered.len(),
+                            failed = result.failed.len(),
+                            "self-repair scan complete"
+                        );
+                        if let Some(ref cb) = on_scan {
+                            cb(result);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "self-repair scan failed");
+                }
+            }
+        }
+    })
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn make_store() -> (SessionStateStore, sqlx::SqlitePool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        SessionStateStore::run_migrations_for_tests(&pool).await.unwrap();
+        let store = SessionStateStore::new(pool.clone());
+        (store, pool, dir)
+    }
+
+    #[tokio::test]
+    async fn mark_and_check_running() {
+        let (store, _, _dir) = make_store().await;
+        assert!(!is_session_running(&store, "s1").await);
+        mark_session_started(&store, "s1").await.unwrap();
+        assert!(is_session_running(&store, "s1").await);
+        mark_session_finished(&store, "s1").await.unwrap();
+        assert!(!is_session_running(&store, "s1").await);
+    }
+
+    #[tokio::test]
+    async fn scan_ignores_fresh_sessions() {
+        let (store, _, _dir) = make_store().await;
+        mark_session_started(&store, "s1").await.unwrap();
+        // Use a 10-minute threshold — freshly started session should not be stuck.
+        let result = scan_and_repair(&store, &["s1".to_string()], DEFAULT_STUCK_THRESHOLD, 3)
+            .await
+            .unwrap();
+        assert!(result.recovered.is_empty());
+        assert!(result.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_detects_old_session() {
+        let (store, _, _dir) = make_store().await;
+        // Manually write a very old running_since timestamp.
+        store
+            .set("s1", REPAIR_NAMESPACE, "running_since", "1000") // epoch 1s — ancient
+            .await
+            .unwrap();
+
+        let result = scan_and_repair(
+            &store,
+            &["s1".to_string()],
+            Duration::from_secs(60),
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.recovered, vec!["s1".to_string()]);
+        // Should have cleared running_since
+        assert!(!is_session_running(&store, "s1").await);
+    }
+
+    #[tokio::test]
+    async fn max_attempts_marks_failed() {
+        let (store, _, _dir) = make_store().await;
+        store
+            .set("s1", REPAIR_NAMESPACE, "running_since", "1000")
+            .await
+            .unwrap();
+        store
+            .set("s1", REPAIR_NAMESPACE, "repair_attempts", "3")
+            .await
+            .unwrap();
+
+        let result = scan_and_repair(
+            &store,
+            &["s1".to_string()],
+            Duration::from_secs(60),
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(result.recovered.is_empty());
+        assert_eq!(result.failed, vec!["s1".to_string()]);
+        assert!(is_session_failed(&store, "s1").await);
+    }
+}

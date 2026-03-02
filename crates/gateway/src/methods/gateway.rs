@@ -9,10 +9,29 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         Box::new(|ctx| {
             Box::pin(async move {
                 let count = ctx.state.client_count().await;
+
+                // Surface stuck agents if the session state store is available.
+                let stuck_agents = if let Some(store) = ctx.state.services.session_state_store.as_ref() {
+                    let keys = store.list_running_sessions().await.unwrap_or_default();
+                    if keys.is_empty() {
+                        vec![]
+                    } else {
+                        moltis_agents::self_repair::get_stuck_sessions(
+                            store,
+                            &keys,
+                            std::time::Duration::from_secs(10 * 60),
+                        )
+                        .await
+                    }
+                } else {
+                    vec![]
+                };
+
                 Ok(serde_json::json!({
                     "status": "ok",
                     "version": ctx.state.version,
                     "connections": count,
+                    "stuckAgents": stuck_agents,
                 }))
             })
         }),

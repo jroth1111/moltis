@@ -1199,6 +1199,8 @@ pub struct GatewayServices {
     pub session_metadata: Option<Arc<moltis_sessions::metadata::SqliteSessionMetadata>>,
     /// Optional session store for message-index lookups (e.g. deduplication).
     pub session_store: Option<Arc<moltis_sessions::store::SessionStore>>,
+    /// Optional session state store for per-session KV state (self-repair tracking etc.).
+    pub session_state_store: Option<Arc<moltis_sessions::state_store::SessionStateStore>>,
     /// Optional session share store for immutable snapshot links.
     pub session_share_store: Option<Arc<crate::share_store::ShareStore>>,
     /// Optional agent persona store for multi-agent support.
@@ -1282,6 +1284,7 @@ impl GatewayServices {
             channel_stream_outbound: None,
             session_metadata: None,
             session_store: None,
+            session_state_store: None,
             session_share_store: None,
             agent_persona_store: None,
         }
