@@ -2686,6 +2686,10 @@ impl ChatService for LiveChatService {
             .get("_conn_id")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let trace_id = params
+            .get("_trace_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let explicit_model = params.get("model").and_then(|v| v.as_str());
         // Use streaming-only mode if explicitly requested or if no tools are registered.
         let explicit_stream_only = params
@@ -3341,6 +3345,7 @@ impl ChatService for LiveChatService {
             .get("_accept_language")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let trace_id = trace_id.clone();
         // Three-tier context management:
         //   80% (compact)  — LLM fact-extraction + narrative summary replaces history.
         //   90% (archive tier) — strategy-driven truncate/archive while preserving recency.
@@ -3747,6 +3752,7 @@ impl ChatService for LiveChatService {
                         hook_registry,
                         accept_language.clone(),
                         conn_id.clone(),
+                        trace_id.clone(),
                         Some(&session_store),
                         mcp_disabled,
                         client_seq,
@@ -3922,6 +3928,10 @@ impl ChatService for LiveChatService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'text' parameter".to_string())?
             .to_string();
+        let trace_id = params
+            .get("_trace_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let desired_reply_medium = infer_reply_medium(&params, &text);
 
         let explicit_model = params.get("model").and_then(|v| v.as_str());
@@ -4069,6 +4079,7 @@ impl ChatService for LiveChatService {
                 hook_registry,
                 None,
                 None, // send_sync: no conn_id
+                trace_id,
                 Some(&self.session_store),
                 false, // send_sync: MCP tools always enabled for API calls
                 None,  // send_sync: no client seq
@@ -6108,6 +6119,7 @@ async fn run_with_tools(
     hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
     accept_language: Option<String>,
     conn_id: Option<String>,
+    trace_id: Option<String>,
     session_store: Option<&Arc<SessionStore>>,
     mcp_disabled: bool,
     client_seq: Option<u64>,
@@ -6582,6 +6594,9 @@ async fn run_with_tools(
     if let Some(cid) = conn_id.as_deref() {
         tool_context["_conn_id"] = serde_json::json!(cid);
     }
+    if let Some(tid) = trace_id.as_deref() {
+        tool_context["_trace_id"] = serde_json::json!(tid);
+    }
 
     // Research phase: gather context before the main agent turn when enabled.
     let _ = maybe_append_research_context(
@@ -6606,7 +6621,7 @@ async fn run_with_tools(
         hist,
         Some(tool_context.clone()),
         hook_registry.clone(),
-        None,
+        trace_id.clone(),
     )
     .await;
 
@@ -6670,7 +6685,7 @@ async fn run_with_tools(
                         retry_hist,
                         Some(tool_context),
                         hook_registry,
-                        None,
+                        trace_id,
                     )
                     .await
                 },

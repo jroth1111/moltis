@@ -1659,6 +1659,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
             Box::pin(async move {
                 let mut params = ctx.params.clone();
                 params["_conn_id"] = serde_json::json!(ctx.client_conn_id);
+                params["_trace_id"] = serde_json::json!(ctx.trace_id.clone());
                 // Forward client Accept-Language, public remote IP, and timezone.
                 {
                     let inner = ctx.state.inner.read().await;
