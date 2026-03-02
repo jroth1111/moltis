@@ -114,14 +114,22 @@ impl HookHandler for CostGuardHook {
         if let HookPayload::BeforeAgentStart { .. } = payload {
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             // Get all spend from the last 24 hours
-            let cutoff = now - 86400;
+            let cutoff = now - time::Duration::DAY.whole_seconds();
 
             let total: Option<f64> =
-                sqlx::query_scalar("SELECT SUM(cost) FROM agent_spend WHERE ts >= ?")
+                match sqlx::query_scalar("SELECT SUM(cost) FROM agent_spend WHERE ts >= ?")
                     .bind(cutoff)
                     .fetch_optional(self.db.as_ref())
                     .await
-                    .unwrap_or(None);
+                {
+                    Ok(total) => total,
+                    Err(e) => {
+                        warn!(error = %e, "cost-guard: failed to query spend; failing closed");
+                        return Ok(HookAction::Block(
+                            "cost guard unavailable: unable to verify spend".to_string(),
+                        ));
+                    },
+                };
 
             let total = total.unwrap_or(0.0);
             if total >= self.daily_limit_usd {
@@ -140,9 +148,61 @@ impl HookHandler for CostGuardHook {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn setup_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_spend (
+                date TEXT NOT NULL,
+                model TEXT NOT NULL,
+                cost REAL NOT NULL,
+                ts INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn blocks_when_daily_limit_reached() {
+        let pool = setup_pool().await;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        sqlx::query("INSERT INTO agent_spend (date, model, cost, ts) VALUES (?, ?, ?, ?)")
+            .bind("2026-01-01")
+            .bind("m")
+            .bind(10.0_f64)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let hook = CostGuardHook::new(Arc::new(pool), 5.0);
+        let payload = HookPayload::BeforeAgentStart {
+            session_key: "s1".into(),
+            model: "m".into(),
+        };
+        let result = hook.handle(HookEvent::BeforeAgentStart, &payload).await.unwrap();
+        assert!(matches!(result, HookAction::Block(_)));
+    }
+
+    #[tokio::test]
+    async fn fails_closed_when_spend_query_errors() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let hook = CostGuardHook::new(Arc::new(pool), 100.0);
+        let payload = HookPayload::BeforeAgentStart {
+            session_key: "s1".into(),
+            model: "m".into(),
+        };
+        let result = hook.handle(HookEvent::BeforeAgentStart, &payload).await.unwrap();
+        assert!(matches!(result, HookAction::Block(msg) if msg.contains("cost guard unavailable")));
+    }
 
     #[test]
     fn test_compute_cost_claude() {
