@@ -240,6 +240,7 @@ mod tests {
             ]),
             tool_count: 0,
             iteration: 1,
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeLLMCall, &payload)
@@ -264,6 +265,7 @@ mod tests {
             ]),
             tool_count: 0,
             iteration: 1,
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeLLMCall, &payload)
@@ -303,6 +305,7 @@ mod tests {
             ]),
             tool_count: 0,
             iteration: 1,
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeLLMCall, &payload)
@@ -332,6 +335,7 @@ mod tests {
             ]),
             tool_count: 0,
             iteration: 1,
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeLLMCall, &payload)

@@ -2,6 +2,8 @@
 
 pub mod error;
 pub mod hooks;
+pub mod trace;
 pub mod types;
 
 pub use error::{Error, FromMessage, MoltisError, Result};
+pub use trace::TraceId;

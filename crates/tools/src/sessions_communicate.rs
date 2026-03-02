@@ -26,6 +26,8 @@ pub struct SendToSessionRequest {
     pub message: String,
     pub wait_for_reply: bool,
     pub model: Option<String>,
+    /// Trace identifier from the originating request, for log correlation.
+    pub trace_id: Option<String>,
 }
 
 /// Callback used by `sessions_send`.
@@ -267,6 +269,7 @@ impl AgentTool for SessionsSendTool {
             message,
             wait_for_reply,
             model,
+            trace_id: None,
         })
         .await?;
 

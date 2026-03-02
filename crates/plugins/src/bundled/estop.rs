@@ -88,6 +88,7 @@ mod tests {
         let payload = HookPayload::BeforeAgentStart {
             session_key: "s1".into(),
             model: "claude".into(),
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeAgentStart, &payload)
@@ -106,6 +107,7 @@ mod tests {
             messages: serde_json::json!([]),
             tool_count: 0,
             iteration: 1,
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeLLMCall, &payload)
@@ -124,6 +126,7 @@ mod tests {
             messages: serde_json::json!([]),
             tool_count: 0,
             iteration: 1,
+            trace_id: None,
         };
         let result = hook
             .handle_sync(HookEvent::BeforeLLMCall, &payload)

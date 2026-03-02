@@ -101,12 +101,16 @@ pub enum HookPayload {
     BeforeAgentStart {
         session_key: String,
         model: String,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     AgentEnd {
         session_key: String,
         text: String,
         iterations: usize,
         tool_calls: usize,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     BeforeLLMCall {
         session_key: String,
@@ -115,6 +119,8 @@ pub enum HookPayload {
         messages: Value,
         tool_count: usize,
         iteration: usize,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     AfterLLMCall {
         session_key: String,
@@ -125,6 +131,8 @@ pub enum HookPayload {
         input_tokens: u32,
         output_tokens: u32,
         iteration: usize,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     BeforeCompaction {
         session_key: String,
@@ -151,12 +159,16 @@ pub enum HookPayload {
         session_key: String,
         tool_name: String,
         arguments: Value,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     AfterToolCall {
         session_key: String,
         tool_name: String,
         success: bool,
         result: Option<Value>,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     ToolResultPersist {
         session_key: String,
@@ -693,6 +705,7 @@ mod tests {
             session_key: "test".into(),
             tool_name: "exec".into(),
             arguments: serde_json::json!({}),
+            trace_id: None,
         }
     }
 
@@ -862,6 +875,7 @@ mod tests {
             messages: serde_json::json!([{"role": "user", "content": "hello"}]),
             tool_count: 3,
             iteration: 1,
+            trace_id: None,
         };
         assert_eq!(payload.event(), HookEvent::BeforeLLMCall);
     }
@@ -877,6 +891,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             iteration: 2,
+            trace_id: None,
         };
         assert_eq!(payload.event(), HookEvent::AfterLLMCall);
     }
@@ -897,6 +912,7 @@ mod tests {
             messages: serde_json::json!([]),
             tool_count: 0,
             iteration: 1,
+            trace_id: None,
         };
         let json = serde_json::to_string(&before).unwrap();
         let deser: HookPayload = serde_json::from_str(&json).unwrap();
@@ -911,6 +927,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             iteration: 1,
+            trace_id: None,
         };
         let json = serde_json::to_string(&after).unwrap();
         let deser: HookPayload = serde_json::from_str(&json).unwrap();
