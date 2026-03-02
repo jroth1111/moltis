@@ -517,6 +517,7 @@ impl LlmProvider for GitHubCopilotProvider {
             text,
             tool_calls,
             usage,
+        ..Default::default()
         })
     }
 
@@ -805,6 +806,7 @@ mod tests {
                 text,
                 tool_calls,
                 usage,
+            ..Default::default()
             })
         }
     }

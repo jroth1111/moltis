@@ -3,6 +3,20 @@ use {
     tracing::debug,
 };
 
+/// Pattern for tools that require explicit user approval before execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalPattern {
+    /// Glob pattern for tool name (e.g., "exec", "file*", "*").
+    pub tool: String,
+    /// Optional condition expression (future: CEL or simple DSL).
+    /// For now, conditions are informational only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// Human-readable description of why approval is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Glob-based allow/deny policy for tool access.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolPolicy {
@@ -10,6 +24,10 @@ pub struct ToolPolicy {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Tools that require explicit user approval before execution.
+    /// These are allowed (not denied), but need user confirmation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_required: Vec<ApprovalPattern>,
 }
 
 /// Context for resolving which policy layers apply.
@@ -29,14 +47,17 @@ pub fn profile_tools(profile: &str) -> ToolPolicy {
         "minimal" => ToolPolicy {
             allow: vec!["exec".into()],
             deny: Vec::new(),
+            approval_required: Vec::new(),
         },
         "coding" => ToolPolicy {
             allow: vec!["exec".into(), "browser".into(), "memory".into()],
             deny: Vec::new(),
+            approval_required: Vec::new(),
         },
         "full" => ToolPolicy {
             allow: vec!["*".into()],
             deny: Vec::new(),
+            approval_required: Vec::new(),
         },
         _ => ToolPolicy::default(),
     }
@@ -92,7 +113,25 @@ impl ToolPolicy {
                 combined.extend(other.deny.iter().cloned());
                 combined
             },
+            approval_required: {
+                let mut combined = self.approval_required.clone();
+                combined.extend(other.approval_required.iter().cloned());
+                combined
+            },
         }
+    }
+
+    /// Returns Some(ApprovalPattern) if the tool requires explicit approval.
+    /// Returns None if the tool is allowed without approval.
+    /// Note: This should only be called if is_allowed() returns true.
+    pub fn requires_approval(&self, tool_name: &str) -> Option<&ApprovalPattern> {
+        for pattern in &self.approval_required {
+            if pattern_matches(&pattern.tool, tool_name) {
+                debug!(tool = tool_name, pattern = %pattern.tool, "tool requires approval");
+                return Some(pattern);
+            }
+        }
+        None
     }
 }
 
@@ -195,6 +234,7 @@ mod tests {
         let policy = ToolPolicy {
             allow: vec!["*".into()],
             deny: Vec::new(),
+            ..Default::default()
         };
         assert!(policy.is_allowed("exec"));
         assert!(policy.is_allowed("browser"));
@@ -205,6 +245,7 @@ mod tests {
         let policy = ToolPolicy {
             allow: vec!["*".into()],
             deny: vec!["exec".into()],
+            ..Default::default()
         };
         assert!(!policy.is_allowed("exec"));
         assert!(policy.is_allowed("browser"));
@@ -215,6 +256,7 @@ mod tests {
         let policy = ToolPolicy {
             allow: vec!["browser*".into()],
             deny: Vec::new(),
+            ..Default::default()
         };
         assert!(policy.is_allowed("browser"));
         assert!(policy.is_allowed("browser.fetch"));
@@ -226,6 +268,7 @@ mod tests {
         let policy = ToolPolicy {
             allow: Vec::new(),
             deny: Vec::new(),
+            ..Default::default()
         };
         assert!(policy.is_allowed("exec"));
     }
@@ -235,10 +278,12 @@ mod tests {
         let base = ToolPolicy {
             allow: vec!["*".into()],
             deny: vec!["dangerous".into()],
+            ..Default::default()
         };
         let overlay = ToolPolicy {
             allow: Vec::new(),
             deny: vec!["exec".into()],
+            ..Default::default()
         };
         let merged = base.merge_with(&overlay);
         assert!(!merged.is_allowed("dangerous"));
@@ -301,5 +346,91 @@ mod tests {
         let policy = resolve_effective_policy(&config, &ctx);
         assert!(!policy.is_allowed("exec"));
         assert!(policy.is_allowed("browser"));
+    }
+
+    #[test]
+    fn test_approval_required_pattern() {
+        let policy = ToolPolicy {
+            allow: vec!["*".into()],
+            deny: Vec::new(),
+            approval_required: vec![ApprovalPattern {
+                tool: "exec".into(),
+                condition: Some("destructive".into()),
+                description: Some("Exec commands need approval".into()),
+            }],
+        };
+        assert!(policy.is_allowed("exec"));
+        let approval = policy.requires_approval("exec");
+        assert!(approval.is_some());
+        assert_eq!(approval.unwrap().tool, "exec");
+        assert_eq!(approval.unwrap().description, Some("Exec commands need approval".into()));
+    }
+
+    #[test]
+    fn test_approval_not_required_for_unmatched_tool() {
+        let policy = ToolPolicy {
+            allow: vec!["*".into()],
+            deny: Vec::new(),
+            approval_required: vec![ApprovalPattern {
+                tool: "exec".into(),
+                condition: None,
+                description: None,
+            }],
+        };
+        assert!(policy.is_allowed("browser"));
+        assert!(policy.requires_approval("browser").is_none());
+    }
+
+    #[test]
+    fn test_approval_merge_accumulates() {
+        let base = ToolPolicy {
+            allow: vec!["*".into()],
+            deny: Vec::new(),
+            approval_required: vec![ApprovalPattern {
+                tool: "exec".into(),
+                condition: None,
+                description: Some("Base approval".into()),
+            }],
+        };
+        let overlay = ToolPolicy {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            approval_required: vec![ApprovalPattern {
+                tool: "file_delete".into(),
+                condition: None,
+                description: Some("Overlay approval".into()),
+            }],
+        };
+        let merged = base.merge_with(&overlay);
+        assert!(merged.requires_approval("exec").is_some());
+        assert!(merged.requires_approval("file_delete").is_some());
+        assert!(merged.requires_approval("browser").is_none());
+    }
+
+    #[test]
+    fn test_resolve_approval_required() {
+        let config = serde_json::json!({
+            "tools": {
+                "policy": {
+                    "allow": ["*"],
+                    "deny": [],
+                    "approval_required": [
+                        {
+                            "tool": "exec",
+                            "description": "Shell commands need approval"
+                        }
+                    ]
+                }
+            }
+        });
+        let ctx = PolicyContext {
+            agent_id: "test".into(),
+            ..Default::default()
+        };
+        let policy = resolve_effective_policy(&config, &ctx);
+        assert!(policy.is_allowed("exec"));
+        let approval = policy.requires_approval("exec");
+        assert!(approval.is_some());
+        assert_eq!(approval.unwrap().description, Some("Shell commands need approval".into()));
     }
 }

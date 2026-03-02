@@ -2038,6 +2038,22 @@ pub struct ToolPolicyConfig {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub profile: Option<String>,
+    /// Tools that require explicit user approval before execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_required: Vec<ApprovalPatternConfig>,
+}
+
+/// Pattern for tools requiring explicit approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalPatternConfig {
+    /// Glob pattern for tool name (e.g., "exec", "file*", "*").
+    pub tool: String,
+    /// Optional condition expression (future: CEL or simple DSL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// Human-readable description of why approval is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// OAuth provider configuration (e.g. openai-codex).
