@@ -6535,6 +6535,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "moltis-tasks"
+version = "0.10.6"
+dependencies = [
+ "anyhow",
+ "moltis-metrics",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "moltis-telegram"
 version = "0.10.6"
 dependencies = [
