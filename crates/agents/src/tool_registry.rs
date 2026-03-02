@@ -104,31 +104,40 @@ impl ToolRegistry {
     /// Register a built-in tool with an optional per-tool rate limit.
     pub fn register_with_limit(&mut self, tool: Box<dyn AgentTool>, limit: Option<RateLimit>) {
         let name = tool.name().to_string();
-        self.tools.insert(name, ToolEntry {
-            tool: Arc::from(tool),
-            source: ToolSource::Builtin,
-            rate_limit: limit,
-        });
+        self.tools.insert(
+            name,
+            ToolEntry {
+                tool: Arc::from(tool),
+                source: ToolSource::Builtin,
+                rate_limit: limit,
+            },
+        );
     }
 
     /// Register a tool from an MCP server.
     pub fn register_mcp(&mut self, tool: Box<dyn AgentTool>, server: String) {
         let name = tool.name().to_string();
-        self.tools.insert(name, ToolEntry {
-            tool: Arc::from(tool),
-            source: ToolSource::Mcp { server },
-            rate_limit: None,
-        });
+        self.tools.insert(
+            name,
+            ToolEntry {
+                tool: Arc::from(tool),
+                source: ToolSource::Mcp { server },
+                rate_limit: None,
+            },
+        );
     }
 
     /// Register a tool from a WASM component.
     pub fn register_wasm(&mut self, tool: Box<dyn AgentTool>, component_hash: [u8; 32]) {
         let name = tool.name().to_string();
-        self.tools.insert(name, ToolEntry {
-            tool: Arc::from(tool),
-            source: ToolSource::Wasm { component_hash },
-            rate_limit: None,
-        });
+        self.tools.insert(
+            name,
+            ToolEntry {
+                tool: Arc::from(tool),
+                source: ToolSource::Wasm { component_hash },
+                rate_limit: None,
+            },
+        );
     }
 
     pub fn unregister(&mut self, name: &str) -> bool {
@@ -206,11 +215,14 @@ impl ToolRegistry {
             .iter()
             .filter(|(name, _)| !name.starts_with(prefix))
             .map(|(name, entry)| {
-                (name.clone(), ToolEntry {
-                    tool: Arc::clone(&entry.tool),
-                    source: entry.source.clone(),
-                    rate_limit: entry.rate_limit.clone(),
-                })
+                (
+                    name.clone(),
+                    ToolEntry {
+                        tool: Arc::clone(&entry.tool),
+                        source: entry.source.clone(),
+                        rate_limit: entry.rate_limit.clone(),
+                    },
+                )
             })
             .collect();
         ToolRegistry { tools }
@@ -223,11 +235,14 @@ impl ToolRegistry {
             .iter()
             .filter(|(_, entry)| !matches!(entry.source, ToolSource::Mcp { .. }))
             .map(|(name, entry)| {
-                (name.clone(), ToolEntry {
-                    tool: Arc::clone(&entry.tool),
-                    source: entry.source.clone(),
-                    rate_limit: entry.rate_limit.clone(),
-                })
+                (
+                    name.clone(),
+                    ToolEntry {
+                        tool: Arc::clone(&entry.tool),
+                        source: entry.source.clone(),
+                        rate_limit: entry.rate_limit.clone(),
+                    },
+                )
             })
             .collect();
         ToolRegistry { tools }
@@ -240,11 +255,14 @@ impl ToolRegistry {
             .iter()
             .filter(|(name, _)| !exclude.contains(&name.as_str()))
             .map(|(name, entry)| {
-                (name.clone(), ToolEntry {
-                    tool: Arc::clone(&entry.tool),
-                    source: entry.source.clone(),
-                    rate_limit: entry.rate_limit.clone(),
-                })
+                (
+                    name.clone(),
+                    ToolEntry {
+                        tool: Arc::clone(&entry.tool),
+                        source: entry.source.clone(),
+                        rate_limit: entry.rate_limit.clone(),
+                    },
+                )
             })
             .collect();
         ToolRegistry { tools }
@@ -260,11 +278,14 @@ impl ToolRegistry {
             .iter()
             .filter(|(name, _)| predicate(name))
             .map(|(name, entry)| {
-                (name.clone(), ToolEntry {
-                    tool: Arc::clone(&entry.tool),
-                    source: entry.source.clone(),
-                    rate_limit: entry.rate_limit.clone(),
-                })
+                (
+                    name.clone(),
+                    ToolEntry {
+                        tool: Arc::clone(&entry.tool),
+                        source: entry.source.clone(),
+                        rate_limit: entry.rate_limit.clone(),
+                    },
+                )
             })
             .collect();
         ToolRegistry { tools }

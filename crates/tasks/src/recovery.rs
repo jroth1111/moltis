@@ -25,11 +25,7 @@ pub enum RecoveryPhase {
 /// `attempt` is the attempt that just failed (1-indexed after the first Claim),
 /// `max_attempts` is the configured budget from `TaskSpec`.
 #[must_use]
-pub fn classify_recovery(
-    class: &FailureClass,
-    attempt: u8,
-    max_attempts: u8,
-) -> RecoveryPhase {
+pub fn classify_recovery(class: &FailureClass, attempt: u8, max_attempts: u8) -> RecoveryPhase {
     // Budget exhausted or permanently non-retryable.
     if attempt >= max_attempts {
         return RecoveryPhase::TerminalFailure;

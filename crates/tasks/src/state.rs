@@ -71,10 +71,7 @@ mod optional_rfc3339 {
     use serde::{Deserialize, Deserializer, Serializer};
     use time::OffsetDateTime;
 
-    pub fn serialize<S: Serializer>(
-        v: &Option<OffsetDateTime>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(v: &Option<OffsetDateTime>, s: S) -> Result<S::Ok, S::Error> {
         match v {
             Some(dt) => time::serde::rfc3339::serialize(dt, s),
             None => s.serialize_none(),
@@ -159,28 +156,31 @@ mod tests {
     #[test]
     fn terminal_states_are_terminal() {
         assert!(RuntimeState::Terminal(TerminalState::Completed).is_terminal());
-        assert!(RuntimeState::Terminal(TerminalState::Failed {
-            class: FailureClass::AgentError
-        })
-        .is_terminal());
-        assert!(RuntimeState::Terminal(TerminalState::Canceled {
-            reason: "manual".into()
-        })
-        .is_terminal());
+        assert!(
+            RuntimeState::Terminal(TerminalState::Failed {
+                class: FailureClass::AgentError
+            })
+            .is_terminal()
+        );
+        assert!(
+            RuntimeState::Terminal(TerminalState::Canceled {
+                reason: "manual".into()
+            })
+            .is_terminal()
+        );
     }
 
     #[test]
     fn non_terminal_states_are_not_terminal() {
         assert!(!RuntimeState::Pending.is_terminal());
-        assert!(!RuntimeState::Blocked {
-            waiting_on: vec![]
-        }
-        .is_terminal());
-        assert!(!RuntimeState::Active {
-            owner: "agent-1".into(),
-            lease_expires_at: None,
-        }
-        .is_terminal());
+        assert!(!RuntimeState::Blocked { waiting_on: vec![] }.is_terminal());
+        assert!(
+            !RuntimeState::Active {
+                owner: "agent-1".into(),
+                lease_expires_at: None,
+            }
+            .is_terminal()
+        );
     }
 
     #[test]

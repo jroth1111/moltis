@@ -32,10 +32,7 @@ impl TaskStore {
                 .map_err(|e| TransitionError::Other(e.to_string()))?;
         }
 
-        let url = format!(
-            "sqlite://{}?mode=rwc",
-            db_path.to_string_lossy()
-        );
+        let url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
         let opts = url
             .parse::<SqliteConnectOptions>()
             .map_err(|e| TransitionError::Other(e.to_string()))?
@@ -76,8 +73,8 @@ impl TaskStore {
 
     /// Insert a fully-constructed task (used by `create` and migrations).
     async fn insert(&self, task: &Task) -> Result<(), TransitionError> {
-        let spec_json = serde_json::to_string(&task.spec)
-            .map_err(|e| TransitionError::Other(e.to_string()))?;
+        let spec_json =
+            serde_json::to_string(&task.spec).map_err(|e| TransitionError::Other(e.to_string()))?;
         let runtime_json = serde_json::to_string(&task.runtime)
             .map_err(|e| TransitionError::Other(e.to_string()))?;
         let blocked_by_json = serde_json::to_string(&task.blocked_by)
@@ -118,14 +115,10 @@ impl TaskStore {
     }
 
     /// Read a single task.
-    pub async fn get(
-        &self,
-        list_id: &str,
-        task_id: &str,
-    ) -> Result<Option<Task>, TransitionError> {
+    pub async fn get(&self, list_id: &str, task_id: &str) -> Result<Option<Task>, TransitionError> {
         let row = sqlx::query(
             "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
-             FROM tasks WHERE list_id = ? AND id = ?"
+             FROM tasks WHERE list_id = ? AND id = ?",
         )
         .bind(list_id)
         .bind(task_id)
@@ -154,7 +147,7 @@ impl TaskStore {
     ) -> Result<Vec<Task>, TransitionError> {
         let rows = sqlx::query(
             "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
-             FROM tasks WHERE list_id = ? ORDER BY updated_at DESC"
+             FROM tasks WHERE list_id = ? ORDER BY updated_at DESC",
         )
         .bind(list_id)
         .fetch_all(&self.pool)
@@ -227,7 +220,7 @@ impl TaskStore {
 
         let rows_affected = sqlx::query(
             "UPDATE tasks SET runtime_json = ?, version = ?, updated_at = ? \
-             WHERE list_id = ? AND id = ? AND version = ?"
+             WHERE list_id = ? AND id = ? AND version = ?",
         )
         .bind(&runtime_json)
         .bind(new_version)
@@ -312,15 +305,15 @@ impl TaskStore {
             task.blocked_by = by.to_vec();
         }
 
-        let spec_json = serde_json::to_string(&task.spec)
-            .map_err(|e| TransitionError::Other(e.to_string()))?;
+        let spec_json =
+            serde_json::to_string(&task.spec).map_err(|e| TransitionError::Other(e.to_string()))?;
         let blocked_by_json = serde_json::to_string(&task.blocked_by)
             .map_err(|e| TransitionError::Other(e.to_string()))?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
 
         sqlx::query(
             "UPDATE tasks SET spec_json = ?, blocked_by = ?, updated_at = ? \
-             WHERE list_id = ? AND id = ?"
+             WHERE list_id = ? AND id = ?",
         )
         .bind(&spec_json)
         .bind(&blocked_by_json)
@@ -344,7 +337,7 @@ impl TaskStore {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let rows = sqlx::query(
             "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
-             FROM tasks WHERE list_id = ?"
+             FROM tasks WHERE list_id = ?",
         )
         .bind(list_id)
         .fetch_all(&self.pool)
@@ -374,7 +367,7 @@ impl TaskStore {
     pub async fn expired_leases(&self, list_id: &str) -> Result<Vec<Task>, TransitionError> {
         let rows = sqlx::query(
             "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
-             FROM tasks WHERE list_id = ?"
+             FROM tasks WHERE list_id = ?",
         )
         .bind(list_id)
         .fetch_all(&self.pool)

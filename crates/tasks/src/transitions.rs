@@ -105,10 +105,15 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
         // ── Pending ────────────────────────────────────────────────────────
 
         // Pending → Active (agent claims the task)
-        (RuntimeState::Pending, TransitionEvent::Claim { owner, lease_duration_secs }) => {
-            let lease_expires_at = lease_duration_secs.map(|secs| {
-                OffsetDateTime::now_utc() + time::Duration::seconds(secs as i64)
-            });
+        (
+            RuntimeState::Pending,
+            TransitionEvent::Claim {
+                owner,
+                lease_duration_secs,
+            },
+        ) => {
+            let lease_expires_at = lease_duration_secs
+                .map(|secs| OffsetDateTime::now_utc() + time::Duration::seconds(secs as i64));
             Ok(RuntimeState::Active {
                 owner: owner.clone(),
                 lease_expires_at,
@@ -117,12 +122,16 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
 
         // Pending → Blocked (dependency tracking)
         (RuntimeState::Pending, TransitionEvent::Block { waiting_on }) => {
-            Ok(RuntimeState::Blocked { waiting_on: waiting_on.clone() })
+            Ok(RuntimeState::Blocked {
+                waiting_on: waiting_on.clone(),
+            })
         },
 
         // Pending → Terminal(Canceled)
         (RuntimeState::Pending, TransitionEvent::Cancel { reason }) => {
-            Ok(RuntimeState::Terminal(TerminalState::Canceled { reason: reason.clone() }))
+            Ok(RuntimeState::Terminal(TerminalState::Canceled {
+                reason: reason.clone(),
+            }))
         },
 
         // ── Blocked ────────────────────────────────────────────────────────
@@ -134,7 +143,9 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
 
         // Blocked → Terminal(Canceled)
         (RuntimeState::Blocked { .. }, TransitionEvent::Cancel { reason }) => {
-            Ok(RuntimeState::Terminal(TerminalState::Canceled { reason: reason.clone() }))
+            Ok(RuntimeState::Terminal(TerminalState::Canceled {
+                reason: reason.clone(),
+            }))
         },
 
         // ── Active ─────────────────────────────────────────────────────────
@@ -147,7 +158,11 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
         // Active → Retrying (recoverable failure, budget not exhausted)
         (
             RuntimeState::Active { .. },
-            TransitionEvent::Fail { class, handoff, retry_after },
+            TransitionEvent::Fail {
+                class,
+                handoff,
+                retry_after,
+            },
         ) => {
             let attempt = task.runtime.attempt;
             let max = task.spec.max_attempts;
@@ -183,29 +198,30 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
         },
 
         // Active → AwaitingHuman (explicit escalation)
-        (
-            RuntimeState::Active { .. },
-            TransitionEvent::Escalate { question, handoff },
-        ) => Ok(RuntimeState::AwaitingHuman {
-            question: question.clone(),
-            handoff: handoff.clone(),
-        }),
+        (RuntimeState::Active { .. }, TransitionEvent::Escalate { question, handoff }) => {
+            Ok(RuntimeState::AwaitingHuman {
+                question: question.clone(),
+                handoff: handoff.clone(),
+            })
+        },
 
         // Active → Terminal(Canceled)
         (RuntimeState::Active { .. }, TransitionEvent::Cancel { reason }) => {
-            Ok(RuntimeState::Terminal(TerminalState::Canceled { reason: reason.clone() }))
+            Ok(RuntimeState::Terminal(TerminalState::Canceled {
+                reason: reason.clone(),
+            }))
         },
 
         // ── Retrying ───────────────────────────────────────────────────────
 
         // Retrying → Pending (promoted by recovery cron)
-        (RuntimeState::Retrying { .. }, TransitionEvent::PromoteRetry) => {
-            Ok(RuntimeState::Pending)
-        },
+        (RuntimeState::Retrying { .. }, TransitionEvent::PromoteRetry) => Ok(RuntimeState::Pending),
 
         // Retrying → Terminal(Canceled)
         (RuntimeState::Retrying { .. }, TransitionEvent::Cancel { reason }) => {
-            Ok(RuntimeState::Terminal(TerminalState::Canceled { reason: reason.clone() }))
+            Ok(RuntimeState::Terminal(TerminalState::Canceled {
+                reason: reason.clone(),
+            }))
         },
 
         // ── AwaitingHuman ──────────────────────────────────────────────────
@@ -217,7 +233,9 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
 
         // AwaitingHuman → Terminal(Canceled)
         (RuntimeState::AwaitingHuman { .. }, TransitionEvent::Cancel { reason }) => {
-            Ok(RuntimeState::Terminal(TerminalState::Canceled { reason: reason.clone() }))
+            Ok(RuntimeState::Terminal(TerminalState::Canceled {
+                reason: reason.clone(),
+            }))
         },
 
         // ── Terminal ───────────────────────────────────────────────────────
@@ -241,10 +259,13 @@ mod tests {
 
     fn active_task(owner: &str) -> Task {
         let t = pending_task();
-        apply(t, &TransitionEvent::Claim {
-            owner: owner.to_string(),
-            lease_duration_secs: None,
-        })
+        apply(
+            t,
+            &TransitionEvent::Claim {
+                owner: owner.to_string(),
+                lease_duration_secs: None,
+            },
+        )
         .expect("claim")
     }
 
@@ -253,10 +274,13 @@ mod tests {
     #[test]
     fn pending_claim_goes_active() {
         let task = pending_task();
-        let result = apply(task, &TransitionEvent::Claim {
-            owner: "agent-1".into(),
-            lease_duration_secs: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Claim {
+                owner: "agent-1".into(),
+                lease_duration_secs: None,
+            },
+        )
         .expect("claim should succeed");
         assert!(result.runtime.state.is_active());
         assert_eq!(result.runtime.owner.as_deref(), Some("agent-1"));
@@ -268,9 +292,12 @@ mod tests {
     fn pending_block_goes_blocked() {
         let task = pending_task();
         let dep = TaskId::from("dep-1");
-        let result = apply(task, &TransitionEvent::Block {
-            waiting_on: vec![dep.clone()],
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Block {
+                waiting_on: vec![dep.clone()],
+            },
+        )
         .expect("block should succeed");
         assert!(matches!(
             result.runtime.state,
@@ -281,9 +308,12 @@ mod tests {
     #[test]
     fn pending_cancel() {
         let task = pending_task();
-        let result = apply(task, &TransitionEvent::Cancel {
-            reason: "not needed".into(),
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Cancel {
+                reason: "not needed".into(),
+            },
+        )
         .expect("cancel should succeed");
         assert!(matches!(
             result.runtime.state,
@@ -296,9 +326,12 @@ mod tests {
     #[test]
     fn blocked_deps_met_goes_pending() {
         let t = pending_task();
-        let blocked = apply(t, &TransitionEvent::Block {
-            waiting_on: vec![TaskId::from("x")],
-        })
+        let blocked = apply(
+            t,
+            &TransitionEvent::Block {
+                waiting_on: vec![TaskId::from("x")],
+            },
+        )
         .expect("block");
         let pending = apply(blocked, &TransitionEvent::DependenciesMet).expect("deps met");
         assert_eq!(pending.runtime.state, RuntimeState::Pending);
@@ -320,13 +353,19 @@ mod tests {
     #[test]
     fn active_fail_retryable_goes_retrying() {
         let task = active_task("agent");
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::ProviderTransient,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::ProviderTransient,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail retryable");
-        assert!(matches!(result.runtime.state, RuntimeState::Retrying { .. }));
+        assert!(matches!(
+            result.runtime.state,
+            RuntimeState::Retrying { .. }
+        ));
         assert_eq!(
             result.runtime.last_failure,
             Some(FailureClass::ProviderTransient)
@@ -339,11 +378,14 @@ mod tests {
         task.runtime.attempt = 3; // already at max
         task.spec.max_attempts = 3;
 
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::AgentError,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail should succeed");
         assert!(matches!(
             result.runtime.state,
@@ -356,11 +398,14 @@ mod tests {
     #[test]
     fn active_fail_human_required_goes_awaiting_human() {
         let task = active_task("agent");
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::ProviderPermanent,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::ProviderPermanent,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail human-required");
         // ProviderPermanent.requires_human() → AwaitingHuman (not terminal)
         assert!(matches!(
@@ -372,10 +417,13 @@ mod tests {
     #[test]
     fn active_escalate_goes_awaiting_human() {
         let task = active_task("agent");
-        let result = apply(task, &TransitionEvent::Escalate {
-            question: "which env?".into(),
-            handoff: HandoffContext::default(),
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Escalate {
+                question: "which env?".into(),
+                handoff: HandoffContext::default(),
+            },
+        )
         .expect("escalate");
         assert!(matches!(
             result.runtime.state,
@@ -388,11 +436,14 @@ mod tests {
     #[test]
     fn retrying_promote_goes_pending() {
         let task = active_task("agent");
-        let retrying = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::AgentError,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let retrying = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail");
         let promoted = apply(retrying, &TransitionEvent::PromoteRetry).expect("promote");
         assert_eq!(promoted.runtime.state, RuntimeState::Pending);
@@ -403,14 +454,20 @@ mod tests {
     #[test]
     fn awaiting_human_resolve_goes_pending() {
         let task = active_task("agent");
-        let awaiting = apply(task, &TransitionEvent::Escalate {
-            question: "question".into(),
-            handoff: HandoffContext::default(),
-        })
+        let awaiting = apply(
+            task,
+            &TransitionEvent::Escalate {
+                question: "question".into(),
+                handoff: HandoffContext::default(),
+            },
+        )
         .expect("escalate");
-        let resolved = apply(awaiting, &TransitionEvent::HumanResolve {
-            resolution: "use prod".into(),
-        })
+        let resolved = apply(
+            awaiting,
+            &TransitionEvent::HumanResolve {
+                resolution: "use prod".into(),
+            },
+        )
         .expect("resolve");
         assert_eq!(resolved.runtime.state, RuntimeState::Pending);
     }
@@ -426,9 +483,12 @@ mod tests {
         let err = apply(done.clone(), &TransitionEvent::Complete).unwrap_err();
         assert!(matches!(err, TransitionError::InvalidTransition { .. }));
 
-        let err2 = apply(done, &TransitionEvent::Cancel {
-            reason: "late".into(),
-        })
+        let err2 = apply(
+            done,
+            &TransitionEvent::Cancel {
+                reason: "late".into(),
+            },
+        )
         .unwrap_err();
         assert!(matches!(err2, TransitionError::InvalidTransition { .. }));
     }
@@ -440,10 +500,13 @@ mod tests {
         let t0 = pending_task();
         assert_eq!(t0.runtime.version, 0);
 
-        let t1 = apply(t0, &TransitionEvent::Claim {
-            owner: "a".into(),
-            lease_duration_secs: None,
-        })
+        let t1 = apply(
+            t0,
+            &TransitionEvent::Claim {
+                owner: "a".into(),
+                lease_duration_secs: None,
+            },
+        )
         .expect("claim");
         assert_eq!(t1.runtime.version, 1);
 
@@ -466,10 +529,13 @@ mod tests {
     #[test]
     fn claim_with_lease_sets_expiry() {
         let task = pending_task();
-        let claimed = apply(task, &TransitionEvent::Claim {
-            owner: "agent".into(),
-            lease_duration_secs: Some(300),
-        })
+        let claimed = apply(
+            task,
+            &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: Some(300),
+            },
+        )
         .expect("claim");
         if let RuntimeState::Active {
             lease_expires_at: Some(exp),

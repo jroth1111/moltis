@@ -19,10 +19,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use {
-    async_trait::async_trait,
-    serde_json::json,
-};
+use {async_trait::async_trait, serde_json::json};
 
 use {
     crate::{
@@ -265,9 +262,7 @@ impl AgentTool for TaskListTool {
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let action = require_str(&params, "action")?;
         let list_id = str_param_any(&params, &["list_id", "listId"]).unwrap_or("default");
-        let expected_version = params
-            .get("expected_version")
-            .and_then(|v| v.as_u64());
+        let expected_version = params.get("expected_version").and_then(|v| v.as_u64());
 
         match action {
             // ── create ────────────────────────────────────────────────────
@@ -302,8 +297,7 @@ impl AgentTool for TaskListTool {
 
             // ── list ──────────────────────────────────────────────────────
             "list" => {
-                let filter = str_param(&params, "status")
-                    .and_then(parse_status_filter);
+                let filter = str_param(&params, "status").and_then(parse_status_filter);
                 let tasks = self
                     .store
                     .list(list_id, filter)
@@ -337,15 +331,16 @@ impl AgentTool for TaskListTool {
                 let subject = str_param(&params, "subject");
                 let description = str_param(&params, "description");
                 let owner = str_param(&params, "owner");
-                let new_blocked_by = params
-                    .get("blocked_by")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .map(TaskId::from)
-                            .collect::<Vec<_>>()
-                    });
+                let new_blocked_by =
+                    params
+                        .get("blocked_by")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(TaskId::from)
+                                .collect::<Vec<_>>()
+                        });
 
                 // Apply metadata update first if any.
                 if subject.is_some() || description.is_some() || new_blocked_by.is_some() {
@@ -390,7 +385,9 @@ impl AgentTool for TaskListTool {
                                 },
                                 _ => {
                                     // Already pending or invalid; skip transition.
-                                    return Ok(json!({ "ok": true, "task": task_view(&task_before) }));
+                                    return Ok(
+                                        json!({ "ok": true, "task": task_view(&task_before) }),
+                                    );
                                 },
                             }
                         },
@@ -398,7 +395,7 @@ impl AgentTool for TaskListTool {
                             return Err(Error::message(format!(
                                 "unknown status for update: {other}"
                             ))
-                            .into())
+                            .into());
                         },
                     };
 
@@ -508,9 +505,7 @@ impl AgentTool for TaskListTool {
             // ── resolve (new) ─────────────────────────────────────────────
             "resolve" => {
                 let id = require_str(&params, "id")?;
-                let resolution = str_param(&params, "resolution")
-                    .unwrap_or("")
-                    .to_string();
+                let resolution = str_param(&params, "resolution").unwrap_or("").to_string();
 
                 let task = self
                     .store
@@ -585,7 +580,11 @@ impl TaskListTool {
         let mut incomplete = Vec::new();
         for dep_id in &task.blocked_by {
             match self.store.get(&task.list_id, &dep_id.0).await {
-                Ok(Some(dep)) if !dep.is_terminal() || dep.runtime.state != RuntimeState::Terminal(TerminalState::Completed) => {
+                Ok(Some(dep))
+                    if !dep.is_terminal()
+                        || dep.runtime.state
+                            != RuntimeState::Terminal(TerminalState::Completed) =>
+                {
                     incomplete.push(dep_id.0.clone());
                 },
                 Ok(None) => {
@@ -708,9 +707,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = t
-            .execute(json!({ "action": "claim", "id": main_id }))
-            .await;
+        let result = t.execute(json!({ "action": "claim", "id": main_id })).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("blocked"));
     }

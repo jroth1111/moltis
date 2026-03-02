@@ -46,7 +46,7 @@ impl EventLog {
         sqlx::query(
             "INSERT INTO task_events \
              (task_id, list_id, event_type, from_state, to_state, agent_id, detail, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(task_id)
         .bind(list_id)
@@ -72,7 +72,7 @@ impl EventLog {
              agent_id, detail, created_at \
              FROM task_events \
              WHERE list_id = ? AND task_id = ? \
-             ORDER BY id ASC"
+             ORDER BY id ASC",
         )
         .bind(list_id)
         .bind(task_id)

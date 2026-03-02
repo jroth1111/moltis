@@ -75,7 +75,11 @@ impl FailureClass {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::AgentError | Self::ContextOverflow | Self::ProviderTransient | Self::ToolError | Self::TimeoutExceeded
+            Self::AgentError
+                | Self::ContextOverflow
+                | Self::ProviderTransient
+                | Self::ToolError
+                | Self::TimeoutExceeded
         )
     }
 
@@ -145,7 +149,10 @@ impl HandoffContext {
         let mut parts = Vec::new();
 
         if !self.last_action.is_empty() {
-            parts.push(format!("Previous attempt last action: {}", self.last_action));
+            parts.push(format!(
+                "Previous attempt last action: {}",
+                self.last_action
+            ));
         }
         if !self.observed_error.is_empty() {
             parts.push(format!("Previous failure: {}", self.observed_error));
@@ -161,10 +168,7 @@ impl HandoffContext {
             ));
         }
         if !self.suggested_next_step.is_empty() {
-            parts.push(format!(
-                "Suggested next step: {}",
-                self.suggested_next_step
-            ));
+            parts.push(format!("Suggested next step: {}", self.suggested_next_step));
         }
 
         parts.join("\n\n")
