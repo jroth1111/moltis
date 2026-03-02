@@ -52,6 +52,8 @@ pub mod llm {
     pub const TIME_TO_FIRST_TOKEN_SECONDS: &str = "moltis_llm_time_to_first_token_seconds";
     /// Tokens per second generation rate
     pub const TOKENS_PER_SECOND: &str = "moltis_llm_tokens_per_second";
+    /// LLM response confidence score (0.0 to 1.0)
+    pub const CONFIDENCE: &str = "moltis_llm_confidence";
 }
 
 /// Session metrics

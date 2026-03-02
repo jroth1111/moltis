@@ -398,6 +398,23 @@ pub struct CompletionResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+    /// Optional confidence score from the LLM (0.0 to 1.0).
+    /// Low values indicate uncertainty; used for logging and metrics.
+    pub confidence: Option<f64>,
+    /// Optional reasoning/thinking content (e.g., from Claude's extended thinking).
+    pub reasoning: Option<String>,
+}
+
+impl Default for CompletionResponse {
+    fn default() -> Self {
+        Self {
+            text: None,
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            confidence: None,
+            reasoning: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -742,5 +759,39 @@ mod tests {
         let meta = provider.model_metadata().await.unwrap();
         assert_eq!(meta.id, "stub-model");
         assert_eq!(meta.context_length, 42_000);
+    }
+
+
+    // ── CompletionResponse confidence field tests ───────────────────────
+
+    #[test]
+    fn completion_response_accepts_confidence() {
+        let response = CompletionResponse {
+            text: Some("result".into()),
+            tool_calls: vec![],
+            usage: Usage::default(),
+            confidence: Some(0.85),
+            reasoning: None,
+        };
+        assert_eq!(response.confidence, Some(0.85));
+    }
+
+    #[test]
+    fn completion_response_accepts_reasoning() {
+        let response = CompletionResponse {
+            text: Some("result".into()),
+            tool_calls: vec![],
+            usage: Usage::default(),
+            confidence: None,
+            reasoning: Some("I thought about this...".into()),
+        };
+        assert_eq!(response.reasoning, Some("I thought about this...".to_string()));
+    }
+
+    #[test]
+    fn completion_response_defaults_confidence_to_none() {
+        let response = CompletionResponse::default();
+        assert!(response.confidence.is_none());
+        assert!(response.reasoning.is_none());
     }
 }

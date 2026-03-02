@@ -819,6 +819,31 @@ pub async fn run_agent_loop_with_context(
             trace!(iteration = iterations, text = %text, "LLM response text");
         }
 
+        // Log low-confidence warnings and emit confidence metric.
+        if let Some(confidence) = response.confidence {
+            #[cfg(feature = "metrics")]
+            {
+                moltis_metrics::histogram!(llm_metrics::CONFIDENCE).record(confidence);
+            }
+            if confidence < 0.5 {
+                warn!(
+                    iteration = iterations,
+                    confidence,
+                    trace_id = trace_id.as_deref().unwrap_or(""),
+                    "LLM response has low confidence score"
+                );
+            } else {
+                debug!(
+                    iteration = iterations,
+                    confidence,
+                    "LLM confidence score"
+                );
+            }
+        }
+        if let Some(ref reasoning) = response.reasoning {
+            trace!(iteration = iterations, reasoning_len = reasoning.len(), "LLM reasoning received");
+        }
+
         // Fallback: parse tool calls from model text if the provider returned
         // no structured tool calls (some providers/models emit text-based calls).
         if response.tool_calls.is_empty()
@@ -1991,6 +2016,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+            ..Default::default()
             })
         }
 
@@ -2042,6 +2068,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             } else {
                 Ok(CompletionResponse {
@@ -2052,6 +2079,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             }
         }
@@ -2097,6 +2125,7 @@ mod tests {
                     text: Some("```tool_call\n{\"tool\": \"exec\", \"arguments\": {\"command\": \"echo hello\"}}\n```".into()),
                     tool_calls: vec![],
                     usage: Usage { input_tokens: 10, output_tokens: 20, ..Default::default() },
+                ..Default::default()
                 })
             } else {
                 // Verify tool result was fed back.
@@ -2122,6 +2151,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             }
         }
@@ -2299,6 +2329,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             } else {
                 let tool_content = messages
@@ -2323,6 +2354,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             }
         }
@@ -2471,6 +2503,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             } else {
                 let assistant_tool_text = messages
@@ -2515,6 +2548,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             }
         }
@@ -2655,6 +2689,7 @@ mod tests {
                         output_tokens: 20,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             } else {
                 let tool_content = messages
@@ -2684,6 +2719,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             }
         }
@@ -2832,6 +2868,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             } else {
                 Ok(CompletionResponse {
@@ -2842,6 +2879,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             }
         }
@@ -3319,6 +3357,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             } else {
                 // Second call: verify tool result was sanitized (image stripped)
@@ -3352,6 +3391,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             }
         }
@@ -3607,6 +3647,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+            ..Default::default()
             })
         }
 
@@ -3693,6 +3734,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -3752,6 +3794,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+            ..Default::default()
             })
         }
 
@@ -3851,6 +3894,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -3901,6 +3945,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+            ..Default::default()
             })
         }
 
@@ -3950,6 +3995,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -3988,6 +4034,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+            ..Default::default()
             })
         }
 
@@ -4036,6 +4083,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -4108,6 +4156,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+            ..Default::default()
             })
         }
 
@@ -4196,6 +4245,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -4261,6 +4311,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+            ..Default::default()
             })
         }
 
@@ -4347,6 +4398,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await
         .unwrap();
@@ -4516,6 +4568,7 @@ mod tests {
                     text: Some("Recovered!".into()),
                     tool_calls: vec![],
                     usage: Usage::default(),
+                ..Default::default()
                 })
             }
         }
@@ -4569,6 +4622,7 @@ mod tests {
                     text: Some("Recovered from rate limit".into()),
                     tool_calls: vec![],
                     usage: Usage::default(),
+                ..Default::default()
                 })
             }
         }
@@ -4629,6 +4683,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await;
         assert!(result.is_ok(), "should recover after retry: {result:?}");
@@ -4697,6 +4752,7 @@ mod tests {
             None,
             None,
             None,
+        None,
         )
         .await;
         assert!(result.is_ok(), "should recover after retries: {result:?}");
