@@ -138,17 +138,25 @@ impl TinderBrowserTool {
         }
 
         // On successful "type" command, increment exchange count.
+        let mut exchange_warning: Option<String> = None;
         let exchange_synced = if command == "type" {
             if let Some(match_id) = params["match_id"].as_str() {
                 match funnel::increment_exchange(&self.pool, match_id).await {
                     Ok(_) => true,
                     Err(e) => {
                         warn!(match_id = %match_id, error = %e, "failed to increment exchange count");
+                        exchange_warning = Some(format!(
+                            "message sent but exchange_count update failed for match_id={match_id}: {e}"
+                        ));
                         false
-                    }
+                    },
                 }
-            } else { true }
-        } else { true };
+            } else {
+                true
+            }
+        } else {
+            true
+        };
 
         // Handle screenshots: detect base64 image data in output.
         let mut screenshot_path: Option<String> = None;
@@ -166,6 +174,9 @@ impl TinderBrowserTool {
             "output": stdout,
             "exchange_count_synced": exchange_synced
         });
+        if let Some(warning) = exchange_warning {
+            result["warning"] = json!(warning);
+        }
         if let Some(path) = screenshot_path {
             result["screenshot_path"] = json!(path);
         }
