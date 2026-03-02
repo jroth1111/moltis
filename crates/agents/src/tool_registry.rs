@@ -48,16 +48,6 @@ impl RateLimit {
     }
 }
 
-impl Clone for RateLimit {
-    fn clone(&self) -> Self {
-        Self {
-            max_per_minute: self.max_per_minute,
-            remaining: Arc::clone(&self.remaining),
-            // Shares the existing 60s reset task — does NOT spawn a new one
-        }
-    }
-}
-
 /// Agent-callable tool.
 #[async_trait]
 pub trait AgentTool: Send + Sync {
