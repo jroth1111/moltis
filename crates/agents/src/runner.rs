@@ -653,6 +653,7 @@ pub async fn run_agent_loop_with_context(
                             session_key: session_key_for_hooks.clone(),
                             provider: provider.name().to_string(),
                             model: provider.id().to_string(),
+                            error: Some(msg.clone()),
                             text: None,
                             tool_calls: vec![],
                             input_tokens: 0,
@@ -815,6 +816,7 @@ pub async fn run_agent_loop_with_context(
                 session_key: session_key_for_hooks.clone(),
                 provider: provider.name().to_string(),
                 model: provider.id().to_string(),
+                error: None,
                 text: response.text.clone(),
                 tool_calls: tc_json,
                 input_tokens: response.usage.input_tokens,
@@ -1384,6 +1386,7 @@ pub async fn run_agent_loop_streaming(
                     session_key: session_key_for_hooks.clone(),
                     provider: provider.name().to_string(),
                     model: provider.id().to_string(),
+                    error: Some(err.clone()),
                     text: None,
                     tool_calls: vec![],
                     input_tokens: 0,
@@ -1530,6 +1533,7 @@ pub async fn run_agent_loop_streaming(
                 session_key: session_key_for_hooks.clone(),
                 provider: provider.name().to_string(),
                 model: provider.id().to_string(),
+                error: None,
                 text: if accumulated_text.is_empty() {
                     None
                 } else {
