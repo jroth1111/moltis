@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
@@ -4855,6 +4855,7 @@ pub async fn start_gateway(
     // - force process exit to avoid hanging after ctrl-c
     {
         let browser_for_shutdown = Arc::clone(&banner.browser_for_lifecycle);
+        let state_for_shutdown = Arc::clone(state);
         #[cfg(feature = "tailscale")]
         let reset_tailscale_on_exit =
             banner.tailscale_mode != TailscaleMode::Off && banner.tailscale_reset_on_exit;
@@ -4863,6 +4864,46 @@ pub async fn start_gateway(
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_err() {
                 return;
+            }
+
+            if !state_for_shutdown.mark_shutting_down() {
+                return;
+            }
+
+            info!("shutdown signal received; entering drain mode");
+
+            if let Some(hooks) = state_for_shutdown.inner.read().await.hook_registry.clone() {
+                if let Err(e) = hooks.dispatch(&moltis_common::hooks::HookPayload::GatewayStop).await
+                {
+                    tracing::warn!("GatewayStop hook dispatch failed: {e}");
+                }
+            }
+
+            state_for_shutdown
+                .close_all_clients_going_away("server is shutting down")
+                .await;
+
+            let drain_timeout = std::time::Duration::from_secs(30);
+            let remaining_runs = state_for_shutdown
+                .wait_for_inflight_agent_runs(drain_timeout)
+                .await;
+            if remaining_runs == 0 {
+                info!(
+                    drain_secs = drain_timeout.as_secs(),
+                    "all in-flight agent runs drained before shutdown"
+                );
+            } else {
+                warn!(
+                    drain_secs = drain_timeout.as_secs(),
+                    remaining_runs,
+                    "forcing shutdown with in-flight agent runs still active"
+                );
+            }
+
+            if let Some(store) = state_for_shutdown.services.session_store.as_ref() {
+                if let Err(e) = flush_session_store_data(store).await {
+                    warn!(error = %e, "failed to flush session store during shutdown");
+                }
             }
 
             #[cfg(feature = "mdns")]
@@ -4957,6 +4998,14 @@ async fn ws_upgrade_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    if state.gateway.is_shutting_down() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway is shutting down",
+        )
+            .into_response();
+    }
+
     // ── CSWSH protection ────────────────────────────────────────────────
     // Reject cross-origin WebSocket upgrades.  Browsers always send an
     // Origin header on cross-origin requests; non-browser clients (CLI,
@@ -5189,6 +5238,33 @@ fn startup_setup_code_lines(code: &str) -> Vec<String> {
         "enter this code to set your password or register a passkey".to_string(),
         String::new(),
     ]
+}
+
+async fn flush_session_store_data(store: &SessionStore) -> std::io::Result<()> {
+    let base_dir = store.base_dir.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if !base_dir.exists() {
+            return Ok(());
+        }
+
+        for entry in std::fs::read_dir(&base_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Ok(file) = OpenOptions::new().read(true).open(&path) {
+                let _ = file.sync_all();
+            }
+        }
+
+        if let Ok(dir) = File::open(&base_dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Check whether a WebSocket `Origin` header matches the request `Host`.
