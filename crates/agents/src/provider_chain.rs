@@ -19,142 +19,10 @@ use {async_trait::async_trait, tokio_stream::Stream, tracing::warn};
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 
-use crate::model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent};
-
-/// How a provider error should be handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderErrorKind {
-    /// 429 — rotate to next provider.
-    RateLimit,
-    /// 401/403 — rotate (bad key or permissions).
-    AuthError,
-    /// 5xx — rotate to next provider.
-    ServerError,
-    /// Billing/usage limit exhausted — rotate.
-    BillingExhausted,
-    /// Plan/model does not support this request — different from billing exhaustion.
-    /// Example: "Your plan doesn't include access to this model."
-    /// Should skip the entire provider, not just the key.
-    NonRetryableRateLimit,
-    /// Context window exceeded — don't rotate, caller should compact.
-    ContextWindow,
-    /// 400, bad format — don't rotate, it'll fail everywhere.
-    InvalidRequest,
-    /// Unrecognised error — attempt failover.
-    Unknown,
-}
-
-impl ProviderErrorKind {
-    /// Whether this error kind should trigger failover to the next provider.
-    #[must_use]
-    pub fn should_failover(self) -> bool {
-        matches!(
-            self,
-            Self::RateLimit
-                | Self::AuthError
-                | Self::ServerError
-                | Self::BillingExhausted
-                | Self::NonRetryableRateLimit
-                | Self::Unknown
-        )
-    }
-}
-
-/// Error patterns for context window overflow (reused from runner.rs).
-const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
-    "context_length_exceeded",
-    "max_tokens",
-    "too many tokens",
-    "request too large",
-    "maximum context length",
-    "context window",
-    "token limit",
-    "content_too_large",
-    "request_too_large",
-];
-
-/// Classify an error into a `ProviderErrorKind` based on the error message.
-#[must_use]
-pub fn classify_error(err: &anyhow::Error) -> ProviderErrorKind {
-    let msg = err.to_string().to_lowercase();
-
-    // Context window — must check first since "request too large" overlaps.
-    if CONTEXT_WINDOW_PATTERNS.iter().any(|p| msg.contains(p)) {
-        return ProviderErrorKind::ContextWindow;
-    }
-
-    // Plan/model access errors — non-retryable with key rotation.
-    // Must check before the general rate limit check.
-    if msg.contains("your plan does not include")
-        || msg.contains("model not available")
-        || msg.contains("not available on your plan")
-        || msg.contains("upgrade your plan")
-        || msg.contains("organization does not have access")
-    {
-        return ProviderErrorKind::NonRetryableRateLimit;
-    }
-
-    // Rate limiting.
-    if msg.contains("429")
-        || msg.contains("rate limit")
-        || msg.contains("rate_limit")
-        || msg.contains("too many requests")
-    {
-        return ProviderErrorKind::RateLimit;
-    }
-
-    // Auth errors.
-    if msg.contains("401")
-        || msg.contains("403")
-        || msg.contains("unauthorized")
-        || msg.contains("forbidden")
-        || msg.contains("invalid api key")
-        || msg.contains("invalid_api_key")
-        || msg.contains("authentication")
-    {
-        return ProviderErrorKind::AuthError;
-    }
-
-    // Billing / quota exhaustion.
-    if msg.contains("billing")
-        || msg.contains("quota")
-        || msg.contains("insufficient_quota")
-        || msg.contains("usage limit")
-        || msg.contains("credit")
-    {
-        return ProviderErrorKind::BillingExhausted;
-    }
-
-    // Server errors.
-    if msg.contains("500")
-        || msg.contains("502")
-        || msg.contains("503")
-        || msg.contains("504")
-        || msg.contains("internal server error")
-        || msg.contains("bad gateway")
-        || msg.contains("service unavailable")
-        || msg.contains("overloaded")
-    {
-        return ProviderErrorKind::ServerError;
-    }
-
-    // Invalid request (400-level, non-auth, non-rate-limit).
-    if msg.contains("400") || msg.contains("bad request") || msg.contains("invalid_request") {
-        return ProviderErrorKind::InvalidRequest;
-    }
-
-    ProviderErrorKind::Unknown
-}
-
-/// Parse a retry-after duration (in milliseconds) from an error message.
-/// Looks for patterns like "retry after 30", "retry-after: 5.5", "Retry-After: 60".
-#[must_use]
-pub fn parse_retry_after_ms(msg: &str) -> Option<u64> {
-    let re = regex::Regex::new(r"(?i)retry.?after[:\s]+(\d+\.?\d*)").ok()?;
-    let cap = re.captures(msg)?;
-    let secs: f64 = cap.get(1)?.as_str().parse().ok()?;
-    Some((secs * 1000.0) as u64)
-}
+use crate::{
+    classify,
+    model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent},
+};
 
 // ── Circuit breaker (same pattern as embeddings_fallback.rs) ─────────────
 
@@ -338,7 +206,7 @@ impl LlmProvider for ProviderChain {
                     return Ok(resp);
                 },
                 Err(e) => {
-                    let kind = classify_error(&e);
+                    let kind = classify::classify_anyhow(&e);
                     entry.state.record_failure();
 
                     // Record error metrics
@@ -405,7 +273,10 @@ impl LlmProvider for ProviderChain {
 mod tests {
     use {
         super::*,
-        crate::model::{ChatMessage, StreamEvent, Usage},
+        crate::{
+            classify::ProviderErrorKind,
+            model::{ChatMessage, StreamEvent, Usage},
+        },
         async_trait::async_trait,
         tokio_stream::StreamExt,
     };
@@ -632,43 +503,61 @@ mod tests {
     #[test]
     fn classify_rate_limit() {
         let err = anyhow::anyhow!("429 Too Many Requests: rate limit exceeded");
-        assert_eq!(classify_error(&err), ProviderErrorKind::RateLimit);
+        assert_eq!(
+            classify::classify_anyhow(&err),
+            ProviderErrorKind::RateLimit
+        );
     }
 
     #[test]
     fn classify_auth() {
         let err = anyhow::anyhow!("401 Unauthorized");
-        assert_eq!(classify_error(&err), ProviderErrorKind::AuthError);
+        assert_eq!(
+            classify::classify_anyhow(&err),
+            ProviderErrorKind::AuthError
+        );
     }
 
     #[test]
     fn classify_server() {
         let err = anyhow::anyhow!("502 Bad Gateway");
-        assert_eq!(classify_error(&err), ProviderErrorKind::ServerError);
+        assert_eq!(
+            classify::classify_anyhow(&err),
+            ProviderErrorKind::ServerError
+        );
     }
 
     #[test]
     fn classify_context_window() {
         let err = anyhow::anyhow!("context_length_exceeded: maximum context length is 200000");
-        assert_eq!(classify_error(&err), ProviderErrorKind::ContextWindow);
+        assert_eq!(
+            classify::classify_anyhow(&err),
+            ProviderErrorKind::ContextWindow
+        );
     }
 
     #[test]
     fn classify_billing() {
         let err = anyhow::anyhow!("insufficient_quota: billing limit reached");
-        assert_eq!(classify_error(&err), ProviderErrorKind::BillingExhausted);
+        assert_eq!(
+            classify::classify_anyhow(&err),
+            ProviderErrorKind::BillingExhausted
+        );
     }
 
     #[test]
     fn classify_invalid_request() {
         let err = anyhow::anyhow!("400 Bad Request: invalid JSON");
-        assert_eq!(classify_error(&err), ProviderErrorKind::InvalidRequest);
+        assert_eq!(
+            classify::classify_anyhow(&err),
+            ProviderErrorKind::InvalidRequest
+        );
     }
 
     #[test]
     fn classify_unknown() {
         let err = anyhow::anyhow!("connection reset by peer");
-        assert_eq!(classify_error(&err), ProviderErrorKind::Unknown);
+        assert_eq!(classify::classify_anyhow(&err), ProviderErrorKind::Unknown);
     }
 
     #[test]
@@ -805,7 +694,7 @@ mod tests {
     fn classify_non_retryable_rate_limit() {
         let err = anyhow::anyhow!("Your plan does not include access to this model");
         assert_eq!(
-            classify_error(&err),
+            classify::classify_anyhow(&err),
             ProviderErrorKind::NonRetryableRateLimit
         );
     }
@@ -814,7 +703,7 @@ mod tests {
     fn classify_non_retryable_model_not_available() {
         let err = anyhow::anyhow!("model not available for your account");
         assert_eq!(
-            classify_error(&err),
+            classify::classify_anyhow(&err),
             ProviderErrorKind::NonRetryableRateLimit
         );
     }
@@ -823,7 +712,7 @@ mod tests {
     fn classify_non_retryable_upgrade_plan() {
         let err = anyhow::anyhow!("Please upgrade your plan to access this feature");
         assert_eq!(
-            classify_error(&err),
+            classify::classify_anyhow(&err),
             ProviderErrorKind::NonRetryableRateLimit
         );
     }
@@ -832,7 +721,7 @@ mod tests {
     fn classify_non_retryable_org_access() {
         let err = anyhow::anyhow!("Your organization does not have access to this model");
         assert_eq!(
-            classify_error(&err),
+            classify::classify_anyhow(&err),
             ProviderErrorKind::NonRetryableRateLimit
         );
     }
@@ -840,17 +729,20 @@ mod tests {
     #[test]
     fn parse_retry_after_seconds() {
         assert_eq!(
-            parse_retry_after_ms("rate limited, retry after 30"),
+            classify::parse_retry_after_ms("rate limited, retry after 30"),
             Some(30_000)
         );
-        assert_eq!(parse_retry_after_ms("Retry-After: 5.5"), Some(5_500));
-        assert_eq!(parse_retry_after_ms("no hint here"), None);
+        assert_eq!(
+            classify::parse_retry_after_ms("Retry-After: 5.5"),
+            Some(5_500)
+        );
+        assert_eq!(classify::parse_retry_after_ms("no hint here"), None);
     }
 
     #[test]
     fn parse_retry_after_integer() {
         assert_eq!(
-            parse_retry_after_ms("retry-after: 60"),
+            classify::parse_retry_after_ms("retry-after: 60"),
             Some(60_000)
         );
     }
@@ -888,9 +780,17 @@ mod tests {
         .with_circuit_breaker(1, Duration::from_millis(50));
 
         let _ = chain.complete(&[], &[]).await;
-        assert!(chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
+        assert!(
+            chain.chain[0]
+                .state
+                .is_tripped(1, Duration::from_millis(50))
+        );
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
+        assert!(
+            !chain.chain[0]
+                .state
+                .is_tripped(1, Duration::from_millis(50))
+        );
     }
 }
