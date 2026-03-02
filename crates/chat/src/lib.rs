@@ -2350,6 +2350,33 @@ fn enqueue_with_limit(
     Some(entry.len())
 }
 
+/// Select the index of the next message to replay from a sorted (highest-first) queue,
+/// applying a starvation bound so that low-priority messages cannot be skipped forever.
+///
+/// Returns `(index_to_remove, new_consecutive_high_serves)`.
+fn pick_next_with_starvation(
+    queued: &[QueuedMessage],
+    consecutive_high_serves: usize,
+    starvation_bound: usize,
+) -> (usize, usize) {
+    debug_assert!(!queued.is_empty());
+    let high_priority = queued[0].priority;
+    let low_priority = queued[queued.len() - 1].priority;
+    // Starvation guard: when the bound is active and there is at least one
+    // lower-priority tier, force-pick the lowest-priority message.
+    if starvation_bound > 0
+        && consecutive_high_serves >= starvation_bound
+        && low_priority < high_priority
+    {
+        (queued.len() - 1, 0)
+    } else {
+        // Take from the highest-priority end; bump the counter only for
+        // above-normal priority picks so normal/low picks reset it.
+        let new_count = if high_priority > 0 { consecutive_high_serves + 1 } else { 0 };
+        (0, new_count)
+    }
+}
+
 /// A tool call currently executing within an active agent run.
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveToolCall {
@@ -2374,6 +2401,8 @@ pub struct LiveChatService {
     session_locks: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
     /// Per-session message queue for messages arriving during an active run.
     message_queue: Arc<RwLock<HashMap<String, Vec<QueuedMessage>>>>,
+    /// Per-session count of consecutive high-priority messages served (starvation guard).
+    consecutive_high_priority_serves: Arc<RwLock<HashMap<String, usize>>>,
     /// Per-session last-seen client sequence number for ordering diagnostics.
     last_client_seq: Arc<RwLock<HashMap<String, u64>>>,
     /// Per-session accumulated thinking text for active runs, so it can be
@@ -2410,6 +2439,7 @@ impl LiveChatService {
             hook_registry: None,
             session_locks: Arc::new(RwLock::new(HashMap::new())),
             message_queue: Arc::new(RwLock::new(HashMap::new())),
+            consecutive_high_priority_serves: Arc::new(RwLock::new(HashMap::new())),
             last_client_seq: Arc::new(RwLock::new(HashMap::new())),
             active_thinking_text: Arc::new(RwLock::new(HashMap::new())),
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
@@ -2954,6 +2984,8 @@ impl ChatService for LiveChatService {
             let tool_registry = Arc::clone(&self.tool_registry);
             let session_key_clone = session_key.clone();
             let message_queue = Arc::clone(&self.message_queue);
+            let consecutive_high_priority_serves =
+                Arc::clone(&self.consecutive_high_priority_serves);
             let state_for_drain = Arc::clone(&self.state);
             let accept_language = params
                 .get("_accept_language")
@@ -3036,25 +3068,39 @@ impl ChatService for LiveChatService {
                     .remove(&session_key_clone)
                     .unwrap_or_default();
                 if !queued.is_empty() {
-                    let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                    let chat_cfg = moltis_config::discover_and_load().chat;
+                    let queue_mode = chat_cfg.message_queue_mode;
+                    let starvation_bound = chat_cfg.priority_starvation_bound;
                     let chat = state_for_drain.chat_service().await;
                     match queue_mode {
                         MessageQueueMode::Followup => {
-                            let mut iter = queued.into_iter();
-                            let Some(first) = iter.next() else {
-                                return;
-                            };
-                            let rest: Vec<QueuedMessage> = iter.collect();
-                            if !rest.is_empty() {
+                            let mut queued = queued;
+                            let consecutive = *consecutive_high_priority_serves
+                                .read()
+                                .await
+                                .get(&session_key_clone)
+                                .unwrap_or(&0);
+                            let (pick_idx, new_consecutive) = pick_next_with_starvation(
+                                &queued,
+                                consecutive,
+                                starvation_bound,
+                            );
+                            let selected = queued.remove(pick_idx);
+                            *consecutive_high_priority_serves
+                                .write()
+                                .await
+                                .entry(session_key_clone.clone())
+                                .or_default() = new_consecutive;
+                            if !queued.is_empty() {
                                 message_queue
                                     .write()
                                     .await
                                     .entry(session_key_clone.clone())
                                     .or_default()
-                                    .extend(rest);
+                                    .extend(queued);
                             }
                             info!(session = %session_key_clone, "replaying queued message (followup)");
-                            let mut replay_params = first.params;
+                            let mut replay_params = selected.params;
                             replay_params["_queued_replay"] = serde_json::json!(true);
                             if let Err(e) = chat.send(replay_params).await {
                                 warn!(session = %session_key_clone, error = %e, "failed to replay queued message");
@@ -3690,6 +3736,8 @@ impl ChatService for LiveChatService {
         let agent_timeout_secs = moltis_config::discover_and_load().tools.agent_timeout_secs;
 
         let message_queue = Arc::clone(&self.message_queue);
+        let consecutive_high_priority_serves =
+            Arc::clone(&self.consecutive_high_priority_serves);
         let state_for_drain = Arc::clone(&self.state);
         let deferred_channel_target = deferred_channel_target.clone();
 
@@ -3867,27 +3915,39 @@ impl ChatService for LiveChatService {
                 .remove(&session_key_clone)
                 .unwrap_or_default();
             if !queued.is_empty() {
-                let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                let chat_cfg = moltis_config::discover_and_load().chat;
+                let queue_mode = chat_cfg.message_queue_mode;
+                let starvation_bound = chat_cfg.priority_starvation_bound;
                 let chat = state_for_drain.chat_service().await;
                 match queue_mode {
                     MessageQueueMode::Followup => {
-                        let mut iter = queued.into_iter();
-                        let Some(first) = iter.next() else {
-                            return;
-                        };
-                        // Put remaining messages back so the replayed run's
-                        // own drain loop picks them up after it completes.
-                        let rest: Vec<QueuedMessage> = iter.collect();
-                        if !rest.is_empty() {
+                        let mut queued = queued;
+                        let consecutive = *consecutive_high_priority_serves
+                            .read()
+                            .await
+                            .get(&session_key_clone)
+                            .unwrap_or(&0);
+                        let (pick_idx, new_consecutive) = pick_next_with_starvation(
+                            &queued,
+                            consecutive,
+                            starvation_bound,
+                        );
+                        let selected = queued.remove(pick_idx);
+                        *consecutive_high_priority_serves
+                            .write()
+                            .await
+                            .entry(session_key_clone.clone())
+                            .or_default() = new_consecutive;
+                        if !queued.is_empty() {
                             message_queue
                                 .write()
                                 .await
                                 .entry(session_key_clone.clone())
                                 .or_default()
-                                .extend(rest);
+                                .extend(queued);
                         }
                         info!(session = %session_key_clone, "replaying queued message (followup)");
-                        let mut replay_params = first.params;
+                        let mut replay_params = selected.params;
                         replay_params["_queued_replay"] = serde_json::json!(true);
                         if let Err(e) = chat.send(replay_params).await {
                             warn!(session = %session_key_clone, error = %e, "failed to replay queued message");
@@ -4238,6 +4298,10 @@ impl ChatService for LiveChatService {
             .remove(session_key)
             .unwrap_or_default();
         let count = removed.len();
+        self.consecutive_high_priority_serves
+            .write()
+            .await
+            .remove(session_key);
         info!(session = %session_key, count, "cancel_queued: cleared message queue");
 
         broadcast(
@@ -10427,6 +10491,55 @@ mod tests {
         assert_eq!(entry[0].params["text"], "first");
         assert_eq!(entry[1].params["text"], "second");
         assert_eq!(entry[2].params["text"], "third");
+    }
+
+    #[test]
+    fn pick_next_with_starvation_no_bound_always_picks_highest() {
+        let queued = vec![
+            QueuedMessage { params: serde_json::json!({"text": "high"}), priority: 50 },
+            QueuedMessage { params: serde_json::json!({"text": "normal"}), priority: 0 },
+            QueuedMessage { params: serde_json::json!({"text": "low"}), priority: -50 },
+        ];
+        // bound = 0 means disabled: always picks index 0 (highest priority).
+        let (idx, new_count) = pick_next_with_starvation(&queued, 10, 0);
+        assert_eq!(idx, 0);
+        // high_priority > 0 so count increments
+        assert_eq!(new_count, 11);
+    }
+
+    #[test]
+    fn pick_next_with_starvation_forces_low_after_bound() {
+        let queued = vec![
+            QueuedMessage { params: serde_json::json!({"text": "high"}), priority: 50 },
+            QueuedMessage { params: serde_json::json!({"text": "low"}), priority: -50 },
+        ];
+        // After 5 consecutive high-priority serves with bound = 5, picks last (low).
+        let (idx, new_count) = pick_next_with_starvation(&queued, 5, 5);
+        assert_eq!(idx, 1, "should pick the low-priority message");
+        assert_eq!(new_count, 0, "counter should reset to 0");
+    }
+
+    #[test]
+    fn pick_next_with_starvation_no_lower_tier_keeps_high() {
+        // All messages at same priority — no lower tier to force.
+        let queued = vec![
+            QueuedMessage { params: serde_json::json!({"text": "a"}), priority: 50 },
+            QueuedMessage { params: serde_json::json!({"text": "b"}), priority: 50 },
+        ];
+        let (idx, _) = pick_next_with_starvation(&queued, 99, 5);
+        assert_eq!(idx, 0, "with no lower tier, should still pick head");
+    }
+
+    #[test]
+    fn pick_next_with_starvation_below_bound_increments_count() {
+        let queued = vec![
+            QueuedMessage { params: serde_json::json!({"text": "high"}), priority: 50 },
+            QueuedMessage { params: serde_json::json!({"text": "low"}), priority: -50 },
+        ];
+        // 3 serves, bound = 5 → not yet triggered
+        let (idx, new_count) = pick_next_with_starvation(&queued, 3, 5);
+        assert_eq!(idx, 0);
+        assert_eq!(new_count, 4);
     }
 
     #[tokio::test]

@@ -1239,6 +1239,10 @@ pub struct ChatConfig {
     /// When the queue is full, new messages are rejected with an error.
     #[serde(default = "default_message_queue_max_size")]
     pub message_queue_max_size: usize,
+    /// Number of consecutive high-priority messages to serve before forcing one
+    /// lower-priority message through (starvation prevention). Set to 0 to disable.
+    #[serde(default = "default_priority_starvation_bound")]
+    pub priority_starvation_bound: usize,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1257,6 +1261,10 @@ fn default_message_queue_max_size() -> usize {
     100
 }
 
+fn default_priority_starvation_bound() -> usize {
+    5
+}
+
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
@@ -1268,6 +1276,7 @@ impl Default for ChatConfig {
             context_compaction_keep_recent: default_compaction_keep_recent(),
             research: ResearchConfig::default(),
             message_queue_max_size: default_message_queue_max_size(),
+            priority_starvation_bound: default_priority_starvation_bound(),
         }
     }
 }

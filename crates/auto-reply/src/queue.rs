@@ -33,4 +33,66 @@ pub mod priority {
     pub const NORMAL: i32 = 0;
     /// Low-priority background / batch messages.
     pub const LOW: i32 = -50;
+    /// Maintenance / scheduled background tasks (lowest tier).
+    pub const MAINTENANCE: i32 = -100;
+}
+
+/// Typed priority class for messages entering the queue.
+///
+/// Maps to `_priority` integer values used by the chat queue:
+/// - `Interactive`  → 0   (user-initiated chat)
+/// - `Background`   → -50 (inter-session agent sends)
+/// - `Maintenance`  → -100 (cron / scheduled jobs)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessagePriority {
+    /// Direct user interaction — highest tier.
+    Interactive,
+    /// Background inter-session message from another agent.
+    Background,
+    /// Scheduled/cron maintenance task — lowest tier.
+    Maintenance,
+}
+
+impl MessagePriority {
+    /// Convert to the integer `_priority` value recognised by the chat queue.
+    #[must_use]
+    pub fn as_i32(self) -> i32 {
+        match self {
+            Self::Interactive => priority::NORMAL,
+            Self::Background => priority::LOW,
+            Self::Maintenance => priority::MAINTENANCE,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_priority_as_i32_values() {
+        assert_eq!(MessagePriority::Interactive.as_i32(), 0);
+        assert_eq!(MessagePriority::Background.as_i32(), -50);
+        assert_eq!(MessagePriority::Maintenance.as_i32(), -100);
+    }
+
+    #[test]
+    fn priority_ordering() {
+        assert!(
+            MessagePriority::Interactive.as_i32() > MessagePriority::Background.as_i32(),
+            "Interactive must outrank Background"
+        );
+        assert!(
+            MessagePriority::Background.as_i32() > MessagePriority::Maintenance.as_i32(),
+            "Background must outrank Maintenance"
+        );
+    }
+
+    #[test]
+    fn priority_constants_ordering() {
+        assert!(priority::SYSTEM > priority::HIGH);
+        assert!(priority::HIGH > priority::NORMAL);
+        assert!(priority::NORMAL > priority::LOW);
+        assert!(priority::LOW > priority::MAINTENANCE);
+    }
 }
