@@ -60,6 +60,7 @@ impl ToolPolicy {
         // Check deny first — deny wins.
         for pattern in &self.deny {
             if pattern_matches(pattern, tool_name) {
+                debug!(tool = tool_name, pattern, "tool denied by deny list");
                 return false;
             }
         }
@@ -73,6 +74,7 @@ impl ToolPolicy {
                 return true;
             }
         }
+        debug!(tool = tool_name, "tool denied: not in allow list");
         false
     }
 
