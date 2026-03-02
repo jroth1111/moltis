@@ -203,6 +203,9 @@ pub struct MoltisConfig {
     pub memory: MemoryEmbeddingConfig,
     pub tailscale: TailscaleConfig,
     pub failover: FailoverConfig,
+    /// Per-provider outbound rate limits. Key is the provider name (e.g. "openai").
+    #[serde(default)]
+    pub provider_rate_limits: HashMap<String, ProviderRateLimitConfig>,
     pub heartbeat: HeartbeatConfig,
     pub voice: VoiceConfig,
     pub cron: CronConfig,
@@ -728,6 +731,13 @@ impl Default for FailoverConfig {
             fallback_models: Vec::new(),
         }
     }
+}
+
+/// Outbound rate limit configuration for a single provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderRateLimitConfig {
+    /// Maximum requests per minute to this provider. `None` means no limit.
+    pub requests_per_minute: Option<u32>,
 }
 
 /// Heartbeat configuration — periodic health-check agent turn.
@@ -1312,8 +1322,12 @@ impl Default for ResearchConfig {
     }
 }
 
-fn default_research_trigger() -> String { "question".to_string() }
-fn default_research_max_iterations() -> usize { 3 }
+fn default_research_trigger() -> String {
+    "question".to_string()
+}
+fn default_research_max_iterations() -> usize {
+    3
+}
 
 /// Tools configuration (exec, sandbox, policy, web, browser).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2084,7 +2098,10 @@ impl std::fmt::Debug for ProviderEntry {
         f.debug_struct("ProviderEntry")
             .field("enabled", &self.enabled)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("extra_api_keys", &format!("[{} keys]", self.extra_api_keys.len()))
+            .field(
+                "extra_api_keys",
+                &format!("[{} keys]", self.extra_api_keys.len()),
+            )
             .field("base_url", &self.base_url)
             .field("models", &self.models)
             .field("fetch_models", &self.fetch_models)
@@ -2562,7 +2579,10 @@ memory = 300
     #[test]
     fn provider_entry_extra_api_keys_round_trip() {
         let entry = ProviderEntry {
-            extra_api_keys: vec![Secret::new("sk-extra-1".into()), Secret::new("sk-extra-2".into())],
+            extra_api_keys: vec![
+                Secret::new("sk-extra-1".into()),
+                Secret::new("sk-extra-2".into()),
+            ],
             ..ProviderEntry::default()
         };
 
