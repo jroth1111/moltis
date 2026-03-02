@@ -605,6 +605,7 @@ pub async fn run_agent_loop(
         history,
         None,
         None,
+        None,
     )
     .await
 }
@@ -620,6 +621,7 @@ pub async fn run_agent_loop_with_context(
     history: Option<Vec<ChatMessage>>,
     tool_context: Option<serde_json::Value>,
     hook_registry: Option<Arc<HookRegistry>>,
+    trace_id: Option<String>,
 ) -> Result<AgentRunResult, AgentRunError> {
     let native_tools = provider.supports_tools();
     let config = moltis_config::discover_and_load();
@@ -706,6 +708,7 @@ pub async fn run_agent_loop_with_context(
                 messages: serde_json::Value::Array(msgs_json),
                 tool_count: schemas_for_api.len(),
                 iteration: iterations,
+                trace_id: trace_id.clone(),
             };
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
@@ -752,6 +755,7 @@ pub async fn run_agent_loop_with_context(
                             input_tokens: 0,
                             output_tokens: 0,
                             iteration: iterations,
+                            trace_id: trace_id.clone(),
                         };
                         if let Err(dispatch_err) = hooks.dispatch(&payload).await {
                             warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
@@ -913,6 +917,7 @@ pub async fn run_agent_loop_with_context(
                 input_tokens: response.usage.input_tokens,
                 output_tokens: response.usage.output_tokens,
                 iteration: iterations,
+                trace_id: trace_id.clone(),
             };
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
@@ -1001,6 +1006,7 @@ pub async fn run_agent_loop_with_context(
                 let session_key = session_key_for_hooks.clone();
                 let tc_name = tc.name.clone();
                 let _tc_id = tc.id.clone();
+                let trace_id = trace_id.clone();
 
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
@@ -1016,6 +1022,7 @@ pub async fn run_agent_loop_with_context(
                             session_key: session_key.clone(),
                             tool_name: tc_name.clone(),
                             arguments: args.clone(),
+                            trace_id: trace_id.clone(),
                         };
                         match hooks.dispatch(&payload).await {
                             Ok(HookAction::Block(reason)) => {
@@ -1058,6 +1065,7 @@ pub async fn run_agent_loop_with_context(
                                     tool_name: tc_name.clone(),
                                     success: !has_error,
                                     result: Some(val.clone()),
+                                    trace_id: trace_id.clone(),
                                 };
                                 if let Err(e) = hooks.dispatch(&payload).await {
                                     warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
@@ -1080,6 +1088,7 @@ pub async fn run_agent_loop_with_context(
                                     tool_name: tc_name.clone(),
                                     success: false,
                                     result: None,
+                                    trace_id: trace_id.clone(),
                                 };
                                 if let Err(e) = hooks.dispatch(&payload).await {
                                     warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
@@ -1164,6 +1173,7 @@ pub async fn run_agent_loop_streaming(
     history: Option<Vec<ChatMessage>>,
     tool_context: Option<serde_json::Value>,
     hook_registry: Option<Arc<HookRegistry>>,
+    trace_id: Option<String>,
 ) -> Result<AgentRunResult, AgentRunError> {
     let native_tools = provider.supports_tools();
     let config = moltis_config::discover_and_load();
@@ -1264,6 +1274,7 @@ pub async fn run_agent_loop_streaming(
                 messages: serde_json::Value::Array(msgs_json),
                 tool_count: schemas_for_api.len(),
                 iteration: iterations,
+                trace_id: trace_id.clone(),
             };
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
@@ -1428,6 +1439,7 @@ pub async fn run_agent_loop_streaming(
                     input_tokens: 0,
                     output_tokens: 0,
                     iteration: iterations,
+                    trace_id: trace_id.clone(),
                 };
                 if let Err(dispatch_err) = hooks.dispatch(&payload).await {
                     warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for streaming provider error");
@@ -1577,6 +1589,7 @@ pub async fn run_agent_loop_streaming(
                 input_tokens,
                 output_tokens,
                 iteration: iterations,
+                trace_id: trace_id.clone(),
             };
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
@@ -1679,6 +1692,7 @@ pub async fn run_agent_loop_streaming(
                 let hook_registry = hook_registry.clone();
                 let session_key = session_key_for_hooks.clone();
                 let tc_name = tc.name.clone();
+                let trace_id = trace_id.clone();
 
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
@@ -1694,6 +1708,7 @@ pub async fn run_agent_loop_streaming(
                             session_key: session_key.clone(),
                             tool_name: tc_name.clone(),
                             arguments: args.clone(),
+                            trace_id: trace_id.clone(),
                         };
                         match hooks.dispatch(&payload).await {
                             Ok(HookAction::Block(reason)) => {
@@ -1735,6 +1750,7 @@ pub async fn run_agent_loop_streaming(
                                     tool_name: tc_name.clone(),
                                     success: !has_error,
                                     result: Some(val.clone()),
+                                    trace_id: trace_id.clone(),
                                 };
                                 if let Err(e) = hooks.dispatch(&payload).await {
                                     warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
@@ -1755,6 +1771,7 @@ pub async fn run_agent_loop_streaming(
                                     tool_name: tc_name.clone(),
                                     success: false,
                                     result: None,
+                                    trace_id: trace_id.clone(),
                                 };
                                 if let Err(e) = hooks.dispatch(&payload).await {
                                     warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");

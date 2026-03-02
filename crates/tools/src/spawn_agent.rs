@@ -335,6 +335,7 @@ impl AgentTool for SpawnAgentTool {
             None, // no history
             Some(tool_context),
             None, // no hooks for sub-agents
+            None, // no trace_id propagated to sub-agents yet
         )
         .await;
 

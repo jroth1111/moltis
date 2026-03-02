@@ -6577,6 +6577,7 @@ async fn run_with_tools(
         hist,
         Some(tool_context.clone()),
         hook_registry.clone(),
+        None,
     )
     .await;
 
@@ -6640,6 +6641,7 @@ async fn run_with_tools(
                         retry_hist,
                         Some(tool_context),
                         hook_registry,
+                        None,
                     )
                     .await
                 },
