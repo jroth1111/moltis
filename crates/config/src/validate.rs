@@ -336,6 +336,15 @@ fn build_schema_map() -> KnownKeys {
                 ("priority_models", Leaf),
                 ("allowed_models", Leaf),
                 ("fact_extraction", Leaf),
+                (
+                    "research",
+                    Struct(HashMap::from([
+                        ("enabled", Leaf),
+                        ("trigger", Leaf),
+                        ("keywords", Leaf),
+                        ("max_iterations", Leaf),
+                    ])),
+                ),
             ])),
         ),
         (
