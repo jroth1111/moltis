@@ -221,6 +221,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 0,
                 iteration: 1,
+                trace_id: None,
             };
             hook.handle(HookEvent::AfterLLMCall, &payload)
                 .await
@@ -234,6 +235,7 @@ mod tests {
             messages: serde_json::json!([]),
             tool_count: 0,
             iteration: 1,
+            trace_id: None,
         };
         let result = hook
             .handle(HookEvent::BeforeLLMCall, &payload)
@@ -259,6 +261,7 @@ mod tests {
             messages: serde_json::json!([]),
             tool_count: 0,
             iteration: 2,
+            trace_id: None,
         };
         let allow = hook
             .handle(HookEvent::BeforeLLMCall, &before)
@@ -276,6 +279,7 @@ mod tests {
             input_tokens: 1,
             output_tokens: 0,
             iteration: 2,
+            trace_id: None,
         };
         hook.handle(HookEvent::AfterLLMCall, &fail).await.unwrap();
 
@@ -303,6 +307,7 @@ mod tests {
             input_tokens: 1,
             output_tokens: 0,
             iteration: 1,
+            trace_id: None,
         };
         hook.handle(HookEvent::AfterLLMCall, &fail).await.unwrap();
 
@@ -323,6 +328,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 0,
             iteration: 1,
+            trace_id: None,
         };
         hook.handle(HookEvent::AfterLLMCall, &payload).await.unwrap();
         let snapshot = hook.snapshot().await;
