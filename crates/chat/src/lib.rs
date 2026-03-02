@@ -5821,7 +5821,7 @@ async fn run_with_tools(
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     // Keep the runtime datetime/date sentence as the final prompt line for better cache locality.
-    let system_prompt =
+    let mut system_prompt =
         apply_voice_reply_suffix(system_prompt, desired_reply_medium, runtime_context);
 
     // Determine sandbox mode for this session.
@@ -6238,20 +6238,34 @@ async fn run_with_tools(
         tool_context["_conn_id"] = serde_json::json!(cid);
     }
 
-    // TODO(research-phase): Before calling the runner, check research config and run:
-    // if config.chat.research.enabled {
-    //     let trigger = moltis_agents::research::ResearchTrigger::from_config(
-    //         &config.chat.research.trigger,
-    //         &config.chat.research.keywords,
-    //     );
-    //     if let Some(result) = moltis_agents::research::run_research_phase(
-    //         &trigger, &text, &chat_history, provider.clone(), config.chat.research.max_iterations,
-    //     ).await? {
-    //         // inject result.context as a system prompt suffix
-    //         system_prompt.push_str("\n\n");
-    //         system_prompt.push_str(&result.context);
-    //     }
-    // }
+    // Research phase: gather context before the main agent turn when enabled.
+    if persona.config.chat.research.enabled {
+        let research_trigger = moltis_agents::research::ResearchTrigger::from_config(
+            &persona.config.chat.research.trigger,
+            &persona.config.chat.research.keywords,
+        );
+        let research_text: &str = match user_content {
+            UserContent::Text(t) => t.as_str(),
+            UserContent::Multimodal(parts) => parts
+                .iter()
+                .find_map(|p| {
+                    if let ContentPart::Text(t) = p { Some(t.as_str()) } else { None }
+                })
+                .unwrap_or(""),
+        };
+        if let Ok(Some(result)) = moltis_agents::research::run_research_phase(
+            &research_trigger,
+            research_text,
+            hist.as_deref().unwrap_or(&[]),
+            provider.clone(),
+            persona.config.chat.research.max_iterations,
+        )
+        .await
+        {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&result.context);
+        }
+    }
 
     let provider_ref = provider.clone();
     let first_result = run_agent_loop_streaming(
