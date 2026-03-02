@@ -10,6 +10,9 @@ use {
     serde::{Deserialize, Serialize},
 };
 
+#[cfg(feature = "metrics")]
+use moltis_metrics::counter;
+
 /// A single search hit within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -142,6 +145,8 @@ impl SessionStore {
                     Err(e) => {
                         skipped_lines += 1;
                         tracing::warn!("skipping malformed JSONL line: {e}");
+                        #[cfg(feature = "metrics")]
+                        counter!("moltis_sessions_jsonl_lines_skipped").increment(1);
                     },
                 }
             }
