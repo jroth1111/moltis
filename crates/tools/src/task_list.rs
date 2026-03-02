@@ -1,7 +1,7 @@
 //! Shared task list tool for inter-agent task coordination.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -89,6 +89,22 @@ impl Default for TaskList {
 pub struct TaskStore {
     data_dir: PathBuf,
     lists: RwLock<HashMap<String, TaskList>>,
+}
+
+fn would_create_cycle(tasks: &HashMap<String, Task>, task_id: &str, new_deps: &[String]) -> bool {
+    let mut visited = HashSet::new();
+    let mut stack = new_deps.to_vec();
+    while let Some(current) = stack.pop() {
+        if current == task_id {
+            return true;
+        }
+        if visited.insert(current.clone()) {
+            if let Some(t) = tasks.get(&current) {
+                stack.extend(t.blocked_by.iter().cloned());
+            }
+        }
+    }
+    false
 }
 
 impl TaskStore {
@@ -224,6 +240,69 @@ impl TaskStore {
         let list = lists
             .get_mut(list_id)
             .ok_or_else(|| Error::message(format!("missing task list: {list_id}")))?;
+
+        // Validate before mutating.
+        {
+            let task = list
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
+
+            // Status transition: Pending → Completed is forbidden (must pass through InProgress).
+            if let Some(TaskStatus::Completed) = &status {
+                if task.status == TaskStatus::Pending {
+                    return Err(Error::message(format!(
+                        "task {task_id} cannot transition from pending to completed directly; \
+                         set status to in_progress first"
+                    )));
+                }
+            }
+
+            // Validate new blocked_by list.
+            if let Some(ref deps) = blocked_by {
+                // Self-reference check.
+                if deps.contains(&task_id.to_string()) {
+                    return Err(Error::message(format!(
+                        "task {task_id} cannot block itself"
+                    )));
+                }
+                // Existence check.
+                for dep_id in deps {
+                    if !list.tasks.contains_key(dep_id.as_str()) {
+                        return Err(Error::message(format!(
+                            "blocked_by refers to nonexistent task: {dep_id}"
+                        )));
+                    }
+                }
+                // Cycle check.
+                if would_create_cycle(&list.tasks, task_id, deps) {
+                    return Err(Error::message(format!(
+                        "task {task_id}: setting blocked_by would create a dependency cycle"
+                    )));
+                }
+            }
+
+            // When transitioning to InProgress, check all current (or new) deps are completed.
+            if let Some(TaskStatus::InProgress) = &status {
+                let effective_deps = blocked_by.as_deref().unwrap_or(&task.blocked_by);
+                let blocked: Vec<String> = effective_deps
+                    .iter()
+                    .filter(|dep_id| {
+                        list.tasks
+                            .get(dep_id.as_str())
+                            .is_some_and(|dep| dep.status != TaskStatus::Completed)
+                    })
+                    .cloned()
+                    .collect();
+                if !blocked.is_empty() {
+                    return Err(Error::message(format!(
+                        "task {task_id} is blocked by incomplete tasks: {}",
+                        blocked.join(", ")
+                    )));
+                }
+            }
+        }
+
         let task = list
             .tasks
             .get_mut(task_id)
@@ -522,6 +601,16 @@ mod tests {
             .as_str()
             .ok_or_else(|| std::io::Error::other("missing task id"))?;
 
+        // First set to in_progress
+        task_tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "in_progress"
+            }))
+            .await?;
+
+        // Then set to completed
         task_tool
             .execute(serde_json::json!({
                 "action": "update",
@@ -586,6 +675,155 @@ mod tests {
             .err()
             .ok_or_else(|| std::io::Error::other("expected blocked claim failure"))?;
         assert!(err.to_string().contains("blocked by incomplete tasks"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_rejects_pending_to_completed() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let task_tool = tool(&tmp);
+        let created = task_tool
+            .execute(serde_json::json!({
+                "action": "create",
+                "subject": "work"
+            }))
+            .await?;
+        let id = created["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+
+        let result = task_tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "completed"
+            }))
+            .await;
+        let err = result
+            .err()
+            .ok_or_else(|| std::io::Error::other("expected transition error"))?;
+        assert!(err.to_string().contains("in_progress first"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_rejects_self_block() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let task_tool = tool(&tmp);
+        let created = task_tool
+            .execute(serde_json::json!({
+                "action": "create",
+                "subject": "work"
+            }))
+            .await?;
+        let id = created["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+
+        let result = task_tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": id,
+                "blocked_by": [id]
+            }))
+            .await;
+        let err = result
+            .err()
+            .ok_or_else(|| std::io::Error::other("expected self-block error"))?;
+        assert!(err.to_string().contains("cannot block itself"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_rejects_nonexistent_dep() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let task_tool = tool(&tmp);
+        let created = task_tool
+            .execute(serde_json::json!({
+                "action": "create",
+                "subject": "work"
+            }))
+            .await?;
+        let id = created["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+
+        let result = task_tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": id,
+                "blocked_by": ["999"]
+            }))
+            .await;
+        let err = result
+            .err()
+            .ok_or_else(|| std::io::Error::other("expected nonexistent dep error"))?;
+        assert!(err.to_string().contains("nonexistent task"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_rejects_cycle() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let task_tool = tool(&tmp);
+
+        // Create task A and B
+        let a = task_tool
+            .execute(serde_json::json!({"action": "create", "subject": "A"}))
+            .await?;
+        let a_id = a["task"]["id"].as_str().ok_or_else(|| std::io::Error::other("missing id"))?;
+
+        let b = task_tool
+            .execute(serde_json::json!({"action": "create", "subject": "B"}))
+            .await?;
+        let b_id = b["task"]["id"].as_str().ok_or_else(|| std::io::Error::other("missing id"))?;
+
+        // Set A blocked_by B (valid)
+        task_tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": a_id,
+                "blocked_by": [b_id]
+            }))
+            .await?;
+
+        // Now try to set B blocked_by A — this creates a cycle
+        let result = task_tool
+            .execute(serde_json::json!({
+                "action": "update",
+                "id": b_id,
+                "blocked_by": [a_id]
+            }))
+            .await;
+        let err = result
+            .err()
+            .ok_or_else(|| std::io::Error::other("expected cycle error"))?;
+        assert!(err.to_string().contains("cycle"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_allows_valid_transitions() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let task_tool = tool(&tmp);
+        let created = task_tool
+            .execute(serde_json::json!({"action": "create", "subject": "work"}))
+            .await?;
+        let id = created["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+
+        // Pending → InProgress is valid
+        let result = task_tool
+            .execute(serde_json::json!({"action": "update", "id": id, "status": "in_progress"}))
+            .await?;
+        assert_eq!(result["task"]["status"], "in_progress");
+
+        // InProgress → Completed is valid
+        let result = task_tool
+            .execute(serde_json::json!({"action": "update", "id": id, "status": "completed"}))
+            .await?;
+        assert_eq!(result["task"]["status"], "completed");
         Ok(())
     }
 }
