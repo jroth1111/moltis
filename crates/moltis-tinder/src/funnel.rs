@@ -147,7 +147,7 @@ pub async fn update_funnel(
     new_state: FunnelState,
 ) -> anyhow::Result<()> {
     let now = now_ms();
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE tinder_matches SET funnel_state = ?, updated_at = ? WHERE id = ?",
     )
     .bind(new_state.to_string())
@@ -155,6 +155,9 @@ pub async fn update_funnel(
     .bind(id)
     .execute(pool)
     .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("match not found: {id}");
+    }
     Ok(())
 }
 
