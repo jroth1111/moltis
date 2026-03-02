@@ -368,6 +368,64 @@ pub enum ApprovalAction {
     NeedsApproval,
 }
 
+/// Persist a pending approval to the database so it survives restarts.
+pub async fn persist_approval(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    session_key: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let expires_at = now + 3600;
+    sqlx::query(
+        "INSERT OR IGNORE INTO pending_approvals (id, session_key, tool_name, arguments, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(id)
+    .bind(session_key)
+    .bind(tool_name)
+    .bind(arguments)
+    .bind(now)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Remove a resolved or denied approval from the database.
+pub async fn cleanup_approval(pool: &sqlx::SqlitePool, id: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM pending_approvals WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Recover pending approvals that have not expired, cleaning up stale rows.
+pub async fn recover_pending(
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<Vec<(String, String, String, String)>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    // Clean expired
+    sqlx::query("DELETE FROM pending_approvals WHERE expires_at < ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    // Return remaining
+    let rows = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT id, session_key, tool_name, arguments FROM pending_approvals",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {

@@ -106,6 +106,15 @@ pub async fn exec_command(command: &str, opts: &ExecOpts) -> Result<ExecResult> 
         cmd.env(k, v);
     }
 
+    // Scrub the inherited environment to avoid leaking secrets to child processes.
+    const SAFE_ENV_VARS: &[&str] = &["PATH", "HOME", "USER", "LANG", "TMPDIR", "TERM", "DISPLAY"];
+    cmd.env_clear();
+    for v in SAFE_ENV_VARS {
+        if let Ok(val) = std::env::var(v) {
+            cmd.env(v, val);
+        }
+    }
+
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     // Prevent the child from inheriting stdin.

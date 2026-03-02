@@ -4,6 +4,49 @@ use {
     std::{collections::HashMap, sync::Arc},
 };
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Per-tool rate limiter with a sliding-window reset every 60 seconds.
+pub struct RateLimit {
+    pub max_per_minute: u32,
+    remaining: Arc<AtomicU32>,
+}
+
+impl RateLimit {
+    pub fn new(max_per_minute: u32) -> Self {
+        let remaining = Arc::new(AtomicU32::new(max_per_minute));
+        let r = Arc::clone(&remaining);
+        let limit = max_per_minute;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                r.store(limit, Ordering::Relaxed);
+            }
+        });
+        Self {
+            max_per_minute,
+            remaining,
+        }
+    }
+
+    pub fn try_acquire(&self) -> std::result::Result<(), &'static str> {
+        loop {
+            let cur = self.remaining.load(Ordering::Relaxed);
+            if cur == 0 {
+                return Err("rate limit exceeded");
+            }
+            if self
+                .remaining
+                .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Agent-callable tool.
 #[async_trait]
 pub trait AgentTool: Send + Sync {
@@ -28,6 +71,7 @@ pub enum ToolSource {
 struct ToolEntry {
     tool: Arc<dyn AgentTool>,
     source: ToolSource,
+    rate_limit: Option<RateLimit>,
 }
 
 /// Registry of available tools for an agent run.
@@ -53,10 +97,16 @@ impl ToolRegistry {
 
     /// Register a built-in tool.
     pub fn register(&mut self, tool: Box<dyn AgentTool>) {
+        self.register_with_limit(tool, None);
+    }
+
+    /// Register a built-in tool with an optional per-tool rate limit.
+    pub fn register_with_limit(&mut self, tool: Box<dyn AgentTool>, limit: Option<RateLimit>) {
         let name = tool.name().to_string();
         self.tools.insert(name, ToolEntry {
             tool: Arc::from(tool),
             source: ToolSource::Builtin,
+            rate_limit: limit,
         });
     }
 
@@ -66,6 +116,7 @@ impl ToolRegistry {
         self.tools.insert(name, ToolEntry {
             tool: Arc::from(tool),
             source: ToolSource::Mcp { server },
+            rate_limit: None,
         });
     }
 
@@ -75,6 +126,7 @@ impl ToolRegistry {
         self.tools.insert(name, ToolEntry {
             tool: Arc::from(tool),
             source: ToolSource::Wasm { component_hash },
+            rate_limit: None,
         });
     }
 
@@ -97,6 +149,20 @@ impl ToolRegistry {
     /// Return a cloned tool handle by name.
     pub fn get_arc(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
         self.tools.get(name).map(|e| Arc::clone(&e.tool))
+    }
+
+    /// Dispatch a tool call by name: check rate limit, then execute.
+    pub async fn call(&self, name: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let entry = self
+            .tools
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        if let Some(ref rl) = entry.rate_limit {
+            if let Err(e) = rl.try_acquire() {
+                return Err(anyhow::anyhow!("{}", e));
+            }
+        }
+        entry.tool.execute(params).await
     }
 
     pub fn list_schemas(&self) -> Vec<serde_json::Value> {
@@ -142,6 +208,7 @@ impl ToolRegistry {
                 (name.clone(), ToolEntry {
                     tool: Arc::clone(&entry.tool),
                     source: entry.source.clone(),
+                    rate_limit: None,
                 })
             })
             .collect();
@@ -158,6 +225,7 @@ impl ToolRegistry {
                 (name.clone(), ToolEntry {
                     tool: Arc::clone(&entry.tool),
                     source: entry.source.clone(),
+                    rate_limit: None,
                 })
             })
             .collect();
@@ -174,6 +242,7 @@ impl ToolRegistry {
                 (name.clone(), ToolEntry {
                     tool: Arc::clone(&entry.tool),
                     source: entry.source.clone(),
+                    rate_limit: None,
                 })
             })
             .collect();
@@ -193,6 +262,7 @@ impl ToolRegistry {
                 (name.clone(), ToolEntry {
                     tool: Arc::clone(&entry.tool),
                     source: entry.source.clone(),
+                    rate_limit: None,
                 })
             })
             .collect();
