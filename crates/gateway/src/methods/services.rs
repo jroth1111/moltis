@@ -29,6 +29,17 @@ pub(super) fn model_probe_params(provider: Option<&str>) -> serde_json::Value {
     params
 }
 
+fn chat_send_result_is_queued(result: &serde_json::Value) -> bool {
+    result
+        .get("queued")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || result
+            .get("state")
+            .and_then(|v| v.as_str())
+            .is_some_and(|state| state.eq_ignore_ascii_case("queued"))
+}
+
 async fn active_session_key_for_ctx(ctx: &MethodContext) -> Option<String> {
     if let Some(session_key) = ctx
         .params
@@ -960,12 +971,25 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "sessions.reset",
         Box::new(|ctx| {
             Box::pin(async move {
-                ctx.state
+                let key = ctx
+                    .params
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let result = ctx
+                    .state
                     .services
                     .session
                     .reset(ctx.params.clone())
                     .await
-                    .map_err(ErrorShape::from)
+                    .map_err(ErrorShape::from)?;
+                // Clear in-memory undo history so a future undo can't resurrect
+                // messages from a session that has just been cleared.
+                if !key.is_empty() {
+                    ctx.state.inner.write().await.undo_managers.remove(&key);
+                }
+                Ok(result)
             })
         }),
     );
@@ -987,6 +1011,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .await
                     .map_err(ErrorShape::from)?;
                 if !key.is_empty() {
+                    // Remove stale undo manager so deleted session can't be resurrected.
+                    ctx.state.inner.write().await.undo_managers.remove(&key);
                     broadcast(
                         &ctx.state,
                         "session",
@@ -1009,12 +1035,17 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "sessions.clear_all",
         Box::new(|ctx| {
             Box::pin(async move {
-                ctx.state
+                let result = ctx
+                    .state
                     .services
                     .session
                     .clear_all()
                     .await
-                    .map_err(ErrorShape::from)
+                    .map_err(ErrorShape::from)?;
+                // `clear_all` removes session histories. Drop all in-memory undo
+                // checkpoints so stale snapshots cannot recreate cleared sessions.
+                ctx.state.inner.write().await.undo_managers.clear();
+                Ok(result)
             })
         }),
     );
@@ -1643,12 +1674,52 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         }
                     }
                 }
-                ctx.state
+
+                // Capture pre-turn message snapshot for undo stack.
+                let pre_turn_snapshot: Option<(String, Vec<serde_json::Value>)> = {
+                    let inner = ctx.state.inner.read().await;
+                    if let Some(session_key) = inner.active_sessions.get(&ctx.client_conn_id).cloned() {
+                        if let Some(store) = ctx.state.services.session_store.as_ref() {
+                            store.read(&session_key).await.ok().map(|msgs| (session_key, msgs))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let result = ctx.state
                     .chat()
                     .await
                     .send(params)
                     .await
-                    .map_err(ErrorShape::from)
+                    .map_err(ErrorShape::from);
+
+                // After a successful turn, push the pre-turn snapshot onto the undo stack.
+                // Skip if the message was queued rather than executed synchronously: the
+                // pre-turn snapshot would be stale (the session hasn't changed yet).
+                let was_queued = result
+                    .as_ref()
+                    .ok()
+                    .is_some_and(chat_send_result_is_queued);
+                if result.is_ok() && !was_queued {
+                    if let Some((session_key, snapshot)) = pre_turn_snapshot {
+                        let turn_index = {
+                            let inner = ctx.state.inner.read().await;
+                            // Use undo depth as a proxy for turn count.
+                            inner.undo_managers.get(&session_key).map_or(0, |m| m.undo_depth())
+                        };
+                        let mut inner = ctx.state.inner.write().await;
+                        let mgr = inner
+                            .undo_managers
+                            .entry(session_key)
+                            .or_insert_with(moltis_sessions::undo::UndoManager::new);
+                        mgr.push(snapshot, turn_index);
+                    }
+                }
+
+                result
             })
         }),
     );
@@ -1746,6 +1817,128 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .compact(params)
                     .await
                     .map_err(ErrorShape::from)
+            })
+        }),
+    );
+
+    reg.register(
+        "chat.undo",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                let session_key = {
+                    let inner = ctx.state.inner.read().await;
+                    inner
+                        .active_sessions
+                        .get(&ctx.client_conn_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ErrorShape::new(error_codes::UNAVAILABLE, "no active session")
+                        })?
+                };
+                let session_store = ctx
+                    .state
+                    .services
+                    .session_store
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
+                    })?;
+                let current_messages = session_store
+                    .read(&session_key)
+                    .await
+                    .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+                let (checkpoint, manager_before) = {
+                    let mut inner = ctx.state.inner.write().await;
+                    let mgr = inner
+                        .undo_managers
+                        .entry(session_key.clone())
+                        .or_insert_with(moltis_sessions::undo::UndoManager::new);
+                    let manager_before = mgr.clone();
+                    (mgr.undo(current_messages), manager_before)
+                };
+                match checkpoint {
+                    Some(cp) => {
+                        if let Err(e) = session_store
+                            .replace_history(&session_key, cp.messages.clone())
+                            .await
+                        {
+                            let mut inner = ctx.state.inner.write().await;
+                            inner
+                                .undo_managers
+                                .insert(session_key.clone(), manager_before);
+                            return Err(ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()));
+                        }
+                        Ok(serde_json::json!({
+                            "ok": true,
+                            "sessionKey": session_key,
+                            "turnIndex": cp.turn_index,
+                            "messageCount": cp.messages.len(),
+                        }))
+                    }
+                    None => Ok(serde_json::json!({
+                        "ok": false,
+                        "reason": "nothing to undo",
+                    })),
+                }
+            })
+        }),
+    );
+
+    reg.register(
+        "chat.redo",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                let session_key = {
+                    let inner = ctx.state.inner.read().await;
+                    inner
+                        .active_sessions
+                        .get(&ctx.client_conn_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ErrorShape::new(error_codes::UNAVAILABLE, "no active session")
+                        })?
+                };
+                let session_store = ctx
+                    .state
+                    .services
+                    .session_store
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
+                    })?;
+                let (checkpoint, manager_before) = {
+                    let mut inner = ctx.state.inner.write().await;
+                    let mgr = inner
+                        .undo_managers
+                        .entry(session_key.clone())
+                        .or_insert_with(moltis_sessions::undo::UndoManager::new);
+                    let manager_before = mgr.clone();
+                    (mgr.redo(), manager_before)
+                };
+                match checkpoint {
+                    Some(cp) => {
+                        if let Err(e) = session_store
+                            .replace_history(&session_key, cp.messages.clone())
+                            .await
+                        {
+                            let mut inner = ctx.state.inner.write().await;
+                            inner
+                                .undo_managers
+                                .insert(session_key.clone(), manager_before);
+                            return Err(ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()));
+                        }
+                        Ok(serde_json::json!({
+                            "ok": true,
+                            "sessionKey": session_key,
+                            "turnIndex": cp.turn_index,
+                            "messageCount": cp.messages.len(),
+                        }))
+                    }
+                    None => Ok(serde_json::json!({
+                        "ok": false,
+                        "reason": "nothing to redo",
+                    })),
+                }
             })
         }),
     );

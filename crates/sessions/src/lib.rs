@@ -12,6 +12,7 @@ pub mod metadata;
 pub mod session_events;
 pub mod state_store;
 pub mod store;
+pub mod undo;
 
 pub use {
     error::{Error, Result},
