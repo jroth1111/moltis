@@ -46,6 +46,37 @@ fn normalize_nfkc_lowercase(input: &str) -> String {
     input.nfkc().flat_map(|c| c.to_lowercase()).collect()
 }
 
+/// Removes `data:image/...;base64,<payload>` sequences from the input string.
+///
+/// Used before pattern scanning to avoid false positives from screenshot
+/// base64 payloads injected by `screenshot_resolver`.
+pub fn strip_image_data_uris(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    let tag = "data:image/";
+
+    while let Some(start) = rest.find(tag) {
+        output.push_str(&rest[..start]);
+        let after = &rest[start..];
+        if let Some(base64_pos) = after.find("base64,") {
+            let payload_start = start + base64_pos + "base64,".len();
+            let payload = &rest[payload_start..];
+            let payload_len = payload
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+                .count();
+            let drop_len = (payload_start - start) + payload_len;
+            rest = &rest[start + drop_len..];
+        } else {
+            output.push_str(tag);
+            rest = &rest[start + tag.len()..];
+        }
+    }
+
+    output.push_str(rest);
+    output
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {

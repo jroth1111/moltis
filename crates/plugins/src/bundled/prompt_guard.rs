@@ -7,7 +7,7 @@ use moltis_common::{
     hooks::{HookAction, HookEvent, HookHandler, HookPayload},
 };
 
-use crate::bundled::pattern_scanner::PatternScanner;
+use crate::bundled::pattern_scanner::{PatternScanner, strip_image_data_uris};
 
 pub struct PromptGuardHook {
     scanner: PatternScanner,
@@ -53,7 +53,7 @@ impl HookHandler for PromptGuardHook {
     async fn handle(&self, _event: HookEvent, payload: &HookPayload) -> Result<HookAction> {
         match payload {
             HookPayload::BeforeLLMCall { messages, .. } => {
-                let messages_str = messages.to_string();
+                let messages_str = strip_image_data_uris(&messages.to_string());
                 if self.scanner.matches(&messages_str) {
                     warn!("prompt-guard: potential prompt injection detected in LLM messages");
                     return Ok(HookAction::Block(
@@ -66,7 +66,7 @@ impl HookHandler for PromptGuardHook {
                 tool_name,
                 ..
             } => {
-                let args_str = arguments.to_string();
+                let args_str = strip_image_data_uris(&arguments.to_string());
                 if self.scanner.matches(&args_str) {
                     warn!(
                         tool = %tool_name,
@@ -114,6 +114,32 @@ mod tests {
             model: "claude-sonnet-4-20250514".into(),
             messages: serde_json::json!([
                 {"role": "user", "content": "How do I write a function in Rust?"}
+            ]),
+            tool_count: 0,
+            iteration: 1,
+        };
+        let result = hook.handle(HookEvent::BeforeLLMCall, &payload).await.unwrap();
+        assert!(matches!(result, HookAction::Continue));
+    }
+
+    #[tokio::test]
+    async fn screenshot_base64_does_not_trigger_prompt_guard() {
+        let hook = PromptGuardHook::new();
+        // Simulate a message with a screenshot-resolver injected image data URI.
+        // The base64 payload is long enough to trigger high-entropy detection if not stripped.
+        let b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/==";
+        let payload = HookPayload::BeforeLLMCall {
+            session_key: "s1".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            messages: serde_json::json!([
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "[screenshot_resolver] /tmp/shot.png"},
+                        {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{b64}")}}
+                    ]
+                }
             ]),
             tool_count: 0,
             iteration: 1,
