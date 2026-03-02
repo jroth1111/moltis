@@ -64,14 +64,6 @@ impl DomainApprovalManager {
         session: &str,
         domain: &str,
     ) -> (FilterAction, Option<ApprovalSource>) {
-        // Empty config allowlist means allow-all (audit-only mode).
-        if self.config_allowlist.is_empty() {
-            #[cfg(feature = "metrics")]
-            counter!("domain_checks_total", "result" => "allowed", "source" => "config")
-                .increment(1);
-            return (FilterAction::Allow, Some(ApprovalSource::Config));
-        }
-
         // Config allowlist.
         for pattern in &self.config_allowlist {
             if pattern.matches(domain) {
@@ -262,9 +254,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_empty_allowlist_allows_all_domains() {
-        // Empty config allowlist = audit-only mode: all domains allowed.
+    async fn test_empty_allowlist_requires_approval() {
+        // Empty config allowlist = fail-closed: all domains require approval.
         let mgr = DomainApprovalManager::new(&[], Duration::from_secs(60));
+        assert_eq!(
+            mgr.check_domain("sess1", "anything.com").await,
+            FilterAction::NeedsApproval
+        );
+        assert_eq!(
+            mgr.check_domain("sess1", "evil.org").await,
+            FilterAction::NeedsApproval
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_allowlist_still_allows_session_approved_domains() {
+        let mgr = DomainApprovalManager::new(&[], Duration::from_secs(60));
+        mgr.add_trusted_domain("sess1", "example.com").await;
+
+        assert_eq!(
+            mgr.check_domain("sess1", "example.com").await,
+            FilterAction::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wildcard_allowlist_allows_all_domains() {
+        // A wildcard entry in the config allowlist restores allow-all behaviour.
+        let mgr = DomainApprovalManager::new(&["*".into()], Duration::from_secs(60));
         assert_eq!(
             mgr.check_domain("sess1", "anything.com").await,
             FilterAction::Allow
@@ -277,7 +294,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_domain_session_allowlist() {
-        // Use a non-empty config allowlist so empty-allowlist-allows-all doesn't kick in.
         let mgr = DomainApprovalManager::new(&["github.com".into()], Duration::from_secs(60));
         mgr.add_trusted_domain("sess1", "example.com").await;
         assert_eq!(
@@ -310,7 +326,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_and_resolve_denied() {
-        // Use a non-empty config allowlist so empty-allowlist-allows-all doesn't kick in.
         let mgr = DomainApprovalManager::new(&["github.com".into()], Duration::from_secs(60));
         let (id, rx) = mgr.create_request("sess1", "evil.com").await;
 
@@ -351,7 +366,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_trusted_domain() {
-        // Use a non-empty config allowlist so empty-allowlist-allows-all doesn't kick in.
         let mgr = DomainApprovalManager::new(&["github.com".into()], Duration::from_secs(60));
         mgr.add_trusted_domain("sess1", "example.com").await;
         assert_eq!(
