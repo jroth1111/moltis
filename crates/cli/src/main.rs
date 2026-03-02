@@ -12,6 +12,7 @@ mod channel_commands;
 mod config_commands;
 mod db_commands;
 mod doctor_commands;
+mod estop_commands;
 mod hooks_commands;
 #[cfg(feature = "openclaw-import")]
 mod import_commands;
@@ -122,6 +123,11 @@ enum Commands {
     Hooks {
         #[command(subcommand)]
         action: hooks_commands::HookAction,
+    },
+    /// Emergency stop management.
+    Estop {
+        #[command(subcommand)]
+        action: estop_commands::EstopAction,
     },
     /// Sandbox image management.
     Sandbox {
@@ -420,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Config { action }) => config_commands::handle_config(action).await,
         Some(Commands::Doctor) => doctor_commands::handle_doctor().await,
         Some(Commands::Hooks { action }) => hooks_commands::handle_hooks(action).await,
+        Some(Commands::Estop { action }) => estop_commands::handle_estop(action, &data_dir),
         #[cfg(feature = "tls")]
         Some(Commands::TrustCa) => trust_ca().await,
         Some(_) => {
