@@ -2862,6 +2862,15 @@ impl ChatService for LiveChatService {
                     let position = {
                         let mut q = self.message_queue.write().await;
                         let entry = q.entry(session_key.clone()).or_default();
+                        let max_queue_size = moltis_config::discover_and_load().chat.message_queue_max_size;
+                        if entry.len() >= max_queue_size {
+                            return Ok(serde_json::json!({
+                                "ok": false,
+                                "error": "message queue is full",
+                                "queueSize": entry.len(),
+                                "maxQueueSize": max_queue_size,
+                            }));
+                        }
                         entry.push(QueuedMessage {
                             params: params.clone(),
                         });
