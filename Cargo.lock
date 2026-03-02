@@ -6297,6 +6297,7 @@ dependencies = [
 name = "moltis-plugins"
 version = "0.10.6"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "async-trait",
  "moltis-agents",
@@ -6314,6 +6315,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 

@@ -164,8 +164,10 @@ serde_yaml        = "0.9"
 tokio-tungstenite = "0.26"
 toml              = "0.8"
 toml_edit         = "0.22"
+unicode-normalization = "0.1"
 # LLM provider crates (optional, behind feature flags)
 async-openai = { features = ["chat-completion"], version = "0.32" }
+aho-corasick = "1"
 base64       = "0.22"
 bytes        = "1"
 encoding_rs  = "0.8"
