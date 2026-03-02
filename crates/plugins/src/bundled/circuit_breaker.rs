@@ -139,10 +139,14 @@ impl HookHandler for CircuitBreakerHook {
             },
             HookPayload::AfterLLMCall {
                 provider,
+                text,
+                tool_calls,
                 output_tokens,
                 ..
             } => {
-                if *output_tokens == 0 {
+                let failed =
+                    *output_tokens == 0 && text.is_none() && tool_calls.is_empty();
+                if failed {
                     let mut states = self.states.write().await;
                     let mut counts = self.failure_counts.write().await;
                     let state = states
@@ -305,5 +309,25 @@ mod tests {
         assert!(hook.reset_provider("p").await);
         let snapshot = hook.snapshot().await;
         assert!(snapshot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn does_not_treat_zero_tokens_with_text_as_failure() {
+        let hook = CircuitBreakerHook::new(1, 60);
+        let payload = HookPayload::AfterLLMCall {
+            session_key: "s1".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            text: Some("ok".into()),
+            tool_calls: vec![],
+            input_tokens: 100,
+            output_tokens: 0,
+            iteration: 1,
+        };
+        hook.handle(HookEvent::AfterLLMCall, &payload).await.unwrap();
+        let snapshot = hook.snapshot().await;
+        let state = snapshot.iter().find(|s| s.provider == "p").unwrap();
+        assert_eq!(state.state, "closed");
+        assert_eq!(state.failure_count, 0);
     }
 }

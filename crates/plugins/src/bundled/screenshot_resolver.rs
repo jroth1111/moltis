@@ -4,7 +4,10 @@
 //! `screenshot_path`. When found, it reads the file and injects image content
 //! into the messages payload.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -16,6 +19,7 @@ use moltis_common::{
 };
 
 pub struct ScreenshotResolverHook;
+const MAX_SCREENSHOT_BYTES: u64 = 8 * 1024 * 1024;
 
 impl ScreenshotResolverHook {
     pub fn new() -> Self {
@@ -68,7 +72,7 @@ impl HookHandler for ScreenshotResolverHook {
                         continue;
                     }
 
-                    match image_data_uri_from_path(&screenshot_path) {
+                    match image_data_uri_from_path(&screenshot_path).await {
                         Ok(data_uri) => {
                             changed = true;
                             debug!(path = %screenshot_path, "screenshot-resolver: injected image message");
@@ -146,11 +150,26 @@ fn collect_paths_from_json(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-fn image_data_uri_from_path(path: &str) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)?;
-    let mime = guess_mime(path);
+async fn image_data_uri_from_path(path: &str) -> anyhow::Result<String> {
+    let candidate = resolve_media_path(path)?;
+    let metadata = tokio::fs::metadata(&candidate).await?;
+    if metadata.len() > MAX_SCREENSHOT_BYTES {
+        anyhow::bail!("screenshot too large: {} bytes", metadata.len());
+    }
+
+    let bytes = tokio::fs::read(&candidate).await?;
+    let mime = guess_mime(candidate.to_string_lossy().as_ref());
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(format!("data:{mime};base64,{b64}"))
+}
+
+fn resolve_media_path(path: &str) -> anyhow::Result<PathBuf> {
+    let candidate = std::fs::canonicalize(path)?;
+    let media_root = std::fs::canonicalize(moltis_config::data_dir().join("media"))?;
+    if !candidate.starts_with(&media_root) {
+        anyhow::bail!("screenshot path outside media root");
+    }
+    Ok(candidate)
 }
 
 fn guess_mime(path: &str) -> &'static str {
@@ -173,7 +192,41 @@ fn guess_mime(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{
+        io::Write,
+        path::Path,
+        sync::{Mutex, OnceLock},
+    };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct DataDirOverride;
+
+    impl DataDirOverride {
+        fn new(path: &Path) -> Self {
+            moltis_config::set_data_dir(path.to_path_buf());
+            Self
+        }
+    }
+
+    impl Drop for DataDirOverride {
+        fn drop(&mut self) {
+            moltis_config::clear_data_dir();
+        }
+    }
+
+    fn prepare_media_file() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let path = media.join("screenshot-test.png");
+        let mut file = std::fs::File::create(&path).expect("file create");
+        file.write_all(b"png-bytes").expect("file write");
+        (dir, path.display().to_string())
+    }
 
     #[tokio::test]
     async fn continues_with_no_screenshots() {
@@ -197,9 +250,9 @@ mod tests {
 
     #[tokio::test]
     async fn injects_image_when_screenshot_path_is_present() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(b"png-bytes").unwrap();
-        let path = file.path().display().to_string();
+        let _guard = env_lock().lock().expect("env lock");
+        let (dir, path) = prepare_media_file();
+        let _data_dir = DataDirOverride::new(dir.path());
 
         let hook = ScreenshotResolverHook::new();
         let payload = HookPayload::BeforeLLMCall {
@@ -232,9 +285,9 @@ mod tests {
 
     #[tokio::test]
     async fn skips_already_injected_screenshot() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(b"png-bytes").unwrap();
-        let path = file.path().display().to_string();
+        let _guard = env_lock().lock().expect("env lock");
+        let (dir, path) = prepare_media_file();
+        let _data_dir = DataDirOverride::new(dir.path());
 
         let hook = ScreenshotResolverHook::new();
         let payload = HookPayload::BeforeLLMCall {
@@ -247,6 +300,35 @@ mod tests {
                     {"type":"text","text": format!("[screenshot_resolver] {path}")},
                     {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
                 ]}
+            ]),
+            tool_count: 0,
+            iteration: 1,
+        };
+        let result = hook
+            .handle(HookEvent::BeforeLLMCall, &payload)
+            .await
+            .unwrap();
+        assert!(matches!(result, HookAction::Continue));
+    }
+
+    #[tokio::test]
+    async fn rejects_paths_outside_media_root() {
+        let _guard = env_lock().lock().expect("env lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).expect("media dir");
+        let _data_dir = DataDirOverride::new(dir.path());
+
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        let outside_path = outside.path().display().to_string();
+
+        let hook = ScreenshotResolverHook::new();
+        let payload = HookPayload::BeforeLLMCall {
+            session_key: "s1".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            messages: serde_json::json!([
+                {"role": "tool", "content": format!("{{\"screenshot_path\": \"{outside_path}\"}}")}
             ]),
             tool_count: 0,
             iteration: 1,

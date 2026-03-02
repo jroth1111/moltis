@@ -732,6 +732,21 @@ pub async fn run_agent_loop_with_context(
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
+                    if let Some(ref hooks) = hook_registry {
+                        let payload = HookPayload::AfterLLMCall {
+                            session_key: session_key_for_hooks.clone(),
+                            provider: provider.name().to_string(),
+                            model: provider.id().to_string(),
+                            text: None,
+                            tool_calls: vec![],
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            iteration: iterations,
+                        };
+                        if let Err(dispatch_err) = hooks.dispatch(&payload).await {
+                            warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
+                        }
+                    }
                     if is_context_window_error(&msg) {
                         return Err(AgentRunError::ContextWindowExceeded(msg));
                     }
@@ -1388,6 +1403,21 @@ pub async fn run_agent_loop_streaming(
 
         // Handle stream errors — retry on transient failures/rate limits.
         if let Some(err) = stream_error {
+            if let Some(ref hooks) = hook_registry {
+                let payload = HookPayload::AfterLLMCall {
+                    session_key: session_key_for_hooks.clone(),
+                    provider: provider.name().to_string(),
+                    model: provider.id().to_string(),
+                    text: None,
+                    tool_calls: vec![],
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    iteration: iterations,
+                };
+                if let Err(dispatch_err) = hooks.dispatch(&payload).await {
+                    warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for streaming provider error");
+                }
+            }
             if is_context_window_error(&err) {
                 return Err(AgentRunError::ContextWindowExceeded(err));
             }
