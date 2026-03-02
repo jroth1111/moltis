@@ -1649,6 +1649,61 @@ impl ProviderRegistry {
             }
         }
 
+        // Anthropic extra API keys — register additional fallback providers that use
+        // the same model set but different API keys, enabling key rotation before
+        // failing over to a different provider.
+        if config.is_enabled("anthropic") {
+            if let Some(entry) = config.get("anthropic") {
+                if !entry.extra_api_keys.is_empty() {
+                    let base_url = entry
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.anthropic.com".into());
+                    let alias = entry.alias.clone();
+                    let base_label = alias.as_deref().unwrap_or("anthropic");
+                    let preferred = configured_models_for_provider(config, "anthropic");
+                    let discovered = if should_fetch_models(config, "anthropic") {
+                        ANTHROPIC_MODELS
+                            .iter()
+                            .map(|(id, name)| DiscoveredModel::new(*id, *name))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let model_snapshots: Vec<(String, String, Option<i64>)> =
+                        merge_preferred_and_discovered_models(preferred, discovered)
+                            .into_iter()
+                            .map(|m| (m.id, m.display_name, m.created_at))
+                            .collect();
+
+                    for (key_idx, extra_key) in entry.extra_api_keys.iter().enumerate() {
+                        let extra_label = format!("{base_label}-key-{}", key_idx + 2);
+                        for (model_id, display_name, created_at) in &model_snapshots {
+                            if self.has_provider_model(&extra_label, model_id) {
+                                continue;
+                            }
+                            let provider =
+                                Arc::new(anthropic::AnthropicProvider::with_alias(
+                                    extra_key.clone(),
+                                    model_id.clone(),
+                                    base_url.clone(),
+                                    Some(extra_label.clone()),
+                                ));
+                            self.register(
+                                ModelInfo {
+                                    id: model_id.clone(),
+                                    provider: extra_label.clone(),
+                                    display_name: display_name.clone(),
+                                    created_at: *created_at,
+                                },
+                                provider,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // OpenAI — register all known OpenAI models when API key is available.
         if config.is_enabled("openai")
             && let Some(key) = resolve_api_key(config, "openai", "OPENAI_API_KEY", env_overrides)
@@ -1698,6 +1753,54 @@ impl ProviderRegistry {
                     },
                     provider,
                 );
+            }
+        }
+
+        // OpenAI extra API keys — same pattern as Anthropic above.
+        if config.is_enabled("openai") {
+            if let Some(entry) = config.get("openai") {
+                if !entry.extra_api_keys.is_empty() {
+                    let base_url = entry
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| "https://api.openai.com/v1".into());
+                    let alias = entry.alias.clone();
+                    let base_label = alias.as_deref().unwrap_or("openai");
+                    let stream_transport = entry.stream_transport;
+                    let preferred = configured_models_for_provider(config, "openai");
+                    let model_snapshots: Vec<(String, String, Option<i64>)> =
+                        merge_preferred_and_discovered_models(preferred, Vec::new())
+                            .into_iter()
+                            .map(|m| (m.id, m.display_name, m.created_at))
+                            .collect();
+
+                    for (key_idx, extra_key) in entry.extra_api_keys.iter().enumerate() {
+                        let extra_label = format!("{base_label}-key-{}", key_idx + 2);
+                        for (model_id, display_name, created_at) in &model_snapshots {
+                            if self.has_provider_model(&extra_label, model_id) {
+                                continue;
+                            }
+                            let provider = Arc::new(
+                                openai::OpenAiProvider::new_with_name(
+                                    extra_key.clone(),
+                                    model_id.clone(),
+                                    base_url.clone(),
+                                    extra_label.clone(),
+                                )
+                                .with_stream_transport(stream_transport),
+                            );
+                            self.register(
+                                ModelInfo {
+                                    id: model_id.clone(),
+                                    provider: extra_label.clone(),
+                                    display_name: display_name.clone(),
+                                    created_at: *created_at,
+                                },
+                                provider,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
