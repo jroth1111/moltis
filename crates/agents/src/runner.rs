@@ -15,7 +15,7 @@ use crate::{
         ChatMessage, CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage, UserContent,
         values_to_chat_messages,
     },
-    response_sanitizer::{clean_response, recover_tool_calls_from_content},
+    response_sanitizer::{clean_response, recover_tool_calls_from_content, sanitize_with_leak_detection},
     tool_parsing::{
         looks_like_failed_tool_call, new_synthetic_tool_call_id, parse_tool_calls_from_text,
     },
@@ -452,6 +452,15 @@ pub fn sanitize_tool_result(input: &str, max_bytes: usize) -> String {
     result
 }
 
+fn sanitize_tool_result_for_llm(
+    result: &serde_json::Value,
+    max_tool_result_bytes: usize,
+    leak_detection_sensitivity: f64,
+) -> String {
+    let tool_result_str = sanitize_tool_result(&result.to_string(), max_tool_result_bytes);
+    sanitize_with_leak_detection(&tool_result_str, leak_detection_sensitivity)
+}
+
 // ── Multimodal tool result helpers ─────────────────────────────────────────
 
 /// Image extracted from a tool result for multimodal handling.
@@ -615,6 +624,7 @@ pub async fn run_agent_loop_with_context(
     let native_tools = provider.supports_tools();
     let config = moltis_config::discover_and_load();
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
+    let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
     let tool_schemas = tools.list_schemas();
 
@@ -1115,7 +1125,11 @@ pub async fn run_agent_loop_with_context(
             // Always sanitize tool results as strings - most LLM APIs don't support
             // multimodal content in tool results. Images are stripped but the UI
             // still receives them via ToolCallEnd event.
-            let tool_result_str = sanitize_tool_result(&result.to_string(), max_tool_result_bytes);
+            let tool_result_str = sanitize_tool_result_for_llm(
+                &result,
+                max_tool_result_bytes,
+                leak_detection_sensitivity,
+            );
             debug!(
                 tool = %tc.name,
                 id = %tc.id,
@@ -1154,6 +1168,7 @@ pub async fn run_agent_loop_streaming(
     let native_tools = provider.supports_tools();
     let config = moltis_config::discover_and_load();
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
+    let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
     let tool_schemas = tools.list_schemas();
 
@@ -1785,7 +1800,11 @@ pub async fn run_agent_loop_streaming(
             // Always sanitize tool results as strings - most LLM APIs don't support
             // multimodal content in tool results. Images are stripped but the UI
             // still receives them via ToolCallEnd event.
-            let tool_result_str = sanitize_tool_result(&result.to_string(), max_tool_result_bytes);
+            let tool_result_str = sanitize_tool_result_for_llm(
+                &result,
+                max_tool_result_bytes,
+                leak_detection_sensitivity,
+            );
             debug!(
                 tool = %tc.name,
                 id = %tc.id,
@@ -3064,6 +3083,40 @@ mod tests {
         let input = format!("code: {hex}");
         let result = sanitize_tool_result(&input, 50_000);
         assert!(result.contains(hex));
+    }
+
+    #[test]
+    fn test_sanitize_tool_result_for_llm_preserves_tool_xml_like_content() {
+        let result = serde_json::json!({
+            "result": "<thinking>model diagnostics</thinking>",
+            "status": "ok"
+        });
+        let sanitized = sanitize_tool_result_for_llm(&result, 50_000, 0.0);
+        assert_eq!(sanitized, result.to_string());
+    }
+
+    #[test]
+    fn test_sanitize_tool_result_for_llm_uses_configured_sensitivity() {
+        let result = serde_json::json!({
+            "creds": "AKIAIOSFODNN7EXAMPLE",
+            "status": "sensitive"
+        });
+
+        let disabled = sanitize_tool_result_for_llm(&result, 50_000, 0.0);
+        let enabled = sanitize_tool_result_for_llm(&result, 50_000, 1.0);
+
+        assert_eq!(disabled, result.to_string());
+        assert_eq!(enabled, "[BLOCKED: potential credential leak]");
+    }
+
+    #[test]
+    fn test_sanitize_tool_result_for_llm_warn_allows_content() {
+        let result = serde_json::json!({
+            "certificate": "-----BEGIN CERTIFICATE-----\nMIIBxTCCAW..."
+        });
+
+        let sanitized = sanitize_tool_result_for_llm(&result, 50_000, 1.0);
+        assert_eq!(sanitized, result.to_string());
     }
 
     // ── extract_images_from_text tests ───────────────────────────────
