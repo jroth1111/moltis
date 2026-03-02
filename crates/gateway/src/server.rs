@@ -1197,6 +1197,13 @@ pub async fn prepare_gateway(
         );
     }
 
+    // Initialize OTLP if configured (available after feature/observability merge).
+    // TODO: available after merge of feature/observability
+    // if let Some(endpoint) = &config.otlp_endpoint {
+    //     moltis_metrics::init_otlp(endpoint, "moltis").ok();
+    //     tracing::info!(endpoint=%endpoint, "OTLP endpoint configured");
+    // }
+
     let base_provider_config = config.providers.clone();
 
     // Merge any previously saved API keys into the provider config so they
@@ -1454,6 +1461,23 @@ pub async fn prepare_gateway(
 
     let openclaw_startup_status = log_startup_openclaw_detection();
 
+    // ── E-STOP flag ────────────────────────────────────────────────────────
+    // A shared atomic flag that, when true, causes EstopHook to abort all
+    // agent tool calls. The flag persists across connections via the `estop`
+    // sentinel file in the data directory. The HTTP endpoint at POST /api/estop
+    // toggles it at runtime; the flag is checked on every hook invocation once
+    // feature/bundled-hooks is merged.
+    //
+    // TODO: available after merge of feature/bundled-hooks (EstopHook itself)
+    let estop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let estop_path = data_dir.join("estop");
+        if estop_path.exists() {
+            estop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("E-STOP file found at startup — agent actions blocked");
+        }
+    }
+
     // Enable log persistence so entries survive restarts.
     if let Some(ref buf) = log_buffer {
         buf.enable_persistence(data_dir.join("logs.jsonl"));
@@ -1496,6 +1520,12 @@ pub async fn prepare_gateway(
     moltis_vault::run_migrations(&db_pool)
         .await
         .expect("failed to run vault migrations");
+
+    // Recover pending approvals from last run.
+    // (available after feature/tool-hardening merge)
+    // moltis_tools::approval::recover_pending(&db_pool).await?;
+    // TODO: re-present recovered approvals via session event bus
+    // TODO: available after merge of feature/tool-hardening
 
     // Migrate plugins data into unified skills system (idempotent, non-fatal).
     moltis_skills::migration::migrate_plugins_to_skills(&data_dir).await;
@@ -3459,6 +3489,32 @@ pub async fn prepare_gateway(
             tool_registry.register(Box::new(spawn_tool));
         }
 
+        // ── TaskBoardTool (available after feature/bundled-hooks merge) ──────
+        // TODO: available after merge of feature/bundled-hooks
+        // use moltis_plugins::bundled::task_board::TaskBoardTool;
+        // tool_registry.register(Box::new(TaskBoardTool::new(Arc::clone(&session_state_store))));
+
+        // ── Tinder subsystem: tools, hooks, and cron jobs ─────────────────
+        // register_tinder_subsystem is a no-op until feature/moltis-tinder is
+        // merged; the call structure is already wired so uncommenting the body
+        // of that function is sufficient.
+        if let Some(ref hook_arc) = state.inner.read().await.hook_registry {
+            // We need a mutable HookRegistry — clone-and-replace is the correct
+            // pattern here. After feature/moltis-tinder lands, if HookRegistry
+            // gains interior mutability this can be simplified.
+            //
+            // TODO: uncomment after merge of feature/moltis-tinder
+            // let mut hooks_mut = (**hook_arc).clone();
+            // crate::tinder_subsystem::register_tinder_subsystem(
+            //     &cron_service,
+            //     &mut tool_registry,
+            //     &mut hooks_mut,
+            //     Arc::clone(&db_pool),
+            //     &data_dir,
+            // ).await?;
+            let _ = hook_arc; // keep borrow checker happy until TODO is live
+        }
+
         let shared_tool_registry = Arc::new(tokio::sync::RwLock::new(tool_registry));
         let mut chat_service = LiveChatService::new(
             Arc::clone(&registry),
@@ -3673,6 +3729,59 @@ pub async fn prepare_gateway(
             },
         ),
     );
+
+    // ── E-STOP HTTP endpoints ──────────────────────────────────────────────
+    // POST /api/estop { "enable": true/false } — set the e-stop flag.
+    // GET  /api/estop                          — read current state.
+    //
+    // The flag is backed by a sentinel file at <data_dir>/estop so it
+    // survives gateway restarts. Writes to the flag also update the atomic
+    // used by EstopHook (available after feature/bundled-hooks merge).
+    {
+        let estop_flag_post = Arc::clone(&estop_flag);
+        let data_dir_for_estop = data_dir.clone();
+        let estop_flag_get = Arc::clone(&estop_flag);
+
+        app = app.route(
+            "/api/estop",
+            axum::routing::post(
+                move |Json(payload): Json<serde_json::Value>| {
+                    let flag = Arc::clone(&estop_flag_post);
+                    let dir = data_dir_for_estop.clone();
+                    async move {
+                        let enable = payload
+                            .get("enable")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        flag.store(enable, std::sync::atomic::Ordering::Relaxed);
+                        let estop_path = dir.join("estop");
+                        if enable {
+                            if let Err(e) = std::fs::write(&estop_path, b"") {
+                                tracing::warn!("failed to write estop file: {e}");
+                            } else {
+                                tracing::warn!("E-STOP enabled — agent actions blocked");
+                            }
+                        } else {
+                            if estop_path.exists() {
+                                if let Err(e) = std::fs::remove_file(&estop_path) {
+                                    tracing::warn!("failed to remove estop file: {e}");
+                                }
+                            }
+                            tracing::info!("E-STOP cleared — agent actions unblocked");
+                        }
+                        Json(serde_json::json!({ "stopped": enable }))
+                    }
+                },
+            )
+            .get(move || {
+                let flag = Arc::clone(&estop_flag_get);
+                async move {
+                    let stopped = flag.load(std::sync::atomic::Ordering::Relaxed);
+                    Json(serde_json::json!({ "stopped": stopped }))
+                }
+            }),
+        );
+    }
 
     // Resolve TLS configuration (only when compiled with the `tls` feature).
     let tls_active = tls_enabled_for_gateway;
@@ -5575,6 +5684,43 @@ pub(crate) async fn discover_and_build_hooks(
             let memory_hook = SessionMemoryHook::new(data.clone(), Arc::clone(store));
             registry.register(Arc::new(memory_hook));
         }
+
+        // ── Bundled safety & cost hooks (available after feature/bundled-hooks merge) ──
+        // TODO: available after merge of feature/bundled-hooks
+        // use moltis_plugins::bundled::{
+        //     estop::EstopHook,
+        //     cost_guard::{CostTrackerHook, CostGuardHook},
+        //     circuit_breaker::CircuitBreakerHook,
+        //     prompt_guard::PromptGuardHook,
+        //     leak_detector::LeakDetectorHook,
+        //     screenshot_resolver::ScreenshotResolverHook,
+        // };
+        //
+        // // E-STOP: block all agent actions when the stop flag is set.
+        // // The flag and its file path are wired in prepare_gateway and shared here
+        // // through the ESTOP_FLAG lazy static (see prepare_gateway for details).
+        // hooks.register(Arc::new(EstopHook::new(Arc::clone(&crate::estop::ESTOP_FLAG))));
+        //
+        // // Cost tracking + guard: record token spend per run, abort when daily
+        // // limit (config.cost_guard.daily_limit_usd) is exceeded.
+        // hooks.register(Arc::new(CostTrackerHook::new(Arc::clone(&pool))));
+        // hooks.register(Arc::new(CostGuardHook::new(
+        //     Arc::clone(&pool),
+        //     config.cost_guard.daily_limit_usd,
+        // )));
+        //
+        // // Circuit breaker: open after 3 consecutive failures; reset after 60 s.
+        // hooks.register(Arc::new(CircuitBreakerHook::new(3, 60)));
+        //
+        // // Prompt guard: strip/redact dangerous prompt-injection patterns.
+        // hooks.register(Arc::new(PromptGuardHook::new()));
+        //
+        // // Leak detector: warn when PII patterns appear in agent output.
+        // hooks.register(Arc::new(LeakDetectorHook::new()));
+        //
+        // // Screenshot resolver: rewrite blob: URLs in tool output to served paths.
+        // // Requires a MediaStore handle; wire once moltis-media is initialised.
+        // // hooks.register(Arc::new(ScreenshotResolverHook::new(Arc::clone(&media_store))));
     }
 
     for (name, description, events, source_file) in builtin_hook_metadata() {

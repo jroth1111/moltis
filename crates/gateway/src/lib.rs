@@ -64,6 +64,7 @@ pub mod tailscale;
 pub mod tailscale_routes;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod tinder_subsystem;
 pub mod tools_routes;
 pub mod tts_phrases;
 pub mod update_check;
