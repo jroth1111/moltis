@@ -13,6 +13,7 @@ use moltis_common::hooks::{HookAction, HookPayload, HookRegistry};
 use crate::{
     model::{
         ChatMessage, CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage, UserContent,
+        values_to_chat_messages,
     },
     response_sanitizer::{clean_response, recover_tool_calls_from_content},
     tool_parsing::{
@@ -116,6 +117,23 @@ const SERVER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2
 const RATE_LIMIT_INITIAL_RETRY_MS: u64 = 2_000;
 const RATE_LIMIT_MAX_RETRY_MS: u64 = 60_000;
 const RATE_LIMIT_MAX_RETRIES: u8 = 10;
+
+fn parse_before_llm_modified_messages(modified: serde_json::Value) -> Option<Vec<ChatMessage>> {
+    let messages_value = if modified.is_array() {
+        modified
+    } else if let Some(messages) = modified.get("messages") {
+        messages.clone()
+    } else {
+        return None;
+    };
+
+    let arr = messages_value.as_array()?;
+    let parsed = values_to_chat_messages(arr);
+    if parsed.is_empty() && !arr.is_empty() {
+        return None;
+    }
+    Some(parsed)
+}
 
 fn next_rate_limit_retry_ms(previous_ms: Option<u64>) -> u64 {
     previous_ms
@@ -686,8 +704,17 @@ pub async fn run_agent_loop_with_context(
                         "blocked by BeforeLLMCall hook: {reason}"
                     )));
                 },
-                Ok(HookAction::ModifyPayload(_)) => {
-                    debug!("BeforeLLMCall ModifyPayload ignored (messages are typed)");
+                Ok(HookAction::ModifyPayload(v)) => {
+                    if let Some(updated_messages) = parse_before_llm_modified_messages(v) {
+                        debug!(
+                            old_count = messages.len(),
+                            new_count = updated_messages.len(),
+                            "BeforeLLMCall modified request messages"
+                        );
+                        messages = updated_messages;
+                    } else {
+                        warn!("BeforeLLMCall ModifyPayload ignored (invalid messages payload)");
+                    }
                 },
                 Ok(HookAction::Continue) => {},
                 Err(e) => {
@@ -1215,8 +1242,17 @@ pub async fn run_agent_loop_streaming(
                         "blocked by BeforeLLMCall hook: {reason}"
                     )));
                 },
-                Ok(HookAction::ModifyPayload(_)) => {
-                    debug!("BeforeLLMCall ModifyPayload ignored (messages are typed)");
+                Ok(HookAction::ModifyPayload(v)) => {
+                    if let Some(updated_messages) = parse_before_llm_modified_messages(v) {
+                        debug!(
+                            old_count = messages.len(),
+                            new_count = updated_messages.len(),
+                            "BeforeLLMCall modified request messages"
+                        );
+                        messages = updated_messages;
+                    } else {
+                        warn!("BeforeLLMCall ModifyPayload ignored (invalid messages payload)");
+                    }
                 },
                 Ok(HookAction::Continue) => {},
                 Err(e) => {
