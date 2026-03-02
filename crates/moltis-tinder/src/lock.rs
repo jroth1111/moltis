@@ -3,6 +3,8 @@ use tracing::debug;
 
 /// Time-to-live for a session lock in milliseconds (5 minutes).
 const LOCK_TTL_MS: i64 = 5 * 60 * 1000;
+const LOCK_NAMESPACE: &str = "tinder_lock";
+const LOCK_KEY: &str = "owner";
 
 use crate::util::now_ms;
 
@@ -28,13 +30,13 @@ impl SessionLock {
         let now = now_ms();
         let expires = now + LOCK_TTL_MS;
 
-        // Try to insert a new lock row. If it already exists and has not
-        // expired, the INSERT OR IGNORE will be a no-op.
+        // Fast path: acquire via INSERT OR IGNORE.
         let result = sqlx::query(
-            "INSERT OR IGNORE INTO session_state (session_key, namespace, key, value, updated_at) \
-             VALUES (?, 'tinder_lock', 'owner', ?, ?)",
+            "INSERT OR IGNORE INTO session_state (session_key, namespace, key, value, updated_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&self.session_key)
+        .bind(LOCK_NAMESPACE)
+        .bind(LOCK_KEY)
         .bind(expires.to_string())
         .bind(now)
         .execute(&self.pool)
@@ -45,30 +47,25 @@ impl SessionLock {
             return Ok(true);
         }
 
-        // Row exists — check if it has expired.
-        let existing = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM session_state WHERE session_key = ? AND namespace = 'tinder_lock' AND key = 'owner'",
+        // Slow path: existing lock may be stale. Use compare-and-set semantics
+        // to avoid multiple contenders taking the lock simultaneously.
+        let takeover = sqlx::query(
+            "UPDATE session_state SET value = ?, updated_at = ? \
+             WHERE session_key = ? AND namespace = ? AND key = ? \
+               AND CAST(value AS INTEGER) < ?",
         )
+        .bind(expires.to_string())
+        .bind(now)
         .bind(&self.session_key)
-        .fetch_optional(&self.pool)
+        .bind(LOCK_NAMESPACE)
+        .bind(LOCK_KEY)
+        .bind(now)
+        .execute(&self.pool)
         .await?;
 
-        if let Some(val) = existing {
-            let expires_at: i64 = val.parse().unwrap_or(0);
-            if expires_at < now {
-                // Lock expired, take it over.
-                sqlx::query(
-                    "UPDATE session_state SET value = ?, updated_at = ? \
-                     WHERE session_key = ? AND namespace = 'tinder_lock' AND key = 'owner'",
-                )
-                .bind((now + LOCK_TTL_MS).to_string())
-                .bind(now)
-                .bind(&self.session_key)
-                .execute(&self.pool)
-                .await?;
-                debug!(session_key = %self.session_key, "tinder session lock re-acquired (expired)");
-                return Ok(true);
-            }
+        if takeover.rows_affected() > 0 {
+            debug!(session_key = %self.session_key, "tinder session lock re-acquired (expired)");
+            return Ok(true);
         }
 
         Ok(false)
@@ -77,9 +74,11 @@ impl SessionLock {
     /// Release the lock.
     pub async fn release(&self) -> Result<()> {
         sqlx::query(
-            "DELETE FROM session_state WHERE session_key = ? AND namespace = 'tinder_lock' AND key = 'owner'",
+            "DELETE FROM session_state WHERE session_key = ? AND namespace = ? AND key = ?",
         )
         .bind(&self.session_key)
+        .bind(LOCK_NAMESPACE)
+        .bind(LOCK_KEY)
         .execute(&self.pool)
         .await?;
         debug!(session_key = %self.session_key, "tinder session lock released");
@@ -90,13 +89,12 @@ impl SessionLock {
     pub async fn refresh(&self) -> Result<()> {
         let now = now_ms();
         let expires = now + LOCK_TTL_MS;
-        sqlx::query(
-            "UPDATE session_state SET value = ?, updated_at = ? \
-             WHERE session_key = ? AND namespace = 'tinder_lock' AND key = 'owner'",
-        )
+        sqlx::query("UPDATE session_state SET value = ?, updated_at = ? WHERE session_key = ? AND namespace = ? AND key = ?")
         .bind(expires.to_string())
         .bind(now)
         .bind(&self.session_key)
+        .bind(LOCK_NAMESPACE)
+        .bind(LOCK_KEY)
         .execute(&self.pool)
         .await?;
         Ok(())

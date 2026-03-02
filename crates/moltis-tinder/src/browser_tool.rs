@@ -6,7 +6,7 @@ use moltis_agents::tool_registry::AgentTool;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::funnel;
+use crate::{SessionLock, funnel};
 
 pub struct TinderBrowserTool {
     pool: Arc<sqlx::SqlitePool>,
@@ -54,7 +54,34 @@ impl AgentTool for TinderBrowserTool {
             .ok_or_else(|| anyhow::anyhow!("missing command"))?;
 
         let session_id = params["session_id"].as_str().unwrap_or("tinder-default");
+        let lock_session_key = params["_session_key"].as_str().unwrap_or(session_id);
 
+        // Guard browser state and tinder DB writes from concurrent runs.
+        let lock = SessionLock::new(self.pool.as_ref().clone(), lock_session_key.to_string());
+        if !lock.try_acquire().await? {
+            return Ok(json!({
+                "status": "skipped",
+                "error": format!("session lock held for {lock_session_key}")
+            }));
+        }
+
+        let result = self.execute_with_lock(command, session_id, &params).await;
+
+        if let Err(e) = lock.release().await {
+            warn!(session = %lock_session_key, error = %e, "failed to release tinder session lock");
+        }
+
+        result
+    }
+}
+
+impl TinderBrowserTool {
+    async fn execute_with_lock(
+        &self,
+        command: &str,
+        session_id: &str,
+        params: &Value,
+    ) -> Result<Value> {
         let state_dir = self.data_dir.join("browser_state");
         tokio::fs::create_dir_all(&state_dir).await?;
         let state_path = state_dir.join(format!("{session_id}.json"));
@@ -95,7 +122,7 @@ impl AgentTool for TinderBrowserTool {
                     "status": "error",
                     "error": format!("failed to spawn moltis-browser: {e}")
                 }));
-            }
+            },
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -167,8 +194,8 @@ async fn decode_and_save_screenshot(b64: &str, data_dir: &std::path::Path) -> Re
     use image::GenericImageView;
 
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
-    let img = image::load_from_memory(&bytes)
-        .map_err(|e| anyhow::anyhow!("image decode error: {e}"))?;
+    let img =
+        image::load_from_memory(&bytes).map_err(|e| anyhow::anyhow!("image decode error: {e}"))?;
 
     let (w, h) = img.dimensions();
     let max_dim = 768u32;
