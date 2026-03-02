@@ -3930,12 +3930,54 @@ pub async fn prepare_gateway(
     }
 
     // Spawn self-repair background scanner (scans every 60s for stuck agent sessions).
+    let state_for_self_repair = Arc::clone(&state);
+    let session_store_for_self_repair = Arc::clone(&session_store);
+    let on_self_repair_scan: Arc<
+        dyn Fn(moltis_agents::self_repair::RepairScanResult) + Send + Sync,
+    > = Arc::new(move |result| {
+        let state = Arc::clone(&state_for_self_repair);
+        let session_store = Arc::clone(&session_store_for_self_repair);
+        tokio::spawn(async move {
+            for session_key in result.recovered {
+                #[cfg(feature = "metrics")]
+                moltis_metrics::counter!(moltis_metrics::session::RECOVERY_TOTAL).increment(1);
+
+                match session_store.validate_session_integrity(&session_key).await {
+                    Ok(report) => {
+                        broadcast(
+                            &state,
+                            "session.recovered",
+                            serde_json::json!({
+                                "sessionKey": session_key,
+                                "recovered": report.recovered,
+                                "removedMalformedLines": report.removed_malformed_lines,
+                                "appendedAssistantMessages": report.appended_assistant_messages,
+                                "injectedToolResults": report.injected_tool_results,
+                            }),
+                            BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    },
+                    Err(error) => {
+                        warn!(
+                            session = %session_key,
+                            error = %error,
+                            "session integrity validation failed after self-repair"
+                        );
+                    },
+                }
+            }
+        });
+    });
     moltis_agents::self_repair::start_background_task(
         Arc::clone(&session_state_store),
         std::time::Duration::from_secs(60),
         moltis_agents::self_repair::DEFAULT_STUCK_THRESHOLD,
         moltis_agents::self_repair::DEFAULT_MAX_REPAIR_ATTEMPTS,
-        None,
+        Some(on_self_repair_scan),
     );
 
     // Spawn tick timer.

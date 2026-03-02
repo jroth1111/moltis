@@ -19,6 +19,15 @@ pub struct SearchResult {
     pub message_index: usize,
 }
 
+/// Outcome of validating and repairing a session JSONL file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionIntegrityReport {
+    pub recovered: bool,
+    pub removed_malformed_lines: u64,
+    pub appended_assistant_messages: u64,
+    pub injected_tool_results: u64,
+}
+
 /// Append-only JSONL session storage with file locking.
 pub struct SessionStore {
     pub base_dir: PathBuf,
@@ -142,6 +151,143 @@ impl SessionStore {
             .into_iter()
             .filter(|msg| msg.get("run_id").and_then(|v| v.as_str()) == Some(&run_id))
             .collect())
+    }
+
+    /// Validate and repair a session JSONL file in place.
+    ///
+    /// Repairs include:
+    /// - dropping malformed JSONL lines
+    /// - appending synthetic tool_result rows for tool calls that never completed
+    /// - appending a synthetic assistant message when the file ends with a user message
+    pub async fn validate_session_integrity(&self, key: &str) -> Result<SessionIntegrityReport> {
+        let path = self.path_for(key);
+
+        tokio::task::spawn_blocking(move || -> Result<SessionIntegrityReport> {
+            if !path.exists() {
+                return Ok(SessionIntegrityReport::default());
+            }
+
+            let file = File::open(&path)?;
+            let reader = BufReader::new(file);
+            let mut valid_lines: Vec<String> = Vec::new();
+            let mut valid_values: Vec<serde_json::Value> = Vec::new();
+            let mut removed_malformed = 0_u64;
+            let mut pending_tool_calls: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
+            for line in reader.lines() {
+                let line = line?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(value) => {
+                        match value.get("role").and_then(|v| v.as_str()) {
+                            Some("assistant") => {
+                                if let Some(tool_calls) =
+                                    value.get("tool_calls").and_then(|v| v.as_array())
+                                {
+                                    for call in tool_calls {
+                                        let Some(id) = call.get("id").and_then(|v| v.as_str()) else {
+                                            continue;
+                                        };
+                                        let tool_name = call
+                                            .get("function")
+                                            .and_then(|f| f.get("name"))
+                                            .and_then(|v| v.as_str())
+                                            .or_else(|| call.get("name").and_then(|v| v.as_str()))
+                                            .unwrap_or("unknown");
+                                        pending_tool_calls
+                                            .insert(id.to_string(), tool_name.to_string());
+                                    }
+                                }
+                            },
+                            Some("tool") | Some("tool_result") => {
+                                if let Some(tool_call_id) =
+                                    value.get("tool_call_id").and_then(|v| v.as_str())
+                                {
+                                    pending_tool_calls.remove(tool_call_id);
+                                }
+                            },
+                            _ => {},
+                        }
+
+                        valid_lines.push(trimmed.to_string());
+                        valid_values.push(value);
+                    },
+                    Err(_) => {
+                        removed_malformed = removed_malformed.saturating_add(1);
+                    },
+                }
+            }
+
+            let ends_with_user = valid_values
+                .last()
+                .and_then(|v| v.get("role"))
+                .and_then(|v| v.as_str())
+                == Some("user");
+
+            let mut injected_tool_results = 0_u64;
+            for (tool_call_id, tool_name) in pending_tool_calls {
+                let synthetic = crate::message::PersistedMessage::tool_result(
+                    tool_call_id,
+                    tool_name,
+                    None,
+                    false,
+                    None,
+                    Some("Recovered: tool call interrupted before result was persisted".to_string()),
+                );
+                let value = serde_json::to_value(&synthetic)?;
+                valid_lines.push(serde_json::to_string(&value)?);
+                valid_values.push(value);
+                injected_tool_results = injected_tool_results.saturating_add(1);
+            }
+
+            let mut appended_assistant_messages = 0_u64;
+            if ends_with_user {
+                let synthetic = crate::message::PersistedMessage::assistant(
+                    "Recovered from an interrupted run. Please continue from the latest request.",
+                    "recovery",
+                    "system",
+                    0,
+                    0,
+                    None,
+                );
+                let value = serde_json::to_value(&synthetic)?;
+                valid_lines.push(serde_json::to_string(&value)?);
+                appended_assistant_messages = 1;
+            }
+
+            let recovered = removed_malformed > 0
+                || appended_assistant_messages > 0
+                || injected_tool_results > 0;
+            if !recovered {
+                return Ok(SessionIntegrityReport::default());
+            }
+
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)?;
+            let mut lock = RwLock::new(file);
+            let mut guard = lock
+                .write()
+                .map_err(|e| Error::lock_failed(e.to_string()))?;
+            for line in &valid_lines {
+                writeln!(*guard, "{line}")?;
+            }
+            guard.sync_data()?;
+
+            Ok(SessionIntegrityReport {
+                recovered,
+                removed_malformed_lines: removed_malformed,
+                appended_assistant_messages,
+                injected_tool_results,
+            })
+        })
+        .await?
     }
 
     /// Read the last N messages from a session file.
@@ -1071,5 +1217,78 @@ mod tests {
 
         let msgs = store.read("main").await.unwrap();
         assert_eq!(msgs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_validate_session_integrity_repairs_interrupted_session() {
+        let (store, _dir) = temp_store();
+        let path = store.path_for("repair:case");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let assistant_with_tool_call = serde_json::json!({
+            "role": "assistant",
+            "content": "running tool",
+            "tool_calls": [{
+                "id": "tool-call-1",
+                "type": "function",
+                "function": {
+                    "name": "exec",
+                    "arguments": "{}"
+                }
+            }]
+        });
+        let user_message = serde_json::json!({
+            "role": "user",
+            "content": "continue"
+        });
+        let mut raw = String::new();
+        raw.push_str(&serde_json::to_string(&assistant_with_tool_call).unwrap());
+        raw.push('\n');
+        raw.push_str("{not valid json}\n");
+        raw.push_str(&serde_json::to_string(&user_message).unwrap());
+        raw.push('\n');
+        fs::write(&path, raw).unwrap();
+
+        let report = store.validate_session_integrity("repair:case").await.unwrap();
+        assert!(report.recovered);
+        assert_eq!(report.removed_malformed_lines, 1);
+        assert_eq!(report.injected_tool_results, 1);
+        assert_eq!(report.appended_assistant_messages, 1);
+
+        let repaired = store.read("repair:case").await.unwrap();
+        assert_eq!(repaired.len(), 4);
+        assert!(
+            repaired
+                .iter()
+                .any(|msg| msg.get("role").and_then(|v| v.as_str()) == Some("tool_result"))
+        );
+        assert_eq!(
+            repaired
+                .last()
+                .and_then(|msg| msg.get("role"))
+                .and_then(|v| v.as_str()),
+            Some("assistant")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_session_integrity_noop_for_clean_session() {
+        let (store, _dir) = temp_store();
+        store
+            .append("clean", &json!({"role": "user", "content": "hello"}))
+            .await
+            .unwrap();
+        store
+            .append("clean", &json!({"role": "assistant", "content": "hi"}))
+            .await
+            .unwrap();
+
+        let report = store.validate_session_integrity("clean").await.unwrap();
+        assert!(!report.recovered);
+        assert_eq!(report.removed_malformed_lines, 0);
+        assert_eq!(report.injected_tool_results, 0);
+        assert_eq!(report.appended_assistant_messages, 0);
     }
 }

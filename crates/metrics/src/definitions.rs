@@ -68,6 +68,8 @@ pub mod session {
     pub const MESSAGES_TOTAL: &str = "moltis_session_messages_total";
     /// Session duration in seconds
     pub const DURATION_SECONDS: &str = "moltis_session_duration_seconds";
+    /// Session recoveries performed after self-repair detected interrupted runs
+    pub const RECOVERY_TOTAL: &str = "moltis_session_recovery_total";
 }
 
 /// Chat metrics
