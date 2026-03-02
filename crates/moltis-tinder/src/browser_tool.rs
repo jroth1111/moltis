@@ -13,6 +13,8 @@ pub struct TinderBrowserTool {
     data_dir: PathBuf,
 }
 
+const DEFAULT_SESSION_ID: &str = "tinder-default";
+
 impl TinderBrowserTool {
     pub fn new(pool: Arc<sqlx::SqlitePool>, data_dir: PathBuf) -> Self {
         Self { pool, data_dir }
@@ -53,26 +55,42 @@ impl AgentTool for TinderBrowserTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing command"))?;
 
-        let session_id = params["session_id"].as_str().unwrap_or("tinder-default");
-        let lock_session_key = params["_session_key"].as_str().unwrap_or(session_id);
+        let raw_session_id = params["session_id"].as_str().unwrap_or(DEFAULT_SESSION_ID);
+        let session_id = sanitize_session_id(raw_session_id)?;
 
         // Guard browser state and tinder DB writes from concurrent runs.
-        let lock = SessionLock::new(self.pool.as_ref().clone(), lock_session_key.to_string());
+        let lock = SessionLock::new(self.pool.as_ref().clone(), session_id.clone());
         if !lock.try_acquire().await? {
             return Ok(json!({
                 "status": "skipped",
-                "error": format!("session lock held for {lock_session_key}")
+                "error": format!("session lock held for {session_id}")
             }));
         }
 
-        let result = self.execute_with_lock(command, session_id, &params).await;
+        let result = self.execute_with_lock(command, &session_id, &params).await;
 
         if let Err(e) = lock.release().await {
-            warn!(session = %lock_session_key, error = %e, "failed to release tinder session lock");
+            warn!(session = %session_id, error = %e, "failed to release tinder session lock");
         }
 
         result
     }
+}
+
+fn sanitize_session_id(session_id: &str) -> Result<String> {
+    if session_id.is_empty() {
+        anyhow::bail!("session_id cannot be empty");
+    }
+    if session_id.len() > 64 {
+        anyhow::bail!("session_id too long (max 64)");
+    }
+    if !session_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        anyhow::bail!("session_id contains invalid characters");
+    }
+    Ok(session_id.to_string())
 }
 
 impl TinderBrowserTool {
@@ -226,4 +244,23 @@ async fn decode_and_save_screenshot(b64: &str, data_dir: &std::path::Path) -> Re
 
     resized.save(&filepath)?;
     Ok(filepath.display().to_string())
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use super::sanitize_session_id;
+
+    #[test]
+    fn accepts_safe_session_id() {
+        let id = sanitize_session_id("session-123_abc").expect("valid id");
+        assert_eq!(id, "session-123_abc");
+    }
+
+    #[test]
+    fn rejects_traversal_session_id() {
+        assert!(sanitize_session_id("../escape").is_err());
+        assert!(sanitize_session_id("/abs/path").is_err());
+        assert!(sanitize_session_id("name with spaces").is_err());
+    }
 }

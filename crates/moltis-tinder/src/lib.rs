@@ -12,10 +12,10 @@ pub use funnel_tool::TinderFunnelTool;
 pub use hooks::FunnelGuardHook;
 pub use lock::SessionLock;
 
+/// Run database migrations for the Tinder subsystem.
 pub async fn run_migrations(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     sqlx::migrate!("./migrations")
-        .set_ignore_missing(true)
         .run(pool)
-        .await?;
-    Ok(())
+        .await
+        .map_err(|e| anyhow::anyhow!("moltis-tinder migrations failed: {e}"))
 }
