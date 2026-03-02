@@ -1212,6 +1212,8 @@ pub async fn run_agent_loop_streaming(
         // Use streaming API.
         #[cfg(feature = "metrics")]
         let iter_start = std::time::Instant::now();
+        #[cfg(feature = "metrics")]
+        let mut first_token_at: Option<std::time::Instant> = None;
         let mut stream = provider.stream_with_tools(messages.clone(), schemas_for_api.clone());
 
         // Accumulate answer text, reasoning text, and tool calls from the stream.
@@ -1234,6 +1236,10 @@ pub async fn run_agent_loop_streaming(
         while let Some(event) = stream.next().await {
             match event {
                 StreamEvent::Delta(text) => {
+                    #[cfg(feature = "metrics")]
+                    if first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     accumulated_text.push_str(&text);
                     if let Some(cb) = on_event {
                         cb(RunnerEvent::TextDelta(text));
@@ -1245,12 +1251,20 @@ pub async fn run_agent_loop_streaming(
                     }
                 },
                 StreamEvent::ReasoningDelta(text) => {
+                    #[cfg(feature = "metrics")]
+                    if first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     accumulated_reasoning.push_str(&text);
                     if let Some(cb) = on_event {
                         cb(RunnerEvent::ThinkingText(accumulated_reasoning.clone()));
                     }
                 },
                 StreamEvent::ToolCallStart { id, name, index } => {
+                    #[cfg(feature = "metrics")]
+                    if first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     let vec_pos = tool_calls.len();
                     debug!(tool = %name, id = %id, stream_index = index, vec_pos, "tool call started in stream");
                     tool_calls.push(ToolCall {
@@ -1262,6 +1276,10 @@ pub async fn run_agent_loop_streaming(
                     tool_call_args.insert(index, String::new());
                 },
                 StreamEvent::ToolCallArgumentsDelta { index, delta } => {
+                    #[cfg(feature = "metrics")]
+                    if first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     if let Some(args) = tool_call_args.get_mut(&index) {
                         args.push_str(&delta);
                     }
@@ -1317,9 +1335,38 @@ pub async fn run_agent_loop_streaming(
                             labels::MODEL => model_id
                         )
                         .record(duration);
+
+                        if let Some(first_token_time) = first_token_at {
+                            histogram!(
+                                llm_metrics::TIME_TO_FIRST_TOKEN_SECONDS,
+                                labels::PROVIDER => provider.name().to_string(),
+                                labels::MODEL => provider.id().to_string()
+                            )
+                            .record(first_token_time.duration_since(iter_start).as_secs_f64());
+                        }
+
+                        if duration > 0.0 && usage.output_tokens > 0 {
+                            histogram!(
+                                llm_metrics::TOKENS_PER_SECOND,
+                                labels::PROVIDER => provider.name().to_string(),
+                                labels::MODEL => provider.id().to_string()
+                            )
+                            .record(f64::from(usage.output_tokens) / duration);
+                        }
                     }
                 },
                 StreamEvent::Error(msg) => {
+                    #[cfg(feature = "metrics")]
+                    {
+                        let kind = classify_error_message(&msg);
+                        counter!(
+                            llm_metrics::COMPLETION_ERRORS_TOTAL,
+                            labels::PROVIDER => provider.name().to_string(),
+                            labels::MODEL => provider.id().to_string(),
+                            labels::ERROR_TYPE => format!("{kind:?}")
+                        )
+                        .increment(1);
+                    }
                     stream_error = Some(msg);
                     break;
                 },
