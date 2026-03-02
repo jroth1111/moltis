@@ -121,6 +121,44 @@ pub enum BrowserAction {
     /// Refresh the page.
     Refresh,
 
+    /// Hover the mouse over an element (triggers hover CSS and JS events).
+    Hover { ref_: u32 },
+
+    /// Double-click an element (fires two click events + a `dblclick` event).
+    DoubleClick { ref_: u32 },
+
+    /// Focus an element via keyboard focus without clicking it.
+    Focus { ref_: u32 },
+
+    /// Drag from one element to another (pointer events, not HTML5 drag-and-drop).
+    Drag { from_ref: u32, to_ref: u32 },
+
+    /// Check a checkbox or radio button. No-op if already checked.
+    Check { ref_: u32 },
+
+    /// Uncheck a checkbox. No-op if already unchecked.
+    Uncheck { ref_: u32 },
+
+    /// Select an option in a `<select>` element by its value attribute.
+    Select { ref_: u32, value: String },
+
+    /// Press a named key on the focused element.
+    ///
+    /// Use CDP key names: `"Enter"`, `"Escape"`, `"Tab"`, `"Backspace"`,
+    /// `"ArrowDown"`, `"ArrowUp"`, `"F5"`, single chars `"a"`, `"1"`, etc.
+    Press { key: String },
+
+    /// Upload a file to a `<input type="file">` element.
+    ///
+    /// `path` must be an absolute path on the machine running the browser.
+    Upload { ref_: u32, path: String },
+
+    /// Clear the value of an input or textarea element.
+    ///
+    /// Uses the native value setter so React's synthetic event system detects
+    /// the change, then fires `input` + `change` events.
+    Clear { ref_: u32 },
+
     /// Close the browser session.
     Close,
 }
@@ -232,6 +270,18 @@ impl fmt::Display for BrowserAction {
             Self::Back => write!(f, "back"),
             Self::Forward => write!(f, "forward"),
             Self::Refresh => write!(f, "refresh"),
+            Self::Hover { ref_ } => write!(f, "hover(ref={ref_})"),
+            Self::DoubleClick { ref_ } => write!(f, "double_click(ref={ref_})"),
+            Self::Focus { ref_ } => write!(f, "focus(ref={ref_})"),
+            Self::Drag { from_ref, to_ref } => {
+                write!(f, "drag(from={from_ref}, to={to_ref})")
+            },
+            Self::Check { ref_ } => write!(f, "check(ref={ref_})"),
+            Self::Uncheck { ref_ } => write!(f, "uncheck(ref={ref_})"),
+            Self::Select { ref_, .. } => write!(f, "select(ref={ref_})"),
+            Self::Press { key } => write!(f, "press(key={key})"),
+            Self::Upload { ref_, .. } => write!(f, "upload(ref={ref_})"),
+            Self::Clear { ref_ } => write!(f, "clear(ref={ref_})"),
             Self::Close => write!(f, "close"),
         }
     }

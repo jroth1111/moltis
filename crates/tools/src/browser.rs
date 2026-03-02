@@ -96,7 +96,9 @@ impl AgentTool for BrowserTool {
          or needs interaction (clicking, forms, screenshots, JavaScript-heavy pages).\n\n\
          REQUIRED: You MUST specify an 'action' parameter. Example:\n\
          {\"action\": \"navigate\", \"url\": \"https://example.com\"}\n\n\
-         Actions: navigate, screenshot, snapshot, click, type, scroll, evaluate, wait, close\n\n\
+         Core actions: navigate, screenshot, snapshot, click, type, scroll, evaluate, wait\n\
+         Extended actions: hover, double_click, focus, drag, check, uncheck, select, press, upload, clear\n\
+         Navigation: back, forward, refresh, get_url, get_title, close\n\n\
          BROWSER CHOICE: optionally set \"browser\" to choose one (auto, chrome, chromium, \
          edge, brave, opera, vivaldi, arc). If no browser is installed, Moltis will try \
          to auto-install one.\n\n\
@@ -107,7 +109,16 @@ impl AgentTool for BrowserTool {
          2. {\"action\": \"snapshot\"} - get interactive elements with ref numbers\n\
          3. {\"action\": \"click\", \"ref_\": N} - click element by ref number\n\
          4. {\"action\": \"screenshot\"} - capture the current view\n\
-         5. {\"action\": \"close\"} - close the browser when done"
+         5. {\"action\": \"close\"} - close the browser when done\n\n\
+         EXTENDED EXAMPLES:\n\
+         - {\"action\": \"hover\", \"ref_\": N} - move mouse over element\n\
+         - {\"action\": \"double_click\", \"ref_\": N} - double-click element\n\
+         - {\"action\": \"drag\", \"from_ref\": N, \"to_ref\": M} - drag between elements\n\
+         - {\"action\": \"check\", \"ref_\": N} - check a checkbox\n\
+         - {\"action\": \"select\", \"ref_\": N, \"value\": \"option-value\"} - select dropdown option\n\
+         - {\"action\": \"press\", \"key\": \"Enter\"} - press a key (Enter/Escape/Tab/Arrow*)\n\
+         - {\"action\": \"upload\", \"ref_\": N, \"path\": \"/abs/path/file.pdf\"} - file upload\n\
+         - {\"action\": \"clear\", \"ref_\": N} - clear an input field"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -117,7 +128,16 @@ impl AgentTool for BrowserTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["navigate", "screenshot", "snapshot", "click", "type", "scroll", "evaluate", "wait", "get_url", "get_title", "back", "forward", "refresh", "close"],
+                    "enum": [
+                        "navigate", "screenshot", "snapshot",
+                        "click", "double_click", "hover",
+                        "type", "clear",
+                        "scroll", "evaluate", "wait",
+                        "focus", "drag",
+                        "check", "uncheck", "select",
+                        "press", "upload",
+                        "get_url", "get_title", "back", "forward", "refresh", "close"
+                    ],
                     "description": "REQUIRED. The browser action to perform. Use 'navigate' with 'url' to open a page, 'snapshot' to see elements, 'screenshot' to capture."
                 },
                 "session_id": {
@@ -135,11 +155,31 @@ impl AgentTool for BrowserTool {
                 },
                 "ref_": {
                     "type": "integer",
-                    "description": "Element reference number from snapshot (for click/type/scroll)"
+                    "description": "Element reference number from snapshot (for click/type/hover/double_click/focus/check/uncheck/select/upload/clear/scroll)"
+                },
+                "from_ref": {
+                    "type": "integer",
+                    "description": "Source element reference number (for 'drag' action)"
+                },
+                "to_ref": {
+                    "type": "integer",
+                    "description": "Destination element reference number (for 'drag' action)"
                 },
                 "text": {
                     "type": "string",
                     "description": "Text to type (for 'type' action)"
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Option value to select (for 'select' action — matches the HTML value attribute)"
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Key name to press (for 'press' action). Examples: Enter, Escape, Tab, Backspace, ArrowDown, F5, or a single character like 'a'"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Absolute file path to upload (for 'upload' action)"
                 },
                 "code": {
                     "type": "string",
@@ -290,5 +330,45 @@ mod tests {
             required.iter().any(|v| v == "action"),
             "action should be in required fields"
         );
+    }
+
+    #[test]
+    fn test_schema_includes_extended_actions() {
+        let config = moltis_config::schema::BrowserConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tool = BrowserTool::from_config(&config).unwrap();
+        let schema = tool.parameters_schema();
+        let action_enum = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let actions: Vec<&str> = action_enum.iter().filter_map(|v| v.as_str()).collect();
+
+        for expected in [
+            "hover", "double_click", "focus", "drag", "check", "uncheck", "select", "press",
+            "upload", "clear",
+        ] {
+            assert!(
+                actions.contains(&expected),
+                "extended action '{expected}' must be in schema enum"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_has_extended_action_properties() {
+        let config = moltis_config::schema::BrowserConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tool = BrowserTool::from_config(&config).unwrap();
+        let schema = tool.parameters_schema();
+        let props = schema["properties"].as_object().unwrap();
+
+        for expected in ["from_ref", "to_ref", "key", "path", "value"] {
+            assert!(
+                props.contains_key(expected),
+                "schema must include property '{expected}'"
+            );
+        }
     }
 }

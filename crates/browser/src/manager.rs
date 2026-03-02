@@ -223,6 +223,24 @@ impl BrowserManager {
             BrowserAction::Back => self.go_back(session_id, sandbox).await,
             BrowserAction::Forward => self.go_forward(session_id, sandbox).await,
             BrowserAction::Refresh => self.refresh(session_id, sandbox).await,
+            BrowserAction::Hover { ref_ } => self.hover(session_id, ref_, sandbox).await,
+            BrowserAction::DoubleClick { ref_ } => {
+                self.double_click(session_id, ref_, sandbox).await
+            },
+            BrowserAction::Focus { ref_ } => self.focus(session_id, ref_, sandbox).await,
+            BrowserAction::Drag { from_ref, to_ref } => {
+                self.drag(session_id, from_ref, to_ref, sandbox).await
+            },
+            BrowserAction::Check { ref_ } => self.check(session_id, ref_, sandbox).await,
+            BrowserAction::Uncheck { ref_ } => self.uncheck(session_id, ref_, sandbox).await,
+            BrowserAction::Select { ref_, value } => {
+                self.select(session_id, ref_, &value, sandbox).await
+            },
+            BrowserAction::Press { key } => self.press(session_id, &key, sandbox).await,
+            BrowserAction::Upload { ref_, path } => {
+                self.upload(session_id, ref_, &path, sandbox).await
+            },
+            BrowserAction::Clear { ref_ } => self.clear(session_id, ref_, sandbox).await,
             BrowserAction::Close => self.close(session_id, sandbox).await,
         };
 
@@ -742,6 +760,227 @@ impl BrowserManager {
 
         info!(session_id = sid, "closed browser session");
 
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Extended actions (Phase 4)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Hover the mouse over an element.
+    async fn hover(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "hover")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        let (x, y) = find_element_by_ref(&page, ref_).await?;
+
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            crate::stealth::behavior::bezier_mouse_move(&page, (0.0, 0.0), (x, y)).await?;
+        } else {
+            crate::actions::hover_instant(&page, x, y).await?;
+        }
+
+        #[cfg(not(feature = "stealth"))]
+        crate::actions::hover_instant(&page, x, y).await?;
+
+        debug!(session_id = sid, ref_ = ref_, x, y, "hovered element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Double-click an element.
+    async fn double_click(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "double_click")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (x, y) = find_element_by_ref(&page, ref_).await?;
+
+        // Move to element (behavioral or instant) then fire the double-click events
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            crate::stealth::behavior::bezier_mouse_move(&page, (0.0, 0.0), (x, y)).await?;
+        } else {
+            crate::actions::hover_instant(&page, x, y).await?;
+        }
+
+        #[cfg(not(feature = "stealth"))]
+        crate::actions::hover_instant(&page, x, y).await?;
+
+        crate::actions::double_click_events(&page, x, y).await?;
+        debug!(session_id = sid, ref_ = ref_, x, y, "double-clicked element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Focus an element via keyboard focus without clicking.
+    async fn focus(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "focus")?;
+        let page = self.pool.get_page(&sid).await?;
+        focus_element_by_ref(&page, ref_).await?;
+        debug!(session_id = sid, ref_ = ref_, "focused element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Drag from one element to another.
+    async fn drag(
+        &self,
+        session_id: Option<&str>,
+        from_ref: u32,
+        to_ref: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "drag")?;
+        let page = self.pool.get_page(&sid).await?;
+        let (from_x, from_y) = find_element_by_ref(&page, from_ref).await?;
+        let (to_x, to_y) = find_element_by_ref(&page, to_ref).await?;
+
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            // Bezier approach to source → press → bezier drag to destination → release
+            crate::stealth::behavior::bezier_mouse_move(&page, (0.0, 0.0), (from_x, from_y))
+                .await?;
+            let press = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MousePressed)
+                .x(from_x)
+                .y(from_y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            page.execute(press)
+                .await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            crate::stealth::behavior::bezier_mouse_move(&page, (from_x, from_y), (to_x, to_y))
+                .await?;
+            let release = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseReleased)
+                .x(to_x)
+                .y(to_y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            page.execute(release)
+                .await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+        } else {
+            crate::actions::drag_instant(&page, from_x, from_y, to_x, to_y).await?;
+        }
+
+        #[cfg(not(feature = "stealth"))]
+        crate::actions::drag_instant(&page, from_x, from_y, to_x, to_y).await?;
+
+        debug!(
+            session_id = sid,
+            from_ref,
+            to_ref,
+            "dragged element"
+        );
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Check a checkbox or radio element.
+    async fn check(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "check")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        crate::actions::check_element(&page, ref_).await?;
+        debug!(session_id = sid, ref_ = ref_, "checked element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Uncheck a checkbox element.
+    async fn uncheck(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "uncheck")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        crate::actions::uncheck_element(&page, ref_).await?;
+        debug!(session_id = sid, ref_ = ref_, "unchecked element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Select an option in a `<select>` element by value.
+    async fn select(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        value: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "select")?;
+        let page = self.pool.get_page(&sid).await?;
+        crate::actions::select_option(&page, ref_, value).await?;
+        debug!(session_id = sid, ref_ = ref_, value, "selected option");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Press a named key or printable character.
+    async fn press(
+        &self,
+        session_id: Option<&str>,
+        key: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "press")?;
+        let page = self.pool.get_page(&sid).await?;
+        crate::actions::press_key(&page, key).await?;
+        debug!(session_id = sid, key, "pressed key");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Upload a file to a file input element.
+    async fn upload(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        path: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "upload")?;
+        let page = self.pool.get_page(&sid).await?;
+        crate::actions::upload_file(&page, ref_, path).await?;
+        debug!(session_id = sid, ref_ = ref_, path, "uploaded file");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Clear an input or textarea element.
+    async fn clear(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "clear")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        focus_element_by_ref(&page, ref_).await?;
+        crate::actions::clear_input(&page, ref_).await?;
+        debug!(session_id = sid, ref_ = ref_, "cleared element");
         Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
     }
 
