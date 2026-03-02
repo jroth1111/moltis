@@ -182,15 +182,14 @@ impl ProviderState {
     }
 
     /// Returns `true` when the circuit is open (provider should be skipped).
-    /// Trips after 3 consecutive failures; resets after 60s cooldown.
-    fn is_tripped(&self) -> bool {
+    fn is_tripped(&self, threshold: usize, cooldown: Duration) -> bool {
         let failures = self.consecutive_failures.load(Ordering::SeqCst);
-        if failures < 3 {
+        if failures < threshold {
             return false;
         }
         let last = self.last_failure.lock().unwrap_or_else(|e| e.into_inner());
         match *last {
-            Some(t) if t.elapsed() < Duration::from_secs(60) => true,
+            Some(t) if t.elapsed() < cooldown => true,
             _ => {
                 drop(last);
                 self.consecutive_failures.store(0, Ordering::SeqCst);
@@ -211,6 +210,8 @@ struct ChainEntry {
 /// Implements `LlmProvider` itself so callers don't need to know about failover.
 pub struct ProviderChain {
     chain: Vec<ChainEntry>,
+    cb_threshold: usize,
+    cb_cooldown: Duration,
 }
 
 impl ProviderChain {
@@ -223,12 +224,23 @@ impl ProviderChain {
                 state: ProviderState::new(),
             })
             .collect();
-        Self { chain }
+        Self {
+            chain,
+            cb_threshold: 3,
+            cb_cooldown: Duration::from_secs(60),
+        }
     }
 
     /// Build a chain with one provider (no failover). Useful as a passthrough.
     pub fn single(provider: Arc<dyn LlmProvider>) -> Self {
         Self::new(vec![provider])
+    }
+
+    /// Override the circuit breaker threshold and cooldown.
+    pub fn with_circuit_breaker(mut self, threshold: usize, cooldown: Duration) -> Self {
+        self.cb_threshold = threshold;
+        self.cb_cooldown = cooldown;
+        self
     }
 
     fn primary(&self) -> &ChainEntry {
@@ -264,7 +276,7 @@ impl LlmProvider for ProviderChain {
         let start = Instant::now();
 
         for entry in &self.chain {
-            if entry.state.is_tripped() {
+            if entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
                 continue;
             }
 
@@ -379,7 +391,7 @@ impl LlmProvider for ProviderChain {
         // If the stream yields an Error event, we can't transparently retry mid-stream,
         // so we pick the best available provider upfront.
         for entry in &self.chain {
-            if !entry.state.is_tripped() {
+            if !entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
                 return entry.provider.stream_with_tools(messages, tools);
             }
         }
@@ -593,7 +605,7 @@ mod tests {
         }
 
         // After tripping, the flaky provider should be skipped.
-        assert!(chain.chain[0].state.is_tripped());
+        assert!(chain.chain[0].state.is_tripped(3, Duration::from_secs(60)));
     }
 
     #[tokio::test]
@@ -846,5 +858,39 @@ mod tests {
     #[test]
     fn non_retryable_rate_limit_should_failover() {
         assert!(ProviderErrorKind::NonRetryableRateLimit.should_failover());
+    }
+
+    #[tokio::test]
+    async fn configurable_cb_threshold_one_failure() {
+        let chain = ProviderChain::new(vec![
+            Arc::new(FailingProvider {
+                id: "flaky",
+                error_msg: "500 internal server error",
+            }),
+            Arc::new(SuccessProvider { id: "backup" }),
+        ])
+        .with_circuit_breaker(1, Duration::from_secs(60));
+
+        // First failure should trip the breaker (threshold=1).
+        let _ = chain.complete(&[], &[]).await;
+        assert!(chain.chain[0].state.is_tripped(1, Duration::from_secs(60)));
+    }
+
+    #[tokio::test]
+    async fn configurable_cb_cooldown() {
+        let chain = ProviderChain::new(vec![
+            Arc::new(FailingProvider {
+                id: "flaky",
+                error_msg: "500 internal server error",
+            }),
+            Arc::new(SuccessProvider { id: "backup" }),
+        ])
+        .with_circuit_breaker(1, Duration::from_millis(50));
+
+        let _ = chain.complete(&[], &[]).await;
+        assert!(chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
     }
 }
