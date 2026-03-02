@@ -2329,6 +2329,18 @@ struct QueuedMessage {
     params: Value,
 }
 
+fn enqueue_with_limit(
+    entry: &mut Vec<QueuedMessage>,
+    params: Value,
+    max_queue_size: usize,
+) -> Option<usize> {
+    if entry.len() >= max_queue_size {
+        return None;
+    }
+    entry.push(QueuedMessage { params });
+    Some(entry.len())
+}
+
 /// A tool call currently executing within an active agent run.
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveToolCall {
@@ -2852,7 +2864,9 @@ impl ChatService for LiveChatService {
             let permit: OwnedSemaphorePermit = match session_sem.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                    let chat_cfg = moltis_config::discover_and_load().chat;
+                    let queue_mode = chat_cfg.message_queue_mode;
+                    let max_queue_size = chat_cfg.message_queue_max_size;
                     info!(
                         session = %session_key,
                         mode = ?queue_mode,
@@ -2862,19 +2876,17 @@ impl ChatService for LiveChatService {
                     let position = {
                         let mut q = self.message_queue.write().await;
                         let entry = q.entry(session_key.clone()).or_default();
-                        let max_queue_size = moltis_config::discover_and_load().chat.message_queue_max_size;
-                        if entry.len() >= max_queue_size {
+                        let Some(position) =
+                            enqueue_with_limit(entry, params.clone(), max_queue_size)
+                        else {
                             return Ok(serde_json::json!({
                                 "ok": false,
                                 "error": "message queue is full",
                                 "queueSize": entry.len(),
                                 "maxQueueSize": max_queue_size,
                             }));
-                        }
-                        entry.push(QueuedMessage {
-                            params: params.clone(),
-                        });
-                        entry.len()
+                        };
+                        position
                     };
                     broadcast(
                         &self.state,
@@ -3595,7 +3607,9 @@ impl ChatService for LiveChatService {
             Ok(p) => p,
             Err(_) => {
                 // Active run — enqueue and return immediately.
-                let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                let chat_cfg = moltis_config::discover_and_load().chat;
+                let queue_mode = chat_cfg.message_queue_mode;
+                let max_queue_size = chat_cfg.message_queue_max_size;
                 info!(
                     session = %session_key,
                     mode = ?queue_mode,
@@ -3605,10 +3619,16 @@ impl ChatService for LiveChatService {
                 let position = {
                     let mut q = self.message_queue.write().await;
                     let entry = q.entry(session_key.clone()).or_default();
-                    entry.push(QueuedMessage {
-                        params: params.clone(),
-                    });
-                    entry.len()
+                    let Some(position) = enqueue_with_limit(entry, params.clone(), max_queue_size)
+                    else {
+                        return Ok(serde_json::json!({
+                            "ok": false,
+                            "error": "message queue is full",
+                            "queueSize": entry.len(),
+                            "maxQueueSize": max_queue_size,
+                        }));
+                    };
+                    position
                 };
                 broadcast(
                     &self.state,
@@ -10300,6 +10320,30 @@ mod tests {
 
         // Queue should be empty.
         assert!(queue.read().await.get(key).is_none());
+    }
+
+    #[test]
+    fn enqueue_with_limit_accepts_until_capacity() {
+        let mut entry = Vec::new();
+
+        let first = enqueue_with_limit(&mut entry, serde_json::json!({"text": "a"}), 2);
+        assert_eq!(first, Some(1));
+
+        let second = enqueue_with_limit(&mut entry, serde_json::json!({"text": "b"}), 2);
+        assert_eq!(second, Some(2));
+        assert_eq!(entry.len(), 2);
+    }
+
+    #[test]
+    fn enqueue_with_limit_rejects_when_full_without_mutating() {
+        let mut entry = vec![QueuedMessage {
+            params: serde_json::json!({"text": "already"}),
+        }];
+
+        let result = enqueue_with_limit(&mut entry, serde_json::json!({"text": "new"}), 1);
+        assert_eq!(result, None);
+        assert_eq!(entry.len(), 1);
+        assert_eq!(entry[0].params["text"], "already");
     }
 
     #[tokio::test]
