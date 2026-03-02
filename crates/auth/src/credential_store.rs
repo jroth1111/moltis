@@ -451,7 +451,7 @@ impl CredentialStore {
         let prefix = &raw_key[..raw_key.len().min(11)]; // "mk_" + 8 chars
         let hash = sha256_hex(&raw_key);
 
-        // Store scopes as JSON array, or NULL for full access
+        // Store scopes as JSON array, or NULL when omitted (means no access until scopes are assigned)
         let scopes_json = scopes
             .filter(|s| !s.is_empty())
             .map(|s| serde_json::to_string(s).unwrap_or_default());
