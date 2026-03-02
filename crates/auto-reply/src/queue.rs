@@ -19,3 +19,18 @@ pub enum DropPolicy {
     Newest,
     None,
 }
+
+/// Default message priority (normal).
+pub const DEFAULT_PRIORITY: i32 = 0;
+
+/// Well-known priority levels.
+pub mod priority {
+    /// System / control-plane messages.
+    pub const SYSTEM: i32 = 100;
+    /// Urgent user-initiated messages.
+    pub const HIGH: i32 = 50;
+    /// Normal messages.
+    pub const NORMAL: i32 = 0;
+    /// Low-priority background / batch messages.
+    pub const LOW: i32 = -50;
+}

@@ -2327,6 +2327,8 @@ impl ModelService for LiveModelService {
 #[derive(Debug, Clone)]
 struct QueuedMessage {
     params: Value,
+    /// Higher values are dequeued first (default 0).
+    priority: i32,
 }
 
 fn enqueue_with_limit(
@@ -2337,7 +2339,14 @@ fn enqueue_with_limit(
     if entry.len() >= max_queue_size {
         return None;
     }
-    entry.push(QueuedMessage { params });
+    let priority = params
+        .get("_priority")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let msg = QueuedMessage { params, priority };
+    // Insert in sorted position (highest priority first) for O(n) insert.
+    let pos = entry.partition_point(|m| m.priority >= priority);
+    entry.insert(pos, msg);
     Some(entry.len())
 }
 
@@ -10068,9 +10077,11 @@ mod tests {
             let mut q = queue.write().await;
             q.entry(key.to_string()).or_default().push(QueuedMessage {
                 params: serde_json::json!({"text": "hello"}),
+                priority: 0,
             });
             q.entry(key.to_string()).or_default().push(QueuedMessage {
                 params: serde_json::json!({"text": "world"}),
+                priority: 0,
             });
         }
 
@@ -10089,12 +10100,15 @@ mod tests {
         let msgs = [
             QueuedMessage {
                 params: serde_json::json!({"text": "first", "model": "gpt-4"}),
+                priority: 0,
             },
             QueuedMessage {
                 params: serde_json::json!({"text": "second"}),
+                priority: 0,
             },
             QueuedMessage {
                 params: serde_json::json!({"text": "third", "_conn_id": "c1"}),
+                priority: 0,
             },
         ];
 
@@ -10163,12 +10177,15 @@ mod tests {
             let entry = q.entry(key.to_string()).or_default();
             entry.push(QueuedMessage {
                 params: serde_json::json!({"text": "a"}),
+                priority: 0,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({"text": "b"}),
+                priority: 0,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({"text": "c"}),
+                priority: 0,
             });
         }
 
@@ -10213,18 +10230,21 @@ mod tests {
                     "text": "a",
                     "_channel_reply_target": make_target("m1"),
                 }),
+                priority: 0,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({
                     "text": "b",
                     "_channel_reply_target": make_target("m2"),
                 }),
+                priority: 0,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({
                     "text": "c",
                     "_channel_reply_target": make_target("m3"),
                 }),
+                priority: 0,
             });
         }
 
@@ -10265,18 +10285,21 @@ mod tests {
                     "text": "first",
                     "_channel_reply_target": make_target("m1"),
                 }),
+                priority: 0,
             },
             QueuedMessage {
                 params: serde_json::json!({
                     "text": "second",
                     "_channel_reply_target": make_target("m2"),
                 }),
+                priority: 0,
             },
             QueuedMessage {
                 params: serde_json::json!({
                     "text": "third",
                     "_channel_reply_target": make_target("m3"),
                 }),
+                priority: 0,
             },
         ];
 
@@ -10324,9 +10347,11 @@ mod tests {
             let entry = q.entry(key.to_string()).or_default();
             entry.push(QueuedMessage {
                 params: serde_json::json!({"text": "a"}),
+                priority: 0,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({"text": "b"}),
+                priority: 0,
             });
         }
 
@@ -10354,12 +10379,54 @@ mod tests {
     fn enqueue_with_limit_rejects_when_full_without_mutating() {
         let mut entry = vec![QueuedMessage {
             params: serde_json::json!({"text": "already"}),
+            priority: 0,
         }];
 
         let result = enqueue_with_limit(&mut entry, serde_json::json!({"text": "new"}), 1);
         assert_eq!(result, None);
         assert_eq!(entry.len(), 1);
         assert_eq!(entry[0].params["text"], "already");
+    }
+
+    #[test]
+    fn enqueue_with_limit_orders_by_priority() {
+        let mut entry = Vec::new();
+
+        // Normal priority.
+        enqueue_with_limit(&mut entry, serde_json::json!({"text": "normal"}), 10);
+        // High priority — should be inserted before normal.
+        enqueue_with_limit(
+            &mut entry,
+            serde_json::json!({"text": "urgent", "_priority": 50}),
+            10,
+        );
+        // Low priority — should be inserted after normal.
+        enqueue_with_limit(
+            &mut entry,
+            serde_json::json!({"text": "background", "_priority": -10}),
+            10,
+        );
+
+        assert_eq!(entry.len(), 3);
+        assert_eq!(entry[0].params["text"], "urgent");
+        assert_eq!(entry[0].priority, 50);
+        assert_eq!(entry[1].params["text"], "normal");
+        assert_eq!(entry[1].priority, 0);
+        assert_eq!(entry[2].params["text"], "background");
+        assert_eq!(entry[2].priority, -10);
+    }
+
+    #[test]
+    fn enqueue_with_limit_equal_priority_preserves_insertion_order() {
+        let mut entry = Vec::new();
+
+        enqueue_with_limit(&mut entry, serde_json::json!({"text": "first"}), 10);
+        enqueue_with_limit(&mut entry, serde_json::json!({"text": "second"}), 10);
+        enqueue_with_limit(&mut entry, serde_json::json!({"text": "third"}), 10);
+
+        assert_eq!(entry[0].params["text"], "first");
+        assert_eq!(entry[1].params["text"], "second");
+        assert_eq!(entry[2].params["text"], "third");
     }
 
     #[tokio::test]
@@ -10372,12 +10439,15 @@ mod tests {
             let entry = q.entry(key.to_string()).or_default();
             entry.push(QueuedMessage {
                 params: serde_json::json!({"text": "x"}),
+                priority: 0,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({"text": "y"}),
+                priority: 0,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({"text": "z"}),
+                priority: 0,
             });
         }
 
