@@ -3416,10 +3416,10 @@ pub async fn prepare_gateway(
                 }
             })
         });
-        tool_registry.register(Box::new(SessionsSendTool::new(
-            Arc::clone(&session_metadata),
-            send_to_session,
-        )));
+        tool_registry.register(Box::new(
+            SessionsSendTool::new(Arc::clone(&session_metadata), send_to_session)
+                .with_state_store(Arc::clone(&session_state_store)),
+        ));
 
         // Register shared task coordination tool for multi-agent workflows.
         tool_registry.register(Box::new(moltis_tools::task_list::TaskListTool::new(

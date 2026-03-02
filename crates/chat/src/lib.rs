@@ -52,6 +52,7 @@ pub mod runtime;
 pub use runtime::{ChatRuntime, TtsOverride};
 use {
     chat_error::parse_chat_error,
+    moltis_common::handoff::HandoffContext,
     moltis_service_traits::{ChatService, ModelService, ServiceError, ServiceResult},
 };
 
@@ -2626,6 +2627,60 @@ async fn mark_self_repair_finished(state_store: Option<&SessionStateStore>, sess
     }
 }
 
+const HANDOFF_NAMESPACE: &str = "handoff";
+
+fn suggested_next_step_for_error(error: &str) -> Option<String> {
+    use moltis_agents::classify::{ProviderErrorKind, classify_error_message};
+
+    let step = match classify_error_message(error) {
+        ProviderErrorKind::ContextWindow => "compact context or reduce prompt size",
+        ProviderErrorKind::RateLimit | ProviderErrorKind::NonRetryableRateLimit => {
+            "switch provider or wait for rate-limit reset"
+        },
+        ProviderErrorKind::AuthError => "verify provider credentials and permissions",
+        ProviderErrorKind::BillingExhausted => "restore provider billing quota",
+        ProviderErrorKind::Timeout | ProviderErrorKind::ServerError => {
+            "retry with an alternate provider"
+        },
+        ProviderErrorKind::InvalidRequest => "fix request parameters before retrying",
+        ProviderErrorKind::Unknown => "retry with additional diagnostics enabled",
+    };
+    Some(step.to_string())
+}
+
+async fn persist_handoff_context(
+    state_store: Option<&Arc<SessionStateStore>>,
+    session_key: &str,
+    handoff: &HandoffContext,
+) {
+    let Some(store) = state_store else {
+        return;
+    };
+
+    let serialized = match serde_json::to_string(handoff) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to serialize handoff context"
+            );
+            return;
+        },
+    };
+
+    if let Err(error) = store
+        .set(session_key, HANDOFF_NAMESPACE, "latest", &serialized)
+        .await
+    {
+        warn!(
+            session = %session_key,
+            error = %error,
+            "failed to persist handoff context"
+        );
+    }
+}
+
 #[async_trait]
 impl ChatService for LiveChatService {
     async fn send(&self, mut params: Value) -> ServiceResult {
@@ -3000,10 +3055,10 @@ impl ChatService for LiveChatService {
                 {
                     warn!("failed to persist /sh assistant message: {e}");
                 }
+                mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
                 if let Ok(count) = session_store.count(&session_key_clone).await {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
-                mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
 
                 active_runs.write().await.remove(&run_id_clone);
                 let mut runs_by_session = active_runs_by_session.write().await;
@@ -3754,6 +3809,7 @@ impl ChatService for LiveChatService {
                         conn_id.clone(),
                         trace_id.clone(),
                         Some(&session_store),
+                        state_store.as_ref(),
                         mcp_disabled,
                         client_seq,
                         Some(Arc::clone(&active_thinking_text)),
@@ -4081,6 +4137,7 @@ impl ChatService for LiveChatService {
                 None, // send_sync: no conn_id
                 trace_id,
                 Some(&self.session_store),
+                self.state_store.as_ref(),
                 false, // send_sync: MCP tools always enabled for API calls
                 None,  // send_sync: no client seq
                 None,  // send_sync: no thinking text tracking
@@ -6121,6 +6178,7 @@ async fn run_with_tools(
     conn_id: Option<String>,
     trace_id: Option<String>,
     session_store: Option<&Arc<SessionStore>>,
+    state_store: Option<&Arc<SessionStateStore>>,
     mcp_disabled: bool,
     client_seq: Option<u64>,
     active_thinking_text: Option<Arc<RwLock<HashMap<String, String>>>>,
@@ -6684,8 +6742,8 @@ async fn run_with_tools(
                         Some(&on_event),
                         retry_hist,
                         Some(tool_context),
-                        hook_registry,
-                        trace_id,
+                        hook_registry.clone(),
+                        trace_id.clone(),
                     )
                     .await
                 },
@@ -6755,6 +6813,40 @@ async fn run_with_tools(
                 silent = is_silent,
                 "agent run complete"
             );
+
+            let handoff_context = HandoffContext {
+                last_action: Some(if tool_calls_made > 0 {
+                    format!("completed run with {tool_calls_made} tool calls")
+                } else {
+                    "completed run without tool calls".to_string()
+                }),
+                observed_error: None,
+                dead_ends: Vec::new(),
+                suggested_next_step: None,
+                estimated_tokens: Some(
+                    request_usage
+                        .input_tokens
+                        .saturating_add(request_usage.output_tokens),
+                ),
+            };
+            persist_handoff_context(state_store, session_key, &handoff_context).await;
+
+            if let Some(ref hooks) = hook_registry {
+                let payload = moltis_common::hooks::HookPayload::AgentEnd {
+                    session_key: session_key.to_string(),
+                    text: display_text.clone(),
+                    iterations,
+                    tool_calls: tool_calls_made,
+                    trace_id: trace_id.clone(),
+                };
+                if let Err(error) = hooks.dispatch(&payload).await {
+                    warn!(
+                        run_id,
+                        error = %error,
+                        "AgentEnd hook dispatch failed"
+                    );
+                }
+            }
 
             // Detect provider failures: silent response with zero tokens
             // produced means the LLM never processed the request (e.g.
@@ -6879,6 +6971,32 @@ async fn run_with_tools(
         Err(e) => {
             let error_str = e.to_string();
             warn!(run_id, error = %error_str, "agent run error");
+            let mut handoff_context = HandoffContext {
+                last_action: Some("agent run failed".to_string()),
+                observed_error: Some(error_str.clone()),
+                dead_ends: Vec::new(),
+                suggested_next_step: suggested_next_step_for_error(&error_str),
+                estimated_tokens: None,
+            };
+            handoff_context.add_dead_end("llm", &error_str, "provider call failed");
+            persist_handoff_context(state_store, session_key, &handoff_context).await;
+
+            if let Some(ref hooks) = hook_registry {
+                let payload = moltis_common::hooks::HookPayload::AgentEnd {
+                    session_key: session_key.to_string(),
+                    text: error_str.clone(),
+                    iterations: 0,
+                    tool_calls: 0,
+                    trace_id: trace_id.clone(),
+                };
+                if let Err(error) = hooks.dispatch(&payload).await {
+                    warn!(
+                        run_id,
+                        error = %error,
+                        "AgentEnd hook dispatch failed for error case"
+                    );
+                }
+            }
             state.set_run_error(run_id, error_str.clone()).await;
             let error_obj = parse_chat_error(&error_str, Some(provider_name));
             mark_unsupported_model(state, model_store, model_id, provider_name, &error_obj).await;
@@ -9667,10 +9785,16 @@ mod tests {
                 .any(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant")),
             "explicit /sh should persist an assistant turn for history coherence"
         );
-        assert!(
-            !moltis_agents::self_repair::is_session_running(&state_store, "main").await,
-            "self-repair running marker should be cleared when /sh run completes"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !moltis_agents::self_repair::is_session_running(&state_store, "main").await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("self-repair running marker should be cleared when /sh run completes");
     }
 
     #[tokio::test]
