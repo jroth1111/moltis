@@ -25,10 +25,10 @@ use {
 use moltis_sessions::state_store::SessionStateStore;
 
 /// Default threshold before a session is considered stuck.
-const DEFAULT_STUCK_THRESHOLD: Duration = Duration::from_secs(10 * 60); // 10 minutes
+pub const DEFAULT_STUCK_THRESHOLD: Duration = Duration::from_secs(10 * 60); // 10 minutes
 
 /// Default number of repair attempts before giving up.
-const DEFAULT_MAX_REPAIR_ATTEMPTS: u32 = 3;
+pub const DEFAULT_MAX_REPAIR_ATTEMPTS: u32 = 3;
 
 /// Namespace used in `SessionStateStore` for self-repair tracking.
 const REPAIR_NAMESPACE: &str = "self_repair";
@@ -128,9 +128,7 @@ pub async fn scan_and_repair(
             );
             // Clear running state so it doesn't keep alerting.
             let _ = store.delete(key, REPAIR_NAMESPACE, "running_since").await;
-            let _ = store
-                .set(key, REPAIR_NAMESPACE, "failed", "true")
-                .await;
+            let _ = store.set(key, REPAIR_NAMESPACE, "failed", "true").await;
             result.failed.push(key.clone());
         } else {
             info!(
@@ -235,10 +233,7 @@ pub fn start_background_task(
             // For now we scan the store for any session that has running_since set.
             // This is a simplified implementation — in production, integrate with
             // the session metadata store to get all known session keys.
-            let keys = store
-                .list_running_sessions()
-                .await
-                .unwrap_or_default();
+            let keys = store.list_running_sessions().await.unwrap_or_default();
 
             if keys.is_empty() {
                 continue;
@@ -256,10 +251,10 @@ pub fn start_background_task(
                             cb(result);
                         }
                     }
-                }
+                },
                 Err(e) => {
                     warn!(error = %e, "self-repair scan failed");
-                }
+                },
             }
         }
     })
@@ -335,14 +330,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = scan_and_repair(
-            &store,
-            &["s1".to_string()],
-            Duration::from_secs(60),
-            3,
-        )
-        .await
-        .unwrap();
+        let result = scan_and_repair(&store, &["s1".to_string()], Duration::from_secs(60), 3)
+            .await
+            .unwrap();
         assert_eq!(result.recovered, vec!["s1".to_string()]);
         // Should have cleared running_since
         assert!(!is_session_running(&store, "s1").await);
@@ -360,14 +350,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = scan_and_repair(
-            &store,
-            &["s1".to_string()],
-            Duration::from_secs(60),
-            3,
-        )
-        .await
-        .unwrap();
+        let result = scan_and_repair(&store, &["s1".to_string()], Duration::from_secs(60), 3)
+            .await
+            .unwrap();
         assert!(result.recovered.is_empty());
         assert_eq!(result.failed, vec!["s1".to_string()]);
         assert!(is_session_failed(&store, "s1").await);
