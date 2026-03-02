@@ -694,6 +694,7 @@ pub async fn run_agent_loop_with_context(
                         output_tokens: 0,
                         iteration: iterations,
                         trace_id: trace_id.clone(),
+                        error_message: Some(msg.clone()),
                     };
                     if let Err(dispatch_err) = hooks.dispatch(&payload).await {
                         warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
@@ -856,6 +857,7 @@ pub async fn run_agent_loop_with_context(
                 output_tokens: response.usage.output_tokens,
                 iteration: iterations,
                 trace_id: trace_id.clone(),
+                error_message: None,
             };
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
@@ -1378,6 +1380,7 @@ pub async fn run_agent_loop_streaming(
                     output_tokens: 0,
                     iteration: iterations,
                     trace_id: trace_id.clone(),
+                    error_message: Some(err.clone()),
                 };
                 if let Err(dispatch_err) = hooks.dispatch(&payload).await {
                     warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for streaming provider error");
@@ -1528,6 +1531,7 @@ pub async fn run_agent_loop_streaming(
                 output_tokens,
                 iteration: iterations,
                 trace_id: trace_id.clone(),
+                error_message: None,
             };
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
