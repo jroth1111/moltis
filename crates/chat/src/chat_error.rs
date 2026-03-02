@@ -3,6 +3,7 @@
 //! Converts raw error strings from agent runners / LLM providers into
 //! structured JSON payloads that the frontend can render directly.
 
+use moltis_agents::classify::extract_retry_after_ms as extract_retry_after_ms_from_message;
 use serde_json::Value;
 
 /// Parse a raw error string into a structured error object with `type`, `icon`,
@@ -278,35 +279,6 @@ fn extract_resets_at(obj: &Value) -> Option<u64> {
     obj.get("resets_at").and_then(|v| v.as_u64())
 }
 
-fn parse_retry_delay_ms_from_fragment(
-    fragment: &str,
-    unit_default_ms: bool,
-    max_ms: u64,
-) -> Option<u64> {
-    let start = fragment.find(|c: char| c.is_ascii_digit())?;
-    let tail = &fragment[start..];
-    let digits_len = tail.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits_len == 0 {
-        return None;
-    }
-    let amount = tail[..digits_len].parse::<u64>().ok()?;
-    let unit = tail[digits_len..].trim_start();
-
-    let ms = if unit.starts_with("ms") || unit.starts_with("millisecond") {
-        amount
-    } else if unit.starts_with("sec") || unit.starts_with("second") || unit.starts_with('s') {
-        amount.saturating_mul(1_000)
-    } else if unit.starts_with("min") || unit.starts_with("minute") || unit.starts_with('m') {
-        amount.saturating_mul(60_000)
-    } else if unit_default_ms {
-        amount
-    } else {
-        amount.saturating_mul(1_000)
-    };
-
-    Some(ms.clamp(1, max_ms))
-}
-
 fn extract_retry_after_ms(raw: &str, err_obj: &Value) -> Option<u64> {
     const MAX_RETRY_AFTER_MS: u64 = 86_400_000;
 
@@ -320,26 +292,7 @@ fn extract_retry_after_ms(raw: &str, err_obj: &Value) -> Option<u64> {
         return Some(seconds.saturating_mul(1_000).clamp(1, MAX_RETRY_AFTER_MS));
     }
 
-    let lower = raw.to_ascii_lowercase();
-    for (needle, default_ms) in [
-        ("retry_after_ms=", true),
-        ("retry-after-ms=", true),
-        ("retry_after=", false),
-        ("retry-after:", false),
-        ("retry after ", false),
-        ("retry in ", false),
-    ] {
-        if let Some(idx) = lower.find(needle) {
-            let fragment = &lower[idx + needle.len()..];
-            if let Some(ms) =
-                parse_retry_delay_ms_from_fragment(fragment, default_ms, MAX_RETRY_AFTER_MS)
-            {
-                return Some(ms);
-            }
-        }
-    }
-
-    None
+    extract_retry_after_ms_from_message(raw, MAX_RETRY_AFTER_MS)
 }
 
 fn extract_http_status(raw: &str) -> Option<u16> {

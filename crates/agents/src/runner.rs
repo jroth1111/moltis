@@ -11,6 +11,7 @@ use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 use moltis_common::hooks::{HookAction, HookPayload, HookRegistry};
 
 use crate::{
+    classify::{ProviderErrorKind, classify_error_message, extract_retry_after_ms},
     model::{
         ChatMessage, CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage, UserContent,
         values_to_chat_messages,
@@ -36,78 +37,6 @@ fn resolve_agent_max_iterations(configured: usize) -> usize {
         return DEFAULT_AGENT_MAX_ITERATIONS;
     }
     configured
-}
-
-/// Error patterns that indicate the context window has been exceeded.
-const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
-    "context_length_exceeded",
-    "max_tokens",
-    "too many tokens",
-    "request too large",
-    "maximum context length",
-    "context window",
-    "token limit",
-    "content_too_large",
-    "request_too_large",
-];
-
-/// Check if an error message indicates a context window overflow.
-fn is_context_window_error(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    CONTEXT_WINDOW_PATTERNS.iter().any(|p| lower.contains(p))
-}
-
-/// Error patterns that indicate a transient server error worth retrying.
-const RETRYABLE_SERVER_PATTERNS: &[&str] = &[
-    "http 500",
-    "http 502",
-    "http 503",
-    "http 529",
-    "server_error",
-    "internal server error",
-    "overloaded",
-    "bad gateway",
-    "service unavailable",
-    "the server had an error processing your request",
-];
-
-/// Check if an error looks like a transient provider failure that may
-/// succeed on retry (5xx, overloaded, etc.).
-fn is_retryable_server_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    RETRYABLE_SERVER_PATTERNS.iter().any(|p| lower.contains(p))
-}
-
-/// Error patterns that indicate provider-side rate limiting.
-const RATE_LIMIT_PATTERNS: &[&str] = &[
-    "http 429",
-    "status=429",
-    "status 429",
-    "status: 429",
-    "too many requests",
-    "rate limit",
-    "rate_limit",
-];
-
-fn is_rate_limit_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p))
-}
-
-/// Error patterns that indicate the account is out of credits/quota.
-/// These are not retryable in the short term and should surface directly.
-const BILLING_QUOTA_PATTERNS: &[&str] = &[
-    "insufficient_quota",
-    "quota exceeded",
-    "current quota",
-    "billing details",
-    "billing limit",
-    "credit balance",
-];
-
-fn is_billing_quota_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    BILLING_QUOTA_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 /// Base delay for non-rate-limit transient retries.
@@ -151,100 +80,42 @@ fn apply_jitter(base_ms: u64, max_ms: u64) -> u64 {
     jittered.clamp(1, max_ms)
 }
 
-fn parse_retry_delay_ms_from_fragment(
-    fragment: &str,
-    unit_default_ms: bool,
-    max_ms: u64,
-) -> Option<u64> {
-    let start = fragment.find(|c: char| c.is_ascii_digit())?;
-    let tail = &fragment[start..];
-    let digits_len = tail.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits_len == 0 {
-        return None;
-    }
-    let amount = tail[..digits_len].parse::<u64>().ok()?;
-    let unit = tail[digits_len..].trim_start();
-
-    let ms = if unit.starts_with("ms") || unit.starts_with("millisecond") {
-        amount
-    } else if unit.starts_with("sec") || unit.starts_with("second") || unit.starts_with('s') {
-        amount.saturating_mul(1_000)
-    } else if unit.starts_with("min") || unit.starts_with("minute") || unit.starts_with('m') {
-        amount.saturating_mul(60_000)
-    } else if unit_default_ms {
-        amount
-    } else {
-        amount.saturating_mul(1_000)
-    };
-
-    Some(ms.clamp(1, max_ms))
-}
-
-/// Extract retry delay hints embedded in provider error messages.
-///
-/// Supports patterns like:
-/// - `retry_after_ms=1234`
-/// - `Retry-After: 30`
-/// - `retry after 30s`
-/// - `retry in 45 seconds`
-fn extract_retry_after_ms(msg: &str, max_ms: u64) -> Option<u64> {
-    let lower = msg.to_ascii_lowercase();
-    for (needle, default_ms) in [
-        ("retry_after_ms=", true),
-        ("retry-after-ms=", true),
-        ("retry_after=", false),
-        ("retry-after:", false),
-        ("retry after ", false),
-        ("retry in ", false),
-    ] {
-        if let Some(idx) = lower.find(needle) {
-            let fragment = &lower[idx + needle.len()..];
-            if let Some(ms) = parse_retry_delay_ms_from_fragment(fragment, default_ms, max_ms) {
-                return Some(ms);
-            }
-        }
-    }
-    None
-}
-
 fn next_retry_delay_ms(
     msg: &str,
     server_retries_remaining: &mut u8,
     rate_limit_retries_remaining: &mut u8,
     rate_limit_backoff_ms: &mut Option<u64>,
 ) -> Option<u64> {
-    // Account/billing quota exhaustion is not transient; don't auto-retry.
-    if is_billing_quota_error(msg) {
-        return None;
+    match classify_error_message(msg) {
+        ProviderErrorKind::RateLimit => {
+            if *rate_limit_retries_remaining == 0 {
+                return None;
+            }
+            *rate_limit_retries_remaining -= 1;
+
+            // Keep exponential state advancing even when the provider gives a
+            // Retry-After hint, so future retries remain bounded and predictable.
+            let current_backoff = *rate_limit_backoff_ms;
+            *rate_limit_backoff_ms = Some(next_rate_limit_retry_ms(current_backoff));
+
+            let hinted_ms = extract_retry_after_ms(msg, RATE_LIMIT_MAX_RETRY_MS);
+            let delay_ms = hinted_ms
+                .or(*rate_limit_backoff_ms)
+                .unwrap_or(RATE_LIMIT_INITIAL_RETRY_MS);
+            Some(delay_ms.clamp(1, RATE_LIMIT_MAX_RETRY_MS))
+        },
+        ProviderErrorKind::ServerError | ProviderErrorKind::Timeout => {
+            if *server_retries_remaining == 0 {
+                return None;
+            }
+            *server_retries_remaining -= 1;
+            Some(apply_jitter(
+                SERVER_RETRY_DELAY.as_millis() as u64,
+                RATE_LIMIT_MAX_RETRY_MS,
+            ))
+        },
+        _ => None,
     }
-
-    if is_rate_limit_error(msg) {
-        if *rate_limit_retries_remaining == 0 {
-            return None;
-        }
-        *rate_limit_retries_remaining -= 1;
-
-        // Keep exponential state advancing even when the provider gives a
-        // Retry-After hint, so future retries remain bounded and predictable.
-        let current_backoff = *rate_limit_backoff_ms;
-        *rate_limit_backoff_ms = Some(next_rate_limit_retry_ms(current_backoff));
-
-        let hinted_ms = extract_retry_after_ms(msg, RATE_LIMIT_MAX_RETRY_MS);
-        let delay_ms = hinted_ms
-            .or(*rate_limit_backoff_ms)
-            .unwrap_or(RATE_LIMIT_INITIAL_RETRY_MS);
-        return Some(delay_ms.clamp(1, RATE_LIMIT_MAX_RETRY_MS));
-    }
-
-    if is_retryable_server_error(msg) {
-        if *server_retries_remaining == 0 {
-            return None;
-        }
-        *server_retries_remaining -= 1;
-        return Some(apply_jitter(SERVER_RETRY_DELAY.as_millis() as u64, RATE_LIMIT_MAX_RETRY_MS));
-    }
-
-    None
 }
 
 /// Typed errors from the agent loop.
@@ -770,9 +641,9 @@ pub async fn run_agent_loop_with_context(
                             warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
                         }
                     }
-                    if is_context_window_error(&msg) {
-                        return Err(AgentRunError::ContextWindowExceeded(msg));
-                    }
+                if classify_error_message(&msg) == ProviderErrorKind::ContextWindow {
+                    return Err(AgentRunError::ContextWindowExceeded(msg));
+                }
                     if let Some(delay_ms) = next_retry_delay_ms(
                         &msg,
                         &mut server_retries_remaining,
@@ -1454,7 +1325,7 @@ pub async fn run_agent_loop_streaming(
                     warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for streaming provider error");
                 }
             }
-            if is_context_window_error(&err) {
+            if classify_error_message(&err) == ProviderErrorKind::ContextWindow {
                 return Err(AgentRunError::ContextWindowExceeded(err));
             }
             if let Some(delay_ms) = next_retry_delay_ms(
@@ -3693,6 +3564,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3851,6 +3723,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3950,6 +3823,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4033,6 +3907,7 @@ mod tests {
             "You are a test bot.",
             &user_content,
             Some(&on_event),
+            None,
             None,
             None,
             None,
@@ -4196,6 +4071,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4347,6 +4223,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4384,39 +4261,61 @@ mod tests {
     // ── Retry tests ─────────────────────────────────────────────────
 
     #[test]
-    fn test_is_retryable_server_error() {
-        assert!(is_retryable_server_error(
-            "openai-codex API error HTTP 500 Internal Server Error: {}"
-        ));
-        assert!(is_retryable_server_error(
-            "The server had an error processing your request."
-        ));
-        assert!(is_retryable_server_error("HTTP 502 Bad Gateway"));
-        assert!(is_retryable_server_error("HTTP 503 Service Unavailable"));
-        assert!(is_retryable_server_error(
-            "overloaded_error: server is overloaded"
-        ));
-        assert!(!is_retryable_server_error("context_length_exceeded"));
-        assert!(!is_retryable_server_error("invalid API key"));
+    fn test_classify_server_errors() {
+        assert_eq!(
+            classify_error_message("openai-codex API error HTTP 500 Internal Server Error: {}"),
+            ProviderErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_error_message("The server had an error processing your request."),
+            ProviderErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_error_message("HTTP 502 Bad Gateway"),
+            ProviderErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_error_message("HTTP 503 Service Unavailable"),
+            ProviderErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_error_message("overloaded_error: server is overloaded"),
+            ProviderErrorKind::ServerError
+        );
     }
 
     #[test]
-    fn test_is_rate_limit_error() {
-        assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
-        assert!(is_rate_limit_error("status=429 upstream limit"));
-        assert!(is_rate_limit_error("rate_limit_exceeded"));
-        assert!(!is_rate_limit_error("HTTP 500 Internal Server Error"));
-        assert!(!is_rate_limit_error("insufficient_quota"));
+    fn test_classify_rate_limit_errors() {
+        assert_eq!(
+            classify_error_message("HTTP 429 Too Many Requests"),
+            ProviderErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_error_message("status=429 upstream limit"),
+            ProviderErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_error_message("rate_limit_exceeded"),
+            ProviderErrorKind::RateLimit
+        );
     }
 
     #[test]
-    fn test_is_billing_quota_error() {
-        assert!(is_billing_quota_error(
-            "You exceeded your current quota, please check your plan and billing details."
-        ));
-        assert!(is_billing_quota_error("insufficient_quota"));
-        assert!(is_billing_quota_error("quota exceeded"));
-        assert!(!is_billing_quota_error("HTTP 429 Too Many Requests"));
+    fn test_classify_billing_quota_errors() {
+        assert_eq!(
+            classify_error_message(
+                "You exceeded your current quota, please check your plan and billing details."
+            ),
+            ProviderErrorKind::BillingExhausted
+        );
+        assert_eq!(
+            classify_error_message("insufficient_quota"),
+            ProviderErrorKind::BillingExhausted
+        );
+        assert_eq!(
+            classify_error_message("quota exceeded"),
+            ProviderErrorKind::BillingExhausted
+        );
     }
 
     #[test]
@@ -4629,6 +4528,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "should recover after retry: {result:?}");
@@ -4694,6 +4594,7 @@ mod tests {
             "sys",
             &UserContent::text("hello"),
             Some(&on_event),
+            None,
             None,
             None,
             None,
