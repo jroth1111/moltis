@@ -99,21 +99,18 @@ pub async fn start_connection(
     // Insert into the shared map.
     {
         let mut map = accounts.write().unwrap_or_else(|e| e.into_inner());
-        map.insert(
-            account_id.clone(),
-            AccountState {
-                client: Arc::clone(&client),
-                account_id: account_id.clone(),
-                config: account_state.config.clone(),
-                cancel: cancel.clone(),
-                message_log: account_state.message_log.clone(),
-                event_sink: account_state.event_sink.clone(),
-                latest_qr: std::sync::RwLock::new(None),
-                connected: std::sync::atomic::AtomicBool::new(false),
-                otp: std::sync::Mutex::new(crate::otp::OtpState::new(otp_cooldown)),
-                recent_sent_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            },
-        );
+        map.insert(account_id.clone(), AccountState {
+            client: Arc::clone(&client),
+            account_id: account_id.clone(),
+            config: account_state.config.clone(),
+            cancel: cancel.clone(),
+            message_log: account_state.message_log.clone(),
+            event_sink: account_state.event_sink.clone(),
+            latest_qr: std::sync::RwLock::new(None),
+            connected: std::sync::atomic::AtomicBool::new(false),
+            otp: std::sync::Mutex::new(crate::otp::OtpState::new(otp_cooldown)),
+            recent_sent_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        });
     }
 
     // Spawn the event loop.

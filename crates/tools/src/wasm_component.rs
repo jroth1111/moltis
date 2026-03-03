@@ -469,13 +469,10 @@ mod tests {
     fn http_host_injects_secret_headers() {
         let (url, handle) = spawn_echo_headers_server();
         let mut secrets = HashMap::new();
-        secrets.insert(
-            "127.0.0.1".to_string(),
-            vec![(
-                "X-Subscription-Token".to_string(),
-                "my-secret-key".to_string(),
-            )],
-        );
+        secrets.insert("127.0.0.1".to_string(), vec![(
+            "X-Subscription-Token".to_string(),
+            "my-secret-key".to_string(),
+        )]);
         let host = host_with_allowlist_and_secrets(None, secrets);
         let request = request_for_url(url);
         let response = host.handle_request(request).unwrap();
@@ -491,10 +488,10 @@ mod tests {
     fn http_host_secret_headers_override_guest_headers() {
         let (url, handle) = spawn_echo_headers_server();
         let mut secrets = HashMap::new();
-        secrets.insert(
-            "127.0.0.1".to_string(),
-            vec![("X-Subscription-Token".to_string(), "host-value".to_string())],
-        );
+        secrets.insert("127.0.0.1".to_string(), vec![(
+            "X-Subscription-Token".to_string(),
+            "host-value".to_string(),
+        )]);
         let host = host_with_allowlist_and_secrets(None, secrets);
         let request = HttpRequest {
             method: "GET".to_string(),

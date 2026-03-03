@@ -1103,20 +1103,16 @@ mod tests {
         let mut same_second_pair: Option<(String, String)> = None;
         for _ in 0..32 {
             let first = store
-                .archive_to_cold_store(
-                    "session:abc",
-                    &[json!({"role": "user", "content": "first"})],
-                )
+                .archive_to_cold_store("session:abc", &[
+                    json!({"role": "user", "content": "first"}),
+                ])
                 .await
                 .unwrap();
             let second = store
-                .archive_to_cold_store(
-                    "session:abc",
-                    &[
-                        json!({"role": "user", "content": "second-a"}),
-                        json!({"role": "assistant", "content": "second-b"}),
-                    ],
-                )
+                .archive_to_cold_store("session:abc", &[
+                    json!({"role": "user", "content": "second-a"}),
+                    json!({"role": "assistant", "content": "second-b"}),
+                ])
                 .await
                 .unwrap();
 

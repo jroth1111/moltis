@@ -28,41 +28,26 @@ pub struct WasmToolLimits {
 impl Default for WasmToolLimits {
     fn default() -> Self {
         let mut overrides = HashMap::new();
-        overrides.insert(
-            "calc".to_string(),
-            ToolLimitOverride {
-                fuel: Some(100_000),
-                memory: Some(2 * MB),
-            },
-        );
-        overrides.insert(
-            "web_fetch".to_string(),
-            ToolLimitOverride {
-                fuel: Some(10_000_000),
-                memory: Some(32 * MB),
-            },
-        );
-        overrides.insert(
-            "web_search".to_string(),
-            ToolLimitOverride {
-                fuel: Some(10_000_000),
-                memory: Some(32 * MB),
-            },
-        );
-        overrides.insert(
-            "show_map".to_string(),
-            ToolLimitOverride {
-                fuel: Some(10_000_000),
-                memory: Some(64 * MB),
-            },
-        );
-        overrides.insert(
-            "location".to_string(),
-            ToolLimitOverride {
-                fuel: Some(5_000_000),
-                memory: Some(16 * MB),
-            },
-        );
+        overrides.insert("calc".to_string(), ToolLimitOverride {
+            fuel: Some(100_000),
+            memory: Some(2 * MB),
+        });
+        overrides.insert("web_fetch".to_string(), ToolLimitOverride {
+            fuel: Some(10_000_000),
+            memory: Some(32 * MB),
+        });
+        overrides.insert("web_search".to_string(), ToolLimitOverride {
+            fuel: Some(10_000_000),
+            memory: Some(32 * MB),
+        });
+        overrides.insert("show_map".to_string(), ToolLimitOverride {
+            fuel: Some(10_000_000),
+            memory: Some(64 * MB),
+        });
+        overrides.insert("location".to_string(), ToolLimitOverride {
+            fuel: Some(5_000_000),
+            memory: Some(16 * MB),
+        });
 
         Self {
             default_memory: DEFAULT_MEMORY_BYTES,

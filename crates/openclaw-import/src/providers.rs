@@ -425,14 +425,11 @@ mod tests {
         let dest = tmp.path().join("provider_keys.json");
 
         let mut providers = HashMap::new();
-        providers.insert(
-            "anthropic".to_string(),
-            MoltisProviderConfig {
-                api_key: Some("sk-test".to_string()),
-                models: vec!["claude-opus-4-6".to_string()],
-                ..Default::default()
-            },
-        );
+        providers.insert("anthropic".to_string(), MoltisProviderConfig {
+            api_key: Some("sk-test".to_string()),
+            models: vec!["claude-opus-4-6".to_string()],
+            ..Default::default()
+        });
 
         write_provider_keys(&providers, &dest).unwrap();
         assert!(dest.is_file());
@@ -455,13 +452,10 @@ mod tests {
         .unwrap();
 
         let mut providers = HashMap::new();
-        providers.insert(
-            "anthropic".to_string(),
-            MoltisProviderConfig {
-                api_key: Some("sk-new".to_string()),
-                ..Default::default()
-            },
-        );
+        providers.insert("anthropic".to_string(), MoltisProviderConfig {
+            api_key: Some("sk-new".to_string()),
+            ..Default::default()
+        });
 
         write_provider_keys(&providers, &dest).unwrap();
 
@@ -538,16 +532,13 @@ mod tests {
         let store = TokenStore::with_path(tmp.path().join("oauth_tokens.json"));
 
         let mut tokens = HashMap::new();
-        tokens.insert(
-            "openai-codex".to_string(),
-            OAuthTokens {
-                access_token: Secret::new("at-123".to_string()),
-                refresh_token: Some(Secret::new("rt-456".to_string())),
-                id_token: None,
-                account_id: Some("acct-1".to_string()),
-                expires_at: Some(1_770_231_225),
-            },
-        );
+        tokens.insert("openai-codex".to_string(), OAuthTokens {
+            access_token: Secret::new("at-123".to_string()),
+            refresh_token: Some(Secret::new("rt-456".to_string())),
+            id_token: None,
+            account_id: Some("acct-1".to_string()),
+            expires_at: Some(1_770_231_225),
+        });
 
         write_oauth_tokens_with_store(&tokens, &store).unwrap();
         let loaded = store

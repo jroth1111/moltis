@@ -153,8 +153,7 @@ impl moltis_agents::tool_registry::AgentTool for TaskBoardTool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use moltis_agents::tool_registry::AgentTool;
+    use {super::*, moltis_agents::tool_registry::AgentTool};
 
     async fn test_store() -> Arc<SessionStateStore> {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
