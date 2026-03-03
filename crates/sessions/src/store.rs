@@ -950,11 +950,17 @@ mod tests {
 
         // Filename must not be empty and must be a .jsonl file.
         assert!(!filename.is_empty());
-        assert!(filename.ends_with(".jsonl"), "expected .jsonl, got {filename}");
+        assert!(
+            filename.ends_with(".jsonl"),
+            "expected .jsonl, got {filename}"
+        );
 
         // Archive file must exist under archive/.
         let archive_path = dir.path().join("archive").join(&filename);
-        assert!(archive_path.exists(), "archive file not found: {archive_path:?}");
+        assert!(
+            archive_path.exists(),
+            "archive file not found: {archive_path:?}"
+        );
 
         // Archive file must contain the same number of lines as messages.
         let content = fs::read_to_string(&archive_path).unwrap();
@@ -977,7 +983,10 @@ mod tests {
             .unwrap();
 
         // Colons must be replaced by underscores in the filename.
-        assert!(!filename.contains(':'), "filename must not contain colons: {filename}");
+        assert!(
+            !filename.contains(':'),
+            "filename must not contain colons: {filename}"
+        );
         let archive_path = dir.path().join("archive").join(&filename);
         assert!(archive_path.exists());
     }
@@ -996,7 +1005,10 @@ mod tests {
         let mut same_second_pair: Option<(String, String)> = None;
         for _ in 0..32 {
             let first = store
-                .archive_to_cold_store("session:abc", &[json!({"role": "user", "content": "first"})])
+                .archive_to_cold_store(
+                    "session:abc",
+                    &[json!({"role": "user", "content": "first"})],
+                )
                 .await
                 .unwrap();
             let second = store
@@ -1037,7 +1049,10 @@ mod tests {
 
         for i in 0..10 {
             store
-                .append("main", &json!({"role": "user", "content": format!("msg-{i}")}))
+                .append(
+                    "main",
+                    &json!({"role": "user", "content": format!("msg-{i}")}),
+                )
                 .await
                 .unwrap();
         }
@@ -1057,7 +1072,10 @@ mod tests {
 
         for i in 0..3 {
             store
-                .append("main", &json!({"role": "user", "content": format!("msg-{i}")}))
+                .append(
+                    "main",
+                    &json!({"role": "user", "content": format!("msg-{i}")}),
+                )
                 .await
                 .unwrap();
         }
