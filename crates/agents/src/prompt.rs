@@ -211,7 +211,7 @@ pub fn build_system_prompt_minimal_runtime(
 
 /// Maximum number of characters from `MEMORY.md` injected into the system
 /// prompt to keep the context window manageable.
-const MEMORY_BOOTSTRAP_MAX_CHARS: usize = 8_000;
+const MEMORY_BOOTSTRAP_MAX_CHARS: usize = 4_000;
 /// Maximum number of characters from project context files (`CLAUDE.md`,
 /// project docs, etc.) injected into the prompt.
 const PROJECT_CONTEXT_MAX_CHARS: usize = 8_000;
@@ -496,27 +496,20 @@ fn append_memory_section(
             "\n\n*(MEMORY.md truncated — use `memory_search` for full content)*\n",
         );
         prompt.push_str(concat!(
-            "\n\n**The information above is what you already know about the user. ",
-            "Always include it in your answers.** ",
-            "Even if a tool search returns no additional results, ",
-            "this section still contains valid, current facts.\n",
+            "\n\n**The information above is baseline context you already know about the user.** ",
+            "Use it directly when relevant, even if no additional tool results are found.\n",
         ));
     }
     if has_memory_search {
         prompt.push_str(concat!(
-            "\nYou also have `memory_search` to find additional details from ",
-            "`memory/*.md` files and past session history beyond what is shown above. ",
-            "**Always search memory before claiming you don't know something.** ",
-            "The long-term memory system holds user facts, past decisions, project context, ",
-            "and anything previously stored.\n",
+            "\nUse `memory_search` when you need historical details not shown above. ",
+            "Search spans `memory/*.md` files and prior session context.\n",
         ));
     }
     if has_memory_save {
         prompt.push_str(concat!(
-            "\n**When the user asks you to remember, save, or note something, ",
-            "you MUST call `memory_save` to persist it.** ",
-            "Do not just acknowledge verbally — without calling the tool, ",
-            "the information will be lost after the session.\n",
+            "\nWhen the user explicitly asks you to remember, save, or note something, ",
+            "call `memory_save` so it persists across sessions.\n",
             "\nChoose the right target to keep context lean:\n",
             "- **MEMORY.md** — only core identity facts (name, age, location, ",
             "language, key preferences). This is loaded into every conversation, ",
@@ -1179,7 +1172,7 @@ mod tests {
         assert!(prompt.contains("Speaks French"));
         // Memory content should include the "already know" hint so models
         // don't ignore it when tool searches return empty.
-        assert!(prompt.contains("information above is what you already know"));
+        assert!(prompt.contains("baseline context you already know"));
     }
 
     #[test]
