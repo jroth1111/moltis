@@ -16,7 +16,7 @@ use {
 use moltis_providers::{ProviderRegistry, local_gguf, local_llm, raw_model_id};
 
 use crate::{
-    broadcast::{BroadcastOpts, broadcast},
+    broadcast::{BroadcastOpts, broadcast_raw},
     services::{LocalLlmService, ServiceResult},
     state::GatewayState,
 };
@@ -104,7 +104,7 @@ async fn download_unified_model(
     let display_name = model.display_name.to_string();
 
     // Broadcast download start
-    broadcast(
+    broadcast_raw(
         state,
         "local-llm.download",
         serde_json::json!({
@@ -133,7 +133,7 @@ async fn download_unified_model(
                     0.0
                 }
             });
-            broadcast(
+            broadcast_raw(
                 &state_for_progress,
                 "local-llm.download",
                 serde_json::json!({
@@ -172,7 +172,7 @@ async fn download_unified_model(
     match result {
         Ok(_) => {
             // Broadcast completion
-            broadcast(
+            broadcast_raw(
                 state,
                 "local-llm.download",
                 serde_json::json!({
@@ -188,7 +188,7 @@ async fn download_unified_model(
         },
         Err(e) => {
             // Broadcast error
-            broadcast(
+            broadcast_raw(
                 state,
                 "local-llm.download",
                 serde_json::json!({
@@ -215,7 +215,7 @@ async fn download_legacy_model(
     let display_name = model.display_name.to_string();
 
     // Broadcast download start
-    broadcast(
+    broadcast_raw(
         state,
         "local-llm.download",
         serde_json::json!({
@@ -244,7 +244,7 @@ async fn download_legacy_model(
                     0.0
                 }
             });
-            broadcast(
+            broadcast_raw(
                 &state_for_progress,
                 "local-llm.download",
                 serde_json::json!({
@@ -283,7 +283,7 @@ async fn download_legacy_model(
     match result {
         Ok(_) => {
             // Broadcast completion
-            broadcast(
+            broadcast_raw(
                 state,
                 "local-llm.download",
                 serde_json::json!({
@@ -299,7 +299,7 @@ async fn download_legacy_model(
         },
         Err(e) => {
             // Broadcast error
-            broadcast(
+            broadcast_raw(
                 state,
                 "local-llm.download",
                 serde_json::json!({
@@ -805,7 +805,7 @@ impl LocalLlmService for LiveLocalLlmService {
                             0.0
                         }
                     });
-                    broadcast(
+                    broadcast_raw(
                         &state,
                         "local-llm.download",
                         serde_json::json!({
@@ -845,7 +845,7 @@ impl LocalLlmService for LiveLocalLlmService {
 
                     // Broadcast completion (if state is available)
                     if let Some(state) = &state {
-                        broadcast(
+                        broadcast_raw(
                             state,
                             "local-llm.download",
                             serde_json::json!({
@@ -894,7 +894,7 @@ impl LocalLlmService for LiveLocalLlmService {
 
                     // Broadcast error (if state is available)
                     if let Some(state) = &state {
-                        broadcast(
+                        broadcast_raw(
                             state,
                             "local-llm.download",
                             serde_json::json!({

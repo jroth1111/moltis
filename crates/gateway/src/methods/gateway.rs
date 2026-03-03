@@ -1,4 +1,4 @@
-use crate::broadcast::{BroadcastOpts, broadcast};
+use crate::broadcast::{BroadcastOpts, broadcast_raw};
 
 use super::MethodRegistry;
 
@@ -125,7 +125,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .get("payload")
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
-                broadcast(&ctx.state, event, payload, BroadcastOpts::default()).await;
+                broadcast_raw(&ctx.state, event, payload, BroadcastOpts::default()).await;
                 Ok(serde_json::json!({}))
             })
         }),

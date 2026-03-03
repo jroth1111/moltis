@@ -1308,7 +1308,7 @@ mod tests {
         state.register_client(c2).await;
 
         // Broadcast a "presence" event
-        crate::broadcast::broadcast(
+        crate::broadcast::broadcast_raw(
             &state,
             "presence",
             serde_json::json!({"type": "test"}),
@@ -1339,7 +1339,7 @@ mod tests {
         state.register_client(c2).await;
 
         // Broadcast scoped to channel
-        crate::broadcast::broadcast(
+        crate::broadcast::broadcast_raw(
             &state,
             "chat",
             serde_json::json!({"text": "hello"}),

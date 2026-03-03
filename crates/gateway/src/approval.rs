@@ -10,7 +10,7 @@ use moltis_tools::{
 };
 
 use crate::{
-    broadcast::{BroadcastOpts, broadcast},
+    broadcast::{BroadcastEvent, BroadcastOpts, broadcast},
     services::{ExecApprovalService, ServiceResult},
     state::GatewayState,
 };
@@ -101,11 +101,7 @@ impl ApprovalBroadcaster for GatewayApprovalBroadcaster {
     async fn broadcast_request(&self, request_id: &str, command: &str) -> moltis_tools::Result<()> {
         broadcast(
             &self.state,
-            "exec.approval.requested",
-            serde_json::json!({
-                "requestId": request_id,
-                "command": command,
-            }),
+            BroadcastEvent::exec_approval_requested(request_id, command),
             BroadcastOpts::default(),
         )
         .await;

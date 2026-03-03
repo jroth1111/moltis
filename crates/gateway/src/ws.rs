@@ -15,7 +15,7 @@ use moltis_protocol::{
 
 use crate::{
     auth,
-    broadcast::{BroadcastOpts, broadcast},
+    broadcast::{BroadcastEvent, BroadcastOpts, broadcast},
     methods::{MethodContext, MethodRegistry},
     nodes::NodeSession,
     state::{ConnectedClient, GatewayState, OutboundWsFrame},
@@ -389,12 +389,7 @@ pub async fn handle_connection(
         // Broadcast presence change.
         broadcast(
             &state,
-            "presence",
-            serde_json::json!({
-                "type": "node.connected",
-                "nodeId": params.client.id,
-                "platform": params.client.platform,
-            }),
+            BroadcastEvent::node_connected(&params.client.id, &params.client.platform),
             BroadcastOpts::default(),
         )
         .await;
@@ -543,11 +538,7 @@ pub async fn handle_connection(
         info!(conn_id = %conn_id, node_id = %node.node_id, "node unregistered");
         broadcast(
             &state,
-            "presence",
-            serde_json::json!({
-                "type": "node.disconnected",
-                "nodeId": node.node_id,
-            }),
+            BroadcastEvent::node_disconnected(&node.node_id),
             BroadcastOpts::default(),
         )
         .await;
