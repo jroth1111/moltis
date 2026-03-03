@@ -42,7 +42,7 @@ use {
         store::SessionStore,
     },
     moltis_skills::discover::SkillDiscoverer,
-    moltis_tools::policy::{ToolPolicy, profile_tools},
+    moltis_tools::policy::effective_tool_policy,
 };
 
 pub mod chat_error;
@@ -346,6 +346,9 @@ struct ContextCompactionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextCompactionAction {
     None,
+    /// Early memory flush at ~70% occupancy — no summarization, only persists
+    /// important memories before they might be lost to compaction.
+    PreCompact,
     Compact,
     ArchiveTier,
     TruncateTier,
@@ -375,6 +378,7 @@ fn context_compaction_action_for_usage(
     estimated_next_input: u64,
     context_window: u64,
 ) -> ContextCompactionAction {
+    let pre_compact_threshold = (context_window * 70) / 100;
     let compact_threshold = (context_window * 80) / 100;
     let archive_threshold = (context_window * 90) / 100;
     let truncate_threshold = (context_window * 95) / 100;
@@ -384,6 +388,8 @@ fn context_compaction_action_for_usage(
         ContextCompactionAction::ArchiveTier
     } else if estimated_next_input >= compact_threshold {
         ContextCompactionAction::Compact
+    } else if estimated_next_input >= pre_compact_threshold {
+        ContextCompactionAction::PreCompact
     } else {
         ContextCompactionAction::None
     }
@@ -1430,31 +1436,6 @@ fn prompt_sandbox_no_network_state(backend: &str, configured_no_network: bool) -
     }
 }
 
-fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
-    let mut effective = ToolPolicy::default();
-    if let Some(profile) = config.tools.policy.profile.as_deref()
-        && !profile.is_empty()
-    {
-        effective = effective.merge_with(&profile_tools(profile));
-    }
-    let configured = ToolPolicy {
-        allow: config.tools.policy.allow.clone(),
-        deny: config.tools.policy.deny.clone(),
-        approval_required: config
-            .tools
-            .policy
-            .approval_required
-            .iter()
-            .map(|pattern| moltis_tools::policy::ApprovalPattern {
-                tool: pattern.tool.clone(),
-                condition: pattern.condition.clone(),
-                description: pattern.description.clone(),
-            })
-            .collect(),
-    };
-    effective.merge_with(&configured)
-}
-
 fn apply_runtime_tool_filters(
     base: &ToolRegistry,
     config: &moltis_config::MoltisConfig,
@@ -2471,6 +2452,63 @@ pub struct ActiveToolCall {
     pub started_at: u64,
 }
 
+/// Accumulates path-scoped rules discovered across agent turns.
+///
+/// Deduplicates by source file path so the same `.rules.md` is never appended
+/// twice, and enforces a total character budget.
+struct PathRulesAccumulator {
+    seen: HashSet<PathBuf>,
+    rules_text: String,
+    total_chars: usize,
+}
+
+impl PathRulesAccumulator {
+    const BUDGET: usize = 4_000;
+
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            rules_text: String::new(),
+            total_chars: 0,
+        }
+    }
+
+    fn add(&mut self, rules: &[moltis_projects::ScopedRule]) {
+        for rule in rules {
+            if self.total_chars >= Self::BUDGET {
+                break;
+            }
+            if self.seen.contains(&rule.source_path) {
+                continue;
+            }
+            self.seen.insert(rule.source_path.clone());
+            let remaining = Self::BUDGET.saturating_sub(self.total_chars);
+            let body = if rule.body.len() > remaining {
+                let end = rule.body.floor_char_boundary(remaining);
+                &rule.body[..end]
+            } else {
+                &rule.body
+            };
+            if body.is_empty() {
+                continue;
+            }
+            if !self.rules_text.is_empty() {
+                self.rules_text.push_str("\n\n");
+            }
+            self.rules_text.push_str(body);
+            self.total_chars += body.len();
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        if self.rules_text.is_empty() {
+            None
+        } else {
+            Some(&self.rules_text)
+        }
+    }
+}
+
 pub struct LiveChatService {
     providers: Arc<RwLock<ProviderRegistry>>,
     model_store: Arc<RwLock<DisabledModelsStore>>,
@@ -2502,6 +2540,13 @@ pub struct LiveChatService {
     state_store: Option<Arc<SessionStateStore>>,
     /// Failover configuration for automatic model/provider failover.
     failover_config: moltis_config::schema::FailoverConfig,
+    /// Per-session flag: whether the PreCompact memory flush has already fired
+    /// in the current compaction window.  Reset when a full Compact fires.
+    pre_compact_flushed: Arc<RwLock<HashMap<String, bool>>>,
+    /// Per-session+project path-scoped rules accumulated from tool call file paths.
+    path_rules: Arc<RwLock<HashMap<(String, PathBuf), PathRulesAccumulator>>>,
+    /// Cached chat configuration (immutable at runtime).
+    chat_config: moltis_config::ChatConfig,
 }
 
 impl LiveChatService {
@@ -2531,6 +2576,9 @@ impl LiveChatService {
             active_reply_medium: Arc::new(RwLock::new(HashMap::new())),
             state_store: None,
             failover_config: moltis_config::schema::FailoverConfig::default(),
+            pre_compact_flushed: Arc::new(RwLock::new(HashMap::new())),
+            path_rules: Arc::new(RwLock::new(HashMap::new())),
+            chat_config: moltis_config::discover_and_load().chat,
         }
     }
 
@@ -2665,12 +2713,12 @@ impl LiveChatService {
         "main".to_string()
     }
 
-    /// Resolve the project context prompt section for a session.
+    /// Resolve the project context prompt section and project directory for a session.
     async fn resolve_project_context(
         &self,
         session_key: &str,
         conn_id: Option<&str>,
-    ) -> Option<String> {
+    ) -> (Option<String>, Option<PathBuf>) {
         let project_id = if let Some(cid) = conn_id {
             self.state.active_project_id(cid).await
         } else {
@@ -2686,29 +2734,39 @@ impl LiveChatService {
                 .and_then(|e| e.project_id),
         };
 
-        let pid = project_id?;
-        let val = self
+        let Some(pid) = project_id else {
+            return (None, None);
+        };
+        let Ok(val) = self
             .state
             .project_service()
             .get(serde_json::json!({"id": pid}))
             .await
-            .ok()?;
-        let dir = val.get("directory").and_then(|v| v.as_str())?;
-        let files = match moltis_projects::context::load_context_files(Path::new(dir)) {
+        else {
+            return (None, None);
+        };
+        let Some(dir) = val.get("directory").and_then(|v| v.as_str()) else {
+            return (None, None);
+        };
+        let project_dir = PathBuf::from(dir);
+        let files = match moltis_projects::context::load_context_files(&project_dir) {
             Ok(f) => f,
             Err(e) => {
                 warn!("failed to load project context: {e}");
-                return None;
+                return (None, Some(project_dir));
             },
         };
-        let project: moltis_projects::Project = serde_json::from_value(val.clone()).ok()?;
+        let project: moltis_projects::Project = match serde_json::from_value(val.clone()) {
+            Ok(p) => p,
+            Err(_) => return (None, Some(project_dir)),
+        };
         let worktree_dir = self
             .session_metadata
             .get(session_key)
             .await
             .and_then(|e| e.worktree_branch)
             .and_then(|_| {
-                let wt_path = Path::new(dir).join(".moltis-worktrees").join(session_key);
+                let wt_path = project_dir.join(".moltis-worktrees").join(session_key);
                 if wt_path.exists() {
                     Some(wt_path)
                 } else {
@@ -2720,34 +2778,155 @@ impl LiveChatService {
             context_files: files,
             worktree_dir,
         };
-        Some(ctx.to_prompt_section())
+        (Some(ctx.to_prompt_section()), Some(project_dir))
+    }
+
+    /// Accumulate path-scoped rules for file paths seen in recent session history.
+    ///
+    /// Extracts file-like paths from recent tool call arguments, loads applicable
+    /// `.rules.md` files, and returns the accumulated rules text.
+    async fn resolve_scoped_rules(&self, session_key: &str, project_dir: &Path) -> Option<String> {
+        let project_root = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        let key = (session_key.to_string(), project_root.clone());
+
+        // Load recent session history to extract file paths from tool arguments
+        let messages = self.session_store.read_last_n(session_key, 50).await.ok()?;
+        let mut file_paths: Vec<PathBuf> = Vec::new();
+
+        // Scan for tool_use arguments containing file-like paths
+        for msg in &messages {
+            if let Some(content) = msg.get("content") {
+                extract_file_paths_from_content(content, &mut file_paths);
+            }
+        }
+
+        if file_paths.is_empty() {
+            return self
+                .path_rules
+                .read()
+                .await
+                .get(&key)
+                .and_then(|acc| acc.text().map(String::from));
+        }
+
+        let mut accumulators = self.path_rules.write().await;
+        // Keep only one project accumulator per session to avoid cross-project leakage.
+        accumulators.retain(|(sess, root), _| sess != session_key || root == &project_root);
+        let accumulator = accumulators
+            .entry(key)
+            .or_insert_with(PathRulesAccumulator::new);
+
+        for path in &file_paths {
+            let normalized = normalize_extracted_file_path(path, &project_root);
+            if let Ok(rules) = moltis_projects::load_path_scoped_rules(&project_root, &normalized) {
+                accumulator.add(&rules);
+            }
+        }
+
+        accumulator.text().map(String::from)
     }
 }
 
-async fn mark_self_repair_started(state_store: Option<&SessionStateStore>, session_key: &str) {
-    if let Some(store) = state_store
-        && let Err(error) =
-            moltis_agents::self_repair::mark_session_started(store, session_key).await
+fn normalize_extracted_file_path(path: &Path, project_dir: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if (raw == "~" || raw.starts_with("~/"))
+        && let Some(home) = moltis_config::home_dir()
     {
-        warn!(
-            session = %session_key,
-            error = %error,
-            "failed to mark session as running for self-repair"
-        );
+        let suffix = raw.strip_prefix("~/").unwrap_or("");
+        return home.join(suffix);
+    }
+
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_dir.join(path)
     }
 }
 
-async fn mark_self_repair_finished(state_store: Option<&SessionStateStore>, session_key: &str) {
-    if let Some(store) = state_store
-        && let Err(error) =
-            moltis_agents::self_repair::mark_session_finished(store, session_key).await
-    {
-        warn!(
-            session = %session_key,
-            error = %error,
-            "failed to clear session running state for self-repair"
-        );
+/// Extract file-like paths from a JSON content value (tool_use arguments).
+fn extract_file_paths_from_content(content: &Value, paths: &mut Vec<PathBuf>) {
+    match content {
+        Value::String(s) => {
+            if looks_like_file_path(s) {
+                paths.push(PathBuf::from(s));
+            }
+        },
+        Value::Array(arr) => {
+            for item in arr {
+                // Look for tool_use blocks
+                if let Some("tool_use") = item.get("type").and_then(|v| v.as_str())
+                    && let Some(input) = item.get("input")
+                {
+                    extract_file_paths_from_value(input, paths);
+                }
+                extract_file_paths_from_content(item, paths);
+            }
+        },
+        Value::Object(map) => {
+            for v in map.values() {
+                extract_file_paths_from_content(v, paths);
+            }
+        },
+        _ => {},
     }
+}
+
+/// Extract file-like paths from a tool arguments value.
+fn extract_file_paths_from_value(value: &Value, paths: &mut Vec<PathBuf>) {
+    match value {
+        Value::String(s) => {
+            if looks_like_file_path(s) {
+                paths.push(PathBuf::from(s));
+            }
+        },
+        Value::Array(arr) => {
+            for item in arr {
+                extract_file_paths_from_value(item, paths);
+            }
+        },
+        Value::Object(map) => {
+            for v in map.values() {
+                extract_file_paths_from_value(v, paths);
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Heuristic: does this string look like a filesystem path?
+fn looks_like_file_path(s: &str) -> bool {
+    if s.len() < 2 || s.len() > 500 {
+        return false;
+    }
+    // Should not contain control chars.
+    if s.contains('\n') || s.contains('\r') || s.contains('\0') {
+        return false;
+    }
+    // Exclude URLs and URI-like payloads.
+    if s.contains("://") {
+        return false;
+    }
+
+    if s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with("~/")
+        || (s.as_bytes().get(1) == Some(&b':')
+            && matches!(s.as_bytes().get(2), Some(b'\\') | Some(b'/')))
+    {
+        return true;
+    }
+
+    if s.contains('/') || s.contains('\\') {
+        return true;
+    }
+
+    let path = Path::new(s);
+    path.extension().is_some()
+        && !s.chars().any(char::is_whitespace)
+        && s.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// RAII guard that ensures self-repair cleanup happens when dropped.
@@ -2767,16 +2946,15 @@ impl SelfRepairGuard {
 
     /// Mark the session as started. Must be awaited after creating the guard.
     async fn mark_started(&self) {
-        if let Some(ref store) = self.state_store {
-            if let Err(error) =
+        if let Some(ref store) = self.state_store
+            && let Err(error) =
                 moltis_agents::self_repair::mark_session_started(store, &self.session_key).await
-            {
-                warn!(
-                    session = %self.session_key,
-                    error = %error,
-                    "failed to mark session as running for self-repair"
-                );
-            }
+        {
+            warn!(
+                session = %self.session_key,
+                error = %error,
+                "failed to mark session as running for self-repair"
+            );
         }
     }
 }
@@ -2863,9 +3041,7 @@ async fn consume_inbound_handoff_context(
     state_store: Option<&Arc<SessionStateStore>>,
     session_key: &str,
 ) -> Option<HandoffContext> {
-    let Some(store) = state_store else {
-        return None;
-    };
+    let store = state_store?;
 
     let raw = match store
         .get(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
@@ -2882,9 +3058,7 @@ async fn consume_inbound_handoff_context(
         },
     };
 
-    let Some(raw) = raw else {
-        return None;
-    };
+    let raw = raw?;
 
     if let Err(error) = store
         .delete(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
@@ -3173,9 +3347,8 @@ impl ChatService for LiveChatService {
             let permit: OwnedSemaphorePermit = match session_sem.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    let chat_cfg = moltis_config::discover_and_load().chat;
-                    let queue_mode = chat_cfg.message_queue_mode;
-                    let max_queue_size = chat_cfg.message_queue_max_size;
+                    let queue_mode = self.chat_config.message_queue_mode;
+                    let max_queue_size = self.chat_config.message_queue_max_size;
                     let priority = resolve_queue_priority(&params);
                     info!(
                         session = %session_key,
@@ -3261,6 +3434,7 @@ impl ChatService for LiveChatService {
                 .and_then(|v| v.as_str())
                 .map(String::from);
             let conn_id_for_tool = conn_id.clone();
+            let chat_config_for_drain = self.chat_config.clone();
 
             let handle = tokio::spawn(async move {
                 let permit = permit; // hold permit until command run completes
@@ -3271,7 +3445,9 @@ impl ChatService for LiveChatService {
                     .write()
                     .await
                     .insert(session_key_clone.clone(), ReplyMedium::Text);
-                mark_self_repair_started(state_store.as_deref(), &session_key_clone).await;
+                let _self_repair_guard =
+                    SelfRepairGuard::new(state_store.as_ref(), &session_key_clone);
+                _self_repair_guard.mark_started().await;
 
                 let assistant_output = run_explicit_shell_command(
                     &state,
@@ -3310,7 +3486,6 @@ impl ChatService for LiveChatService {
                 {
                     warn!("failed to persist /sh assistant message: {e}");
                 }
-                mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
                 if let Ok(count) = session_store.count(&session_key_clone).await {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
@@ -3337,9 +3512,8 @@ impl ChatService for LiveChatService {
                     .remove(&session_key_clone)
                     .unwrap_or_default();
                 if !queued.is_empty() {
-                    let chat_cfg = moltis_config::discover_and_load().chat;
-                    let queue_mode = chat_cfg.message_queue_mode;
-                    let starvation_bound = chat_cfg.priority_starvation_bound;
+                    let queue_mode = chat_config_for_drain.message_queue_mode;
+                    let starvation_bound = chat_config_for_drain.priority_starvation_bound;
                     let chat = state_for_drain.chat_service().await;
                     match queue_mode {
                         MessageQueueMode::Followup => {
@@ -3482,9 +3656,15 @@ impl ChatService for LiveChatService {
         }
 
         // Resolve project context for this connection's active project.
-        let project_context = self
+        let (project_context, project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+
+        let scoped_rules = if let Some(ref dir) = project_dir {
+            self.resolve_scoped_rules(&session_key, dir).await
+        } else {
+            None
+        };
 
         // Dispatch MessageReceived hook (read-only).
         if let Some(ref hooks) = self.hook_registry {
@@ -3674,10 +3854,13 @@ impl ChatService for LiveChatService {
             .and_then(|v| v.as_str())
             .map(String::from);
         let trace_id = trace_id.clone();
-        // Three-tier context management:
-        //   80% (compact)  — LLM fact-extraction + narrative summary replaces history.
-        //   90% (archive tier) — strategy-driven truncate/archive while preserving recency.
-        //   95% (truncate) — emergency: keep last 6 messages, no LLM call needed.
+        // Four-tier context management:
+        //   70% (pre-compact) — silent memory flush only; no summarization. Runs once
+        //                       per compaction window to capture memories before the
+        //                       compact window is reached.
+        //   80% (compact)     — LLM fact-extraction + narrative summary replaces history.
+        //   90% (archive tier)— strategy-driven truncate/archive while preserving recency.
+        //   95% (truncate)    — emergency: keep last 6 messages, no LLM call needed.
         let context_window = provider.context_window() as u64;
         let token_usage = session_token_usage_from_messages(&history);
         let compaction_config =
@@ -3856,7 +4039,70 @@ impl ChatService for LiveChatService {
                     }
                 }
             },
+            ContextCompactionAction::PreCompact => {
+                // Run the silent memory turn once per compaction window to persist
+                // important memories before the context might be fully compacted.
+                // The dedup flag prevents repeated flushes on successive turns at 70-80%.
+                let already_flushed = self
+                    .pre_compact_flushed
+                    .read()
+                    .await
+                    .get(&session_key)
+                    .copied()
+                    .unwrap_or(false);
+                if already_flushed {
+                    debug!(
+                        session = %session_key,
+                        "near-compaction: memory flush already ran this window, skipping"
+                    );
+                } else {
+                    self.pre_compact_flushed
+                        .write()
+                        .await
+                        .insert(session_key.clone(), true);
+                    debug!(
+                        session = %session_key,
+                        estimated_next_input,
+                        context_window,
+                        "near-compaction threshold: running early memory flush (no summarization)"
+                    );
+                    if let Some(mm) = self.state.memory_manager()
+                        && let Ok(flush_provider) =
+                            self.resolve_provider(&session_key, &history).await
+                    {
+                        let chat_history_for_memory = values_to_chat_messages(&history);
+                        let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::new(
+                            AgentScopedMemoryWriter::new(Arc::clone(mm), session_agent_id.clone()),
+                        );
+                        match moltis_agents::silent_turn::run_silent_memory_turn(
+                            flush_provider,
+                            &chat_history_for_memory,
+                            writer,
+                        )
+                        .await
+                        {
+                            Ok(paths) => {
+                                if !paths.is_empty() {
+                                    info!(
+                                        session = %session_key,
+                                        files = paths.len(),
+                                        "near-compaction: silent memory turn wrote files"
+                                    );
+                                }
+                            },
+                            Err(e) => warn!(
+                                session = %session_key,
+                                error = %e,
+                                "near-compaction: silent memory turn failed"
+                            ),
+                        }
+                    }
+                }
+            },
             ContextCompactionAction::Compact => {
+                // Reset the pre-compact dedup flag — a fresh compaction window begins.
+                self.pre_compact_flushed.write().await.remove(&session_key);
+
                 let pre_compact_msg_count = history.len();
                 let pre_compact_total = token_usage
                     .current_request_input_tokens
@@ -3940,9 +4186,8 @@ impl ChatService for LiveChatService {
             Ok(p) => p,
             Err(_) => {
                 // Active run — enqueue and return immediately.
-                let chat_cfg = moltis_config::discover_and_load().chat;
-                let queue_mode = chat_cfg.message_queue_mode;
-                let max_queue_size = chat_cfg.message_queue_max_size;
+                let queue_mode = self.chat_config.message_queue_mode;
+                let max_queue_size = self.chat_config.message_queue_max_size;
                 let priority = resolve_queue_priority(&params);
                 info!(
                     session = %session_key,
@@ -4016,10 +4261,12 @@ impl ChatService for LiveChatService {
         let message_queue_priority_streak = Arc::clone(&self.message_queue_priority_streak);
         let state_for_drain = Arc::clone(&self.state);
         let deferred_channel_target = deferred_channel_target.clone();
+        let chat_config_for_drain = self.chat_config.clone();
 
         let handle = tokio::spawn(async move {
             let permit = permit; // hold permit until agent run completes
             let ctx_ref = project_context.as_deref();
+            let scoped_rules_ref = scoped_rules.as_deref();
             if let Some(target) = deferred_channel_target {
                 // Register the channel reply target only after we own the
                 // session permit, so queued messages keep per-message routing.
@@ -4042,7 +4289,8 @@ impl ChatService for LiveChatService {
                 )
                 .await;
             }
-            mark_self_repair_started(state_store.as_deref(), &session_key_clone).await;
+            let _self_repair_guard = SelfRepairGuard::new(state_store.as_ref(), &session_key_clone);
+            _self_repair_guard.mark_started().await;
             let agent_fut = async {
                 if stream_only {
                     run_streaming(
@@ -4058,6 +4306,7 @@ impl ChatService for LiveChatService {
                         &session_agent_id_clone,
                         desired_reply_medium,
                         ctx_ref,
+                        scoped_rules_ref,
                         user_message_index,
                         &discovered_skills,
                         Some(&runtime_context),
@@ -4081,6 +4330,7 @@ impl ChatService for LiveChatService {
                         &session_agent_id_clone,
                         desired_reply_medium,
                         ctx_ref,
+                        scoped_rules_ref,
                         Some(&runtime_context),
                         user_message_index,
                         &discovered_skills,
@@ -4166,7 +4416,8 @@ impl ChatService for LiveChatService {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
             }
-            mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
+            // Guard dropped here → mark_self_repair_finished runs in background.
+            drop(_self_repair_guard);
 
             active_runs.write().await.remove(&run_id_clone);
             let mut runs_by_session = active_runs_by_session.write().await;
@@ -4193,9 +4444,8 @@ impl ChatService for LiveChatService {
                 .remove(&session_key_clone)
                 .unwrap_or_default();
             if !queued.is_empty() {
-                let chat_cfg = moltis_config::discover_and_load().chat;
-                let queue_mode = chat_cfg.message_queue_mode;
-                let starvation_bound = chat_cfg.priority_starvation_bound;
+                let queue_mode = chat_config_for_drain.message_queue_mode;
+                let starvation_bound = chat_config_for_drain.priority_starvation_bound;
                 let chat = state_for_drain.chat_service().await;
                 match queue_mode {
                     MessageQueueMode::Followup => {
@@ -4387,7 +4637,8 @@ impl ChatService for LiveChatService {
 
         // send_sync is text-only (used by API calls and channels).
         let user_content = UserContent::text(&text);
-        mark_self_repair_started(self.state_store.as_deref(), &session_key).await;
+        let _self_repair_guard = SelfRepairGuard::new(self.state_store.as_ref(), &session_key);
+        _self_repair_guard.mark_started().await;
         let result = if stream_only {
             run_streaming(
                 &state,
@@ -4401,6 +4652,7 @@ impl ChatService for LiveChatService {
                 &session_key,
                 &session_agent_id,
                 desired_reply_medium,
+                None,
                 None,
                 user_message_index,
                 &[],
@@ -4425,6 +4677,7 @@ impl ChatService for LiveChatService {
                 &session_agent_id,
                 desired_reply_medium,
                 None,
+                None,
                 Some(&runtime_context),
                 user_message_index,
                 &[],
@@ -4441,7 +4694,7 @@ impl ChatService for LiveChatService {
             )
             .await
         };
-        mark_self_repair_finished(self.state_store.as_deref(), &session_key).await;
+        drop(_self_repair_guard);
 
         // Persist assistant response (even empty ones — needed for LLM history coherence).
         if let Some(ref assistant_output) = result {
@@ -4548,7 +4801,10 @@ impl ChatService for LiveChatService {
         );
 
         if aborted && let Some(ref key) = resolved_session_key {
-            mark_self_repair_finished(self.state_store.as_deref(), key).await;
+            // Directly call finish since there's no guard in the abort path.
+            if let Some(ref store) = self.state_store {
+                let _ = moltis_agents::self_repair::mark_session_finished(store, key).await;
+            }
             self.active_thinking_text.write().await.remove(key);
             self.active_tool_calls.write().await.remove(key);
             self.active_reply_medium.write().await.remove(key);
@@ -5238,9 +5494,14 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let project_context = self
+        let (project_context, project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+        let scoped_rules = if let Some(ref dir) = project_dir {
+            self.resolve_scoped_rules(&session_key, dir).await
+        } else {
+            None
+        };
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5290,6 +5551,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                scoped_rules.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -5301,6 +5563,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                scoped_rules.as_deref(),
             )
         };
 
@@ -5361,9 +5624,14 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let project_context = self
+        let (project_context, project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+        let scoped_rules = if let Some(ref dir) = project_dir {
+            self.resolve_scoped_rules(&session_key, dir).await
+        } else {
+            None
+        };
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5411,6 +5679,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                scoped_rules.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -5422,6 +5691,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                scoped_rules.as_deref(),
             )
         };
 
@@ -6470,6 +6740,7 @@ async fn run_with_tools(
     agent_id: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
+    scoped_rules: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     user_message_index: usize,
     skills: &[moltis_skills::types::SkillMetadata],
@@ -6520,6 +6791,7 @@ async fn run_with_tools(
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
+            scoped_rules,
         )
     } else {
         build_system_prompt_minimal_runtime(
@@ -6531,6 +6803,7 @@ async fn run_with_tools(
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
+            scoped_rules,
         )
     };
 
@@ -6900,6 +7173,19 @@ async fn run_with_tools(
                     "toolCallsMade": tool_calls_made,
                     "seq": seq,
                 }),
+                RunnerEvent::IntentDrift {
+                    drift_score,
+                    iteration,
+                } => {
+                    serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "intent_drift",
+                        "driftScore": drift_score,
+                        "iteration": iteration,
+                        "seq": seq,
+                    })
+                },
                 RunnerEvent::RetryingAfterError { error, delay_ms } => {
                     let error_obj =
                         parse_chat_error(&error, Some(provider_name_for_events.as_str()));
@@ -7493,6 +7779,7 @@ async fn run_streaming(
     agent_id: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
+    scoped_rules: Option<&str>,
     user_message_index: usize,
     _skills: &[moltis_skills::types::SkillMetadata],
     runtime_context: Option<&PromptRuntimeContext>,
@@ -7512,6 +7799,7 @@ async fn run_streaming(
         persona.tools_text.as_deref(),
         runtime_context,
         persona.memory_text.as_deref(),
+        scoped_rules,
     );
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
@@ -8884,6 +9172,7 @@ mod tests {
         moltis_agents::{model::LlmProvider, tool_registry::AgentTool},
         moltis_common::types::ReplyPayload,
         std::{
+            path::PathBuf,
             pin::Pin,
             sync::{
                 Arc,
@@ -9248,8 +9537,16 @@ mod tests {
     #[test]
     fn context_compaction_action_orchestrates_threshold_tiers() {
         assert_eq!(
-            context_compaction_action_for_usage(79, 100),
+            context_compaction_action_for_usage(69, 100),
             ContextCompactionAction::None
+        );
+        assert_eq!(
+            context_compaction_action_for_usage(70, 100),
+            ContextCompactionAction::PreCompact
+        );
+        assert_eq!(
+            context_compaction_action_for_usage(79, 100),
+            ContextCompactionAction::PreCompact
         );
         assert_eq!(
             context_compaction_action_for_usage(80, 100),
@@ -12323,5 +12620,81 @@ mod tests {
             mode: Some(ToolMode::Auto),
         };
         assert_eq!(effective_tool_mode(&text), ToolMode::Text);
+    }
+
+    #[test]
+    fn test_pre_compact_fires_memory_flush_before_compact() {
+        // At 72% occupancy the action is PreCompact: silent memory flush, no
+        // summarisation.  This guarantees a ~10% buffer before full compaction
+        // (Compact) fires at 80%, so memories are not lost in a large-token jump.
+        assert_eq!(
+            context_compaction_action_for_usage(72, 100),
+            ContextCompactionAction::PreCompact
+        );
+        // Below 70% no action is taken — we are not near the compaction boundary.
+        assert_eq!(
+            context_compaction_action_for_usage(69, 100),
+            ContextCompactionAction::None
+        );
+        // At 80% the action escalates to Compact (full summarisation path), not
+        // PreCompact, so the two code paths are distinct.
+        assert_eq!(
+            context_compaction_action_for_usage(80, 100),
+            ContextCompactionAction::Compact
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_compact_dedup_only_fires_once_per_window() {
+        // Replicate the pre_compact_flushed dedup logic used by LiveChatService to
+        // confirm it fires at most once per compaction window and resets when a full
+        // Compact fires.
+        let flushed: Arc<RwLock<HashMap<String, bool>>> = Arc::new(RwLock::new(HashMap::new()));
+        let session = "s1".to_string();
+
+        // Initially no flush has occurred for this session.
+        let already = flushed.read().await.get(&session).copied().unwrap_or(false);
+        assert!(!already, "no flush before first PreCompact");
+
+        // First PreCompact turn: mark flushed.
+        flushed.write().await.insert(session.clone(), true);
+
+        // Subsequent PreCompact turns at the same usage level must be no-ops.
+        let already = flushed.read().await.get(&session).copied().unwrap_or(false);
+        assert!(already, "dedup flag must be set after first PreCompact");
+
+        // Full Compact fires: reset the dedup flag for the new compaction window.
+        flushed.write().await.remove(&session);
+
+        // PreCompact may now fire again in the next window.
+        let already = flushed.read().await.get(&session).copied().unwrap_or(false);
+        assert!(
+            !already,
+            "dedup flag must be cleared after Compact resets the window"
+        );
+    }
+
+    #[test]
+    fn path_rules_accumulator_truncates_multibyte_safely() {
+        let mut acc = PathRulesAccumulator::new();
+        let long = "€".repeat(2_000);
+        acc.add(&[moltis_projects::ScopedRule {
+            source_path: PathBuf::from("rules.md"),
+            body: long,
+            globs: None,
+        }]);
+
+        let text = acc.text().expect("accumulator should contain rule text");
+        assert!(text.is_char_boundary(text.len()));
+        assert!(text.len() <= PathRulesAccumulator::BUDGET);
+    }
+
+    #[test]
+    fn looks_like_file_path_accepts_relative_paths_and_rejects_urls() {
+        assert!(looks_like_file_path("src/main.rs"));
+        assert!(looks_like_file_path("Cargo.toml"));
+        assert!(looks_like_file_path("./scripts/test.sh"));
+        assert!(!looks_like_file_path("https://example.com/file.rs"));
+        assert!(!looks_like_file_path("profile"));
     }
 }

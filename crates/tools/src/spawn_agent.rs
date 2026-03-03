@@ -1,12 +1,16 @@
 //! Sub-agent tool: lets the LLM delegate tasks to a child agent loop.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use {async_trait::async_trait, tracing::info};
 
-use crate::{
-    error::Error,
-    params::{bool_param, str_param, u64_param},
+use {
+    crate::{
+        error::Error,
+        params::{bool_param, str_param, u64_param},
+    },
+    moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent},
+    time::OffsetDateTime,
 };
 
 use {
@@ -49,6 +53,13 @@ pub struct SpawnAgentTool {
     tool_registry: Arc<ToolRegistry>,
     agents_config: Option<Arc<tokio::sync::RwLock<AgentsConfig>>>,
     on_event: Option<OnSpawnEvent>,
+    /// Optional task store for lifecycle management when `task_id` is provided.
+    task_store: Option<Arc<TaskStore>>,
+    /// Task orchestration config (lease durations, heartbeat interval).
+    tasks_config: moltis_config::schema::TasksConfig,
+    /// Global tool policy resolver — enforced on all sub-agent tool registries.
+    /// Resolved at spawn time so policy updates are picked up without restart.
+    tool_policy_resolver: crate::policy::ToolPolicyResolver,
 }
 
 impl SpawnAgentTool {
@@ -63,6 +74,11 @@ impl SpawnAgentTool {
             tool_registry,
             agents_config: None,
             on_event: None,
+            task_store: None,
+            tasks_config: moltis_config::schema::TasksConfig::default(),
+            tool_policy_resolver: crate::policy::fixed_tool_policy_resolver(
+                crate::policy::ToolPolicy::default(),
+            ),
         }
     }
 
@@ -78,6 +94,36 @@ impl SpawnAgentTool {
         agents_config: Arc<tokio::sync::RwLock<AgentsConfig>>,
     ) -> Self {
         self.agents_config = Some(agents_config);
+        self
+    }
+
+    /// Attach a task store so sub-agents linked to a `task_id` receive
+    /// automatic lifecycle transitions (Complete / Fail) on exit.
+    pub fn with_task_store(mut self, store: Arc<TaskStore>) -> Self {
+        self.task_store = Some(store);
+        self
+    }
+
+    /// Set task orchestration config (lease duration, heartbeat interval, etc.).
+    pub fn with_tasks_config(mut self, cfg: moltis_config::schema::TasksConfig) -> Self {
+        self.tasks_config = cfg;
+        self
+    }
+
+    /// Set the global tool policy enforced on all sub-agent tool registries.
+    /// Deny rules from this policy always win over per-spawn allow lists.
+    pub fn with_tool_policy(mut self, policy: crate::policy::ToolPolicy) -> Self {
+        self.tool_policy_resolver = crate::policy::fixed_tool_policy_resolver(policy);
+        self
+    }
+
+    /// Set a runtime tool policy resolver enforced on all sub-agent registries.
+    /// Deny rules from the resolved policy always win over per-spawn allow lists.
+    pub fn with_tool_policy_resolver(
+        mut self,
+        resolver: crate::policy::ToolPolicyResolver,
+    ) -> Self {
+        self.tool_policy_resolver = resolver;
         self
     }
 
@@ -112,6 +158,7 @@ impl SpawnAgentTool {
 
     fn build_sub_tools(
         &self,
+        task: &str,
         allow_tools: &[String],
         deny_tools: &[String],
         delegate_only: bool,
@@ -125,14 +172,19 @@ impl SpawnAgentTool {
             self.tool_registry
                 .clone_allowed_by(|name| name != "spawn_agent" && allowed.contains(name))
         } else {
-            // Default behavior preserves old semantics.
-            self.tool_registry.clone_without(&["spawn_agent"])
+            // Auto-select tools based on task description.
+            let selected = crate::tool_selector::select_tools_for_task(task, &self.tool_registry);
+            selected.clone_without(&["spawn_agent"])
         };
 
         if !deny_tools.is_empty() {
             let deny: HashSet<&str> = deny_tools.iter().map(String::as_str).collect();
             sub_tools = sub_tools.clone_allowed_by(|name| !deny.contains(name));
         }
+
+        // Apply global ToolPolicy — deny always wins over per-spawn allow lists.
+        let policy = (self.tool_policy_resolver)();
+        sub_tools = sub_tools.clone_allowed_by(|name| policy.is_allowed(name));
 
         sub_tools
     }
@@ -172,11 +224,16 @@ impl AgentTool for SpawnAgentTool {
         "spawn_agent"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["orchestration"]
+    }
+
     fn description(&self) -> &str {
         "Spawn a sub-agent to handle a complex, multi-step task autonomously. \
          The sub-agent runs its own agent loop with access to tools and returns \
          the result when done. Use this to delegate tasks that require multiple \
-         tool calls or independent reasoning. Supports optional tool policy controls."
+         tool calls or independent reasoning. Tools are automatically selected \
+         based on the task description unless `allow_tools` is explicitly provided."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -212,6 +269,14 @@ impl AgentTool for SpawnAgentTool {
                 "delegate_only": {
                     "type": "boolean",
                     "description": "If true, sub-agent is restricted to delegation/session/task tools."
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Optional task ID to link this sub-agent to a task. When provided with list_id, the task is automatically marked Complete on success or Fail on error."
+                },
+                "list_id": {
+                    "type": "string",
+                    "description": "Task list ID required when task_id is provided."
                 }
             },
             "required": ["task"]
@@ -222,6 +287,23 @@ impl AgentTool for SpawnAgentTool {
         let task = str_param(&params, "task")
             .ok_or_else(|| Error::message("missing required parameter: task"))?;
         let context = str_param(&params, "context").unwrap_or("");
+
+        // Task lifecycle: resolve linked task (if any) before building the prompt.
+        let task_id: Option<TaskId> = str_param(&params, "task_id").map(TaskId::from);
+        let list_id: Option<String> = str_param(&params, "list_id").map(str::to_string);
+
+        // Fetch prior HandoffContext so dead_ends are injected into the sub-agent prompt.
+        let prior_handoff: Option<HandoffContext> =
+            if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
+                store
+                    .get(lid, &tid.0)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.runtime.handoff)
+            } else {
+                None
+            };
         let (preset_name, preset) = self.resolve_preset(&params).await?;
         let explicit_model = str_param(&params, "model").map(String::from);
         let model_id = explicit_model
@@ -290,7 +372,9 @@ impl AgentTool for SpawnAgentTool {
         });
 
         // Build filtered tool registry from policy knobs.
-        let sub_tools = self.build_sub_tools(&allow_tools, &deny_tools, delegate_only);
+        // When no explicit allow_tools are specified, the selector automatically
+        // scopes tools based on the task description.
+        let sub_tools = self.build_sub_tools(task, &allow_tools, &deny_tools, delegate_only);
 
         // Build system prompt.
         let mut system_prompt = if context.is_empty() {
@@ -316,6 +400,16 @@ impl AgentTool for SpawnAgentTool {
             system_prompt.push_str(extra);
         }
 
+        // Inject prior HandoffContext (dead-ends, last failure) into the system prompt
+        // so this attempt knows what has already been tried.
+        if let Some(ref handoff) = prior_handoff {
+            let ctx = handoff.as_prompt_context();
+            if !ctx.is_empty() {
+                system_prompt.push_str("\n\n---\n\n");
+                system_prompt.push_str(&ctx);
+            }
+        }
+
         // Build tool context with incremented depth and propagated session key.
         let mut tool_context = serde_json::json!({
             SPAWN_DEPTH_KEY: depth + 1,
@@ -323,6 +417,53 @@ impl AgentTool for SpawnAgentTool {
         if let Some(session_key) = params.get("_session_key") {
             tool_context["_session_key"] = session_key.clone();
         }
+
+        // Set initial lease on the linked task before starting the agent loop.
+        if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
+            let new_exp = OffsetDateTime::now_utc()
+                + time::Duration::seconds(self.tasks_config.lease_duration_secs as i64);
+            let _ = store
+                .apply_transition(
+                    lid,
+                    &tid.0,
+                    None,
+                    &TransitionEvent::RenewLease {
+                        new_expires_at: new_exp,
+                    },
+                )
+                .await;
+        }
+
+        // Spawn a heartbeat task that periodically renews the lease while the agent runs.
+        let heartbeat_handle: Option<tokio::task::JoinHandle<()>> =
+            if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
+                let store = Arc::clone(store);
+                let tid = tid.clone();
+                let lid = lid.clone();
+                let lease_secs = self.tasks_config.lease_duration_secs as i64;
+                let hb_secs = self.tasks_config.lease_heartbeat_interval_secs.max(1);
+                Some(tokio::spawn(async move {
+                    let mut iv = tokio::time::interval(Duration::from_secs(hb_secs));
+                    iv.tick().await; // skip the first immediate tick
+                    loop {
+                        iv.tick().await;
+                        let new_exp =
+                            OffsetDateTime::now_utc() + time::Duration::seconds(lease_secs);
+                        let _ = store
+                            .apply_transition(
+                                &lid,
+                                &tid.0,
+                                None,
+                                &TransitionEvent::RenewLease {
+                                    new_expires_at: new_exp,
+                                },
+                            )
+                            .await;
+                    }
+                }))
+            } else {
+                None
+            };
 
         // Run the sub-agent loop (no event forwarding, no hooks, no history).
         let user_content = moltis_agents::UserContent::text(task);
@@ -351,6 +492,39 @@ impl AgentTool for SpawnAgentTool {
             iterations,
             tool_calls_made,
         });
+
+        // Stop heartbeat — must happen before we apply Complete/Fail.
+        if let Some(h) = heartbeat_handle {
+            h.abort();
+        }
+
+        // Apply task lifecycle transition for linked tasks.
+        if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
+            match &result {
+                Ok(_) => {
+                    let _ = store
+                        .apply_transition(lid, &tid.0, None, &TransitionEvent::Complete)
+                        .await;
+                },
+                Err(err) => {
+                    let class = moltis_agents::runner::classify_error(&err.to_string());
+                    let mut handoff = prior_handoff.clone().unwrap_or_default();
+                    handoff.observed_error = err.to_string();
+                    let _ = store
+                        .apply_transition(
+                            lid,
+                            &tid.0,
+                            None,
+                            &TransitionEvent::Fail {
+                                class,
+                                handoff,
+                                retry_after: None,
+                            },
+                        )
+                        .await;
+                },
+            }
+        }
 
         let result = result?;
 
@@ -641,6 +815,7 @@ mod tests {
         );
 
         let filtered = spawn_tool.build_sub_tools(
+            "test task",
             &[
                 "exec".to_string(),
                 "task_list".to_string(),
@@ -653,6 +828,93 @@ mod tests {
         assert!(filtered.get("task_list").is_none());
         assert!(filtered.get("spawn_agent").is_none());
         assert!(filtered.get("web_fetch").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_sub_tools_respects_global_tool_policy() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "ok".into(),
+            model_id: "mock".into(),
+        });
+        let policy = crate::policy::ToolPolicy {
+            allow: vec!["*".into()],
+            deny: vec!["exec".into()],
+            approval_required: Vec::new(),
+        };
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            registry_with_tools(&["spawn_agent", "exec", "web_fetch", "task_list"]),
+        )
+        .with_tool_policy(policy);
+
+        // Even though exec is in the allow list, global policy denies it.
+        let filtered = spawn_tool.build_sub_tools(
+            "test task",
+            &["exec".to_string(), "web_fetch".to_string()],
+            &[],
+            false,
+        );
+        assert!(
+            filtered.get("exec").is_none(),
+            "global policy should deny exec"
+        );
+        assert!(filtered.get("web_fetch").is_some());
+        assert!(filtered.get("task_list").is_none(), "not in allow list");
+    }
+
+    #[tokio::test]
+    async fn test_build_sub_tools_refreshes_policy_between_calls() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "ok".into(),
+            model_id: "mock".into(),
+        });
+        let runtime_policy = Arc::new(std::sync::RwLock::new(crate::policy::ToolPolicy {
+            allow: vec!["*".into()],
+            deny: vec!["exec".into()],
+            approval_required: Vec::new(),
+        }));
+        let runtime_policy_for_resolver = Arc::clone(&runtime_policy);
+        let resolver: crate::policy::ToolPolicyResolver = Arc::new(move || {
+            runtime_policy_for_resolver
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            registry_with_tools(&["spawn_agent", "exec", "web_fetch"]),
+        )
+        .with_tool_policy_resolver(resolver);
+
+        let first = spawn_tool.build_sub_tools(
+            "test task",
+            &["exec".to_string(), "web_fetch".to_string()],
+            &[],
+            false,
+        );
+        assert!(first.get("exec").is_none());
+        assert!(first.get("web_fetch").is_some());
+
+        {
+            let mut guard = runtime_policy.write().unwrap_or_else(|e| e.into_inner());
+            *guard = crate::policy::ToolPolicy {
+                allow: vec!["*".into()],
+                deny: vec!["web_fetch".into()],
+                approval_required: Vec::new(),
+            };
+        }
+
+        let second = spawn_tool.build_sub_tools(
+            "test task",
+            &["exec".to_string(), "web_fetch".to_string()],
+            &[],
+            false,
+        );
+        assert!(second.get("exec").is_some());
+        assert!(second.get("web_fetch").is_none());
     }
 
     #[tokio::test]
@@ -674,7 +936,7 @@ mod tests {
             ]),
         );
 
-        let filtered = spawn_tool.build_sub_tools(&[], &[], true);
+        let filtered = spawn_tool.build_sub_tools("test task", &[], &[], true);
         assert!(filtered.get("spawn_agent").is_some());
         assert!(filtered.get("sessions_list").is_some());
         assert!(filtered.get("sessions_history").is_some());
@@ -771,6 +1033,142 @@ mod tests {
                 .err()
                 .map(|e| e.to_string().contains("not found"))
                 .unwrap_or(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_lifecycle_completes_on_success() {
+        use {
+            moltis_tasks::{RuntimeState, TaskSpec, TaskStore, TransitionEvent},
+            std::sync::Arc,
+            tempfile::TempDir,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("tasks.db");
+        let store = Arc::new(TaskStore::open(&db_path).await.unwrap());
+
+        // Create a task and claim it so it's Active.
+        let spec = TaskSpec::new("test task", "");
+        let task = store.create("default", spec, vec![]).await.unwrap();
+        let task = store
+            .apply_transition(
+                "default",
+                &task.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".to_string(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(task.runtime.state.is_active());
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "done".into(),
+            model_id: "mock".into(),
+        });
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_task_store(Arc::clone(&store));
+
+        let params = serde_json::json!({
+            "task": "do work",
+            "task_id": task.id.0,
+            "list_id": "default",
+        });
+        spawn_tool.execute(params).await.unwrap();
+
+        let updated = store.get("default", &task.id.0).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                updated.runtime.state,
+                RuntimeState::Terminal(moltis_tasks::TerminalState::Completed)
+            ),
+            "expected Completed, got {:?}",
+            updated.runtime.state
+        );
+    }
+
+    /// Verify that `with_tasks_config` is wired correctly: the initial `RenewLease`
+    /// fires before the agent loop (visible in the event log) and the task ends
+    /// Completed regardless of a custom lease config.
+    #[tokio::test]
+    async fn test_tasks_config_initial_lease_renew_fires() {
+        use {
+            moltis_config::schema::TasksConfig,
+            moltis_tasks::{RuntimeState, TaskSpec, TaskStore, TransitionEvent},
+            tempfile::TempDir,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("tasks.db");
+        let store = Arc::new(TaskStore::open(&db_path).await.unwrap());
+
+        // Create a task and claim it (no lease, so lease_expires_at starts as None).
+        let spec = TaskSpec::new("lease-test", "");
+        let task = store.create("lst", spec, vec![]).await.unwrap();
+        store
+            .apply_transition(
+                "lst",
+                &task.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "done".into(),
+            model_id: "mock".into(),
+        });
+        let custom_cfg = TasksConfig {
+            lease_duration_secs: 7200,
+            lease_heartbeat_interval_secs: 300,
+            ..TasksConfig::default()
+        };
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_task_store(Arc::clone(&store))
+        .with_tasks_config(custom_cfg);
+
+        spawn_tool
+            .execute(serde_json::json!({
+                "task": "do work",
+                "task_id": task.id.0,
+                "list_id": "lst",
+            }))
+            .await
+            .unwrap();
+
+        // Task must be terminal after a successful run.
+        let final_task = store.get("lst", &task.id.0).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                final_task.runtime.state,
+                RuntimeState::Terminal(moltis_tasks::TerminalState::Completed)
+            ),
+            "expected Completed, got {:?}",
+            final_task.runtime.state
+        );
+
+        // The event log must contain a RenewLease entry — proof the pre-loop
+        // lease set fired with the custom config.
+        let history = store.event_log().history("lst", &task.id.0).await.unwrap();
+        let has_renew = history.iter().any(|e| e.event_type == "RenewLease");
+        assert!(
+            has_renew,
+            "expected a RenewLease event in log; got: {history:?}"
         );
     }
 }

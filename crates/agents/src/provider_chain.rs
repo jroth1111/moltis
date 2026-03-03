@@ -623,9 +623,11 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_rejects_primary_then_fallback_succeeds() {
-        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
-        cfg.enabled = true;
-        cfg.wait_on_limit = false;
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig {
+            enabled: true,
+            wait_on_limit: false,
+            ..Default::default()
+        };
         cfg.defaults.max_requests_per_window = 0;
         cfg.providers.insert(
             "success".to_string(),
@@ -709,9 +711,11 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_rate_limiter_rejects_primary_then_uses_fallback() {
-        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
-        cfg.enabled = true;
-        cfg.wait_on_limit = false;
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig {
+            enabled: true,
+            wait_on_limit: false,
+            ..Default::default()
+        };
         cfg.defaults.max_requests_per_window = 10;
         let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
         limiter.note_retry_after_ms("streaming-text", "primary", 10_000);
@@ -740,9 +744,11 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_rate_limiter_waits_then_uses_primary() {
-        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
-        cfg.enabled = true;
-        cfg.wait_on_limit = true;
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig {
+            enabled: true,
+            wait_on_limit: true,
+            ..Default::default()
+        };
         cfg.defaults.max_requests_per_window = 10;
         let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
         limiter.note_retry_after_ms("streaming-text", "primary", 40);

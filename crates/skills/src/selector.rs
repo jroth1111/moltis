@@ -71,9 +71,11 @@ pub fn select_skills<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::types::{SkillMetadata, SkillRequirements};
-    use std::path::PathBuf;
+    use {
+        super::*,
+        crate::types::{SkillMetadata, SkillRequirements},
+        std::path::PathBuf,
+    };
 
     fn mock_skill(name: &str, description: &str) -> SkillMetadata {
         SkillMetadata {

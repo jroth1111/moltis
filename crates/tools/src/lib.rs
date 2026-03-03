@@ -8,6 +8,7 @@
 
 pub mod approval;
 pub mod branch_session;
+pub mod tool_selector;
 
 pub mod error;
 pub mod params;
@@ -57,6 +58,7 @@ pub mod policy;
 pub mod process;
 pub mod sandbox;
 pub mod sandbox_packages;
+pub mod sandbox_pool;
 pub mod send_image;
 pub mod session_state;
 pub mod sessions_communicate;

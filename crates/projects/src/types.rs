@@ -33,6 +33,22 @@ pub struct ContextFile {
     pub content: String,
 }
 
+/// A path-scoped rule loaded from a `.rules.md` file in the directory hierarchy.
+///
+/// Rules are discovered by walking from the project root down to the target
+/// file's parent directory. Each level may contain `.rules.md` and/or
+/// `.claude/rules/*.md` files. An optional `globs:` front-matter key limits
+/// the rule to matching file paths.
+#[derive(Debug, Clone)]
+pub struct ScopedRule {
+    /// Path of the `.rules.md` (or `.claude/rules/X.md`) file.
+    pub source_path: PathBuf,
+    /// Rule body with front matter stripped.
+    pub body: String,
+    /// Glob patterns from front matter. `None` means the rule applies unconditionally.
+    pub globs: Option<Vec<String>>,
+}
+
 /// Aggregated context for a project: the project itself plus all loaded context files.
 #[derive(Debug, Clone)]
 pub struct ProjectContext {

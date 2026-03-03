@@ -264,6 +264,10 @@ impl AgentTool for ExecTool {
         "exec"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["code", "files"]
+    }
+
     fn description(&self) -> &str {
         "Execute a shell command on the server. Returns stdout, stderr, and exit code."
     }
@@ -402,8 +406,11 @@ impl AgentTool for ExecTool {
             "exec tool invoked"
         );
 
-        // Approval gating.
-        if !is_sandboxed && let Some(ref mgr) = self.approval_manager {
+        // Approval gating: gate on runs_on_host (the authoritative variable for
+        // whether execution is container-isolated) rather than !is_sandboxed.
+        // This ensures restricted-host sessions — where is_sandboxed may be true
+        // but has_container_backend is false — still enforce approval checks.
+        if runs_on_host && let Some(ref mgr) = self.approval_manager {
             let action = mgr.check_command(command).await?;
             if action == ApprovalAction::NeedsApproval {
                 info!(command, "command needs approval, waiting...");
@@ -479,7 +486,10 @@ impl AgentTool for ExecTool {
         let result = if let Some(ref router) = self.sandbox_router {
             let sk = session_key.unwrap_or("main");
             if is_sandboxed {
-                let id = router.sandbox_id_for(sk);
+                // Try to acquire a pool slot (no-op if pool is unset or this
+                // session already holds one). Falls back to on-demand sandbox.
+                router.try_acquire_pool_slot(sk).await;
+                let id = router.resolve_sandbox_id(sk).await;
                 let image = router.resolve_image(sk, None).await;
                 let backend = router.backend();
                 info!(session = sk, sandbox_id = %id, backend = backend.backend_name(), image, "sandbox ensure_ready");
@@ -1424,5 +1434,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["exit_code"], 0);
+    }
+
+    // ── restricted-host approval tests ──────────────────────────────────────
+
+    /// `restricted-host` backend executes on the host even when `sandbox_id`
+    /// is set (making `is_sandboxed=true`). The approval gate must fire because
+    /// `runs_on_host=true` (has_container_backend=false for "restricted-host").
+    #[tokio::test]
+    async fn restricted_host_runs_on_host_fires_approval() {
+        use crate::{
+            approval::ApprovalMode,
+            sandbox::{RestrictedHostSandbox, SandboxConfig, SandboxScope},
+        };
+
+        let mut mgr = ApprovalManager::default();
+        mgr.mode = ApprovalMode::Always;
+        let mgr = Arc::new(mgr);
+        let bc = Arc::new(TestBroadcaster::new());
+        let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
+
+        let sandbox: Arc<dyn Sandbox> =
+            Arc::new(RestrictedHostSandbox::new(SandboxConfig::default()));
+        let id = SandboxId {
+            scope: SandboxScope::Session,
+            key: "rh-test".into(),
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Pre-approve so the test doesn't hang.
+        let mgr2 = Arc::clone(&mgr);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let ids = mgr2.pending_ids().await;
+            if let Some(id) = ids.first() {
+                mgr2.resolve(id, ApprovalDecision::Approved, Some("echo rh"))
+                    .await;
+            }
+        });
+
+        let mut tool = ExecTool::default()
+            .with_sandbox(sandbox, id)
+            .with_approval(Arc::clone(&mgr), bc_dyn);
+        tool.working_dir = Some(temp_dir.path().to_path_buf());
+        let _ = tool
+            .execute(serde_json::json!({ "command": "echo rh" }))
+            .await;
+
+        // Broadcaster must have been called — approval gate fired.
+        assert!(
+            bc.called.load(Ordering::SeqCst),
+            "approval broadcast must fire for restricted-host"
+        );
+    }
+
+    /// With `SecurityLevel::Deny` on a restricted-host session, exec must
+    /// return an error without running the command.
+    #[tokio::test]
+    async fn restricted_host_deny_security_level_blocks() {
+        use crate::{
+            approval::{ApprovalMode, SecurityLevel},
+            sandbox::{RestrictedHostSandbox, SandboxConfig, SandboxScope},
+        };
+
+        let mut mgr = ApprovalManager::default();
+        mgr.mode = ApprovalMode::Always;
+        mgr.security_level = SecurityLevel::Deny;
+        let mgr = Arc::new(mgr);
+        let bc = Arc::new(TestBroadcaster::new());
+        let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
+
+        let sandbox: Arc<dyn Sandbox> =
+            Arc::new(RestrictedHostSandbox::new(SandboxConfig::default()));
+        let id = SandboxId {
+            scope: SandboxScope::Session,
+            key: "rh-deny".into(),
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut tool = ExecTool::default()
+            .with_sandbox(sandbox, id)
+            .with_approval(Arc::clone(&mgr), bc_dyn);
+        tool.working_dir = Some(temp_dir.path().to_path_buf());
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo denied" }))
+            .await;
+
+        assert!(result.is_err(), "SecurityLevel::Deny must block exec");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("deny"), "error must mention deny: {msg}");
+        // No broadcast should occur — Deny returns early before creating a request.
+        assert!(
+            !bc.called.load(Ordering::SeqCst),
+            "broadcast must not fire for Deny"
+        );
+    }
+
+    /// A real container backend (backend_name = "docker") with `sandbox_id`
+    /// set makes `runs_on_host=false`, so the approval gate must be skipped.
+    #[tokio::test]
+    async fn container_backend_skips_approval() {
+        use crate::sandbox::SandboxScope;
+
+        let mut mgr = ApprovalManager::default();
+        // ApprovalMode::Always — would fire for every host command.
+        mgr.mode = crate::approval::ApprovalMode::Always;
+        let mgr = Arc::new(mgr);
+        let bc = Arc::new(TestBroadcaster::new());
+        let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
+
+        // CaptureWorkingDirSandbox has backend_name="docker" (real container backend).
+        let sandbox: Arc<dyn Sandbox> = Arc::new(CaptureWorkingDirSandbox::default());
+        let id = SandboxId {
+            scope: SandboxScope::Session,
+            key: "docker-test".into(),
+        };
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut tool = ExecTool::default()
+            .with_sandbox(sandbox, id)
+            .with_approval(Arc::clone(&mgr), bc_dyn);
+        tool.working_dir = Some(temp_dir.path().to_path_buf());
+        // Should succeed without triggering the approval flow.
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo container" }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "container exec must succeed without approval"
+        );
+        // Broadcaster must NOT have been called — approval gate was skipped.
+        assert!(
+            !bc.called.load(Ordering::SeqCst),
+            "approval broadcast must not fire for container backend"
+        );
     }
 }

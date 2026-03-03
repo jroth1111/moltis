@@ -3,11 +3,13 @@
 //! This module provides concrete implementations of the `TtsService` and
 //! `SttService` traits using the moltis-voice crate's providers.
 
+#[cfg(feature = "voice")]
 use {
     async_trait::async_trait,
     serde_json::{Value, json},
 };
 
+#[cfg(feature = "voice")]
 use crate::services::{ServiceError, ServiceResult};
 
 #[cfg(feature = "voice")]

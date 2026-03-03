@@ -654,6 +654,10 @@ impl AgentTool for CronTool {
         "cron"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["scheduling"]
+    }
+
     fn description(&self) -> &str {
         "Manage scheduled tasks (reminders, recurring jobs, cron schedules).\n\
          \n\

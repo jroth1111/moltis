@@ -663,6 +663,10 @@ impl AgentTool for WebSearchTool {
         "web_search"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["web"]
+    }
+
     fn description(&self) -> &str {
         "Search the web and return results. Use this when you need up-to-date information, \
          current events, or facts you're unsure about. Results are localized to the \

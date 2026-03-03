@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::str::FromStr;
+use {
+    serde::{Deserialize, Serialize},
+    std::{fmt, str::FromStr},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
