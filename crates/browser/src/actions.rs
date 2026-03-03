@@ -360,7 +360,15 @@ mod tests {
     fn press_key_named_key_has_empty_text() {
         // Multi-char key names must not carry text (per CDP spec, keyDown text
         // is the character produced; named keys produce no character)
-        for key in ["Enter", "Escape", "Tab", "Backspace", "ArrowDown", "ArrowUp", "F5"] {
+        for key in [
+            "Enter",
+            "Escape",
+            "Tab",
+            "Backspace",
+            "ArrowDown",
+            "ArrowUp",
+            "F5",
+        ] {
             let text = if key.chars().count() == 1 {
                 key.to_string()
             } else {
@@ -410,14 +418,8 @@ mod tests {
             let t = step as f64 / DRAG_STEPS as f64;
             let x = from_x + (to_x - from_x) * t;
             let y = from_y + (to_y - from_y) * t;
-            assert!(
-                x > 0.0 && x <= 100.0,
-                "step {step}: x={x} out of [0, 100]"
-            );
-            assert!(
-                y > 0.0 && y <= 200.0,
-                "step {step}: y={y} out of [0, 200]"
-            );
+            assert!(x > 0.0 && x <= 100.0, "step {step}: x={x} out of [0, 100]");
+            assert!(y > 0.0 && y <= 200.0, "step {step}: y={y} out of [0, 200]");
         }
 
         // Final step must reach the destination exactly

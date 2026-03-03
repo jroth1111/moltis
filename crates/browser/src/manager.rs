@@ -241,6 +241,92 @@ impl BrowserManager {
                 self.upload(session_id, ref_, &path, sandbox).await
             },
             BrowserAction::Clear { ref_ } => self.clear(session_id, ref_, sandbox).await,
+            // Phase 5: Network
+            BrowserAction::InterceptRequests { url_patterns } => {
+                self.intercept_requests(session_id, url_patterns, sandbox, browser)
+                    .await
+            },
+            BrowserAction::StopIntercept => self.stop_intercept(session_id, sandbox, browser).await,
+            BrowserAction::SetExtraHeaders { headers } => {
+                self.set_extra_headers(session_id, headers, sandbox, browser)
+                    .await
+            },
+            BrowserAction::StartHar => self.start_har(session_id, sandbox, browser).await,
+            BrowserAction::StopHar => self.stop_har(session_id, sandbox, browser).await,
+            // Phase 6: Session state
+            BrowserAction::SaveState { name, encrypt } => {
+                self.save_state(session_id, &name, encrypt, sandbox, browser)
+                    .await
+            },
+            BrowserAction::LoadState { name } => {
+                self.load_state(session_id, &name, sandbox, browser).await
+            },
+            BrowserAction::ListStates => self.list_states(session_id, sandbox, browser).await,
+            BrowserAction::DeleteState { name } => {
+                self.delete_state(session_id, &name, sandbox, browser).await
+            },
+            // Phase 7a: Emulation
+            BrowserAction::SetDevice {
+                width,
+                height,
+                device_scale_factor,
+                mobile,
+            } => {
+                self.set_device(
+                    session_id,
+                    width,
+                    height,
+                    device_scale_factor,
+                    mobile,
+                    sandbox,
+                )
+                .await
+            },
+            BrowserAction::SetGeolocation {
+                latitude,
+                longitude,
+                accuracy,
+            } => {
+                self.set_geolocation(session_id, latitude, longitude, accuracy, sandbox)
+                    .await
+            },
+            BrowserAction::SetTimezone { timezone_id } => {
+                self.set_timezone(session_id, &timezone_id, sandbox).await
+            },
+            BrowserAction::SetLocale { locale } => {
+                self.set_locale(session_id, &locale, sandbox).await
+            },
+            BrowserAction::ClearDevice => self.clear_device(session_id, sandbox).await,
+            // Phase 7b: Screencast
+            BrowserAction::StartScreencast {
+                format,
+                quality,
+                every_nth,
+            } => {
+                self.action_start_screencast(
+                    session_id, &format, quality, every_nth, sandbox, browser,
+                )
+                .await
+            },
+            BrowserAction::StopScreencast => {
+                self.action_stop_screencast(session_id, sandbox, browser)
+                    .await
+            },
+            BrowserAction::GetScreencastFrame => {
+                self.action_get_screencast_frame(session_id, sandbox, browser)
+                    .await
+            },
+            // Phase 7c: Tabs
+            BrowserAction::TabNew { name } => {
+                self.tab_new(session_id, &name, sandbox, browser).await
+            },
+            BrowserAction::TabList => self.tab_list(session_id, sandbox, browser).await,
+            BrowserAction::TabSwitch { name } => {
+                self.tab_switch(session_id, &name, sandbox, browser).await
+            },
+            BrowserAction::TabClose { name } => {
+                self.tab_close(session_id, &name, sandbox, browser).await
+            },
             BrowserAction::Close => self.close(session_id, sandbox).await,
         };
 
@@ -462,7 +548,11 @@ impl BrowserManager {
         // Dispatch mouse events — behavioral (Bezier + timing) or instant
         #[cfg(feature = "stealth")]
         if self.config.stealth.enabled && self.config.stealth.behavioral {
-            crate::stealth::behavior::realistic_click(&page, x, y).await?;
+            let from = self.pool.get_mouse_pos(&sid).await;
+            crate::stealth::behavior::realistic_click(&page, from, x, y).await?;
+            self.pool.set_mouse_pos(&sid, (x, y)).await;
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!(moltis_metrics::browser::BEHAVIORAL_CLICKS_TOTAL).increment(1);
             debug!(
                 session_id = sid,
                 ref_ = ref_,
@@ -515,6 +605,8 @@ impl BrowserManager {
         #[cfg(feature = "stealth")]
         if self.config.stealth.enabled && self.config.stealth.behavioral {
             crate::stealth::behavior::realistic_type(&page, text).await?;
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!(moltis_metrics::browser::BEHAVIORAL_TYPES_TOTAL).increment(1);
         } else {
             self.instant_type(&page, text).await?;
         }
@@ -781,7 +873,9 @@ impl BrowserManager {
 
         #[cfg(feature = "stealth")]
         if self.config.stealth.enabled && self.config.stealth.behavioral {
-            crate::stealth::behavior::bezier_mouse_move(&page, (0.0, 0.0), (x, y)).await?;
+            let from = self.pool.get_mouse_pos(&sid).await;
+            crate::stealth::behavior::bezier_mouse_move(&page, from, (x, y)).await?;
+            self.pool.set_mouse_pos(&sid, (x, y)).await;
         } else {
             crate::actions::hover_instant(&page, x, y).await?;
         }
@@ -809,7 +903,9 @@ impl BrowserManager {
         // Move to element (behavioral or instant) then fire the double-click events
         #[cfg(feature = "stealth")]
         if self.config.stealth.enabled && self.config.stealth.behavioral {
-            crate::stealth::behavior::bezier_mouse_move(&page, (0.0, 0.0), (x, y)).await?;
+            let from = self.pool.get_mouse_pos(&sid).await;
+            crate::stealth::behavior::bezier_mouse_move(&page, from, (x, y)).await?;
+            self.pool.set_mouse_pos(&sid, (x, y)).await;
         } else {
             crate::actions::hover_instant(&page, x, y).await?;
         }
@@ -818,7 +914,13 @@ impl BrowserManager {
         crate::actions::hover_instant(&page, x, y).await?;
 
         crate::actions::double_click_events(&page, x, y).await?;
-        debug!(session_id = sid, ref_ = ref_, x, y, "double-clicked element");
+        debug!(
+            session_id = sid,
+            ref_ = ref_,
+            x,
+            y,
+            "double-clicked element"
+        );
         Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
     }
 
@@ -852,7 +954,8 @@ impl BrowserManager {
         #[cfg(feature = "stealth")]
         if self.config.stealth.enabled && self.config.stealth.behavioral {
             // Bezier approach to source → press → bezier drag to destination → release
-            crate::stealth::behavior::bezier_mouse_move(&page, (0.0, 0.0), (from_x, from_y))
+            let current_pos = self.pool.get_mouse_pos(&sid).await;
+            crate::stealth::behavior::bezier_mouse_move(&page, current_pos, (from_x, from_y))
                 .await?;
             let press = DispatchMouseEventParams::builder()
                 .r#type(DispatchMouseEventType::MousePressed)
@@ -878,6 +981,7 @@ impl BrowserManager {
             page.execute(release)
                 .await
                 .map_err(|e| Error::Cdp(e.to_string()))?;
+            self.pool.set_mouse_pos(&sid, (to_x, to_y)).await;
         } else {
             crate::actions::drag_instant(&page, from_x, from_y, to_x, to_y).await?;
         }
@@ -885,12 +989,7 @@ impl BrowserManager {
         #[cfg(not(feature = "stealth"))]
         crate::actions::drag_instant(&page, from_x, from_y, to_x, to_y).await?;
 
-        debug!(
-            session_id = sid,
-            from_ref,
-            to_ref,
-            "dragged element"
-        );
+        debug!(session_id = sid, from_ref, to_ref, "dragged element");
         Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
     }
 
@@ -1070,6 +1169,372 @@ impl BrowserManager {
             .map_err(|e| Error::JsEvalFailed(e.to_string()))?;
 
         Ok(())
+    }
+
+    // ── Phase 5: Network interception & HAR ────────────────────────────────
+
+    async fn intercept_requests(
+        &self,
+        session_id: Option<&str>,
+        url_patterns: Vec<String>,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+
+        let start = Instant::now();
+        self.pool
+            .enable_interception(&sid, url_patterns, Default::default())
+            .await?;
+
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn stop_intercept(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "stop_intercept")?;
+        let start = Instant::now();
+        self.pool.disable_interception(&sid).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn set_extra_headers(
+        &self,
+        session_id: Option<&str>,
+        headers: std::collections::HashMap<String, String>,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+        let start = Instant::now();
+        self.pool.set_extra_headers(&sid, headers).await;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn start_har(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+        let start = Instant::now();
+        self.pool.start_har(&sid).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn stop_har(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "stop_har")?;
+        let start = Instant::now();
+        let har = self.pool.stop_har(&sid).await;
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        if let Some(har_json) = har {
+            resp = resp.with_result(har_json);
+        }
+        Ok((sid, resp))
+    }
+
+    // ── Phase 6: Session state ──────────────────────────────────────────────
+
+    async fn save_state(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        encrypt: bool,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "save_state")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        let state = crate::session_state::capture_state(&page).await?;
+        let path = crate::session_state::save_to_disk(&state, name, encrypt)?;
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        resp = resp.with_url(path.to_string_lossy().into_owned());
+        Ok((sid, resp))
+    }
+
+    async fn load_state(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "load_state")?;
+        let start = Instant::now();
+        let state = crate::session_state::load_from_disk(name)?;
+        let page = self.pool.get_page(&sid).await?;
+        crate::session_state::restore_state(&page, &state).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn list_states(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = session_id
+            .map(String::from)
+            .unwrap_or_else(|| "no-session".to_string());
+        let start = Instant::now();
+        let names = crate::session_state::list_saved()?;
+        let json = serde_json::json!({"states": names});
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        resp = resp.with_result(json);
+        Ok((sid, resp))
+    }
+
+    async fn delete_state(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = session_id
+            .map(String::from)
+            .unwrap_or_else(|| "no-session".to_string());
+        let start = Instant::now();
+        crate::session_state::delete_saved(name)?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    // ── Phase 7a: Emulation ─────────────────────────────────────────────────
+
+    async fn set_device(
+        &self,
+        session_id: Option<&str>,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+        mobile: bool,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "set_device")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::set_device(&page, width, height, device_scale_factor, mobile).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn set_geolocation(
+        &self,
+        session_id: Option<&str>,
+        latitude: f64,
+        longitude: f64,
+        accuracy: f64,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "set_geolocation")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::set_geolocation(&page, latitude, longitude, accuracy).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn set_timezone(
+        &self,
+        session_id: Option<&str>,
+        timezone_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "set_timezone")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::set_timezone(&page, timezone_id).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn set_locale(
+        &self,
+        session_id: Option<&str>,
+        locale: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "set_locale")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::set_locale(&page, locale).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn clear_device(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "clear_device")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::clear_device_override(&page).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    // ── Phase 7b: Screencast ────────────────────────────────────────────────
+
+    async fn action_start_screencast(
+        &self,
+        session_id: Option<&str>,
+        format: &str,
+        quality: u8,
+        every_nth: u32,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+        let start = Instant::now();
+        self.pool
+            .start_screencast(&sid, format, quality, every_nth)
+            .await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn action_stop_screencast(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "stop_screencast")?;
+        let start = Instant::now();
+        self.pool.stop_screencast(&sid).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn action_get_screencast_frame(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "get_screencast_frame")?;
+        let start = Instant::now();
+        let frame_b64 = self.pool.get_screencast_frame(&sid).await;
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        if let Some(b64) = frame_b64 {
+            resp = resp.with_result(serde_json::json!({"frame": b64}));
+        }
+        Ok((sid, resp))
+    }
+
+    // ── Phase 7c: Tabs ──────────────────────────────────────────────────────
+
+    async fn tab_new(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+        let start = Instant::now();
+        self.pool.new_tab(&sid, name).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn tab_list(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = session_id
+            .map(String::from)
+            .unwrap_or_else(|| "no-session".to_string());
+        let start = Instant::now();
+        let tabs = self.pool.list_tabs(&sid).await;
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        resp = resp.with_result(serde_json::json!({"tabs": tabs}));
+        Ok((sid, resp))
+    }
+
+    async fn tab_switch(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "tab_switch")?;
+        let start = Instant::now();
+        self.pool.switch_tab(&sid, name).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn tab_close(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "tab_close")?;
+        let start = Instant::now();
+        self.pool.close_tab(&sid, name).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
     }
 
     /// Close a specific browser session by ID.

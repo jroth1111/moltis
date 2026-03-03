@@ -32,9 +32,13 @@
 pub mod actions;
 pub mod container;
 pub mod detect;
+pub mod emulation;
 pub mod error;
 pub mod manager;
+pub mod network;
 pub mod pool;
+pub mod screencast;
+pub mod session_state;
 pub mod snapshot;
 pub mod types;
 

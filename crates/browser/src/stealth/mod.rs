@@ -117,6 +117,9 @@ pub async fn inject_stealth(page: &Page, config: &StealthConfig) -> Result<(), E
         .await
         .map_err(|e| Error::Cdp(format!("failed to set stealth user agent: {e}")))?;
 
+    #[cfg(feature = "metrics")]
+    moltis_metrics::counter!(moltis_metrics::browser::STEALTH_INJECTIONS_TOTAL).increment(1);
+
     Ok(())
 }
 

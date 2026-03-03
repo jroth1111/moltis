@@ -71,16 +71,16 @@ pub async fn bezier_mouse_move(page: &Page, from: (f64, f64), to: (f64, f64)) ->
 /// Click at `(x, y)` with realistic Bezier mouse movement and randomised timing.
 ///
 /// Sequence:
-/// 1. Bezier move from (0, 0) to the target
+/// 1. Bezier move from `from` to the target
 /// 2. 50–150 ms pre-click pause
 /// 3. MousePressed (left button, click_count = 1)
 /// 4. 50–150 ms button-held pause
 /// 5. MouseReleased
-pub async fn realistic_click(page: &Page, x: f64, y: f64) -> Result<(), Error> {
+pub async fn realistic_click(page: &Page, from: (f64, f64), x: f64, y: f64) -> Result<(), Error> {
     let mut rng = rand::rng();
 
     // Move to the target
-    bezier_mouse_move(page, (0.0, 0.0), (x, y)).await?;
+    bezier_mouse_move(page, from, (x, y)).await?;
 
     // Pre-click pause
     let pre_ms: u64 = 50 + rng.random_range(0_u64..100_u64);

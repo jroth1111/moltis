@@ -20,7 +20,7 @@ pub struct StealthConfig {
     pub enabled: bool,
     /// Inject the 16-evasion JS script via `addScriptToEvaluateOnNewDocument`.
     pub js_evasion: bool,
-    /// Add the 21 stealth Chrome launch flags.
+    /// Add the 19 stealth Chrome launch flags.
     pub stealth_args: bool,
     /// Use Bezier mouse movement and randomised keyboard timing.
     pub behavioral: bool,
@@ -159,8 +159,127 @@ pub enum BrowserAction {
     /// the change, then fires `input` + `change` events.
     Clear { ref_: u32 },
 
+    // ── Phase 5: Network interception & HAR ────────────────────────────────
+    /// Enable CDP `Fetch` domain to intercept matching requests.
+    ///
+    /// `url_patterns` is a list of URL wildcard patterns (e.g. `["*api*"]`).
+    /// An empty list intercepts all requests.
+    InterceptRequests {
+        #[serde(default)]
+        url_patterns: Vec<String>,
+    },
+
+    /// Disable request interception (stops a running intercept + HAR session).
+    StopIntercept,
+
+    /// Inject extra HTTP headers into every subsequent intercepted request.
+    SetExtraHeaders {
+        headers: std::collections::HashMap<String, String>,
+    },
+
+    /// Begin accumulating network requests into a HAR 1.2 log.
+    StartHar,
+
+    /// Stop HAR recording and return the captured HAR JSON in `response.result`.
+    StopHar,
+
+    // ── Phase 6: Session state ─────────────────────────────────────────────
+    /// Capture cookies + storage and save them to disk.
+    SaveState {
+        name: String,
+        #[serde(default)]
+        encrypt: bool,
+    },
+
+    /// Load a previously saved session state and restore cookies + storage.
+    LoadState { name: String },
+
+    /// List saved session state names (returned in `response.result`).
+    ListStates,
+
+    /// Delete a saved session state by name.
+    DeleteState { name: String },
+
+    // ── Phase 7a: Emulation overrides ──────────────────────────────────────
+    /// Override viewport size and device emulation.
+    SetDevice {
+        width: u32,
+        height: u32,
+        #[serde(default = "default_device_scale_factor")]
+        device_scale_factor: f64,
+        #[serde(default)]
+        mobile: bool,
+    },
+
+    /// Override the GPS location reported to the page.
+    SetGeolocation {
+        latitude: f64,
+        longitude: f64,
+        #[serde(default = "default_geo_accuracy")]
+        accuracy: f64,
+    },
+
+    /// Override the timezone reported to the page.
+    SetTimezone { timezone_id: String },
+
+    /// Override the locale reported to the page.
+    SetLocale { locale: String },
+
+    /// Clear any active device-metrics override and restore original viewport.
+    ClearDevice,
+
+    // ── Phase 7b: Screencast ───────────────────────────────────────────────
+    /// Start streaming page frames via the CDP screencast API.
+    StartScreencast {
+        #[serde(default = "default_screencast_format")]
+        format: String,
+        #[serde(default = "default_screencast_quality")]
+        quality: u8,
+        #[serde(default = "default_every_nth")]
+        every_nth: u32,
+    },
+
+    /// Stop the active screencast session.
+    StopScreencast,
+
+    /// Retrieve the most recent screencast frame as a base64 image in `response.result`.
+    GetScreencastFrame,
+
+    // ── Phase 7c: Tab management ───────────────────────────────────────────
+    /// Open a new browser tab with the given name and switch to it.
+    TabNew { name: String },
+
+    /// List all open tab names (returned in `response.result`).
+    TabList,
+
+    /// Switch the active tab to `name`.
+    TabSwitch { name: String },
+
+    /// Close the tab named `name` (cannot close `"main"`).
+    TabClose { name: String },
+
     /// Close the browser session.
     Close,
+}
+
+fn default_device_scale_factor() -> f64 {
+    1.0
+}
+
+fn default_geo_accuracy() -> f64 {
+    1.0
+}
+
+fn default_screencast_format() -> String {
+    "jpeg".to_string()
+}
+
+fn default_screencast_quality() -> u8 {
+    80
+}
+
+fn default_every_nth() -> u32 {
+    1
 }
 
 fn default_wait_timeout_ms() -> u64 {
@@ -282,6 +401,41 @@ impl fmt::Display for BrowserAction {
             Self::Press { key } => write!(f, "press(key={key})"),
             Self::Upload { ref_, .. } => write!(f, "upload(ref={ref_})"),
             Self::Clear { ref_ } => write!(f, "clear(ref={ref_})"),
+            Self::InterceptRequests { url_patterns } => {
+                write!(f, "intercept_requests(patterns={})", url_patterns.len())
+            },
+            Self::StopIntercept => write!(f, "stop_intercept"),
+            Self::SetExtraHeaders { headers } => {
+                write!(f, "set_extra_headers(count={})", headers.len())
+            },
+            Self::StartHar => write!(f, "start_har"),
+            Self::StopHar => write!(f, "stop_har"),
+            Self::SaveState { name, .. } => write!(f, "save_state(name={name})"),
+            Self::LoadState { name } => write!(f, "load_state(name={name})"),
+            Self::ListStates => write!(f, "list_states"),
+            Self::DeleteState { name } => write!(f, "delete_state(name={name})"),
+            Self::SetDevice { width, height, .. } => {
+                write!(f, "set_device({width}x{height})")
+            },
+            Self::SetGeolocation {
+                latitude,
+                longitude,
+                ..
+            } => {
+                write!(f, "set_geolocation({latitude},{longitude})")
+            },
+            Self::SetTimezone { timezone_id } => write!(f, "set_timezone({timezone_id})"),
+            Self::SetLocale { locale } => write!(f, "set_locale({locale})"),
+            Self::ClearDevice => write!(f, "clear_device"),
+            Self::StartScreencast { format, .. } => {
+                write!(f, "start_screencast(format={format})")
+            },
+            Self::StopScreencast => write!(f, "stop_screencast"),
+            Self::GetScreencastFrame => write!(f, "get_screencast_frame"),
+            Self::TabNew { name } => write!(f, "tab_new(name={name})"),
+            Self::TabList => write!(f, "tab_list"),
+            Self::TabSwitch { name } => write!(f, "tab_switch(name={name})"),
+            Self::TabClose { name } => write!(f, "tab_close(name={name})"),
             Self::Close => write!(f, "close"),
         }
     }
