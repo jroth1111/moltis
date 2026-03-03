@@ -21,16 +21,16 @@ mod sandbox_commands;
 #[cfg(all(feature = "gateway", feature = "tailscale"))]
 mod tailscale_commands;
 
+#[cfg(not(feature = "gateway"))]
+use clap::CommandFactory;
+#[cfg(feature = "gateway")]
+use moltis_gateway::logs::{EnabledLogLevels, LogBroadcastLayer, LogBuffer};
 use {
     anyhow::anyhow,
     clap::{Parser, Subcommand},
     tracing::info,
     tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt},
 };
-#[cfg(feature = "gateway")]
-use moltis_gateway::logs::{EnabledLogLevels, LogBroadcastLayer, LogBuffer};
-#[cfg(not(feature = "gateway"))]
-use clap::CommandFactory;
 
 #[derive(Parser)]
 #[command(name = "moltis", about = "Moltis — personal AI gateway", version)]

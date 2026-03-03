@@ -946,7 +946,7 @@ fn local_repo_head_sha(repo_dir: &Path) -> Option<String> {
         Err(_) => {
             tracing::debug!(path = %repo_dir.display(), "skill repo is not a git repository, provenance SHA unavailable");
             return None;
-        }
+        },
     };
     let obj = repo.rev_parse_single("HEAD").ok()?;
     Some(obj.detach().to_hex().to_string())
@@ -1507,11 +1507,9 @@ mod tests {
 
     #[test]
     fn install_dep_proceed_is_allowed() {
-        assert!(ensure_install_dep_approval(
-            ApprovalAction::Proceed,
-            "cargo install ripgrep"
-        )
-        .is_ok());
+        assert!(
+            ensure_install_dep_approval(ApprovalAction::Proceed, "cargo install ripgrep").is_ok()
+        );
     }
 
     #[test]

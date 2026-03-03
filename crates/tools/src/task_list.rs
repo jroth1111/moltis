@@ -313,7 +313,6 @@ impl TaskStore {
                 }
             }
 
-
             // Validate new blocked_by list.
             if let Some(ref deps) = blocked_by {
                 // Self-reference check.

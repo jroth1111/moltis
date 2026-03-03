@@ -37,7 +37,11 @@ impl BroadcastEvent {
         })
     }
 
-    pub fn session(kind: SessionEventKind, session_key: impl Into<String>, version: Option<u64>) -> Self {
+    pub fn session(
+        kind: SessionEventKind,
+        session_key: impl Into<String>,
+        version: Option<u64>,
+    ) -> Self {
         Self::Session(SessionEventPayload {
             kind,
             session_key: session_key.into(),
@@ -114,7 +118,9 @@ impl BroadcastEvent {
             Self::NodePairRequested(payload) => {
                 ("node.pair.requested", serde_json::to_value(payload)?)
             },
-            Self::NodePairResolved(payload) => ("node.pair.resolved", serde_json::to_value(payload)?),
+            Self::NodePairResolved(payload) => {
+                ("node.pair.resolved", serde_json::to_value(payload)?)
+            },
             Self::DevicePairResolved(payload) => {
                 ("device.pair.resolved", serde_json::to_value(payload)?)
             },
@@ -315,7 +321,10 @@ mod tests {
             Err(err) => panic!("failed to map push event: {err}"),
         };
         assert_eq!(push_message.event.as_ref(), "push.subscriptions");
-        assert_eq!(push_message.payload, serde_json::json!({ "action": "removed" }));
+        assert_eq!(
+            push_message.payload,
+            serde_json::json!({ "action": "removed" })
+        );
     }
 
     #[test]
