@@ -426,7 +426,7 @@ mod tests {
                     output_tokens: 1,
                     ..Default::default()
                 },
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -728,7 +728,7 @@ mod tests {
                     output_tokens: 1,
                     ..Default::default()
                 },
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -839,10 +839,7 @@ mod tests {
 
     #[test]
     fn parse_retry_after_integer() {
-        assert_eq!(
-            parse_retry_after_ms("retry-after: 60"),
-            Some(60_000)
-        );
+        assert_eq!(parse_retry_after_ms("retry-after: 60"), Some(60_000));
     }
 
     #[test]

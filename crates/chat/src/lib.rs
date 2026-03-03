@@ -349,7 +349,9 @@ enum ContextCompactionAction {
 }
 
 #[must_use]
-fn context_compaction_config_from_chat(chat: &moltis_config::ChatConfig) -> ContextCompactionConfig {
+fn context_compaction_config_from_chat(
+    chat: &moltis_config::ChatConfig,
+) -> ContextCompactionConfig {
     let strategy = match chat
         .context_compaction_strategy
         .trim()
@@ -2382,7 +2384,7 @@ fn classify_message_priority(params: &Value) -> MessagePriority {
             "critical" => return MessagePriority::Critical,
             "interactive" => return MessagePriority::Interactive,
             "background" => return MessagePriority::Background,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -2432,7 +2434,10 @@ fn pop_next_message(queue: &mut Vec<QueuedMessage>) -> Option<QueuedMessage> {
     queue.sort_by(|a, b| b.priority.cmp(&a.priority));
 
     // Check for critical messages first - they always win
-    if queue.first().is_some_and(|m| m.priority == MessagePriority::Critical) {
+    if queue
+        .first()
+        .is_some_and(|m| m.priority == MessagePriority::Critical)
+    {
         return Some(queue.remove(0));
     }
 
@@ -10194,14 +10199,18 @@ mod tests {
         // Enqueue two messages.
         {
             let mut q = queue.write().await;
-            q.entry(key.to_string()).or_default().push(QueuedMessage::new(
-                serde_json::json!({"text": "hello"}),
-                MessagePriority::default(),
-            ));
-            q.entry(key.to_string()).or_default().push(QueuedMessage::new(
-                serde_json::json!({"text": "world"}),
-                MessagePriority::default(),
-            ));
+            q.entry(key.to_string())
+                .or_default()
+                .push(QueuedMessage::new(
+                    serde_json::json!({"text": "hello"}),
+                    MessagePriority::default(),
+                ));
+            q.entry(key.to_string())
+                .or_default()
+                .push(QueuedMessage::new(
+                    serde_json::json!({"text": "world"}),
+                    MessagePriority::default(),
+                ));
         }
 
         // Drain.
@@ -10529,9 +10538,18 @@ mod tests {
     #[test]
     fn critical_priority_always_selected_first() {
         let mut queue = vec![
-            QueuedMessage::new(serde_json::json!({"text": "normal"}), MessagePriority::Normal),
-            QueuedMessage::new(serde_json::json!({"text": "critical"}), MessagePriority::Critical),
-            QueuedMessage::new(serde_json::json!({"text": "interactive"}), MessagePriority::Interactive),
+            QueuedMessage::new(
+                serde_json::json!({"text": "normal"}),
+                MessagePriority::Normal,
+            ),
+            QueuedMessage::new(
+                serde_json::json!({"text": "critical"}),
+                MessagePriority::Critical,
+            ),
+            QueuedMessage::new(
+                serde_json::json!({"text": "interactive"}),
+                MessagePriority::Interactive,
+            ),
         ];
 
         let selected = pop_next_message(&mut queue).expect("should have message");
@@ -10542,9 +10560,18 @@ mod tests {
     #[test]
     fn higher_priority_processed_first_when_no_starvation() {
         let mut queue = vec![
-            QueuedMessage::new(serde_json::json!({"text": "background"}), MessagePriority::Background),
-            QueuedMessage::new(serde_json::json!({"text": "interactive"}), MessagePriority::Interactive),
-            QueuedMessage::new(serde_json::json!({"text": "normal"}), MessagePriority::Normal),
+            QueuedMessage::new(
+                serde_json::json!({"text": "background"}),
+                MessagePriority::Background,
+            ),
+            QueuedMessage::new(
+                serde_json::json!({"text": "interactive"}),
+                MessagePriority::Interactive,
+            ),
+            QueuedMessage::new(
+                serde_json::json!({"text": "normal"}),
+                MessagePriority::Normal,
+            ),
         ];
 
         // Interactive should win due to higher weight
@@ -10560,7 +10587,10 @@ mod tests {
     #[test]
     fn no_message_starved_beyond_bound() {
         let mut queue = vec![
-            QueuedMessage::new(serde_json::json!({"text": "high"}), MessagePriority::Interactive),
+            QueuedMessage::new(
+                serde_json::json!({"text": "high"}),
+                MessagePriority::Interactive,
+            ),
             QueuedMessage {
                 params: serde_json::json!({"text": "starved"}),
                 priority: MessagePriority::Background,
@@ -10579,45 +10609,72 @@ mod tests {
     fn classify_message_priority_detects_critical() {
         // Approval requests are critical
         let params = serde_json::json!({"text": "Approval required for this action"});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Critical);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Critical
+        );
 
         // Explicit critical marker
         let params = serde_json::json!({"text": "hello", "_priority": "critical"});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Critical);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Critical
+        );
 
         // Tool approval marker
         let params = serde_json::json!({"_tool_approval": true});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Critical);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Critical
+        );
     }
 
     #[test]
     fn classify_message_priority_detects_interactive() {
         // User message marker
         let params = serde_json::json!({"text": "hello", "_user_message": true});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Interactive);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Interactive
+        );
 
         // Channel reply target
         let params = serde_json::json!({"text": "reply", "_channel_reply_target": {}});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Interactive);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Interactive
+        );
 
         // Explicit interactive marker
         let params = serde_json::json!({"text": "hello", "_priority": "interactive"});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Interactive);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Interactive
+        );
     }
 
     #[test]
     fn classify_message_priority_detects_background() {
         // Background marker
         let params = serde_json::json!({"text": "cleanup", "_background": true});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Background);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Background
+        );
 
         // Research task marker
         let params = serde_json::json!({"text": "research", "_research_task": true});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Background);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Background
+        );
 
         // Explicit background marker
         let params = serde_json::json!({"text": "hello", "_priority": "background"});
-        assert_eq!(classify_message_priority(&params), MessagePriority::Background);
+        assert_eq!(
+            classify_message_priority(&params),
+            MessagePriority::Background
+        );
     }
 
     #[test]

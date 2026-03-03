@@ -188,7 +188,10 @@ mod tests {
             session_key: "s1".into(),
             model: "m".into(),
         };
-        let result = hook.handle(HookEvent::BeforeAgentStart, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeAgentStart, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Block(_)));
     }
 
@@ -200,7 +203,10 @@ mod tests {
             session_key: "s1".into(),
             model: "m".into(),
         };
-        let result = hook.handle(HookEvent::BeforeAgentStart, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeAgentStart, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Block(msg) if msg.contains("cost guard unavailable")));
     }
 

@@ -89,7 +89,10 @@ impl CrossSessionLearning {
         let mut guard = self.learnings.write();
         let category_learnings = guard.entry(learning.category.clone()).or_default();
 
-        if category_learnings.iter().any(|l| l.content == learning.content) {
+        if category_learnings
+            .iter()
+            .any(|l| l.content == learning.content)
+        {
             return;
         }
 

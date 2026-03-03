@@ -260,7 +260,7 @@ mod tests {
                         output_tokens: 50,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             } else {
                 Ok(CompletionResponse {
@@ -271,7 +271,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }

@@ -391,13 +391,16 @@ mod tests {
 
     fn test_config() -> CalDavConfig {
         let mut accounts = HashMap::new();
-        accounts.insert("test".to_string(), CalDavAccountConfig {
-            url: Some("https://caldav.example.com".to_string()),
-            username: Some("user".to_string()),
-            password: Some(Secret::new("pass".to_string())),
-            provider: Some("generic".to_string()),
-            ..Default::default()
-        });
+        accounts.insert(
+            "test".to_string(),
+            CalDavAccountConfig {
+                url: Some("https://caldav.example.com".to_string()),
+                username: Some("user".to_string()),
+                password: Some(Secret::new("pass".to_string())),
+                provider: Some("generic".to_string()),
+                ..Default::default()
+            },
+        );
         CalDavConfig {
             enabled: true,
             default_account: Some("test".to_string()),

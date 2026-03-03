@@ -103,7 +103,11 @@ impl IntentDriftDetector {
         let key_entities = extract_entities(message);
         let constraints = extract_constraints(message);
 
-        let extraction_confidence = if primary_goal.is_some() { 0.7 } else { 0.3 };
+        let extraction_confidence = if primary_goal.is_some() {
+            0.7
+        } else {
+            0.3
+        };
 
         UserIntent {
             primary_goal,
@@ -152,9 +156,10 @@ impl IntentDriftDetector {
         };
 
         let suggested_correction = if drift_detected && self.config.auto_suggest_corrections {
-            self.original_intent.primary_goal.as_ref().map(|goal| {
-                format!("Consider refocusing on the original goal: {}", goal)
-            })
+            self.original_intent
+                .primary_goal
+                .as_ref()
+                .map(|goal| format!("Consider refocusing on the original goal: {}", goal))
         } else {
             None
         };
@@ -234,9 +239,27 @@ impl IntentDriftDetector {
 /// Extract the primary goal from a message.
 fn extract_primary_goal(message: &str) -> Option<String> {
     let action_words = [
-        "create", "build", "fix", "implement", "add", "remove", "update",
-        "refactor", "test", "debug", "deploy", "write", "read", "analyze",
-        "help", "explain", "show", "find", "search", "convert", "optimize",
+        "create",
+        "build",
+        "fix",
+        "implement",
+        "add",
+        "remove",
+        "update",
+        "refactor",
+        "test",
+        "debug",
+        "deploy",
+        "write",
+        "read",
+        "analyze",
+        "help",
+        "explain",
+        "show",
+        "find",
+        "search",
+        "convert",
+        "optimize",
     ];
 
     let lower = message.to_lowercase();

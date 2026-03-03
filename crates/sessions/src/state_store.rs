@@ -284,8 +284,13 @@ impl SessionStateStore {
     /// the essential state for resumption.
     pub async fn set_handoff(&self, session_key: &str, ctx: &HandoffContext) -> Result<()> {
         let value = serde_json::to_string(ctx)?;
-        self.set(session_key, HandoffContext::NAMESPACE, HandoffContext::KEY, &value)
-            .await
+        self.set(
+            session_key,
+            HandoffContext::NAMESPACE,
+            HandoffContext::KEY,
+            &value,
+        )
+        .await
     }
 
     /// Get handoff context for a session.
@@ -543,9 +548,15 @@ mod tests {
         let retrieved = store.get_handoff("session:1").await.unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.last_goal, Some("Fix the bug in auth module".to_string()));
+        assert_eq!(
+            retrieved.last_goal,
+            Some("Fix the bug in auth module".to_string())
+        );
         assert_eq!(retrieved.pending_tasks.len(), 2);
-        assert_eq!(retrieved.working_directory, Some(PathBuf::from("/home/user/project")));
+        assert_eq!(
+            retrieved.working_directory,
+            Some(PathBuf::from("/home/user/project"))
+        );
     }
 
     #[tokio::test]
@@ -582,20 +593,19 @@ mod tests {
         let store = SessionStateStore::new(pool);
 
         // Create an expired context by setting created_at to 25 hours ago
-        let mut ctx = HandoffContext::new(
-            Some("Old task".to_string()),
-            vec![],
-            None,
-            None,
-            vec![],
-        );
+        let mut ctx = HandoffContext::new(Some("Old task".to_string()), vec![], None, None, vec![]);
         // 25 hours ago in milliseconds
         ctx.created_at = now_ms().saturating_sub(25 * 60 * 60 * 1000);
 
         // Manually store it
         let value = serde_json::to_string(&ctx).unwrap();
         store
-            .set("session:expired", HandoffContext::NAMESPACE, HandoffContext::KEY, &value)
+            .set(
+                "session:expired",
+                HandoffContext::NAMESPACE,
+                HandoffContext::KEY,
+                &value,
+            )
             .await
             .unwrap();
 
@@ -605,7 +615,11 @@ mod tests {
 
         // Verify it was deleted
         let raw = store
-            .get("session:expired", HandoffContext::NAMESPACE, HandoffContext::KEY)
+            .get(
+                "session:expired",
+                HandoffContext::NAMESPACE,
+                HandoffContext::KEY,
+            )
             .await
             .unwrap();
         assert!(raw.is_none());
@@ -616,13 +630,7 @@ mod tests {
         let pool = test_pool().await;
         let store = SessionStateStore::new(pool);
 
-        let ctx = HandoffContext::new(
-            Some("Task".to_string()),
-            vec![],
-            None,
-            None,
-            vec![],
-        );
+        let ctx = HandoffContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
 
         store.set_handoff("session:clear", &ctx).await.unwrap();
         assert!(store.get_handoff("session:clear").await.unwrap().is_some());
@@ -660,22 +668,10 @@ mod tests {
 
     #[test]
     fn test_handoff_is_expired() {
-        let fresh_ctx = HandoffContext::new(
-            Some("Task".to_string()),
-            vec![],
-            None,
-            None,
-            vec![],
-        );
+        let fresh_ctx = HandoffContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
         assert!(!fresh_ctx.is_expired());
 
-        let mut old_ctx = HandoffContext::new(
-            Some("Task".to_string()),
-            vec![],
-            None,
-            None,
-            vec![],
-        );
+        let mut old_ctx = HandoffContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
         old_ctx.created_at = now_ms().saturating_sub(25 * 60 * 60 * 1000);
         assert!(old_ctx.is_expired());
     }
