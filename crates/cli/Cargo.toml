@@ -83,6 +83,7 @@ default = [
   "prometheus",
   "push-notifications",
   "qmd",
+  "session-encrypt",
   "stealth",
   "tailscale",
   "tls",
@@ -127,6 +128,7 @@ tls                = ["moltis-gateway/tls"]
 trusted-network    = ["moltis-gateway/trusted-network"]
 vault              = ["moltis-gateway/vault", "moltis-web?/vault"]
 voice              = ["moltis-gateway/voice", "moltis-web?/voice"]
+session-encrypt    = ["moltis-browser/session-encrypt"]
 stealth            = ["moltis-browser/stealth"]
 wasm               = ["moltis-tools/wasm"]
 web-ui             = ["dep:moltis-web", "moltis-gateway/web-ui"]
