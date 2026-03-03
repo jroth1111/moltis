@@ -5,7 +5,10 @@ use std::{
 
 use tracing::info;
 
-use crate::{Result, types::ContextFile};
+use crate::{
+    Result,
+    types::{ContextFile, ScopedRule},
+};
 
 /// Names of context files to collect when walking the directory hierarchy.
 const CONTEXT_FILE_NAMES: &[&str] = &["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"];
@@ -71,6 +74,174 @@ pub fn load_context_files(project_dir: &Path) -> Result<Vec<ContextFile>> {
     Ok(files)
 }
 
+/// Parse optional YAML-style front matter from a rules file.
+///
+/// Front matter is delimited by `---` on its own line at the start of the file.
+/// Only the `globs:` key is recognized. Returns `(globs, body)` where body is
+/// the content after the closing `---`.
+fn parse_rules_front_matter(content: &str) -> (Option<Vec<String>>, &str) {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return (None, content);
+    }
+    // Find the closing `---`
+    let after_first = &trimmed[3..].trim_start_matches(['\r', '\n']);
+    let Some(end) = after_first.find("\n---") else {
+        // No closing delimiter — treat entire content as body
+        return (None, content);
+    };
+    let front_matter = &after_first[..end];
+    let body_start = end + 4; // skip "\n---"
+    let body = after_first[body_start..].trim_start_matches(['\r', '\n']);
+
+    let mut globs = Vec::new();
+    let mut in_globs = false;
+    for line in front_matter.lines() {
+        let stripped = line.trim();
+        if stripped.starts_with("globs:") {
+            in_globs = true;
+            // Inline value on same line: `globs: ["*.rs"]`
+            let after_key = stripped.strip_prefix("globs:").unwrap_or("").trim();
+            if after_key.starts_with('[') {
+                // Simple inline array: globs: ["*.rs", "*.toml"]
+                let inner = after_key.trim_matches(|c| c == '[' || c == ']');
+                for item in inner.split(',') {
+                    let g = item.trim().trim_matches(|c| c == '"' || c == '\'');
+                    if !g.is_empty() {
+                        globs.push(g.to_string());
+                    }
+                }
+                in_globs = false;
+            }
+        } else if in_globs && stripped.starts_with('-') {
+            let g = stripped
+                .strip_prefix('-')
+                .unwrap_or("")
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'');
+            if !g.is_empty() {
+                globs.push(g.to_string());
+            }
+        } else {
+            in_globs = false;
+        }
+    }
+
+    let globs = if globs.is_empty() { None } else { Some(globs) };
+    (globs, body)
+}
+
+/// Check whether a file path matches any of the given glob patterns.
+fn matches_any_glob(file_path: &Path, globs: &[String]) -> bool {
+    for pattern in globs {
+        let Ok(glob) = globset::Glob::new(pattern) else {
+            continue;
+        };
+        let matcher = glob.compile_matcher();
+        if matcher.is_match(file_path) {
+            return true;
+        }
+        // Also try matching against just the file name
+        if let Some(name) = file_path.file_name() {
+            if matcher.is_match(Path::new(name)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Collect `.rules.md` and `.claude/rules/*.md` files from a single directory.
+fn collect_rules_at(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let rules_file = dir.join(".rules.md");
+    if rules_file.is_file() {
+        if let Ok(content) = fs::read_to_string(&rules_file) {
+            if !content.trim().is_empty() {
+                out.push((rules_file, content));
+            }
+        }
+    }
+    let rules_dir = dir.join(".claude").join("rules");
+    if rules_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&rules_dir) {
+            let mut paths: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+                .collect();
+            paths.sort();
+            for path in paths {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if !content.trim().is_empty() {
+                        out.push((path, content));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Load path-scoped rules applicable to a given file.
+///
+/// Walks each directory from `project_dir` down to `file_path`'s parent,
+/// collecting `.rules.md` and `.claude/rules/*.md` at each level. Rules with
+/// `globs:` front matter are only included when `file_path` matches at least
+/// one pattern. Results are ordered outermost first, innermost last.
+pub fn load_path_scoped_rules(
+    project_dir: &Path,
+    file_path: &Path,
+) -> Result<Vec<ScopedRule>> {
+    let project_dir = project_dir.canonicalize()?;
+    let file_path = file_path.canonicalize()?;
+
+    // file_path must be under project_dir
+    if !file_path.starts_with(&project_dir) {
+        return Ok(Vec::new());
+    }
+
+    let target_dir = if file_path.is_dir() {
+        file_path.clone()
+    } else {
+        file_path.parent().map(Path::to_path_buf).unwrap_or(file_path.clone())
+    };
+
+    // Build the list of directories from project_dir down to target_dir
+    let relative = target_dir
+        .strip_prefix(&project_dir)
+        .unwrap_or(Path::new(""));
+    let mut dirs = vec![project_dir.clone()];
+    let mut current = project_dir.clone();
+    for component in relative.components() {
+        current = current.join(component);
+        dirs.push(current.clone());
+    }
+
+    let mut rules = Vec::new();
+    for dir in &dirs {
+        for (source_path, content) in collect_rules_at(dir) {
+            let (globs, body) = parse_rules_front_matter(&content);
+            // If globs are specified, only include if file matches
+            if let Some(ref patterns) = globs {
+                if !matches_any_glob(&file_path, patterns) {
+                    continue;
+                }
+            }
+            if !body.trim().is_empty() {
+                info!(path = %source_path.display(), "loaded scoped rule");
+                rules.push(ScopedRule {
+                    source_path,
+                    body: body.to_string(),
+                    globs,
+                });
+            }
+        }
+    }
+
+    Ok(rules)
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
@@ -132,5 +303,130 @@ mod tests {
         fs::write(dir.path().join("CLAUDE.md"), "   \n  ").unwrap();
         let files = load_context_files(dir.path()).unwrap();
         assert!(files.is_empty());
+    }
+
+    // --- Path-scoped rule tests ---
+
+    #[test]
+    fn test_no_rules_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src").join("main.rs");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "fn main() {}").unwrap();
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn test_root_rules_md_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".rules.md"), "Always use snake_case").unwrap();
+        let file = dir.path().join("src").join("lib.rs");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "").unwrap();
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].body, "Always use snake_case");
+        assert!(rules[0].globs.is_none());
+    }
+
+    #[test]
+    fn test_nested_rules_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".rules.md"), "root rule").unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join(".rules.md"), "src rule").unwrap();
+        let file = src.join("main.rs");
+        fs::write(&file, "").unwrap();
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].body, "root rule");
+        assert_eq!(rules[1].body, "src rule");
+    }
+
+    #[test]
+    fn test_glob_filter_includes_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".rules.md"),
+            "---\nglobs:\n  - \"*.rs\"\n---\nRust-only rule",
+        )
+        .unwrap();
+        let file = dir.path().join("main.rs");
+        fs::write(&file, "").unwrap();
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].body, "Rust-only rule");
+        assert_eq!(rules[0].globs.as_ref().unwrap(), &["*.rs"]);
+    }
+
+    #[test]
+    fn test_glob_filter_excludes_non_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".rules.md"),
+            "---\nglobs:\n  - \"*.py\"\n---\nPython-only rule",
+        )
+        .unwrap();
+        let file = dir.path().join("main.rs");
+        fs::write(&file, "").unwrap();
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn test_glob_inline_array() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".rules.md"),
+            "---\nglobs: [\"*.rs\", \"*.toml\"]\n---\nRust+TOML rule",
+        )
+        .unwrap();
+        let file = dir.path().join("Cargo.toml");
+        fs::write(&file, "").unwrap();
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].body, "Rust+TOML rule");
+    }
+
+    #[test]
+    fn test_file_outside_project_returns_empty() {
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let file = other.path().join("outside.rs");
+        fs::write(&file, "").unwrap();
+        let rules = load_path_scoped_rules(project.path(), &file).unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn test_claude_rules_dir_at_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        let rules_dir = sub.join(".claude").join("rules");
+        fs::create_dir_all(&rules_dir).unwrap();
+        fs::write(rules_dir.join("style.md"), "# Sub-dir style").unwrap();
+        let file = sub.join("code.rs");
+        fs::write(&file, "").unwrap();
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].source_path.ends_with("style.md"));
+        assert_eq!(rules[0].body, "# Sub-dir style");
+    }
+
+    #[test]
+    fn test_parse_front_matter_no_delimiters() {
+        let (globs, body) = parse_rules_front_matter("just a body");
+        assert!(globs.is_none());
+        assert_eq!(body, "just a body");
+    }
+
+    #[test]
+    fn test_parse_front_matter_with_globs() {
+        let content = "---\nglobs:\n  - \"*.rs\"\n  - \"*.toml\"\n---\nBody here";
+        let (globs, body) = parse_rules_front_matter(content);
+        assert_eq!(globs.unwrap(), vec!["*.rs", "*.toml"]);
+        assert_eq!(body, "Body here");
     }
 }

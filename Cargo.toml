@@ -175,6 +175,7 @@ bytes        = "1"
 encoding_rs  = "0.8"
 fd-lock      = "4"
 genai        = "0.5"
+globset      = "0.4"
 # GraphQL
 async-graphql      = "7"
 async-graphql-axum = "7"
