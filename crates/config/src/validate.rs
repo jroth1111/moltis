@@ -484,6 +484,9 @@ fn build_schema_map() -> KnownKeys {
             Struct(HashMap::from([
                 ("retry_poll_interval_secs", Leaf),
                 ("max_attempts_override", Leaf),
+                ("lease_duration_secs", Leaf),
+                ("lease_heartbeat_interval_secs", Leaf),
+                ("zombie_poll_interval_secs", Leaf),
             ])),
         ),
         ("env", Map(Box::new(Leaf))),
