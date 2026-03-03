@@ -480,6 +480,10 @@ pub struct SandboxConfig {
     pub wasm_epoch_interval_ms: Option<u64>,
     /// Per-tool WASM limits (fuel/memory). Falls back to built-in defaults when absent.
     pub wasm_tool_limits: Option<WasmToolLimits>,
+    /// Minimum pre-warmed containers to keep ready. 0 = pool disabled (default).
+    pub pool_min_warm: u32,
+    /// Maximum pool slots. Defaults to `pool_min_warm * 2` when 0.
+    pub pool_max: u32,
 }
 
 impl Default for SandboxConfig {
@@ -502,6 +506,8 @@ impl Default for SandboxConfig {
             wasm_fuel_limit: None,
             wasm_epoch_interval_ms: None,
             wasm_tool_limits: None,
+            pool_min_warm: 0,
+            pool_max: 0,
         }
     }
 }
@@ -555,6 +561,8 @@ impl From<&moltis_config::schema::SandboxConfig> for SandboxConfig {
             wasm_fuel_limit: cfg.wasm_fuel_limit,
             wasm_epoch_interval_ms: cfg.wasm_epoch_interval_ms,
             wasm_tool_limits: cfg.wasm_tool_limits.as_ref().map(WasmToolLimits::from),
+            pool_min_warm: cfg.pool_min_warm,
+            pool_max: cfg.pool_max,
         }
     }
 }

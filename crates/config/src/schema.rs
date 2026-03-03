@@ -1881,6 +1881,12 @@ pub struct SandboxConfig {
     pub wasm_epoch_interval_ms: Option<u64>,
     /// Optional per-tool WASM limits (fuel + memory).
     pub wasm_tool_limits: Option<WasmToolLimitsConfig>,
+    /// Minimum pre-warmed containers to keep ready. 0 = pool disabled (default).
+    #[serde(default)]
+    pub pool_min_warm: u32,
+    /// Maximum pool slots. Defaults to `pool_min_warm * 2` when 0.
+    #[serde(default)]
+    pub pool_max: u32,
 }
 
 /// Default packages installed in sandbox containers.
@@ -2078,6 +2084,8 @@ impl Default for SandboxConfig {
             wasm_fuel_limit: None,
             wasm_epoch_interval_ms: None,
             wasm_tool_limits: None,
+            pool_min_warm: 0,
+            pool_max: 0,
         }
     }
 }
