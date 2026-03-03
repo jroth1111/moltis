@@ -465,6 +465,7 @@ impl LlmProvider for LocalGgufProvider {
                 output_tokens,
                 ..Default::default()
             },
+            confidence: None,
         })
     }
 

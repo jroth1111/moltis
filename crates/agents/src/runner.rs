@@ -2145,6 +2145,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                ..Default::default()
             })
         }
 
@@ -2196,6 +2197,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             } else {
                 Ok(CompletionResponse {
@@ -2206,6 +2208,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             }
         }
@@ -2251,6 +2254,7 @@ mod tests {
                     text: Some("```tool_call\n{\"tool\": \"exec\", \"arguments\": {\"command\": \"echo hello\"}}\n```".into()),
                     tool_calls: vec![],
                     usage: Usage { input_tokens: 10, output_tokens: 20, ..Default::default() },
+                    ..Default::default()
                 })
             } else {
                 // Verify tool result was fed back.
@@ -2276,6 +2280,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             }
         }
@@ -2453,6 +2458,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             } else {
                 let tool_content = messages
@@ -2477,6 +2483,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             }
         }
@@ -2625,6 +2632,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             } else {
                 let assistant_tool_text = messages
@@ -2669,6 +2677,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             }
         }
@@ -2809,6 +2818,7 @@ mod tests {
                         output_tokens: 20,
                         ..Default::default()
                     },
+                ..Default::default()
                 })
             } else {
                 let tool_content = messages
@@ -2838,6 +2848,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             }
         }
@@ -2986,6 +2997,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             } else {
                 Ok(CompletionResponse {
@@ -2996,6 +3008,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             }
         }
@@ -3473,6 +3486,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             } else {
                 // Second call: verify tool result was sanitized (image stripped)
@@ -3506,6 +3520,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
+                    ..Default::default()
                 })
             }
         }
@@ -3761,6 +3776,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+                ..Default::default()
             })
         }
 
@@ -3907,6 +3923,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+                ..Default::default()
             })
         }
 
@@ -4057,6 +4074,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+                ..Default::default()
             })
         }
 
@@ -4145,6 +4163,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+                ..Default::default()
             })
         }
 
@@ -4266,6 +4285,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+                ..Default::default()
             })
         }
 
@@ -4420,6 +4440,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+                ..Default::default()
             })
         }
 
@@ -4759,6 +4780,7 @@ mod tests {
                     text: Some("Recovered!".into()),
                     tool_calls: vec![],
                     usage: Usage::default(),
+                    ..Default::default()
                 })
             }
         }
@@ -4812,6 +4834,7 @@ mod tests {
                     text: Some("Recovered from rate limit".into()),
                     tool_calls: vec![],
                     usage: Usage::default(),
+                    ..Default::default()
                 })
             }
         }
