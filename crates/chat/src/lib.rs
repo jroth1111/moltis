@@ -5007,76 +5007,49 @@ impl ChatService for LiveChatService {
             }
         }
 
-        fn parse_compaction_facts(raw: &str) -> Vec<String> {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Vec::new();
-            }
-
-            let candidate = trimmed
-                .strip_prefix("```json")
-                .and_then(|s| s.strip_suffix("```"))
-                .map(str::trim)
-                .or_else(|| {
-                    trimmed
-                        .strip_prefix("```")
-                        .and_then(|s| s.strip_suffix("```"))
-                })
-                .map(str::trim)
-                .unwrap_or(trimmed);
-
-            serde_json::from_str::<Vec<String>>(candidate)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|fact| fact.trim().to_string())
-                .filter(|fact| !fact.is_empty())
-                .collect()
-        }
-
         // Use the session's model if available, otherwise fall back to the model
         // from the last assistant message, then to the first registered provider.
         let provider = self
             .resolve_provider(&session_key, &history)
             .await
             .map_err(ServiceError::message)?;
+        let fact_extraction_enabled = self.chat_config.fact_extraction;
+        let mut facts: Vec<String> = Vec::new();
+        if fact_extraction_enabled {
+            info!(
+                session = %session_key,
+                messages = history.len(),
+                "chat.compact: extracting facts"
+            );
 
-        info!(
-            session = %session_key,
-            messages = history.len(),
-            "chat.compact: extracting facts"
-        );
+            // Pass 1: extract discrete facts as JSON for higher-quality memory retrieval.
+            let mut fact_messages = vec![ChatMessage::system(
+                "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
+            )];
+            fact_messages.extend(values_to_chat_messages(&history));
+            fact_messages.push(ChatMessage::user(
+                "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
+            ));
 
-        // TODO(fact_extraction): if config.compaction.fact_extraction {
-        //     // Two-pass: extract facts as JSON, store as memory docs, then narrative summary
-        // }
-
-        // Pass 1: extract discrete facts as JSON for higher-quality memory retrieval.
-        let mut fact_messages = vec![ChatMessage::system(
-            "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
-        )];
-        fact_messages.extend(values_to_chat_messages(&history));
-        fact_messages.push(ChatMessage::user(
-            "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
-        ));
-
-        let mut fact_stream = provider.stream(fact_messages);
-        let mut facts_raw = String::new();
-        while let Some(event) = fact_stream.next().await {
-            match event {
-                StreamEvent::Delta(delta) => facts_raw.push_str(&delta),
-                StreamEvent::Done(_) => break,
-                StreamEvent::Error(e) => {
-                    warn!(session = %session_key, error = %e, "compact fact extraction failed");
-                    break;
-                },
-                StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. }
-                | StreamEvent::ProviderRaw(_)
-                | StreamEvent::ReasoningDelta(_) => {},
+            let mut fact_stream = provider.stream(fact_messages);
+            let mut facts_raw = String::new();
+            while let Some(event) = fact_stream.next().await {
+                match event {
+                    StreamEvent::Delta(delta) => facts_raw.push_str(&delta),
+                    StreamEvent::Done(_) => break,
+                    StreamEvent::Error(e) => {
+                        warn!(session = %session_key, error = %e, "compact fact extraction failed");
+                        break;
+                    },
+                    StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallArgumentsDelta { .. }
+                    | StreamEvent::ToolCallComplete { .. }
+                    | StreamEvent::ProviderRaw(_)
+                    | StreamEvent::ReasoningDelta(_) => {},
+                }
             }
+            facts = parse_compaction_facts(&facts_raw);
         }
-        let facts = parse_compaction_facts(&facts_raw);
 
         // Pass 2: concise narrative summary for conversation replacement.
         let mut summary_messages = vec![ChatMessage::system(
@@ -5147,6 +5120,11 @@ impl ChatService for LiveChatService {
             if let Err(e) = tokio::fs::create_dir_all(&memory_dir).await {
                 warn!(error = %e, "compact: failed to create memory dir");
             } else {
+                if fact_extraction_enabled && !facts.is_empty() {
+                    let existing_fact_docs = load_existing_fact_documents(&memory_dir).await;
+                    facts = dedupe_compaction_facts(facts, &existing_fact_docs);
+                }
+
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -5166,18 +5144,23 @@ impl ChatService for LiveChatService {
                     wrote_files = true;
                 }
 
-                for (idx, fact) in facts.iter().take(128).enumerate() {
-                    let fact_filename = format!(
-                        "fact-{safe_session_key}-{ts}-{:03}.md",
-                        idx.saturating_add(1)
+                if fact_extraction_enabled && !facts.is_empty() {
+                    let facts_filename = format!("facts-{safe_session_key}-{ts}.md");
+                    let facts_path = memory_dir.join(facts_filename);
+                    let facts_list = facts
+                        .iter()
+                        .take(128)
+                        .enumerate()
+                        .map(|(idx, fact)| format!("{}. {}", idx.saturating_add(1), fact.trim()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let facts_content = format!(
+                        "# Extracted Facts\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n- **Count**: {}\n\n{}",
+                        facts.len().min(128),
+                        facts_list
                     );
-                    let fact_path = memory_dir.join(fact_filename);
-                    let fact_content = format!(
-                        "# Fact\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{}",
-                        fact.trim()
-                    );
-                    if let Err(e) = tokio::fs::write(&fact_path, &fact_content).await {
-                        warn!(error = %e, "compact: failed to write fact memory file");
+                    if let Err(e) = tokio::fs::write(&facts_path, &facts_content).await {
+                        warn!(error = %e, "compact: failed to write facts memory file");
                     } else {
                         wrote_files = true;
                     }
@@ -7823,6 +7806,92 @@ async fn compact_session(
         .map_err(|source| error::Error::external("failed to replace compacted history", source))?;
 
     Ok(())
+}
+
+fn parse_compaction_facts(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let candidate = trimmed
+        .strip_prefix("```json")
+        .and_then(|s| s.strip_suffix("```"))
+        .map(str::trim)
+        .or_else(|| {
+            trimmed
+                .strip_prefix("```")
+                .and_then(|s| s.strip_suffix("```"))
+        })
+        .map(str::trim)
+        .unwrap_or(trimmed);
+
+    serde_json::from_str::<Vec<String>>(candidate)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|fact| fact.trim().to_string())
+        .filter(|fact| !fact.is_empty())
+        .collect()
+}
+
+fn normalize_fact_fingerprint(text: &str) -> String {
+    text.split_whitespace()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn dedupe_compaction_facts(facts: Vec<String>, existing_fact_docs: &[String]) -> Vec<String> {
+    let existing_normalized: Vec<String> = existing_fact_docs
+        .iter()
+        .map(|doc| normalize_fact_fingerprint(doc))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+
+    for fact in facts {
+        let normalized = normalize_fact_fingerprint(&fact);
+        if normalized.is_empty() || seen.contains(&normalized) {
+            continue;
+        }
+        if existing_normalized
+            .iter()
+            .any(|existing| existing.contains(&normalized))
+        {
+            continue;
+        }
+        seen.insert(normalized);
+        deduped.push(fact.trim().to_string());
+    }
+
+    deduped
+}
+
+async fn load_existing_fact_documents(memory_dir: &Path) -> Vec<String> {
+    let mut docs = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(memory_dir).await else {
+        return docs;
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let is_fact_doc = file_name.starts_with("facts-") || file_name.starts_with("fact-");
+        if !is_fact_doc {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+            docs.push(content);
+        }
+    }
+
+    docs
 }
 
 // ── Streaming mode (no tools) ───────────────────────────────────────────────
@@ -12592,6 +12661,63 @@ mod tests {
         assert!(is_identity_profile_path(" identity.md "));
         assert!(!is_identity_profile_path("MEMORY.md"));
         assert!(!is_identity_profile_path("memory/identity.md"));
+    }
+
+    #[test]
+    fn parse_compaction_facts_supports_plain_and_fenced_json() {
+        let plain = r#"["One","Two"]"#;
+        assert_eq!(
+            parse_compaction_facts(plain),
+            vec!["One".to_string(), "Two".to_string()]
+        );
+
+        let fenced = "```json\n[\"Three\", \"Four\"]\n```";
+        assert_eq!(
+            parse_compaction_facts(fenced),
+            vec!["Three".to_string(), "Four".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_fact_fingerprint_is_case_and_whitespace_insensitive() {
+        let a = normalize_fact_fingerprint("  User   prefers   Email  ");
+        let b = normalize_fact_fingerprint("user prefers email");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dedupe_compaction_facts_drops_duplicates_and_existing_matches() {
+        let facts = vec![
+            "User prefers email updates".to_string(),
+            "user prefers   email updates".to_string(),
+            "Deployment deadline is Friday".to_string(),
+        ];
+        let existing = vec!["previous notes: user prefers email updates".to_string()];
+        let deduped = dedupe_compaction_facts(facts, &existing);
+        assert_eq!(deduped, vec!["Deployment deadline is Friday".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn load_existing_fact_documents_reads_fact_files_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let memory_dir = dir.path().join("memory");
+        tokio::fs::create_dir_all(&memory_dir)
+            .await
+            .expect("create dir");
+        tokio::fs::write(memory_dir.join("facts-main-1.md"), "fact doc")
+            .await
+            .expect("write fact");
+        tokio::fs::write(memory_dir.join("fact-main-1-001.md"), "legacy fact doc")
+            .await
+            .expect("write legacy fact");
+        tokio::fs::write(memory_dir.join("compaction-main-1.md"), "summary")
+            .await
+            .expect("write summary");
+
+        let docs = load_existing_fact_documents(&memory_dir).await;
+        assert_eq!(docs.len(), 2);
+        assert!(docs.iter().any(|doc| doc.contains("fact doc")));
+        assert!(docs.iter().any(|doc| doc.contains("legacy fact doc")));
     }
 
     #[test]
