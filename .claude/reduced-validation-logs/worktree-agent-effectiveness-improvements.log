@@ -1,5 +1,0 @@
-Current checkout does not match PR head commit.
-  local HEAD: 85843891
-  PR head:    b2dcbb2
-
-Check out the PR head commit before running local validation.
