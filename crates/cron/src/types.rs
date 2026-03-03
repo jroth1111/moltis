@@ -153,6 +153,16 @@ pub struct CronRunRecord {
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub user_responded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_response_at_ms: Option<u64>,
 }
 
 /// Sandbox configuration for a cron job.
@@ -203,6 +213,10 @@ pub struct CronJobCreate {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Patch for updating an existing job.
@@ -354,6 +368,11 @@ mod tests {
             output: Some("done".into()),
             input_tokens: None,
             output_tokens: None,
+            delivery_channel: None,
+            delivery_to: None,
+            delivered_at_ms: None,
+            user_responded: false,
+            user_response_at_ms: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: CronRunRecord = serde_json::from_str(&json).unwrap();
@@ -375,6 +394,11 @@ mod tests {
             output: Some("done".into()),
             input_tokens: Some(150),
             output_tokens: Some(42),
+            delivery_channel: Some("telegram:bot".into()),
+            delivery_to: Some("12345".into()),
+            delivered_at_ms: Some(2100),
+            user_responded: true,
+            user_response_at_ms: Some(2300),
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: CronRunRecord = serde_json::from_str(&json).unwrap();
@@ -390,6 +414,11 @@ mod tests {
         let rec: CronRunRecord = serde_json::from_str(json).unwrap();
         assert_eq!(rec.input_tokens, None);
         assert_eq!(rec.output_tokens, None);
+        assert_eq!(rec.delivery_channel, None);
+        assert_eq!(rec.delivery_to, None);
+        assert_eq!(rec.delivered_at_ms, None);
+        assert!(!rec.user_responded);
+        assert_eq!(rec.user_response_at_ms, None);
     }
 
     #[test]

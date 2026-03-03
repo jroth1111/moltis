@@ -16,6 +16,14 @@ pub struct SqliteStore {
     pool: SqlitePool,
 }
 
+/// Engagement summary for delivered heartbeat runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngagementStats {
+    pub sample_size: u64,
+    pub response_rate: f64,
+    pub average_response_minutes: Option<f64>,
+}
+
 impl SqliteStore {
     /// Create a new store with its own connection pool and run migrations.
     ///
@@ -38,6 +46,78 @@ impl SqliteStore {
     /// Call [`crate::run_migrations`] before using this constructor.
     pub fn with_pool(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Calculate delivery engagement stats for the most recent delivered runs.
+    pub async fn engagement_stats(&self, job_id: &str, last_n: usize) -> Result<Option<EngagementStats>> {
+        Self::engagement_stats_with_pool(&self.pool, job_id, last_n).await
+    }
+
+    /// Calculate delivery engagement stats using an external connection pool.
+    pub async fn engagement_stats_with_pool(
+        pool: &SqlitePool,
+        job_id: &str,
+        last_n: usize,
+    ) -> Result<Option<EngagementStats>> {
+        let rows = sqlx::query(
+            "SELECT delivered_at_ms, user_responded, user_response_at_ms
+             FROM cron_runs
+             WHERE job_id = ? AND delivered_at_ms IS NOT NULL
+             ORDER BY delivered_at_ms DESC
+             LIMIT ?",
+        )
+        .bind(job_id)
+        .bind(last_n as i64)
+        .fetch_all(pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let sample_size = rows.len() as u64;
+        let mut responded_count = 0u64;
+        let mut latencies_minutes = Vec::new();
+
+        for row in rows {
+            let responded = row
+                .try_get::<Option<i64>, _>("user_responded")
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                != 0;
+            if !responded {
+                continue;
+            }
+            responded_count += 1;
+
+            let delivered_at_ms = row
+                .try_get::<Option<i64>, _>("delivered_at_ms")
+                .ok()
+                .flatten();
+            let responded_at_ms = row
+                .try_get::<Option<i64>, _>("user_response_at_ms")
+                .ok()
+                .flatten();
+            if let (Some(delivered), Some(responded_at)) = (delivered_at_ms, responded_at_ms)
+                && responded_at >= delivered
+            {
+                latencies_minutes.push((responded_at - delivered) as f64 / 60_000.0);
+            }
+        }
+
+        let response_rate = responded_count as f64 / sample_size as f64;
+        let average_response_minutes = if latencies_minutes.is_empty() {
+            None
+        } else {
+            Some(latencies_minutes.iter().sum::<f64>() / latencies_minutes.len() as f64)
+        };
+
+        Ok(Some(EngagementStats {
+            sample_size,
+            response_rate,
+            average_response_minutes,
+        }))
     }
 }
 
@@ -97,8 +177,12 @@ impl CronStore for SqliteStore {
     async fn append_run(&self, job_id: &str, run: &CronRunRecord) -> Result<()> {
         let status = serde_json::to_string(&run.status)?;
         sqlx::query(
-            "INSERT INTO cron_runs (job_id, started_at_ms, finished_at_ms, status, error, duration_ms, output, input_tokens, output_tokens)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO cron_runs (
+                job_id, started_at_ms, finished_at_ms, status, error, duration_ms, output,
+                input_tokens, output_tokens, delivery_channel, delivery_to, delivered_at_ms,
+                user_responded, user_response_at_ms
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(job_id)
         .bind(run.started_at_ms as i64)
@@ -109,6 +193,11 @@ impl CronStore for SqliteStore {
         .bind(&run.output)
         .bind(run.input_tokens.map(|v| v as i64))
         .bind(run.output_tokens.map(|v| v as i64))
+        .bind(&run.delivery_channel)
+        .bind(&run.delivery_to)
+        .bind(run.delivered_at_ms.map(|v| v as i64))
+        .bind(if run.user_responded { 1i64 } else { 0i64 })
+        .bind(run.user_response_at_ms.map(|v| v as i64))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -116,7 +205,9 @@ impl CronStore for SqliteStore {
 
     async fn get_runs(&self, job_id: &str, limit: usize) -> Result<Vec<CronRunRecord>> {
         let rows = sqlx::query(
-            "SELECT job_id, started_at_ms, finished_at_ms, status, error, duration_ms, output, input_tokens, output_tokens
+            "SELECT job_id, started_at_ms, finished_at_ms, status, error, duration_ms, output,
+                    input_tokens, output_tokens, delivery_channel, delivery_to, delivered_at_ms,
+                    user_responded, user_response_at_ms
              FROM cron_runs
              WHERE job_id = ?
              ORDER BY started_at_ms DESC
@@ -146,6 +237,24 @@ impl CronStore for SqliteStore {
                     .map(|v| v as u64),
                 output_tokens: row
                     .try_get::<Option<i64>, _>("output_tokens")
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64),
+                delivery_channel: row.try_get::<Option<String>, _>("delivery_channel").ok().flatten(),
+                delivery_to: row.try_get::<Option<String>, _>("delivery_to").ok().flatten(),
+                delivered_at_ms: row
+                    .try_get::<Option<i64>, _>("delivered_at_ms")
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64),
+                user_responded: row
+                    .try_get::<Option<i64>, _>("user_responded")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)
+                    != 0,
+                user_response_at_ms: row
+                    .try_get::<Option<i64>, _>("user_response_at_ms")
                     .ok()
                     .flatten()
                     .map(|v| v as u64),
@@ -251,6 +360,11 @@ mod tests {
                 output: None,
                 input_tokens: None,
                 output_tokens: None,
+                delivery_channel: None,
+                delivery_to: None,
+                delivered_at_ms: None,
+                user_responded: false,
+                user_response_at_ms: None,
             };
             store.append_run("j1", &run).await.unwrap();
         }
@@ -267,5 +381,77 @@ mod tests {
         let store = make_store().await;
         let runs = store.get_runs("none", 10).await.unwrap();
         assert!(runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_engagement_stats() {
+        let store = make_store().await;
+        store.save_job(&make_job("j1")).await.unwrap();
+
+        let runs = vec![
+            CronRunRecord {
+                job_id: "j1".into(),
+                started_at_ms: 1_000,
+                finished_at_ms: 1_200,
+                status: RunStatus::Ok,
+                error: None,
+                duration_ms: 200,
+                output: Some("first".into()),
+                input_tokens: None,
+                output_tokens: None,
+                delivery_channel: Some("telegram:bot".into()),
+                delivery_to: Some("chat-1".into()),
+                delivered_at_ms: Some(1_200),
+                user_responded: true,
+                user_response_at_ms: Some(1_200 + 5 * 60_000),
+            },
+            CronRunRecord {
+                job_id: "j1".into(),
+                started_at_ms: 2_000,
+                finished_at_ms: 2_200,
+                status: RunStatus::Ok,
+                error: None,
+                duration_ms: 200,
+                output: Some("second".into()),
+                input_tokens: None,
+                output_tokens: None,
+                delivery_channel: Some("telegram:bot".into()),
+                delivery_to: Some("chat-1".into()),
+                delivered_at_ms: Some(2_200),
+                user_responded: false,
+                user_response_at_ms: None,
+            },
+            CronRunRecord {
+                job_id: "j1".into(),
+                started_at_ms: 3_000,
+                finished_at_ms: 3_200,
+                status: RunStatus::Ok,
+                error: None,
+                duration_ms: 200,
+                output: Some("third".into()),
+                input_tokens: None,
+                output_tokens: None,
+                delivery_channel: Some("telegram:bot".into()),
+                delivery_to: Some("chat-1".into()),
+                delivered_at_ms: Some(3_200),
+                user_responded: true,
+                user_response_at_ms: Some(3_200 + 15 * 60_000),
+            },
+        ];
+        for run in &runs {
+            store.append_run("j1", run).await.unwrap();
+        }
+
+        let stats = store.engagement_stats("j1", 10).await.unwrap().unwrap();
+        assert_eq!(stats.sample_size, 3);
+        assert!((stats.response_rate - (2.0 / 3.0)).abs() < 0.0001);
+        assert_eq!(stats.average_response_minutes, Some(10.0));
+    }
+
+    #[tokio::test]
+    async fn test_engagement_stats_none_when_no_deliveries() {
+        let store = make_store().await;
+        store.save_job(&make_job("j1")).await.unwrap();
+        assert!(store.engagement_stats("j1", 10).await.unwrap().is_none());
     }
 }

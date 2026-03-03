@@ -1855,9 +1855,11 @@ pub async fn prepare_gateway(
     // Agent turn: run an LLM turn in a session determined by the job's session_target.
     let agent_state = Arc::clone(&deferred_state);
     let agent_events_queue = Arc::clone(&events_queue);
+    let agent_db_pool = db_pool.clone();
     let on_agent_turn: moltis_cron::service::AgentTurnFn = Arc::new(move |req| {
         let st = Arc::clone(&agent_state);
         let eq = Arc::clone(&agent_events_queue);
+        let pool = agent_db_pool.clone();
         Box::pin(async move {
             let state = st
                 .get()
@@ -1885,6 +1887,9 @@ pub async fn prepare_gateway(
                         output: moltis_cron::heartbeat::HEARTBEAT_OK.to_string(),
                         input_tokens: None,
                         output_tokens: None,
+                        delivery_channel: None,
+                        delivery_to: None,
+                        delivered_at_ms: None,
                     });
                 }
                 let has_prompt_override = hb_cfg
@@ -1903,6 +1908,9 @@ pub async fn prepare_gateway(
                         output: moltis_cron::heartbeat::HEARTBEAT_OK.to_string(),
                         input_tokens: None,
                         output_tokens: None,
+                        delivery_channel: None,
+                        delivery_to: None,
+                        delivered_at_ms: None,
                     });
                 }
             }
@@ -1938,7 +1946,7 @@ pub async fn prepare_gateway(
 
             let prompt_text = if is_heartbeat_turn {
                 let events = eq.drain().await;
-                if events.is_empty() {
+                let mut prompt = if events.is_empty() {
                     req.message.clone()
                 } else {
                     tracing::info!(
@@ -1946,7 +1954,23 @@ pub async fn prepare_gateway(
                         "enriching heartbeat prompt with system events"
                     );
                     moltis_cron::heartbeat::build_event_enriched_prompt(&events, &req.message)
+                };
+                if let Ok(Some(stats)) = moltis_cron::store_sqlite::SqliteStore::engagement_stats_with_pool(
+                    &pool,
+                    "__heartbeat__",
+                    20,
+                )
+                .await
+                    && stats.sample_size >= 5
+                {
+                    let response_rate_pct = (stats.response_rate * 100.0).round();
+                    let average_minutes = stats.average_response_minutes.unwrap_or(0.0).round();
+                    prompt.push_str(&format!(
+                        "\n\nEngagement summary (last {} delivered runs): user engages with ~{}% of heartbeat messages, average response time ~{} minutes.",
+                        stats.sample_size, response_rate_pct as u64, average_minutes as u64
+                    ));
                 }
+                prompt
             } else {
                 req.message.clone()
             };
@@ -2004,6 +2028,9 @@ pub async fn prepare_gateway(
             };
 
             // Deliver output to a channel if requested.
+            let mut delivery_channel = None;
+            let mut delivery_to = None;
+            let mut delivered_at_ms = None;
             if req.deliver
                 && !delivery_text.trim().is_empty()
                 && let (Some(channel_account), Some(chat_id)) = (&req.channel, &req.to)
@@ -2019,6 +2046,15 @@ pub async fn prepare_gateway(
                             error = %e,
                             "cron job channel delivery failed"
                         );
+                    } else {
+                        delivery_channel = Some(channel_account.clone());
+                        delivery_to = Some(chat_id.clone());
+                        delivered_at_ms = Some(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                        );
                     }
                 } else {
                     tracing::debug!(
@@ -2031,6 +2067,9 @@ pub async fn prepare_gateway(
                 output: text,
                 input_tokens,
                 output_tokens,
+                delivery_channel,
+                delivery_to,
+                delivered_at_ms,
             })
         })
     });
@@ -2477,7 +2516,10 @@ pub async fn prepare_gateway(
         );
 
         let channel_sink: Arc<dyn moltis_channels::ChannelEventSink> = Arc::new(
-            crate::channel_events::GatewayChannelEventSink::new(Arc::clone(&deferred_state)),
+            crate::channel_events::GatewayChannelEventSink::new(
+                Arc::clone(&deferred_state),
+                Some(Arc::new(db_pool.clone())),
+            ),
         );
         let tg_plugin = Arc::new(tokio::sync::RwLock::new(
             moltis_telegram::TelegramPlugin::new()

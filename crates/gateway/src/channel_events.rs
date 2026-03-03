@@ -19,6 +19,58 @@ use crate::{
     state::GatewayState,
 };
 
+const HEARTBEAT_JOB_ID: &str = "__heartbeat__";
+const HEARTBEAT_RESPONSE_WINDOW_MS: i64 = 30 * 60 * 1000;
+
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+async fn mark_recent_heartbeat_response(
+    pool: &sqlx::SqlitePool,
+    delivery_channel: &str,
+    delivery_to: &str,
+) -> Result<bool, sqlx::Error> {
+    let now_ms = now_ms_i64();
+    let window_start = now_ms.saturating_sub(HEARTBEAT_RESPONSE_WINDOW_MS);
+    let run_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id
+         FROM cron_runs
+         WHERE job_id = ?
+           AND delivery_channel = ?
+           AND delivery_to = ?
+           AND delivered_at_ms IS NOT NULL
+           AND delivered_at_ms >= ?
+           AND user_responded = 0
+         ORDER BY delivered_at_ms DESC
+         LIMIT 1",
+    )
+    .bind(HEARTBEAT_JOB_ID)
+    .bind(delivery_channel)
+    .bind(delivery_to)
+    .bind(window_start)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(run_id) = run_id else {
+        return Ok(false);
+    };
+
+    sqlx::query(
+        "UPDATE cron_runs
+         SET user_responded = 1, user_response_at_ms = ?
+         WHERE id = ?",
+    )
+    .bind(now_ms)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(true)
+}
+
 /// Default (deterministic) session key for a channel chat.
 fn default_channel_session_key(target: &ChannelReplyTarget) -> String {
     format!(
@@ -162,11 +214,15 @@ async fn dispatch_event_triggered_cron_jobs(state: &GatewayState, channel: &str,
 /// `GatewayState` exists (same pattern as cron callbacks).
 pub struct GatewayChannelEventSink {
     state: Arc<tokio::sync::OnceCell<Arc<GatewayState>>>,
+    db_pool: Option<Arc<sqlx::SqlitePool>>,
 }
 
 impl GatewayChannelEventSink {
-    pub fn new(state: Arc<tokio::sync::OnceCell<Arc<GatewayState>>>) -> Self {
-        Self { state }
+    pub fn new(
+        state: Arc<tokio::sync::OnceCell<Arc<GatewayState>>>,
+        db_pool: Option<Arc<sqlx::SqlitePool>>,
+    ) -> Self {
+        Self { state, db_pool }
     }
 }
 
@@ -217,6 +273,24 @@ impl ChannelEventSink for GatewayChannelEventSink {
         meta: ChannelMessageMeta,
     ) {
         if let Some(state) = self.state.get() {
+            if let Some(ref pool) = self.db_pool {
+                match mark_recent_heartbeat_response(pool, &reply_to.account_id, &reply_to.chat_id)
+                    .await
+                {
+                    Ok(true) => {
+                        debug!(
+                            channel_account = %reply_to.account_id,
+                            chat_id = %reply_to.chat_id,
+                            "correlated inbound message with recent heartbeat delivery"
+                        );
+                    },
+                    Ok(false) => {},
+                    Err(e) => {
+                        warn!(error = %e, "failed to correlate heartbeat response");
+                    },
+                }
+            }
+
             // Start typing immediately so pre-run setup (session/model resolution)
             // does not delay channel feedback.
             let typing_done = start_channel_typing_loop(state, &reply_to);
@@ -701,6 +775,24 @@ impl ChannelEventSink for GatewayChannelEventSink {
             warn!("channel dispatch_to_chat_with_attachments: gateway not ready");
             return;
         };
+
+        if let Some(ref pool) = self.db_pool {
+            match mark_recent_heartbeat_response(pool, &reply_to.account_id, &reply_to.chat_id)
+                .await
+            {
+                Ok(true) => {
+                    debug!(
+                        channel_account = %reply_to.account_id,
+                        chat_id = %reply_to.chat_id,
+                        "correlated inbound attachment message with recent heartbeat delivery"
+                    );
+                },
+                Ok(false) => {},
+                Err(e) => {
+                    warn!(error = %e, "failed to correlate heartbeat response");
+                },
+            }
+        }
 
         // Start typing immediately so image preprocessing/session setup doesn't
         // delay channel feedback.
@@ -1739,11 +1831,10 @@ fn format_model_list(
 mod tests {
     use std::sync::Arc;
 
-    use {
-        async_trait::async_trait,
-        serde_json::{Value, json},
-        tokio::sync::Mutex,
-    };
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+    use sqlx::Row;
+    use tokio::sync::Mutex;
 
     use {
         super::*,
@@ -1893,7 +1984,107 @@ mod tests {
         );
         let state_cell = Arc::new(tokio::sync::OnceCell::new());
         assert!(state_cell.set(state).is_ok());
-        (GatewayChannelEventSink::new(state_cell), run_ids)
+        (GatewayChannelEventSink::new(state_cell, None), run_ids)
+    }
+
+    #[tokio::test]
+    async fn mark_recent_heartbeat_response_updates_matching_run() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        moltis_cron::run_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO cron_jobs (id, data) VALUES (?, ?)")
+            .bind(HEARTBEAT_JOB_ID)
+            .bind("{}")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let now_ms = now_ms_i64();
+        let status = serde_json::to_string(&moltis_cron::types::RunStatus::Ok).unwrap();
+        sqlx::query(
+            "INSERT INTO cron_runs (
+                job_id, started_at_ms, finished_at_ms, status, error, duration_ms, output,
+                input_tokens, output_tokens, delivery_channel, delivery_to, delivered_at_ms,
+                user_responded, user_response_at_ms
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(HEARTBEAT_JOB_ID)
+        .bind(now_ms - 10_000)
+        .bind(now_ms - 9_000)
+        .bind(&status)
+        .bind(Option::<String>::None)
+        .bind(1_000i64)
+        .bind(Some("heartbeat".to_string()))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind("bot-main")
+        .bind("chat-1")
+        .bind(now_ms - 5_000)
+        .bind(0i64)
+        .bind(Option::<i64>::None)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let updated = mark_recent_heartbeat_response(&pool, "bot-main", "chat-1")
+            .await
+            .unwrap();
+        assert!(updated);
+
+        let row = sqlx::query(
+            "SELECT user_responded, user_response_at_ms
+             FROM cron_runs
+             WHERE job_id = ? LIMIT 1",
+        )
+        .bind(HEARTBEAT_JOB_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("user_responded"), 1);
+        assert!(row.get::<Option<i64>, _>("user_response_at_ms").is_some());
+    }
+
+    #[tokio::test]
+    async fn mark_recent_heartbeat_response_ignores_outside_window() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        moltis_cron::run_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO cron_jobs (id, data) VALUES (?, ?)")
+            .bind(HEARTBEAT_JOB_ID)
+            .bind("{}")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let now_ms = now_ms_i64();
+        let status = serde_json::to_string(&moltis_cron::types::RunStatus::Ok).unwrap();
+        sqlx::query(
+            "INSERT INTO cron_runs (
+                job_id, started_at_ms, finished_at_ms, status, error, duration_ms, output,
+                input_tokens, output_tokens, delivery_channel, delivery_to, delivered_at_ms,
+                user_responded, user_response_at_ms
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(HEARTBEAT_JOB_ID)
+        .bind(now_ms - HEARTBEAT_RESPONSE_WINDOW_MS - 20_000)
+        .bind(now_ms - HEARTBEAT_RESPONSE_WINDOW_MS - 19_000)
+        .bind(&status)
+        .bind(Option::<String>::None)
+        .bind(1_000i64)
+        .bind(Some("heartbeat".to_string()))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind("bot-main")
+        .bind("chat-1")
+        .bind(now_ms - HEARTBEAT_RESPONSE_WINDOW_MS - 5_000)
+        .bind(0i64)
+        .bind(Option::<i64>::None)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let updated = mark_recent_heartbeat_response(&pool, "bot-main", "chat-1")
+            .await
+            .unwrap();
+        assert!(!updated);
     }
 
     #[test]

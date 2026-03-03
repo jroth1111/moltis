@@ -250,6 +250,16 @@ pub struct CronRunRecord {
     pub input_tokens: Option<u64>,
     #[serde(default)]
     pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub delivery_channel: Option<String>,
+    #[serde(default)]
+    pub delivery_to: Option<String>,
+    #[serde(default)]
+    pub delivered_at_ms: Option<u64>,
+    #[serde(default)]
+    pub user_responded: Option<bool>,
+    #[serde(default)]
+    pub user_response_at_ms: Option<u64>,
 }
 
 #[derive(Debug, SimpleObject, Deserialize)]
@@ -277,6 +287,8 @@ pub struct HeartbeatConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    #[serde(default)]
+    pub surprise_me: Option<bool>,
     #[serde(default)]
     pub ack_max_chars: Option<u64>,
     #[serde(default)]
