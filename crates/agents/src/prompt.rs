@@ -78,6 +78,10 @@ pub struct PromptHostRuntimeContext {
     pub remote_ip: Option<String>,
     /// `"lat,lon"` (e.g. `"48.8566,2.3522"`) from browser geolocation or `USER.md`.
     pub location: Option<String>,
+    /// Tool names denied for this turn by the dispatch loop's autonomy filter.
+    /// Populated from the `_dispatch_tool_deny` request sideband; empty for regular user sessions.
+    #[allow(clippy::struct_field_names)]
+    pub dispatch_deny: Vec<String>,
 }
 
 /// Runtime context for sandbox execution routing used by the `exec` tool.

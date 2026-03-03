@@ -276,6 +276,10 @@ pub struct TaskSpec {
     /// Only tasks with `is_intent = true` are picked up by the dispatch loop.
     #[serde(default)]
     pub is_intent: bool,
+    /// Maximum autonomy level granted to shift agents for this intent.
+    /// The dispatch loop strips tools above this tier from each shift's registry.
+    #[serde(default)]
+    pub autonomy_tier: AutonomyTier,
     /// Identity context: who initiated this task, where to send notifications.
     #[serde(default)]
     pub principal: Option<TaskPrincipal>,
@@ -301,6 +305,7 @@ impl TaskSpec {
             max_attempts: default_max_attempts(),
             created_at: OffsetDateTime::now_utc(),
             is_intent: false,
+            autonomy_tier: AutonomyTier::default(),
             principal: None,
             parent_task: None,
         }
@@ -583,6 +588,7 @@ mod tests {
     fn task_spec_new_defaults() {
         let spec = TaskSpec::new("test", "desc");
         assert!(!spec.is_intent, "is_intent defaults false");
+        assert_eq!(spec.autonomy_tier, AutonomyTier::Auto, "autonomy_tier defaults Auto");
         assert!(spec.principal.is_none(), "principal defaults None");
         assert!(spec.parent_task.is_none(), "parent_task defaults None");
     }
@@ -599,6 +605,7 @@ mod tests {
         }"#;
         let spec: TaskSpec = serde_json::from_str(json).unwrap();
         assert!(!spec.is_intent);
+        assert_eq!(spec.autonomy_tier, AutonomyTier::Auto);
         assert!(spec.principal.is_none());
         assert!(spec.parent_task.is_none());
     }

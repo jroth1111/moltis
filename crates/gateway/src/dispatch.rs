@@ -35,8 +35,8 @@ use {
     moltis_config::schema::TasksConfig,
     moltis_service_traits::ServiceError,
     moltis_tasks::{
-        HandoffContext, IntentStore, ObjectiveSnapshot, RuntimeState, TaskSpec, TaskStore,
-        TerminalState, TransitionError, TransitionEvent,
+        AutonomyTier, HandoffContext, IntentStore, ObjectiveSnapshot, RuntimeState, TaskSpec,
+        TaskStore, TerminalState, TransitionError, TransitionEvent,
     },
     serde_json::Value,
     tracing::{debug, info, warn},
@@ -207,10 +207,12 @@ async fn process_intent(
     );
 
     // ── 8. Run the shift — blocks until agent completes. ─────────────────────
+    let deny_list = denied_tools_for_tier(intent.spec.autonomy_tier);
     let params = serde_json::json!({
-        "text":          prompt,
-        "_session_key":  session_key,
-        "_source":       "dispatch",
+        "text":                prompt,
+        "_session_key":        session_key,
+        "_source":             "dispatch",
+        "_dispatch_tool_deny": deny_list,
     });
 
     let shift_result = ctx.chat.send_sync(params).await;
@@ -295,6 +297,45 @@ async fn process_intent(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return the list of tool names to deny for a shift running at `tier`.
+///
+/// Tools are classified into three tiers:
+/// - `Auto`    (0): read-only — web_fetch, web_search, calc, memory reads.
+/// - `Confirm` (1): local-write — exec, skill management, sandbox, sessions manage.
+/// - `Approve` (2): external-write — send_image, sessions_send, cron writes, spawn_agent.
+///
+/// Shifts are denied all tools *above* the intent's tier. `task_list` is always
+/// allowed so the shift agent can signal completion or escalation.
+fn denied_tools_for_tier(tier: AutonomyTier) -> Vec<&'static str> {
+    match tier {
+        AutonomyTier::Auto => vec![
+            // Confirm-tier (local-write)
+            "exec",
+            "create_skill",
+            "update_skill",
+            "delete_skill",
+            "sessions_create",
+            "sessions_delete",
+            "sandbox_packages",
+            // Approve-tier (external-write)
+            "send_image",
+            "sessions_send",
+            "spawn_agent",
+            "cron",
+            "process",
+        ],
+        AutonomyTier::Confirm => vec![
+            // Approve-tier only (external-write)
+            "send_image",
+            "sessions_send",
+            "spawn_agent",
+            "cron",
+            "process",
+        ],
+        AutonomyTier::Approve => vec![],
+    }
+}
 
 /// Escalate an intent to `AwaitingHuman` with a reason.
 async fn escalate(
@@ -391,6 +432,34 @@ fn extract_tokens(result: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── denied_tools_for_tier ──────────────────────────────────────────────
+
+    #[test]
+    fn auto_tier_denies_exec_and_send() {
+        let denied = denied_tools_for_tier(AutonomyTier::Auto);
+        assert!(denied.contains(&"exec"), "exec must be denied at Auto tier");
+        assert!(denied.contains(&"send_image"), "send_image must be denied at Auto tier");
+        assert!(denied.contains(&"spawn_agent"), "spawn_agent must be denied at Auto tier");
+        assert!(!denied.contains(&"task_list"), "task_list must never be denied");
+    }
+
+    #[test]
+    fn confirm_tier_denies_only_approve_tools() {
+        let denied = denied_tools_for_tier(AutonomyTier::Confirm);
+        assert!(denied.contains(&"send_image"), "send_image must be denied at Confirm tier");
+        assert!(denied.contains(&"spawn_agent"), "spawn_agent must be denied at Confirm tier");
+        assert!(!denied.contains(&"exec"), "exec must be allowed at Confirm tier");
+        assert!(!denied.contains(&"task_list"), "task_list must never be denied");
+    }
+
+    #[test]
+    fn approve_tier_denies_nothing() {
+        let denied = denied_tools_for_tier(AutonomyTier::Approve);
+        assert!(denied.is_empty(), "Approve tier must deny no tools");
+    }
+
+    // ── extract_tokens ────────────────────────────────────────────────────
 
     #[test]
     fn extract_tokens_both_fields() {

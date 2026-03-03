@@ -1423,6 +1423,25 @@ fn apply_request_runtime_context(host: &mut PromptHostRuntimeContext, params: &V
         host.timezone = Some(timezone);
     }
 
+    // Dispatch-loop autonomy filter: accepted only when the caller explicitly
+    // identifies as the dispatch loop via `_source: "dispatch"`. This prevents
+    // a connected client from injecting an arbitrary tool deny list.
+    let is_dispatch = params
+        .get("_source")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s == "dispatch");
+    if is_dispatch {
+        host.dispatch_deny = params
+            .get("_dispatch_tool_deny")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
     refresh_runtime_prompt_time(host);
 }
 
@@ -1441,6 +1460,7 @@ fn apply_runtime_tool_filters(
     config: &moltis_config::MoltisConfig,
     _skills: &[moltis_skills::types::SkillMetadata],
     mcp_disabled: bool,
+    deny_extra: &[String],
 ) -> ToolRegistry {
     let base_registry = if mcp_disabled {
         base.clone_without_mcp()
@@ -1454,7 +1474,7 @@ fn apply_runtime_tool_filters(
     // runtime can unintentionally remove unrelated tools (for example, leaving
     // only `web_fetch` and preventing `create_skill` from being called).
     // Tool availability here is controlled by configured runtime policy.
-    base_registry.clone_allowed_by(|name| policy.is_allowed(name))
+    base_registry.clone_allowed_by(|name| policy.is_allowed(name) && !deny_extra.iter().any(|d| d == name))
 }
 
 // ── Disabled Models Store ────────────────────────────────────────────────────
@@ -5296,7 +5316,7 @@ impl ChatService for LiveChatService {
         let tools: Vec<Value> = if supports_tools {
             let registry_guard = self.tool_registry.read().await;
             let effective_registry =
-                apply_runtime_tool_filters(&registry_guard, &config, &[], mcp_disabled);
+                apply_runtime_tool_filters(&registry_guard, &config, &[], mcp_disabled, &[]);
             effective_registry
                 .list_schemas()
                 .iter()
@@ -5526,6 +5546,7 @@ impl ChatService for LiveChatService {
                     &persona.config,
                     &discovered_skills,
                     mcp_disabled,
+                    &[],
                 )
             } else {
                 registry_guard.clone_without(&[])
@@ -5656,6 +5677,7 @@ impl ChatService for LiveChatService {
                     &persona.config,
                     &discovered_skills,
                     mcp_disabled,
+                    &[],
                 )
             } else {
                 registry_guard.clone_without(&[])
@@ -6759,10 +6781,15 @@ async fn run_with_tools(
     let native_tools = matches!(tool_mode, ToolMode::Native);
     let tools_enabled = !matches!(tool_mode, ToolMode::Off);
 
+    // Extract dispatch-side tool deny list from sideband (populated by the dispatch loop).
+    let dispatch_deny: &[String] = runtime_context
+        .map(|ctx| ctx.host.dispatch_deny.as_slice())
+        .unwrap_or(&[]);
+
     let mut filtered_registry = {
         let registry_guard = tool_registry.read().await;
         if tools_enabled {
-            apply_runtime_tool_filters(&registry_guard, &persona.config, skills, mcp_disabled)
+            apply_runtime_tool_filters(&registry_guard, &persona.config, skills, mcp_disabled, dispatch_deny)
         } else {
             registry_guard.clone_without(&[])
         }
@@ -11348,7 +11375,7 @@ mod tests {
             source: None,
         }];
 
-        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false, &[]);
         assert!(filtered.get("exec").is_some());
         assert!(filtered.get("web_fetch").is_some());
         assert!(filtered.get("create_skill").is_some());
@@ -11381,9 +11408,51 @@ mod tests {
             source: None,
         }];
 
-        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false, &[]);
         assert!(filtered.get("create_skill").is_some());
         assert!(filtered.get("web_fetch").is_some());
+    }
+
+    #[test]
+    fn runtime_filters_deny_extra_removes_named_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "web_fetch".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "task_list".to_string(),
+        }));
+
+        let cfg = moltis_config::MoltisConfig::default();
+        let deny_extra = vec!["exec".to_string()];
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false, &deny_extra);
+        assert!(filtered.get("web_fetch").is_some(), "web_fetch must survive deny_extra");
+        assert!(filtered.get("task_list").is_some(), "task_list must survive deny_extra");
+        assert!(filtered.get("exec").is_none(), "exec must be denied by deny_extra");
+    }
+
+    #[test]
+    fn apply_request_runtime_context_extracts_dispatch_deny_when_source_matches() {
+        let params = serde_json::json!({
+            "_source": "dispatch",
+            "_dispatch_tool_deny": ["exec", "spawn_agent"],
+        });
+        let mut host = PromptHostRuntimeContext::default();
+        apply_request_runtime_context(&mut host, &params);
+        assert_eq!(host.dispatch_deny, vec!["exec".to_string(), "spawn_agent".to_string()]);
+    }
+
+    #[test]
+    fn apply_request_runtime_context_ignores_dispatch_deny_without_dispatch_source() {
+        let params = serde_json::json!({
+            "_dispatch_tool_deny": ["exec"],
+        });
+        let mut host = PromptHostRuntimeContext::default();
+        apply_request_runtime_context(&mut host, &params);
+        assert!(host.dispatch_deny.is_empty(), "deny list must be ignored when source is not dispatch");
     }
 
     #[test]
