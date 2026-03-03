@@ -195,6 +195,10 @@ impl AgentTool for TaskListTool {
         "task_list"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["orchestration"]
+    }
+
     fn description(&self) -> &str {
         "Manage a shared task list for coordinated multi-agent execution. \
          Actions: create, list, get, update, claim, fail, escalate, resolve, retry, history."

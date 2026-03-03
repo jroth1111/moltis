@@ -358,6 +358,10 @@ impl AgentTool for ProcessTool {
         "process"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["code"]
+    }
+
     fn description(&self) -> &str {
         "Manage interactive terminal processes (TUI apps, REPLs, long-running commands) \
          via tmux sessions in the sandbox. Actions: start, poll, send_keys, paste, kill, list."

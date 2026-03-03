@@ -264,6 +264,10 @@ impl AgentTool for ExecTool {
         "exec"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["code", "files"]
+    }
+
     fn description(&self) -> &str {
         "Execute a shell command on the server. Returns stdout, stderr, and exit code."
     }

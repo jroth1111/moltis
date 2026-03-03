@@ -90,6 +90,10 @@ impl AgentTool for BrowserTool {
         "browser"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["web"]
+    }
+
     fn description(&self) -> &str {
         "Control a real browser to interact with web pages.\n\n\
          USE THIS TOOL when the user says 'browse', 'browser', 'open in browser', \

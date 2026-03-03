@@ -362,6 +362,10 @@ impl AgentTool for WebFetchTool {
         "web_fetch"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["web"]
+    }
+
     fn description(&self) -> &str {
         "Fetch a web page URL and extract its content as readable text or markdown. \
          Use this when you need to read the contents of a specific web page. \

@@ -431,6 +431,10 @@ impl AgentTool for CalcTool {
         "calc"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["code"]
+    }
+
     fn description(&self) -> &str {
         "Evaluate arithmetic expressions safely. Supports +, -, *, /, %, ^, unary +/- and parentheses. \
          No variables, functions, or assignments."

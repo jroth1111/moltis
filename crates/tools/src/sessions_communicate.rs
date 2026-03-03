@@ -91,6 +91,10 @@ impl AgentTool for SessionsListTool {
         "sessions_list"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["session"]
+    }
+
     fn description(&self) -> &str {
         "List available sessions with metadata. Supports optional text filtering and limit."
     }
@@ -163,6 +167,10 @@ impl AgentTool for SessionsHistoryTool {
         "sessions_history"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["session"]
+    }
+
     fn description(&self) -> &str {
         "Read paginated message history from another session."
     }
@@ -225,6 +233,10 @@ impl AgentTool for SessionsHistoryTool {
 impl AgentTool for SessionsSendTool {
     fn name(&self) -> &str {
         "sessions_send"
+    }
+
+    fn categories(&self) -> &'static [&'static str] {
+        &["session"]
     }
 
     fn description(&self) -> &str {
