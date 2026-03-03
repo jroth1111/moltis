@@ -2481,10 +2481,14 @@ impl PathRulesAccumulator {
             self.seen.insert(rule.source_path.clone());
             let remaining = Self::BUDGET.saturating_sub(self.total_chars);
             let body = if rule.body.len() > remaining {
-                &rule.body[..remaining]
+                let end = rule.body.floor_char_boundary(remaining);
+                &rule.body[..end]
             } else {
                 &rule.body
             };
+            if body.is_empty() {
+                continue;
+            }
             if !self.rules_text.is_empty() {
                 self.rules_text.push_str("\n\n");
             }
@@ -2536,8 +2540,8 @@ pub struct LiveChatService {
     /// Per-session flag: whether the PreCompact memory flush has already fired
     /// in the current compaction window.  Reset when a full Compact fires.
     pre_compact_flushed: Arc<RwLock<HashMap<String, bool>>>,
-    /// Per-session path-scoped rules accumulated from tool call file paths.
-    path_rules: Arc<RwLock<HashMap<String, PathRulesAccumulator>>>,
+    /// Per-session+project path-scoped rules accumulated from tool call file paths.
+    path_rules: Arc<RwLock<HashMap<(String, PathBuf), PathRulesAccumulator>>>,
 }
 
 impl LiveChatService {
@@ -2776,6 +2780,11 @@ impl LiveChatService {
     /// Extracts file-like paths from recent tool call arguments, loads applicable
     /// `.rules.md` files, and returns the accumulated rules text.
     async fn resolve_scoped_rules(&self, session_key: &str, project_dir: &Path) -> Option<String> {
+        let project_root = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        let key = (session_key.to_string(), project_root.clone());
+
         // Load recent session history to extract file paths from tool arguments
         let messages = self.session_store.read_last_n(session_key, 50).await.ok()?;
         let mut file_paths: Vec<PathBuf> = Vec::new();
@@ -2792,22 +2801,41 @@ impl LiveChatService {
                 .path_rules
                 .read()
                 .await
-                .get(session_key)
+                .get(&key)
                 .and_then(|acc| acc.text().map(String::from));
         }
 
         let mut accumulators = self.path_rules.write().await;
+        // Keep only one project accumulator per session to avoid cross-project leakage.
+        accumulators.retain(|(sess, root), _| sess != session_key || root == &project_root);
         let accumulator = accumulators
-            .entry(session_key.to_string())
+            .entry(key)
             .or_insert_with(PathRulesAccumulator::new);
 
         for path in &file_paths {
-            if let Ok(rules) = moltis_projects::load_path_scoped_rules(project_dir, path) {
+            let normalized = normalize_extracted_file_path(path, &project_root);
+            if let Ok(rules) = moltis_projects::load_path_scoped_rules(&project_root, &normalized) {
                 accumulator.add(&rules);
             }
         }
 
         accumulator.text().map(String::from)
+    }
+}
+
+fn normalize_extracted_file_path(path: &Path, project_dir: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" || raw.starts_with("~/") {
+        if let Some(home) = moltis_config::home_dir() {
+            let suffix = raw.strip_prefix("~/").unwrap_or("");
+            return home.join(suffix);
+        }
+    }
+
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_dir.join(path)
     }
 }
 
@@ -2866,16 +2894,33 @@ fn looks_like_file_path(s: &str) -> bool {
     if s.len() < 2 || s.len() > 500 {
         return false;
     }
-    // Must start with /, ./, or ~/
-    if !(s.starts_with('/') || s.starts_with("./") || s.starts_with("~/")) {
-        return false;
-    }
-    // Should not contain control chars or common non-path characters
+    // Should not contain control chars.
     if s.contains('\n') || s.contains('\r') || s.contains('\0') {
         return false;
     }
-    // Should have a reasonable file extension or be a directory
-    true
+    // Exclude URLs and URI-like payloads.
+    if s.contains("://") {
+        return false;
+    }
+
+    if s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with("~/")
+        || (s.as_bytes().get(1) == Some(&b':')
+            && matches!(s.as_bytes().get(2), Some(b'\\') | Some(b'/')))
+    {
+        return true;
+    }
+
+    if s.contains('/') || s.contains('\\') {
+        return true;
+    }
+
+    let path = Path::new(s);
+    path.extension().is_some()
+        && !s.chars().any(char::is_whitespace)
+        && s.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 /// RAII guard that ensures self-repair cleanup happens when dropped.
@@ -3610,20 +3655,10 @@ impl ChatService for LiveChatService {
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
 
-        // Accumulate path-scoped rules from recent tool history and fold
-        // into project context so they reach the system prompt without changing
-        // the run_with_tools parameter list.
-        let project_context = if let Some(ref dir) = project_dir {
-            if let Some(rules) = self.resolve_scoped_rules(&session_key, dir).await {
-                let mut ctx = project_context.unwrap_or_default();
-                ctx.push_str("\n\n## Path-Scoped Rules\n\n");
-                ctx.push_str(&rules);
-                Some(ctx)
-            } else {
-                project_context
-            }
+        let scoped_rules = if let Some(ref dir) = project_dir {
+            self.resolve_scoped_rules(&session_key, dir).await
         } else {
-            project_context
+            None
         };
 
         // Dispatch MessageReceived hook (read-only).
@@ -4226,6 +4261,7 @@ impl ChatService for LiveChatService {
         let handle = tokio::spawn(async move {
             let permit = permit; // hold permit until agent run completes
             let ctx_ref = project_context.as_deref();
+            let scoped_rules_ref = scoped_rules.as_deref();
             if let Some(target) = deferred_channel_target {
                 // Register the channel reply target only after we own the
                 // session permit, so queued messages keep per-message routing.
@@ -4265,6 +4301,7 @@ impl ChatService for LiveChatService {
                         &session_agent_id_clone,
                         desired_reply_medium,
                         ctx_ref,
+                        scoped_rules_ref,
                         user_message_index,
                         &discovered_skills,
                         Some(&runtime_context),
@@ -4288,6 +4325,7 @@ impl ChatService for LiveChatService {
                         &session_agent_id_clone,
                         desired_reply_medium,
                         ctx_ref,
+                        scoped_rules_ref,
                         Some(&runtime_context),
                         user_message_index,
                         &discovered_skills,
@@ -4611,6 +4649,7 @@ impl ChatService for LiveChatService {
                 &session_agent_id,
                 desired_reply_medium,
                 None,
+                None,
                 user_message_index,
                 &[],
                 Some(&runtime_context),
@@ -4633,6 +4672,7 @@ impl ChatService for LiveChatService {
                 &session_key,
                 &session_agent_id,
                 desired_reply_medium,
+                None,
                 None,
                 Some(&runtime_context),
                 user_message_index,
@@ -5450,9 +5490,14 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let (project_context, _project_dir) = self
+        let (project_context, project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+        let scoped_rules = if let Some(ref dir) = project_dir {
+            self.resolve_scoped_rules(&session_key, dir).await
+        } else {
+            None
+        };
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5502,7 +5547,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
-                None,
+                scoped_rules.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -5514,7 +5559,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
-                None,
+                scoped_rules.as_deref(),
             )
         };
 
@@ -5575,9 +5620,14 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let (project_context, _project_dir) = self
+        let (project_context, project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+        let scoped_rules = if let Some(ref dir) = project_dir {
+            self.resolve_scoped_rules(&session_key, dir).await
+        } else {
+            None
+        };
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5625,7 +5675,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
-                None,
+                scoped_rules.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -5637,7 +5687,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
-                None,
+                scoped_rules.as_deref(),
             )
         };
 
@@ -6686,6 +6736,7 @@ async fn run_with_tools(
     agent_id: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
+    scoped_rules: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     user_message_index: usize,
     skills: &[moltis_skills::types::SkillMetadata],
@@ -6736,7 +6787,7 @@ async fn run_with_tools(
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
-            None,
+            scoped_rules,
         )
     } else {
         build_system_prompt_minimal_runtime(
@@ -6748,7 +6799,7 @@ async fn run_with_tools(
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
-            None,
+            scoped_rules,
         )
     };
 
@@ -7724,6 +7775,7 @@ async fn run_streaming(
     agent_id: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
+    scoped_rules: Option<&str>,
     user_message_index: usize,
     _skills: &[moltis_skills::types::SkillMetadata],
     runtime_context: Option<&PromptRuntimeContext>,
@@ -7743,7 +7795,7 @@ async fn run_streaming(
         persona.tools_text.as_deref(),
         runtime_context,
         persona.memory_text.as_deref(),
-        None,
+        scoped_rules,
     );
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
@@ -9116,6 +9168,7 @@ mod tests {
         moltis_agents::{model::LlmProvider, tool_registry::AgentTool},
         moltis_common::types::ReplyPayload,
         std::{
+            path::PathBuf,
             pin::Pin,
             sync::{
                 Arc,
@@ -12582,5 +12635,29 @@ mod tests {
             !already,
             "dedup flag must be cleared after Compact resets the window"
         );
+    }
+
+    #[test]
+    fn path_rules_accumulator_truncates_multibyte_safely() {
+        let mut acc = PathRulesAccumulator::new();
+        let long = "€".repeat(2_000);
+        acc.add(&[moltis_projects::ScopedRule {
+            source_path: PathBuf::from("rules.md"),
+            body: long,
+            globs: None,
+        }]);
+
+        let text = acc.text().expect("accumulator should contain rule text");
+        assert!(text.is_char_boundary(text.len()));
+        assert!(text.len() <= PathRulesAccumulator::BUDGET);
+    }
+
+    #[test]
+    fn looks_like_file_path_accepts_relative_paths_and_rejects_urls() {
+        assert!(looks_like_file_path("src/main.rs"));
+        assert!(looks_like_file_path("Cargo.toml"));
+        assert!(looks_like_file_path("./scripts/test.sh"));
+        assert!(!looks_like_file_path("https://example.com/file.rs"));
+        assert!(!looks_like_file_path("profile"));
     }
 }

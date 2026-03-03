@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
 };
@@ -136,23 +137,69 @@ fn parse_rules_front_matter(content: &str) -> (Option<Vec<String>>, &str) {
 }
 
 /// Check whether a file path matches any of the given glob patterns.
-fn matches_any_glob(file_path: &Path, globs: &[String]) -> bool {
+fn matches_any_glob(candidates: &[&Path], globs: &[String]) -> bool {
     for pattern in globs {
         let Ok(glob) = globset::Glob::new(pattern) else {
             continue;
         };
         let matcher = glob.compile_matcher();
-        if matcher.is_match(file_path) {
-            return true;
-        }
-        // Also try matching against just the file name
-        if let Some(name) = file_path.file_name()
-            && matcher.is_match(Path::new(name))
-        {
-            return true;
+        for candidate in candidates {
+            if matcher.is_match(candidate) {
+                return true;
+            }
+            // Also try matching against just the file name.
+            if let Some(name) = candidate.file_name()
+                && matcher.is_match(Path::new(name))
+            {
+                return true;
+            }
         }
     }
     false
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {},
+            Component::ParentDir => {
+                out.pop();
+            },
+            Component::Normal(part) => out.push(part),
+            Component::RootDir => out.push(Path::new("/")),
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+        }
+    }
+    out
+}
+
+fn canonicalize_with_missing(path: &Path) -> std::io::Result<PathBuf> {
+    let mut missing: Vec<OsString> = Vec::new();
+    let mut cursor = path;
+
+    while !cursor.exists() {
+        let Some(name) = cursor.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent;
+    }
+
+    let mut canonical = if cursor.exists() {
+        cursor.canonicalize()?
+    } else {
+        normalize_path(path)
+    };
+    for part in missing.iter().rev() {
+        canonical.push(part);
+    }
+    Ok(canonical)
 }
 
 /// Collect `.rules.md` and `.claude/rules/*.md` files from a single directory.
@@ -194,7 +241,16 @@ fn collect_rules_at(dir: &Path) -> Vec<(PathBuf, String)> {
 /// one pattern. Results are ordered outermost first, innermost last.
 pub fn load_path_scoped_rules(project_dir: &Path, file_path: &Path) -> Result<Vec<ScopedRule>> {
     let project_dir = project_dir.canonicalize()?;
-    let file_path = file_path.canonicalize()?;
+    let raw_target = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        project_dir.join(file_path)
+    };
+    let file_path = if raw_target.exists() {
+        raw_target.canonicalize()?
+    } else {
+        canonicalize_with_missing(&raw_target)?
+    };
 
     // file_path must be under project_dir
     if !file_path.starts_with(&project_dir) {
@@ -226,10 +282,17 @@ pub fn load_path_scoped_rules(project_dir: &Path, file_path: &Path) -> Result<Ve
         for (source_path, content) in collect_rules_at(dir) {
             let (globs, body) = parse_rules_front_matter(&content);
             // If globs are specified, only include if file matches
-            if let Some(ref patterns) = globs
-                && !matches_any_glob(&file_path, patterns)
-            {
-                continue;
+            if let Some(ref patterns) = globs {
+                let mut candidates: Vec<&Path> = vec![file_path.as_path()];
+                if let Ok(rel) = file_path.strip_prefix(&project_dir) {
+                    candidates.push(rel);
+                }
+                if let Ok(rel) = file_path.strip_prefix(dir) {
+                    candidates.push(rel);
+                }
+                if !matches_any_glob(&candidates, patterns) {
+                    continue;
+                }
             }
             if !body.trim().is_empty() {
                 info!(path = %source_path.display(), "loaded scoped rule");
@@ -431,5 +494,39 @@ mod tests {
         let (globs, body) = parse_rules_front_matter(content);
         assert_eq!(globs.unwrap(), vec!["*.rs", "*.toml"]);
         assert_eq!(body, "Body here");
+    }
+
+    #[test]
+    fn test_glob_matches_project_relative_path_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".rules.md"),
+            "---\nglobs:\n  - \"src/**/*.rs\"\n---\nRust tree rule",
+        )
+        .unwrap();
+        let nested = dir.path().join("src").join("core");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("mod.rs");
+        fs::write(&file, "").unwrap();
+
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].body, "Rust tree rule");
+    }
+
+    #[test]
+    fn test_nonexistent_target_path_still_loads_matching_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".rules.md"),
+            "---\nglobs:\n  - \"*.rs\"\n---\nApplies to new Rust files",
+        )
+        .unwrap();
+
+        let file = dir.path().join("src").join("new_file.rs");
+        // Intentionally do not create the file.
+        let rules = load_path_scoped_rules(dir.path(), &file).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].body, "Applies to new Rust files");
     }
 }
