@@ -13,7 +13,6 @@ use {
             DispatchMouseEventType, MouseButton,
         },
     },
-    rand::Rng,
     tokio::time::sleep,
 };
 
@@ -37,14 +36,13 @@ fn cubic_ease_in_out(t: f64) -> f64 {
 /// - 10–30 ms inter-step delay
 pub async fn bezier_mouse_move(page: &Page, from: (f64, f64), to: (f64, f64)) -> Result<(), Error> {
     const STEPS: u32 = 20;
-    let mut rng = rand::rng();
 
     for step in 0..=STEPS {
         let t = step as f64 / STEPS as f64;
         let eased = cubic_ease_in_out(t);
 
-        let jitter_x: f64 = rng.random_range(-1.0_f64..=1.0_f64);
-        let jitter_y: f64 = rng.random_range(-1.0_f64..=1.0_f64);
+        let jitter_x: f64 = rand::random_range(-1.0_f64..=1.0_f64);
+        let jitter_y: f64 = rand::random_range(-1.0_f64..=1.0_f64);
 
         let x = from.0 + (to.0 - from.0) * eased + jitter_x;
         let y = from.1 + (to.1 - from.1) * eased + jitter_y;
@@ -61,7 +59,7 @@ pub async fn bezier_mouse_move(page: &Page, from: (f64, f64), to: (f64, f64)) ->
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
         // Inter-step delay: 10–30 ms
-        let delay_ms: u64 = 10 + rng.random_range(0_u64..20_u64);
+        let delay_ms: u64 = 10 + rand::random_range(0_u64..20_u64);
         sleep(Duration::from_millis(delay_ms)).await;
     }
 
@@ -77,13 +75,11 @@ pub async fn bezier_mouse_move(page: &Page, from: (f64, f64), to: (f64, f64)) ->
 /// 4. 50–150 ms button-held pause
 /// 5. MouseReleased
 pub async fn realistic_click(page: &Page, from: (f64, f64), x: f64, y: f64) -> Result<(), Error> {
-    let mut rng = rand::rng();
-
     // Move to the target
     bezier_mouse_move(page, from, (x, y)).await?;
 
     // Pre-click pause
-    let pre_ms: u64 = 50 + rng.random_range(0_u64..100_u64);
+    let pre_ms: u64 = 50 + rand::random_range(0_u64..100_u64);
     sleep(Duration::from_millis(pre_ms)).await;
 
     // Button down
@@ -100,7 +96,7 @@ pub async fn realistic_click(page: &Page, from: (f64, f64), x: f64, y: f64) -> R
         .map_err(|e| Error::Cdp(e.to_string()))?;
 
     // Hold duration
-    let hold_ms: u64 = 50 + rng.random_range(0_u64..100_u64);
+    let hold_ms: u64 = 50 + rand::random_range(0_u64..100_u64);
     sleep(Duration::from_millis(hold_ms)).await;
 
     // Button up
@@ -124,8 +120,6 @@ pub async fn realistic_click(page: &Page, from: (f64, f64), x: f64, y: f64) -> R
 /// Each character is sent as KeyDown + KeyUp. Delay between events is
 /// `80 ms ± 70 ms`, clamped to `[10, 150] ms`.
 pub async fn realistic_type(page: &Page, text: &str) -> Result<(), Error> {
-    let mut rng = rand::rng();
-
     for c in text.chars() {
         let key_down = DispatchKeyEventParams::builder()
             .r#type(DispatchKeyEventType::KeyDown)
@@ -137,7 +131,7 @@ pub async fn realistic_type(page: &Page, text: &str) -> Result<(), Error> {
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
         // Per-character typing delay: 80 ms ± 70 ms, clamped to [10, 150] ms
-        let variance: i64 = rng.random_range(-70_i64..=70_i64);
+        let variance: i64 = rand::random_range(-70_i64..=70_i64);
         let delay_ms = (80_i64 + variance).clamp(10, 150) as u64;
         sleep(Duration::from_millis(delay_ms)).await;
 
