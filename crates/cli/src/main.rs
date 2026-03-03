@@ -18,7 +18,7 @@ mod hooks_commands;
 mod import_commands;
 mod memory_commands;
 mod sandbox_commands;
-#[cfg(feature = "tailscale")]
+#[cfg(all(feature = "gateway", feature = "tailscale"))]
 mod tailscale_commands;
 
 use {

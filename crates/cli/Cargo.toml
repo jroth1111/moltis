@@ -66,6 +66,9 @@ tikv-jemallocator = { optional = true, workspace = true }
 tempfile = { workspace = true }
 
 [features]
+# Most feature flags (tls, tailscale, metrics, voice, etc.) imply `gateway`
+# via their dep lists below. Code should still double-gate with
+# `#[cfg(all(feature = "gateway", feature = "X"))]` when using gateway types.
 agent = ["gateway", "moltis-gateway/agent", "moltis-web?/agent"]
 caldav = ["gateway", "moltis-gateway/caldav"]
 default = [
