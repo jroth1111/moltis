@@ -218,9 +218,12 @@ impl DedupeCache {
         {
             self.entries.remove(&oldest_key);
         }
-        self.entries.insert(key.to_string(), DedupeEntry {
-            inserted_at: Instant::now(),
-        });
+        self.entries.insert(
+            key.to_string(),
+            DedupeEntry {
+                inserted_at: Instant::now(),
+            },
+        );
         false
     }
 
@@ -805,13 +808,14 @@ impl GatewayState {
                     "client not connected",
                 ));
             }
-            inner
-                .pending_client_requests
-                .insert(request_id.clone(), PendingClientRequest {
+            inner.pending_client_requests.insert(
+                request_id.clone(),
+                PendingClientRequest {
                     method: method.into(),
                     sender: tx,
                     created_at: Instant::now(),
-                });
+                },
+            );
             let sent = inner
                 .clients
                 .get(conn_id)

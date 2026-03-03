@@ -140,16 +140,19 @@ impl ChannelPlugin for DiscordPlugin {
         {
             let otp_cooldown = cfg.otp_cooldown_secs;
             let mut accounts = self.accounts.write().unwrap_or_else(|e| e.into_inner());
-            accounts.insert(account_id.to_string(), AccountState {
-                account_id: account_id.to_string(),
-                config: cfg,
-                message_log: self.message_log.clone(),
-                event_sink: self.event_sink.clone(),
-                cancel: cancel.clone(),
-                bot_user_id: None,
-                http: None,
-                otp: std::sync::Mutex::new(OtpState::new(otp_cooldown)),
-            });
+            accounts.insert(
+                account_id.to_string(),
+                AccountState {
+                    account_id: account_id.to_string(),
+                    config: cfg,
+                    message_log: self.message_log.clone(),
+                    event_sink: self.event_sink.clone(),
+                    cancel: cancel.clone(),
+                    bot_user_id: None,
+                    http: None,
+                    otp: std::sync::Mutex::new(OtpState::new(otp_cooldown)),
+                },
+            );
         }
 
         // Spawn the serenity client in a background task.
