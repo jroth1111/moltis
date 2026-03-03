@@ -4929,7 +4929,7 @@ pub async fn start_gateway(
             }
 
             state_for_shutdown
-                .close_all_clients_going_away("server is shutting down")
+                .notify_clients_shutting_down("server is shutting down")
                 .await;
 
             let drain_timeout = std::time::Duration::from_secs(30);
@@ -4954,6 +4954,10 @@ pub async fn start_gateway(
                     warn!(error = %e, "failed to flush session store during shutdown");
                 }
             }
+
+            state_for_shutdown
+                .close_all_clients_going_away("server is shutting down")
+                .await;
 
             #[cfg(feature = "mdns")]
             if let Some(ref daemon) = _mdns_daemon {

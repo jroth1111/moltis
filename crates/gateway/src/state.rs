@@ -889,6 +889,23 @@ impl GatewayState {
     }
 
     /// Close all connected WebSocket clients with RFC6455 code 1001 ("Going Away").
+    pub async fn notify_clients_shutting_down(&self, reason: &str) {
+        let inner = self.inner.read().await;
+
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let frame = EventFrame::new(
+            "gateway.shutting_down",
+            serde_json::json!({ "reason": reason }),
+            seq,
+        );
+        if let Ok(json) = serde_json::to_string(&frame) {
+            for client in inner.clients.values() {
+                let _ = client.send(&json);
+            }
+        }
+    }
+
+    /// Close all connected WebSocket clients with RFC6455 code 1001 ("Going Away").
     pub async fn close_all_clients_going_away(&self, reason: &str) {
         let mut inner = self.inner.write().await;
 
@@ -1142,6 +1159,24 @@ mod tests {
             },
             OutboundWsFrame::Text(_) => panic!("expected close frame"),
         }
+    }
+
+    #[tokio::test]
+    async fn notify_clients_shutting_down_sends_event_without_closing() {
+        let state = test_state();
+        let (c1, mut rx1) = mock_client("conn-1");
+        state.register_client(c1).await;
+
+        state
+            .notify_clients_shutting_down("server is shutting down")
+            .await;
+
+        let first = rx1.recv().await.expect("should receive shutting_down event");
+        let first_text = expect_text_frame(first);
+        let frame: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        assert_eq!(frame["event"], "gateway.shutting_down");
+        assert_eq!(frame["payload"]["reason"], "server is shutting down");
+        assert_eq!(state.client_count().await, 1);
     }
 
     // ── Subscription tests ──────────────────────────────────────────────
