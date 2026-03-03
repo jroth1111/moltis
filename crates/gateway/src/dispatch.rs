@@ -156,7 +156,7 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
                 shift_id = %pending_shift.id.0,
                 "recovering pending shift from previous attempt"
             );
-            pending_shift
+            *pending_shift
         },
         ShiftClassification::NeedsNew => {
             // ── 3. Get or create IntentState. ─────────────────────────────────
@@ -352,7 +352,7 @@ enum ShiftClassification {
     /// A shift is in Retrying state — wait for the retry timer to fire.
     RetryPending,
     /// An existing Pending shift (from a previous retry) is ready to reclaim.
-    RecoverPending(Task),
+    RecoverPending(Box<Task>),
     /// No non-terminal children — dispatch loop should create a new shift.
     NeedsNew,
 }
@@ -394,7 +394,7 @@ async fn classify_shifts(
     // Third pass: look for an existing Pending shift to recover.
     for child in children {
         if matches!(child.runtime.state, RuntimeState::Pending) {
-            return Ok(ShiftClassification::RecoverPending(child));
+            return Ok(ShiftClassification::RecoverPending(Box::new(child)));
         }
     }
 
