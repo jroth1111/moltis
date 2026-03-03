@@ -278,6 +278,7 @@ fn build_schema_map() -> KnownKeys {
             ("agent_max_iterations", Leaf),
             ("max_tool_result_bytes", Leaf),
             ("leak_detection_sensitivity", Leaf),
+            ("provider_call_timeout_secs", Leaf),
         ]))
     };
 
@@ -482,6 +483,13 @@ fn build_schema_map() -> KnownKeys {
                 ("enabled", Leaf),
                 ("fallback_models", Leaf),
             ])),
+        ),
+        (
+            "provider_rate_limits",
+            Map(Box::new(Struct(HashMap::from([(
+                "requests_per_minute",
+                Leaf,
+            )])))),
         ),
         (
             "heartbeat",

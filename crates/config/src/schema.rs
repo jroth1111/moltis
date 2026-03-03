@@ -203,6 +203,9 @@ pub struct MoltisConfig {
     pub memory: MemoryEmbeddingConfig,
     pub tailscale: TailscaleConfig,
     pub failover: FailoverConfig,
+    /// Per-provider outbound rate limits. Key is the provider name (e.g. "openai").
+    #[serde(default)]
+    pub provider_rate_limits: HashMap<String, ProviderRateLimitConfig>,
     pub heartbeat: HeartbeatConfig,
     pub voice: VoiceConfig,
     pub cron: CronConfig,
@@ -729,6 +732,13 @@ impl Default for FailoverConfig {
             fallback_models: Vec::new(),
         }
     }
+}
+
+/// Outbound rate limit configuration for a single provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderRateLimitConfig {
+    /// Maximum requests per minute to this provider. `None` means no limit.
+    pub requests_per_minute: Option<u32>,
 }
 
 /// Heartbeat configuration — periodic health-check agent turn.
@@ -1408,6 +1418,9 @@ pub struct ToolsConfig {
     /// At > 0.5, entropy-based detection is also enabled.
     #[serde(default = "default_leak_detection_sensitivity")]
     pub leak_detection_sensitivity: f64,
+    /// Maximum wall-clock seconds for a single LLM provider call (0 = no timeout). Default 120.
+    #[serde(default = "default_provider_call_timeout_secs")]
+    pub provider_call_timeout_secs: u64,
 }
 
 impl Default for ToolsConfig {
@@ -1424,6 +1437,7 @@ impl Default for ToolsConfig {
             agent_max_iterations: default_agent_max_iterations(),
             max_tool_result_bytes: default_max_tool_result_bytes(),
             leak_detection_sensitivity: default_leak_detection_sensitivity(),
+            provider_call_timeout_secs: default_provider_call_timeout_secs(),
         }
     }
 }
@@ -1503,6 +1517,10 @@ fn default_max_tool_result_bytes() -> usize {
 
 fn default_leak_detection_sensitivity() -> f64 {
     0.5_f64
+}
+
+fn default_provider_call_timeout_secs() -> u64 {
+    120
 }
 
 /// Map tools configuration.
