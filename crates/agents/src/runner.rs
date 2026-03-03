@@ -29,6 +29,37 @@ use futures::StreamExt;
 /// Fallback loop limit when config is missing or invalid.
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 25;
 
+/// Check if a tool name matches a glob pattern (supports `*` wildcard).
+/// Mirrors `pattern_matches` in `moltis_tools::policy` to avoid a
+/// circular dependency between `moltis-agents` and `moltis-tools`.
+fn approval_pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    pattern == name
+}
+
+/// If any `approval_required` pattern matches `tool_name`, return the
+/// description (or a default). Returns `None` when no approval is needed.
+fn check_approval_required(
+    patterns: &[moltis_config::schema::ApprovalPatternConfig],
+    tool_name: &str,
+) -> Option<String> {
+    for p in patterns {
+        if approval_pattern_matches(&p.tool, tool_name) {
+            let reason = p
+                .description
+                .as_deref()
+                .unwrap_or("tool requires explicit approval");
+            return Some(reason.to_string());
+        }
+    }
+    None
+}
+
 fn resolve_agent_max_iterations(configured: usize) -> usize {
     if configured == 0 {
         warn!(
@@ -642,6 +673,7 @@ pub async fn run_agent_loop_with_context(
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
     let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
+    let approval_patterns = config.tools.policy.approval_required.clone();
     let tool_schemas = tools.list_schemas();
 
     let is_multimodal = matches!(user_content, UserContent::Multimodal(_));
@@ -1048,6 +1080,7 @@ pub async fn run_agent_loop_with_context(
                 let tc_name = tc.name.clone();
                 let _tc_id = tc.id.clone();
                 let trace_id = trace_id.clone();
+                let approval_patterns = approval_patterns.clone();
 
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
@@ -1057,6 +1090,18 @@ pub async fn run_agent_loop_with_context(
                     }
                 }
                 async move {
+                    // Check approval policy — block tools that require explicit
+                    // approval before they reach the hook or execution path.
+                    if let Some(reason) = check_approval_required(&approval_patterns, &tc_name) {
+                        warn!(tool = %tc_name, reason = %reason, "tool requires approval; blocking");
+                        let err_str = format!("approval required: {reason}");
+                        return (
+                            false,
+                            serde_json::json!({ "error": err_str }),
+                            Some(err_str),
+                        );
+                    }
+
                     // Run BeforeToolCall hook.
                     if let Some(ref hooks) = hook_registry {
                         let payload = HookPayload::BeforeToolCall {
@@ -1221,6 +1266,7 @@ pub async fn run_agent_loop_streaming(
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
     let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
+    let approval_patterns = config.tools.policy.approval_required.clone();
     let tool_schemas = tools.list_schemas();
 
     let is_multimodal = matches!(user_content, UserContent::Multimodal(_));
@@ -1734,6 +1780,7 @@ pub async fn run_agent_loop_streaming(
                 let session_key = session_key_for_hooks.clone();
                 let tc_name = tc.name.clone();
                 let trace_id = trace_id.clone();
+                let approval_patterns = approval_patterns.clone();
 
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
@@ -1743,6 +1790,18 @@ pub async fn run_agent_loop_streaming(
                     }
                 }
                 async move {
+                    // Check approval policy — block tools that require explicit
+                    // approval before they reach the hook or execution path.
+                    if let Some(reason) = check_approval_required(&approval_patterns, &tc_name) {
+                        warn!(tool = %tc_name, reason = %reason, "tool requires approval; blocking");
+                        let err_str = format!("approval required: {reason}");
+                        return (
+                            false,
+                            serde_json::json!({ "error": err_str }),
+                            Some(err_str),
+                        );
+                    }
+
                     // Run BeforeToolCall hook.
                     if let Some(ref hooks) = hook_registry {
                         let payload = HookPayload::BeforeToolCall {
@@ -4805,5 +4864,77 @@ mod tests {
             assert!(v >= 1);
             assert!(v <= RATE_LIMIT_MAX_RETRY_MS);
         }
+    }
+
+    // ── approval pattern matching tests ──
+
+    #[test]
+    fn approval_pattern_exact_match() {
+        assert!(approval_pattern_matches("exec", "exec"));
+        assert!(!approval_pattern_matches("exec", "exec_tool"));
+        assert!(!approval_pattern_matches("exec", "browser"));
+    }
+
+    #[test]
+    fn approval_pattern_wildcard_all() {
+        assert!(approval_pattern_matches("*", "exec"));
+        assert!(approval_pattern_matches("*", "anything"));
+    }
+
+    #[test]
+    fn approval_pattern_prefix_wildcard() {
+        assert!(approval_pattern_matches("file*", "file_read"));
+        assert!(approval_pattern_matches("file*", "file_write"));
+        assert!(approval_pattern_matches("file*", "file"));
+        assert!(!approval_pattern_matches("file*", "exec"));
+    }
+
+    #[test]
+    fn check_approval_returns_none_when_empty() {
+        assert!(check_approval_required(&[], "exec").is_none());
+    }
+
+    #[test]
+    fn check_approval_returns_description_on_match() {
+        let patterns = vec![moltis_config::schema::ApprovalPatternConfig {
+            tool: "exec".into(),
+            condition: None,
+            description: Some("Shell commands need approval".into()),
+        }];
+        let result = check_approval_required(&patterns, "exec");
+        assert_eq!(result.as_deref(), Some("Shell commands need approval"));
+    }
+
+    #[test]
+    fn check_approval_returns_default_when_no_description() {
+        let patterns = vec![moltis_config::schema::ApprovalPatternConfig {
+            tool: "exec".into(),
+            condition: None,
+            description: None,
+        }];
+        let result = check_approval_required(&patterns, "exec");
+        assert_eq!(result.as_deref(), Some("tool requires explicit approval"));
+    }
+
+    #[test]
+    fn check_approval_no_match_returns_none() {
+        let patterns = vec![moltis_config::schema::ApprovalPatternConfig {
+            tool: "exec".into(),
+            condition: None,
+            description: Some("blocked".into()),
+        }];
+        assert!(check_approval_required(&patterns, "browser").is_none());
+    }
+
+    #[test]
+    fn check_approval_prefix_pattern_matches() {
+        let patterns = vec![moltis_config::schema::ApprovalPatternConfig {
+            tool: "file*".into(),
+            condition: None,
+            description: Some("File ops need approval".into()),
+        }];
+        assert!(check_approval_required(&patterns, "file_read").is_some());
+        assert!(check_approval_required(&patterns, "file_write").is_some());
+        assert!(check_approval_required(&patterns, "exec").is_none());
     }
 }
