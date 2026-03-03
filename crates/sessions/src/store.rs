@@ -272,6 +272,45 @@ impl SessionStore {
                 .and_then(|v| v.as_str())
                 == Some("user");
 
+            let tail_user_text = valid_values.last().and_then(|value| {
+                let role = value.get("role").and_then(|v| v.as_str())?;
+                if role != "user" {
+                    return None;
+                }
+                if let Some(text) = value.get("content").and_then(|v| v.as_str()) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+                value
+                    .get("content")
+                    .and_then(|v| v.as_array())
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| {
+                                if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+                                    part.get("text").and_then(|v| v.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .and_then(|text| {
+                        let trimmed = text.trim().to_string();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
+                    })
+            });
+
+            let replay_blocked_by_tool_side_effects = !pending_tool_calls.is_empty();
+
             let mut injected_tool_results = 0_u64;
             for (tool_call_id, tool_name) in pending_tool_calls {
                 let synthetic = crate::message::PersistedMessage::tool_result(
@@ -291,46 +330,72 @@ impl SessionStore {
             }
 
             let mut appended_assistant_messages = 0_u64;
+            let mut replay_candidate: Option<String> = None;
             if ends_with_user {
-                let synthetic = crate::message::PersistedMessage::assistant(
-                    "Recovered from an interrupted run. Please continue from the latest request.",
-                    "recovery",
-                    "system",
-                    0,
-                    0,
-                    None,
-                );
-                let value = serde_json::to_value(&synthetic)?;
-                valid_lines.push(serde_json::to_string(&value)?);
-                appended_assistant_messages = 1;
+                if replay_blocked_by_tool_side_effects {
+                    let synthetic = crate::message::PersistedMessage::assistant(
+                        "Recovered from an interrupted run. Automatic replay was skipped because a prior tool call may have produced unresolved side effects.",
+                        "recovery",
+                        "system",
+                        0,
+                        0,
+                        None,
+                    );
+                    let value = serde_json::to_value(&synthetic)?;
+                    valid_lines.push(serde_json::to_string(&value)?);
+                    appended_assistant_messages = 1;
+                } else {
+                    if let Some(text) = tail_user_text {
+                        replay_candidate = Some(text);
+                    } else {
+                        let synthetic = crate::message::PersistedMessage::assistant(
+                            "Recovered from an interrupted run. Automatic replay could not be prepared because the latest user message had no text payload.",
+                            "recovery",
+                            "system",
+                            0,
+                            0,
+                            None,
+                        );
+                        let value = serde_json::to_value(&synthetic)?;
+                        valid_lines.push(serde_json::to_string(&value)?);
+                        appended_assistant_messages = 1;
+                    }
+                }
             }
 
             let recovered = removed_malformed > 0
                 || appended_assistant_messages > 0
-                || injected_tool_results > 0;
+                || injected_tool_results > 0
+                || replay_candidate.is_some();
             if !recovered {
                 return Ok(SessionIntegrityReport::default());
             }
 
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&path)?;
-            let mut lock = RwLock::new(file);
-            let mut guard = lock
-                .write()
-                .map_err(|e| Error::lock_failed(e.to_string()))?;
-            for line in &valid_lines {
-                writeln!(*guard, "{line}")?;
+            let requires_rewrite =
+                removed_malformed > 0 || appended_assistant_messages > 0 || injected_tool_results > 0;
+            if requires_rewrite {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&path)?;
+                let mut lock = RwLock::new(file);
+                let mut guard = lock
+                    .write()
+                    .map_err(|e| Error::lock_failed(e.to_string()))?;
+                for line in &valid_lines {
+                    writeln!(*guard, "{line}")?;
+                }
+                guard.sync_data()?;
             }
-            guard.sync_data()?;
 
             Ok(SessionIntegrityReport {
                 recovered,
                 removed_malformed_lines: removed_malformed,
                 appended_assistant_messages,
                 injected_tool_results,
+                replay_candidate,
+                replay_blocked_by_tool_side_effects,
             })
         })
         .await?
@@ -1396,6 +1461,8 @@ mod tests {
         assert_eq!(report.removed_malformed_lines, 1);
         assert_eq!(report.injected_tool_results, 1);
         assert_eq!(report.appended_assistant_messages, 1);
+        assert!(report.replay_candidate.is_none());
+        assert!(report.replay_blocked_by_tool_side_effects);
 
         let repaired = store.read("repair:case").await.unwrap();
         assert_eq!(repaired.len(), 4);
@@ -1430,6 +1497,30 @@ mod tests {
         assert_eq!(report.removed_malformed_lines, 0);
         assert_eq!(report.injected_tool_results, 0);
         assert_eq!(report.appended_assistant_messages, 0);
+        assert!(report.replay_candidate.is_none());
+        assert!(!report.replay_blocked_by_tool_side_effects);
+    }
+
+    #[tokio::test]
+    async fn test_validate_session_integrity_sets_replay_candidate_for_tail_user() {
+        let (store, _dir) = temp_store();
+        store
+            .append("replay", &json!({"role": "user", "content": "please continue"}))
+            .await
+            .unwrap();
+
+        let report = store.validate_session_integrity("replay").await.unwrap();
+        assert!(report.recovered);
+        assert_eq!(
+            report.replay_candidate.as_deref(),
+            Some("please continue")
+        );
+        assert_eq!(report.appended_assistant_messages, 0);
+        assert!(!report.replay_blocked_by_tool_side_effects);
+
+        let after = store.read("replay").await.unwrap();
+        assert_eq!(after.len(), 1, "replay candidate should not rewrite history");
+        assert_eq!(after[0]["role"], "user");
     }
 
     #[tokio::test]

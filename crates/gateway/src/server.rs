@@ -3935,6 +3935,9 @@ pub async fn prepare_gateway(
     let on_self_repair_scan: Arc<
         dyn Fn(moltis_agents::self_repair::RepairScanResult) + Send + Sync,
     > = Arc::new(move |result| {
+        const SELF_REPAIR_NAMESPACE: &str = "self_repair";
+        const SELF_REPAIR_REPLAY_HASH_KEY: &str = "last_replay_hash";
+
         let state = Arc::clone(&state_for_self_repair);
         let session_store = Arc::clone(&session_store_for_self_repair);
         tokio::spawn(async move {
@@ -3944,6 +3947,78 @@ pub async fn prepare_gateway(
 
                 match session_store.validate_session_integrity(&session_key).await {
                     Ok(report) => {
+                        let replay_candidate = report.replay_candidate.clone();
+                        let mut replay_attempted = false;
+                        let mut replay_blocked_reason: Option<String> = None;
+
+                        if let Some(replay_text) = replay_candidate.as_deref() {
+                            if report.replay_blocked_by_tool_side_effects {
+                                replay_blocked_reason =
+                                    Some("unresolved_tool_side_effects".to_string());
+                            } else if let Some(state_store) =
+                                state.services.session_state_store.as_ref()
+                            {
+                                let replay_hash =
+                                    moltis_common::handoff::HandoffDeadEnd::fingerprint(
+                                        "self_repair_replay",
+                                        replay_text,
+                                    );
+                                let already_replayed = state_store
+                                    .get(
+                                        &session_key,
+                                        SELF_REPAIR_NAMESPACE,
+                                        SELF_REPAIR_REPLAY_HASH_KEY,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|value| value == replay_hash);
+
+                                if already_replayed {
+                                    replay_blocked_reason = Some("already_replayed".to_string());
+                                } else if let Err(error) = state_store
+                                    .set(
+                                        &session_key,
+                                        SELF_REPAIR_NAMESPACE,
+                                        SELF_REPAIR_REPLAY_HASH_KEY,
+                                        &replay_hash,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        session = %session_key,
+                                        error = %error,
+                                        "failed to persist self-repair replay marker"
+                                    );
+                                    replay_blocked_reason =
+                                        Some("replay_marker_write_failed".to_string());
+                                } else {
+                                    let chat = state.chat().await;
+                                    let replay_payload = serde_json::json!({
+                                        "text": replay_text,
+                                        "_session_key": session_key,
+                                        "_recovery_replay": true,
+                                    });
+                                    match chat.send(replay_payload).await {
+                                        Ok(_) => {
+                                            replay_attempted = true;
+                                        },
+                                        Err(error) => {
+                                            warn!(
+                                                session = %session_key,
+                                                error = %error,
+                                                "failed to dispatch self-repair replay"
+                                            );
+                                            replay_blocked_reason =
+                                                Some("replay_dispatch_failed".to_string());
+                                        },
+                                    }
+                                }
+                            } else {
+                                replay_blocked_reason = Some("state_store_unavailable".to_string());
+                            }
+                        }
+
                         broadcast(
                             &state,
                             "session.recovered",
@@ -3953,6 +4028,9 @@ pub async fn prepare_gateway(
                                 "removedMalformedLines": report.removed_malformed_lines,
                                 "appendedAssistantMessages": report.appended_assistant_messages,
                                 "injectedToolResults": report.injected_tool_results,
+                                "replayCandidate": replay_candidate.is_some(),
+                                "replayAttempted": replay_attempted,
+                                "replayBlockedReason": replay_blocked_reason,
                             }),
                             BroadcastOpts {
                                 drop_if_slow: true,
