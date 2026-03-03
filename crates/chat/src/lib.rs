@@ -5326,6 +5326,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                None,
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -5337,6 +5338,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                None,
             )
         };
 
@@ -5447,6 +5449,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                None,
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -5458,6 +5461,7 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                None,
             )
         };
 
@@ -6556,6 +6560,7 @@ async fn run_with_tools(
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
+            None,
         )
     } else {
         build_system_prompt_minimal_runtime(
@@ -6567,6 +6572,7 @@ async fn run_with_tools(
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
+            None,
         )
     };
 
@@ -7558,6 +7564,7 @@ async fn run_streaming(
         persona.tools_text.as_deref(),
         runtime_context,
         persona.memory_text.as_deref(),
+        None,
     );
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.

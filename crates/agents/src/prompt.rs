@@ -149,6 +149,7 @@ pub fn build_system_prompt(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -165,6 +166,7 @@ pub fn build_system_prompt_with_session_runtime(
     tools_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
+    scoped_rules: Option<&str>,
 ) -> String {
     build_system_prompt_full(
         tools,
@@ -179,6 +181,7 @@ pub fn build_system_prompt_with_session_runtime(
         runtime_context,
         true, // include_tools
         memory_text,
+        scoped_rules,
     )
 }
 
@@ -192,6 +195,7 @@ pub fn build_system_prompt_minimal_runtime(
     tools_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
+    scoped_rules: Option<&str>,
 ) -> String {
     build_system_prompt_full(
         &ToolRegistry::new(),
@@ -206,6 +210,7 @@ pub fn build_system_prompt_minimal_runtime(
         runtime_context,
         false, // include_tools
         memory_text,
+        scoped_rules,
     )
 }
 
@@ -218,6 +223,8 @@ const PROJECT_CONTEXT_MAX_CHARS: usize = 8_000;
 /// Maximum number of characters from each workspace file (`AGENTS.md`,
 /// `TOOLS.md`) injected into the prompt.
 const WORKSPACE_FILE_MAX_CHARS: usize = 6_000;
+/// Maximum number of characters from path-scoped rules injected into the prompt.
+const PATH_RULES_MAX_CHARS: usize = 4_000;
 const EXEC_ROUTING_GUIDANCE: &str = "Execution routing:\n\
 - `exec` runs inside sandbox when `Sandbox(exec): enabled=true`.\n\
 - When sandbox is disabled, `exec` runs on the host and may require approval.\n\
@@ -334,6 +341,7 @@ fn build_system_prompt_full(
     runtime_context: Option<&PromptRuntimeContext>,
     include_tools: bool,
     memory_text: Option<&str>,
+    scoped_rules: Option<&str>,
 ) -> String {
     let tool_schemas = if include_tools {
         tools.list_schemas()
@@ -348,6 +356,7 @@ fn build_system_prompt_full(
 
     append_identity_and_user_sections(&mut prompt, identity, user, soul_text);
     append_project_context(&mut prompt, project_context);
+    append_scoped_rules(&mut prompt, scoped_rules);
     append_runtime_section(&mut prompt, runtime_context, include_tools);
     append_skills_section(&mut prompt, include_tools, skills);
     append_workspace_files_section(&mut prompt, agents_text, tools_text);
@@ -403,6 +412,21 @@ fn append_project_context(prompt: &mut String, project_context: Option<&str>) {
             "\n*(Project context truncated for prompt size; use tools/files for full details.)*\n",
         );
         prompt.push('\n');
+    }
+}
+
+fn append_scoped_rules(prompt: &mut String, scoped_rules: Option<&str>) {
+    if let Some(rules) = scoped_rules {
+        if !rules.trim().is_empty() {
+            prompt.push_str("## Path-Scoped Rules\n\n");
+            append_truncated_text_block(
+                prompt,
+                rules,
+                PATH_RULES_MAX_CHARS,
+                "\n*(Path-scoped rules truncated for prompt size.)*\n",
+            );
+            prompt.push('\n');
+        }
     }
 }
 
@@ -804,6 +828,7 @@ mod tests {
         }];
         let prompt = build_system_prompt_with_session_runtime(
             &tools, true, None, &skills, None, None, None, None, None, None, None,
+            None,
         );
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("commit"));
@@ -817,6 +842,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -853,6 +879,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(prompt.contains("Your name is Momo 🦜."));
         assert!(prompt.contains("Your theme: cheerful parrot."));
@@ -881,6 +908,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(prompt.contains("## Soul"));
         assert!(prompt.contains("loyal companion who loves fetch"));
@@ -895,6 +923,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -921,6 +950,7 @@ mod tests {
             None,
             Some("Follow workspace agent instructions."),
             Some("Prefer read-only tools first."),
+            None,
             None,
             None,
         );
@@ -985,6 +1015,7 @@ mod tests {
             None,
             Some(&runtime),
             None,
+            None,
         );
 
         assert!(prompt.contains("## Runtime"));
@@ -1034,6 +1065,7 @@ mod tests {
             None,
             Some(&runtime),
             None,
+            None,
         );
 
         assert!(prompt.contains("location=48.8566,2.3522"));
@@ -1067,6 +1099,7 @@ mod tests {
             None,
             None,
             Some(&runtime),
+            None,
             None,
         );
 
@@ -1102,6 +1135,7 @@ mod tests {
             None,
             Some(&runtime),
             None,
+            None,
         );
 
         assert!(!prompt.contains("location="));
@@ -1129,6 +1163,7 @@ mod tests {
             None,
             Some(&runtime),
             None,
+            None,
         );
 
         assert!(prompt.contains("## Runtime"));
@@ -1153,7 +1188,7 @@ mod tests {
     #[test]
     fn test_silent_replies_not_in_minimal_prompt() {
         let prompt =
-            build_system_prompt_minimal_runtime(None, None, None, None, None, None, None, None);
+            build_system_prompt_minimal_runtime(None, None, None, None, None, None, None, None, None);
         assert!(!prompt.contains("## Silent Replies"));
     }
 
@@ -1173,6 +1208,7 @@ mod tests {
             None,
             None,
             Some(memory),
+            None,
         );
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("Lives in Paris"));
@@ -1199,6 +1235,7 @@ mod tests {
             None,
             None,
             Some(&large_memory),
+            None,
         );
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("MEMORY.md truncated"));
@@ -1214,6 +1251,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1237,6 +1275,7 @@ mod tests {
             None,
             None,
             Some(memory),
+            None,
         );
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("Important fact"));
@@ -1287,6 +1326,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("MUST call `memory_save`"));
@@ -1300,6 +1340,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1327,6 +1368,7 @@ mod tests {
             None,
             None,
             Some(memory),
+            None,
         );
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("Likes coffee"));
@@ -1356,6 +1398,7 @@ mod tests {
             None,
             None,
             Some(&runtime),
+            None,
             None,
         );
 
@@ -1387,6 +1430,7 @@ mod tests {
             None,
             Some(&runtime),
             None,
+            None,
         );
 
         assert!(prompt.contains("The current user date is 2026-02-17."));
@@ -1417,10 +1461,55 @@ mod tests {
             None,
             Some(&runtime),
             None,
+            None,
         );
 
         assert!(!prompt.contains("The current user datetime is "));
         assert!(!prompt.contains("The current user date is "));
+    }
+
+    // ── Path-scoped rules ─────────────────────────────────────────────
+
+    #[test]
+    fn test_scoped_rules_injected_when_provided() {
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt_with_session_runtime(
+            &tools,
+            true,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("Always use snake_case.\nPrefer guard clauses."),
+        );
+        assert!(prompt.contains("## Path-Scoped Rules"));
+        assert!(prompt.contains("Always use snake_case."));
+        assert!(prompt.contains("Prefer guard clauses."));
+    }
+
+    #[test]
+    fn test_scoped_rules_omitted_when_none() {
+        let tools = ToolRegistry::new();
+        let prompt = build_system_prompt_with_session_runtime(
+            &tools,
+            true,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!prompt.contains("## Path-Scoped Rules"));
     }
 
     // ── Phase 4: ModelFamily, compact schema, tool call guidance ────────
