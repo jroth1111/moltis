@@ -3532,13 +3532,18 @@ pub async fn prepare_gateway(
                 });
             });
             let agents_config = Arc::new(tokio::sync::RwLock::new(config.agents.clone()));
+            let tool_policy_resolver: moltis_tools::policy::ToolPolicyResolver = Arc::new(|| {
+                let latest_config = moltis_config::discover_and_load();
+                moltis_tools::policy::effective_tool_policy(&latest_config)
+            });
             let spawn_tool = moltis_tools::spawn_agent::SpawnAgentTool::new(
                 Arc::clone(&registry),
                 default_provider,
                 base_tools,
             )
             .with_on_event(on_spawn_event)
-            .with_agents_config(agents_config);
+            .with_agents_config(agents_config)
+            .with_tool_policy_resolver(tool_policy_resolver);
             tool_registry.register(Box::new(spawn_tool));
         }
 

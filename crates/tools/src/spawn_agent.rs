@@ -49,6 +49,9 @@ pub struct SpawnAgentTool {
     tool_registry: Arc<ToolRegistry>,
     agents_config: Option<Arc<tokio::sync::RwLock<AgentsConfig>>>,
     on_event: Option<OnSpawnEvent>,
+    /// Global tool policy resolver — enforced on all sub-agent tool registries.
+    /// Resolved at spawn time so policy updates are picked up without restart.
+    tool_policy_resolver: crate::policy::ToolPolicyResolver,
 }
 
 impl SpawnAgentTool {
@@ -63,6 +66,9 @@ impl SpawnAgentTool {
             tool_registry,
             agents_config: None,
             on_event: None,
+            tool_policy_resolver: crate::policy::fixed_tool_policy_resolver(
+                crate::policy::ToolPolicy::default(),
+            ),
         }
     }
 
@@ -81,6 +87,22 @@ impl SpawnAgentTool {
         self
     }
 
+    /// Set the global tool policy enforced on all sub-agent tool registries.
+    /// Deny rules from this policy always win over per-spawn allow lists.
+    pub fn with_tool_policy(mut self, policy: crate::policy::ToolPolicy) -> Self {
+        self.tool_policy_resolver = crate::policy::fixed_tool_policy_resolver(policy);
+        self
+    }
+
+    /// Set a runtime tool policy resolver enforced on all sub-agent registries.
+    /// Deny rules from the resolved policy always win over per-spawn allow lists.
+    pub fn with_tool_policy_resolver(
+        mut self,
+        resolver: crate::policy::ToolPolicyResolver,
+    ) -> Self {
+        self.tool_policy_resolver = resolver;
+        self
+    }
     fn emit(&self, event: RunnerEvent) {
         if let Some(ref cb) = self.on_event {
             cb(event);
@@ -134,6 +156,9 @@ impl SpawnAgentTool {
             sub_tools = sub_tools.clone_allowed_by(|name| !deny.contains(name));
         }
 
+        // Apply global ToolPolicy — deny always wins over per-spawn allow lists.
+        let policy = (self.tool_policy_resolver)();
+        sub_tools = sub_tools.clone_allowed_by(|name| policy.is_allowed(name));
         sub_tools
     }
 
@@ -653,6 +678,86 @@ mod tests {
         assert!(filtered.get("task_list").is_none());
         assert!(filtered.get("spawn_agent").is_none());
         assert!(filtered.get("web_fetch").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_sub_tools_respects_global_tool_policy() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "ok".into(),
+            model_id: "mock".into(),
+        });
+        let policy = crate::policy::ToolPolicy {
+            allow: vec!["*".into()],
+            deny: vec!["exec".into()],
+            approval_required: Vec::new(),
+        };
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            registry_with_tools(&["spawn_agent", "exec", "web_fetch", "task_list"]),
+        )
+        .with_tool_policy(policy);
+
+        let filtered = spawn_tool.build_sub_tools(
+            &["exec".to_string(), "web_fetch".to_string()],
+            &[],
+            false,
+        );
+        assert!(filtered.get("exec").is_none());
+        assert!(filtered.get("web_fetch").is_some());
+        assert!(filtered.get("task_list").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_sub_tools_refreshes_policy_between_calls() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "ok".into(),
+            model_id: "mock".into(),
+        });
+        let runtime_policy = Arc::new(std::sync::RwLock::new(crate::policy::ToolPolicy {
+            allow: vec!["*".into()],
+            deny: vec!["exec".into()],
+            approval_required: Vec::new(),
+        }));
+        let runtime_policy_for_resolver = Arc::clone(&runtime_policy);
+        let resolver: crate::policy::ToolPolicyResolver = Arc::new(move || {
+            runtime_policy_for_resolver
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
+
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            registry_with_tools(&["spawn_agent", "exec", "web_fetch"]),
+        )
+        .with_tool_policy_resolver(resolver);
+
+        let first = spawn_tool.build_sub_tools(
+            &["exec".to_string(), "web_fetch".to_string()],
+            &[],
+            false,
+        );
+        assert!(first.get("exec").is_none());
+        assert!(first.get("web_fetch").is_some());
+
+        {
+            let mut guard = runtime_policy.write().unwrap_or_else(|e| e.into_inner());
+            *guard = crate::policy::ToolPolicy {
+                allow: vec!["*".into()],
+                deny: vec!["web_fetch".into()],
+                approval_required: Vec::new(),
+            };
+        }
+
+        let second = spawn_tool.build_sub_tools(
+            &["exec".to_string(), "web_fetch".to_string()],
+            &[],
+            false,
+        );
+        assert!(second.get("exec").is_some());
+        assert!(second.get("web_fetch").is_none());
     }
 
     #[tokio::test]
