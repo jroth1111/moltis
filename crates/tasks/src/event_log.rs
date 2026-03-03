@@ -129,12 +129,28 @@ mod tests {
         log.append("list1", "task-1", "Create", "", "Pending", None, None)
             .await
             .unwrap();
-        log.append("list1", "task-1", "Claim", "Pending", "Active", Some("bot"), None)
-            .await
-            .unwrap();
-        log.append("list1", "task-1", "Complete", "Active", "Terminal", None, Some("done"))
-            .await
-            .unwrap();
+        log.append(
+            "list1",
+            "task-1",
+            "Claim",
+            "Pending",
+            "Active",
+            Some("bot"),
+            None,
+        )
+        .await
+        .unwrap();
+        log.append(
+            "list1",
+            "task-1",
+            "Complete",
+            "Active",
+            "Terminal",
+            None,
+            Some("done"),
+        )
+        .await
+        .unwrap();
 
         let history = log.history("list1", "task-1").await.unwrap();
         assert_eq!(history.len(), 3);
@@ -167,9 +183,17 @@ mod tests {
     #[tokio::test]
     async fn optional_fields_round_trip() {
         let log = test_log().await;
-        log.append("l", "t", "Claim", "Pending", "Active", Some("agent-x"), Some("detail text"))
-            .await
-            .unwrap();
+        log.append(
+            "l",
+            "t",
+            "Claim",
+            "Pending",
+            "Active",
+            Some("agent-x"),
+            Some("detail text"),
+        )
+        .await
+        .unwrap();
 
         let h = log.history("l", "t").await.unwrap();
         assert_eq!(h[0].agent_id.as_deref(), Some("agent-x"));

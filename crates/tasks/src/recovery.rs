@@ -150,7 +150,10 @@ mod tests {
     fn deferred_retry_has_future_timestamp() {
         let phase = classify_recovery(&FailureClass::ProviderTransient, 2, 5);
         if let RecoveryPhase::DeferredRetry { retry_after } = phase {
-            assert!(retry_after > OffsetDateTime::now_utc(), "retry_after must be in the future");
+            assert!(
+                retry_after > OffsetDateTime::now_utc(),
+                "retry_after must be in the future"
+            );
         } else {
             panic!("expected DeferredRetry, got {phase:?}");
         }

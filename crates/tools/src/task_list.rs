@@ -45,7 +45,10 @@ pub struct TaskListTool {
 
 impl TaskListTool {
     pub fn new(store: Arc<TaskStore>) -> Self {
-        Self { store, max_attempts_override: None }
+        Self {
+            store,
+            max_attempts_override: None,
+        }
     }
 
     /// Return the underlying `Arc<TaskStore>` for sharing with other tools.
@@ -660,7 +663,10 @@ mod tests {
         let id = result["task"]["id"].as_str().unwrap().to_string();
 
         // Retrieve the stored spec and check max_attempts was overridden.
-        let got = t.execute(json!({ "action": "get", "id": id })).await.unwrap();
+        let got = t
+            .execute(json!({ "action": "get", "id": id }))
+            .await
+            .unwrap();
         assert_eq!(got["task"]["max_attempts"], 7);
     }
 

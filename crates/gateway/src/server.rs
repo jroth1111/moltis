@@ -3419,10 +3419,9 @@ pub async fn prepare_gateway(
         )));
 
         // Register shared task coordination tool for multi-agent workflows.
-        let task_list_tool =
-            moltis_tools::task_list::TaskListTool::from_data_dir(&data_dir)
-                .await?
-                .with_max_attempts_override(config.tasks.max_attempts_override);
+        let task_list_tool = moltis_tools::task_list::TaskListTool::from_data_dir(&data_dir)
+            .await?
+            .with_max_attempts_override(config.tasks.max_attempts_override);
         let task_store = task_list_tool.store();
         tool_registry.register(Box::new(task_list_tool));
 

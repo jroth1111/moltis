@@ -385,9 +385,14 @@ impl AgentTool for SpawnAgentTool {
             let new_exp = OffsetDateTime::now_utc()
                 + time::Duration::seconds(self.tasks_config.lease_duration_secs as i64);
             let _ = store
-                .apply_transition(lid, &tid.0, None, &TransitionEvent::RenewLease {
-                    new_expires_at: new_exp,
-                })
+                .apply_transition(
+                    lid,
+                    &tid.0,
+                    None,
+                    &TransitionEvent::RenewLease {
+                        new_expires_at: new_exp,
+                    },
+                )
                 .await;
         }
 
@@ -404,14 +409,16 @@ impl AgentTool for SpawnAgentTool {
                     iv.tick().await; // skip the first immediate tick
                     loop {
                         iv.tick().await;
-                        let new_exp = OffsetDateTime::now_utc()
-                            + time::Duration::seconds(lease_secs);
+                        let new_exp =
+                            OffsetDateTime::now_utc() + time::Duration::seconds(lease_secs);
                         let _ = store
                             .apply_transition(
                                 &lid,
                                 &tid.0,
                                 None,
-                                &TransitionEvent::RenewLease { new_expires_at: new_exp },
+                                &TransitionEvent::RenewLease {
+                                    new_expires_at: new_exp,
+                                },
                             )
                             .await;
                     }
@@ -1025,12 +1032,11 @@ mod tests {
 
         // The event log must contain a RenewLease entry — proof the pre-loop
         // lease set fired with the custom config.
-        let history = store
-            .event_log()
-            .history("lst", &task.id.0)
-            .await
-            .unwrap();
+        let history = store.event_log().history("lst", &task.id.0).await.unwrap();
         let has_renew = history.iter().any(|e| e.event_type == "RenewLease");
-        assert!(has_renew, "expected a RenewLease event in log; got: {history:?}");
+        assert!(
+            has_renew,
+            "expected a RenewLease event in log; got: {history:?}"
+        );
     }
 }

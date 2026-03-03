@@ -1026,7 +1026,11 @@ mod tests {
         assert_eq!(count, 1, "only the expired-lease task should be reclaimed");
 
         // The expired task must no longer be Active.
-        let reclaimed = store.get("z", &claimed.id.0).await.expect("get").expect("exists");
+        let reclaimed = store
+            .get("z", &claimed.id.0)
+            .await
+            .expect("get")
+            .expect("exists");
         assert!(
             !reclaimed.runtime.state.is_active(),
             "reclaimed task should not be Active; got {:?}",
@@ -1080,7 +1084,11 @@ mod tests {
         let n = store.promote_due_retries_all().await.expect("promote");
         assert_eq!(n, 1);
 
-        let final_task = store.get("wf", &task.id.0).await.expect("get").expect("exists");
+        let final_task = store
+            .get("wf", &task.id.0)
+            .await
+            .expect("get")
+            .expect("exists");
         assert_eq!(final_task.runtime.state, RuntimeState::Pending);
     }
 }

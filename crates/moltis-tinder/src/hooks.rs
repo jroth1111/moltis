@@ -96,16 +96,14 @@ impl FunnelGuardHook {
         let current = match funnel::get_match(&self.pool, match_id).await {
             Ok(Some(m)) => m,
             Ok(None) => {
-                return Ok(HookAction::Block(format!(
-                    "match not found: {match_id}"
-                )));
-            }
+                return Ok(HookAction::Block(format!("match not found: {match_id}")));
+            },
             Err(e) => {
                 warn!(error = %e, "funnel guard DB error — blocking action");
                 return Ok(HookAction::Block(
                     "guard unavailable, action blocked".to_string(),
                 ));
-            }
+            },
         };
 
         // Block transition to number_secured with < 3 exchanges.
@@ -159,22 +157,20 @@ impl FunnelGuardHook {
                     return Ok(HookAction::Block(
                         "contact pattern detected but match not found".to_string(),
                     ));
-                }
+                },
                 Err(e) => {
                     warn!(error = %e, "funnel guard DB error — blocking action");
                     return Ok(HookAction::Block(
                         "guard unavailable, action blocked".to_string(),
                     ));
-                }
+                },
             };
 
             // Allow contact sharing only if engaged or beyond.
             match current.funnel_state {
-                FunnelState::Engaged
-                | FunnelState::DateProposed
-                | FunnelState::NumberSecured => {
+                FunnelState::Engaged | FunnelState::DateProposed | FunnelState::NumberSecured => {
                     return Ok(HookAction::Continue);
-                }
+                },
                 _ => {
                     info!(
                         match_id = %match_id,
@@ -185,7 +181,7 @@ impl FunnelGuardHook {
                         "contact sharing blocked: match {} is in {} state (need engaged+)",
                         match_id, current.funnel_state
                     )));
-                }
+                },
             }
         }
 

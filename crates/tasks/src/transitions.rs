@@ -209,13 +209,12 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
         },
 
         // Active → Active (lease renewal, no state change)
-        (
-            RuntimeState::Active { owner, .. },
-            TransitionEvent::RenewLease { new_expires_at },
-        ) => Ok(RuntimeState::Active {
-            owner: owner.clone(),
-            lease_expires_at: Some(*new_expires_at),
-        }),
+        (RuntimeState::Active { owner, .. }, TransitionEvent::RenewLease { new_expires_at }) => {
+            Ok(RuntimeState::Active {
+                owner: owner.clone(),
+                lease_expires_at: Some(*new_expires_at),
+            })
+        },
 
         // Active → Terminal(Canceled)
         (RuntimeState::Active { .. }, TransitionEvent::Cancel { reason }) => {
@@ -568,8 +567,13 @@ mod tests {
     #[test]
     fn pending_cancel_goes_terminal_canceled() {
         let task = pending_task();
-        let result = apply(task, &TransitionEvent::Cancel { reason: "stop".into() })
-            .expect("cancel pending");
+        let result = apply(
+            task,
+            &TransitionEvent::Cancel {
+                reason: "stop".into(),
+            },
+        )
+        .expect("cancel pending");
         assert!(matches!(
             result.runtime.state,
             RuntimeState::Terminal(TerminalState::Canceled { .. })
@@ -586,8 +590,13 @@ mod tests {
             },
         )
         .expect("block");
-        let result = apply(blocked, &TransitionEvent::Cancel { reason: "stop".into() })
-            .expect("cancel blocked");
+        let result = apply(
+            blocked,
+            &TransitionEvent::Cancel {
+                reason: "stop".into(),
+            },
+        )
+        .expect("cancel blocked");
         assert!(matches!(
             result.runtime.state,
             RuntimeState::Terminal(TerminalState::Canceled { .. })
@@ -606,8 +615,13 @@ mod tests {
             },
         )
         .expect("fail");
-        let result = apply(retrying, &TransitionEvent::Cancel { reason: "abort".into() })
-            .expect("cancel retrying");
+        let result = apply(
+            retrying,
+            &TransitionEvent::Cancel {
+                reason: "abort".into(),
+            },
+        )
+        .expect("cancel retrying");
         assert!(matches!(
             result.runtime.state,
             RuntimeState::Terminal(TerminalState::Canceled { .. })
@@ -625,8 +639,13 @@ mod tests {
             },
         )
         .expect("escalate");
-        let result = apply(awaiting, &TransitionEvent::Cancel { reason: "abort".into() })
-            .expect("cancel awaiting");
+        let result = apply(
+            awaiting,
+            &TransitionEvent::Cancel {
+                reason: "abort".into(),
+            },
+        )
+        .expect("cancel awaiting");
         assert!(matches!(
             result.runtime.state,
             RuntimeState::Terminal(TerminalState::Canceled { .. })
@@ -709,7 +728,10 @@ mod tests {
         if let RuntimeState::Retrying { retry_after, .. } = result.runtime.state {
             // Allow ±5s around the expected value.
             let delta = (retry_after - future).abs();
-            assert!(delta < time::Duration::seconds(5), "retry_after mismatch: {retry_after}");
+            assert!(
+                delta < time::Duration::seconds(5),
+                "retry_after mismatch: {retry_after}"
+            );
         } else {
             panic!("expected Retrying state");
         }
@@ -753,8 +775,13 @@ mod tests {
         let v_before = claimed.runtime.version;
 
         let new_exp = OffsetDateTime::now_utc() + time::Duration::seconds(3600);
-        let renewed = apply(claimed, &TransitionEvent::RenewLease { new_expires_at: new_exp })
-            .expect("renew lease");
+        let renewed = apply(
+            claimed,
+            &TransitionEvent::RenewLease {
+                new_expires_at: new_exp,
+            },
+        )
+        .expect("renew lease");
 
         assert_eq!(renewed.runtime.version, v_before + 1);
         if let RuntimeState::Active {
