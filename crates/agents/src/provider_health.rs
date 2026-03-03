@@ -4,7 +4,7 @@
 //! metrics: success rate, error rate by class, p50/p95/p99 latency.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -46,8 +46,9 @@ pub struct ProviderHealthTracker {
 }
 
 struct TrackerInner {
-    records: Vec<CallRecord>,
+    records: VecDeque<CallRecord>,
     window: Duration,
+    max_records: usize,
 }
 
 impl ProviderHealthTracker {
@@ -56,8 +57,9 @@ impl ProviderHealthTracker {
     pub fn new(window: Duration) -> Self {
         Self {
             inner: Mutex::new(TrackerInner {
-                records: Vec::new(),
+                records: VecDeque::new(),
                 window,
+                max_records: 10_000,
             }),
         }
     }
@@ -78,7 +80,10 @@ impl ProviderHealthTracker {
             error_class: None,
         };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.records.push(record);
+        inner.records.push_back(record);
+        while inner.records.len() > inner.max_records {
+            inner.records.pop_front();
+        }
     }
 
     /// Record a failed provider call.
@@ -91,7 +96,10 @@ impl ProviderHealthTracker {
             error_class: Some(error_class.to_string()),
         };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.records.push(record);
+        inner.records.push_back(record);
+        while inner.records.len() > inner.max_records {
+            inner.records.pop_front();
+        }
     }
 
     /// Evict expired entries and return rolling stats per provider+model.
@@ -288,5 +296,24 @@ mod tests {
         assert_eq!(s.p50_ms, 51); // index 50 (0-based) in sorted 1..=100
         assert_eq!(s.p95_ms, 96); // index 95
         assert_eq!(s.p99_ms, 100); // index 99
+    }
+
+    #[test]
+    fn records_capped_at_max() {
+        let tracker = ProviderHealthTracker::new(Duration::from_secs(3600));
+        // Manually lower max_records for testing.
+        {
+            let mut inner = tracker.inner.lock().unwrap();
+            inner.max_records = 5;
+        }
+        for i in 1..=10 {
+            tracker.record_success("p", "m", i);
+        }
+        assert_eq!(tracker.len(), 5);
+        // Oldest entries (1..=5) should have been evicted; newest are 6..=10.
+        let stats = tracker.snapshot();
+        let s = &stats[0];
+        assert_eq!(s.total_calls, 5);
+        assert_eq!(s.p50_ms, 8); // sorted [6,7,8,9,10], index 2
     }
 }
