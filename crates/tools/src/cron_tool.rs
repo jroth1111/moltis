@@ -287,6 +287,7 @@ fn normalize_payload_kind(raw: &str) -> Option<&'static str> {
     match normalized.as_str() {
         "systemevent" | "system_event" | "system-event" | "event" => Some("systemEvent"),
         "agentturn" | "agent_turn" | "agent-turn" | "agent" => Some("agentTurn"),
+        "createtask" | "create_task" | "create-task" | "task" => Some("createTask"),
         _ => None,
     }
 }
@@ -315,6 +316,11 @@ fn normalize_payload_value(payload: &mut Value, session_target_hint: Option<&str
             take_alias(obj, "kind", &["payloadKind", "type"]);
             take_alias(obj, "text", &["event", "instruction"]);
             take_alias(obj, "message", &["prompt", "content"]);
+            take_alias(obj, "list_id", &["listId"]);
+            take_alias(obj, "is_intent", &["isIntent"]);
+            take_alias(obj, "autonomy_tier", &["autonomyTier"]);
+            take_alias(obj, "principal_json", &["principalJson"]);
+            take_alias(obj, "blocked_by", &["blockedBy"]);
             take_alias(
                 obj,
                 "timeout_secs",
@@ -337,21 +343,23 @@ fn normalize_payload_value(payload: &mut Value, session_target_hint: Option<&str
                     .ok_or_else(|| Error::message("payload.kind must be a string"))?;
                 let kind_norm = normalize_payload_kind(kind_raw).ok_or_else(|| {
                     Error::message(format!(
-                        "invalid payload kind `{kind_raw}` (expected `systemEvent` or `agentTurn`)"
+                        "invalid payload kind `{kind_raw}` (expected `systemEvent`, `agentTurn`, or `createTask`)"
                     ))
                 })?;
                 *kind_val = Value::String(kind_norm.to_string());
             } else {
                 let has_text = obj.contains_key("text");
                 let has_message = obj.contains_key("message");
-                let inferred = match (has_text, has_message) {
-                    (true, false) => "systemEvent",
-                    (false, true) => "agentTurn",
-                    (true, true) if prefers_system_event(session_target_hint) => "systemEvent",
-                    (true, true) => "agentTurn",
-                    (false, false) => {
+                let has_subject = obj.contains_key("subject");
+                let inferred = match (has_text, has_message, has_subject) {
+                    (false, false, true) => "createTask",
+                    (true, false, _) => "systemEvent",
+                    (false, true, _) => "agentTurn",
+                    (true, true, _) if prefers_system_event(session_target_hint) => "systemEvent",
+                    (true, true, _) => "agentTurn",
+                    (false, false, false) => {
                         return Err(Error::message(
-                            "invalid payload: missing `kind` and no recognizable fields (expected one of `text` or `message`)",
+                            "invalid payload: missing `kind` and no recognizable fields (expected one of `text`, `message`, or `subject`)",
                         ));
                     },
                 };
@@ -394,6 +402,115 @@ fn normalize_payload_value(payload: &mut Value, session_target_hint: Option<&str
                             Error::message("payload kind `agentTurn` requires `message`")
                         })?;
                     obj.insert("message".to_string(), Value::String(message.to_string()));
+                },
+                "createTask" => {
+                    let subject = obj
+                        .get("subject")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|subject| !subject.is_empty())
+                        .ok_or_else(|| {
+                            Error::message("payload kind `createTask` requires `subject`")
+                        })?;
+                    obj.insert("subject".to_string(), Value::String(subject.to_string()));
+
+                    let description = obj
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    obj.insert(
+                        "description".to_string(),
+                        Value::String(description.to_string()),
+                    );
+
+                    let list_id = obj
+                        .get("list_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or("default");
+                    obj.insert("list_id".to_string(), Value::String(list_id.to_string()));
+
+                    let is_intent = obj
+                        .get("is_intent")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    obj.insert("is_intent".to_string(), Value::Bool(is_intent));
+
+                    let autonomy_tier = obj
+                        .get("autonomy_tier")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|tier| !tier.is_empty())
+                        .unwrap_or("auto");
+                    if !matches!(autonomy_tier, "auto" | "confirm" | "approve") {
+                        return Err(Error::message(
+                            "payload.autonomy_tier must be one of: auto, confirm, approve",
+                        ));
+                    }
+                    obj.insert(
+                        "autonomy_tier".to_string(),
+                        Value::String(autonomy_tier.to_string()),
+                    );
+
+                    if let Some(principal_val) = obj.get("principal_json").cloned() {
+                        match principal_val {
+                            Value::Null => {
+                                obj.remove("principal_json");
+                            },
+                            Value::String(s) => {
+                                let trimmed = s.trim();
+                                if trimmed.is_empty() {
+                                    obj.remove("principal_json");
+                                } else {
+                                    obj.insert(
+                                        "principal_json".to_string(),
+                                        Value::String(trimmed.to_string()),
+                                    );
+                                }
+                            },
+                            Value::Object(_) => {
+                                let encoded = serde_json::to_string(&principal_val).map_err(|e| {
+                                    Error::message(format!(
+                                        "failed to serialize payload.principal_json: {e}"
+                                    ))
+                                })?;
+                                obj.insert("principal_json".to_string(), Value::String(encoded));
+                            },
+                            _ => {
+                                return Err(Error::message(
+                                    "payload.principal_json must be a string or object when provided",
+                                ));
+                            },
+                        }
+                    }
+
+                    let blocked_by = obj
+                        .get("blocked_by")
+                        .map(|value| {
+                            value
+                                .as_array()
+                                .ok_or_else(|| {
+                                    Error::message(
+                                        "payload.blocked_by must be an array of strings",
+                                    )
+                                })?
+                                .iter()
+                                .map(|v| {
+                                    v.as_str().map(|s| Value::String(s.to_string())).ok_or_else(
+                                        || {
+                                            Error::message(
+                                                "payload.blocked_by entries must be strings",
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .transpose()?
+                        .unwrap_or_default();
+                    obj.insert("blocked_by".to_string(), Value::Array(blocked_by));
                 },
                 _ => unreachable!("payload kind normalized above"),
             }
@@ -674,6 +791,12 @@ impl AgentTool for CronTool {
          - payload.kind: \"agentTurn\"\n\
          - payload.message: the prompt for the isolated agent run\n\
          \n\
+         For deterministic task creation (no LLM execution in cron path), use:\n\
+         - payload.kind: \"createTask\"\n\
+         - payload.list_id: target list id\n\
+         - payload.subject: task subject\n\
+         - payload.description: optional task description\n\
+         \n\
          To deliver the agent output to a channel (e.g. Telegram) after the run:\n\
          - payload.deliver: true\n\
          - payload.channel: the channel account identifier (e.g. the Telegram \
@@ -685,6 +808,7 @@ impl AgentTool for CronTool {
          Important constraints:\n\
          - sessionTarget \"main\" requires payload kind \"systemEvent\"\n\
          - sessionTarget \"isolated\" requires payload kind \"agentTurn\"\n\
+         - payload kind \"createTask\" is compatible with any sessionTarget\n\
          - When the user asks to send output to a channel, always use \
            sessionTarget \"isolated\" + kind \"agentTurn\" + deliver fields\n\
          \n\
@@ -725,11 +849,18 @@ impl AgentTool for CronTool {
                         },
                         "payload": {
                             "type": "object",
-                            "description": "What to do. Use {kind:'systemEvent', text} for main-session reminders or {kind:'agentTurn', message, model?, timeout_secs?, deliver?, channel?, to?}. `payload.model` selects the LLM for that job. This tool also accepts a shorthand message string at runtime.",
+                            "description": "What to do. Use {kind:'systemEvent', text} for main-session reminders, {kind:'agentTurn', message, model?, timeout_secs?, deliver?, channel?, to?} for isolated agent turns, or {kind:'createTask', list_id, subject, description?, is_intent?, autonomy_tier?, principal_json?, blocked_by?} for deterministic task creation.",
                             "properties": {
-                                "kind": { "type": "string", "enum": ["systemEvent", "agentTurn"] },
+                                "kind": { "type": "string", "enum": ["systemEvent", "agentTurn", "createTask"] },
                                 "text": { "type": "string" },
                                 "message": { "type": "string" },
+                                "list_id": { "type": "string" },
+                                "subject": { "type": "string" },
+                                "description": { "type": "string" },
+                                "is_intent": { "type": "boolean" },
+                                "autonomy_tier": { "type": "string", "enum": ["auto", "confirm", "approve"] },
+                                "principal_json": { "type": "string" },
+                                "blocked_by": { "type": "array", "items": { "type": "string" } },
                                 "model": { "type": "string" },
                                 "timeout_secs": { "type": "integer" },
                                 "deliver": { "type": "boolean", "description": "Set to true to deliver the agent output to a channel (e.g. Telegram) after the run. Requires channel and to." },
@@ -1052,6 +1183,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_accepts_create_task_payload_kind_alias() {
+        let tool = make_tool();
+        let add_result = tool
+            .execute(json!({
+                "action": "add",
+                "job": {
+                    "name": "create task",
+                    "schedule": { "kind": "at", "at_ms": 1234567890000u64 },
+                    "payload": {
+                        "kind": "create_task",
+                        "listId": "default",
+                        "subject": "Prepare briefing",
+                        "description": "Build tomorrow summary",
+                        "isIntent": true,
+                        "autonomyTier": "confirm",
+                        "blockedBy": ["dep-1", "dep-2"]
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(add_result["payload"]["kind"], "createTask");
+        assert_eq!(add_result["payload"]["list_id"], "default");
+        assert_eq!(add_result["payload"]["subject"], "Prepare briefing");
+        assert_eq!(add_result["payload"]["is_intent"], true);
+        assert_eq!(add_result["payload"]["autonomy_tier"], "confirm");
+        assert_eq!(add_result["payload"]["blocked_by"][0], "dep-1");
+    }
+
+    #[tokio::test]
+    async fn test_add_infers_create_task_kind_from_subject() {
+        let tool = make_tool();
+        let add_result = tool
+            .execute(json!({
+                "action": "add",
+                "job": {
+                    "name": "infer createTask",
+                    "schedule": { "kind": "every", "every_ms": 60000 },
+                    "payload": {
+                        "list_id": "default",
+                        "subject": "Nightly digest"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(add_result["payload"]["kind"], "createTask");
+        assert_eq!(add_result["payload"]["description"], "");
+    }
+
+    #[tokio::test]
     async fn test_update_accepts_schedule_string_patch() {
         let tool = make_tool();
         let add_result = tool
@@ -1183,6 +1367,19 @@ mod tests {
         assert!(
             !contains_one_of(&schema),
             "cron tool schema must avoid oneOf for OpenAI Responses API compatibility"
+        );
+    }
+
+    #[test]
+    fn test_parameters_schema_includes_create_task_kind() {
+        let tool = make_tool();
+        let schema = tool.parameters_schema();
+        let kinds = &schema["properties"]["job"]["properties"]["payload"]["properties"]["kind"]
+            ["enum"];
+        let kinds = kinds.as_array().expect("kind enum must be array");
+        assert!(
+            kinds.iter().any(|k| k == "createTask"),
+            "createTask kind must be exposed in tool schema"
         );
     }
 

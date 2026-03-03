@@ -48,11 +48,14 @@ pub type NotifyFn = Arc<dyn Fn(CronNotification) + Send + Sync>;
 /// Parameters passed to the create-task callback.
 #[derive(Debug, Clone)]
 pub struct CreateTaskRequest {
+    pub list_id: String,
     pub subject: String,
     pub description: String,
+    pub is_intent: bool,
     /// Autonomy tier string: "auto" | "confirm" | "approve".
     pub autonomy_tier: String,
-    pub list_id: Option<String>,
+    pub principal_json: Option<String>,
+    pub blocked_by: Vec<String>,
 }
 
 /// Result returned by the create-task callback.
@@ -596,17 +599,23 @@ impl CronService {
                 (self.on_agent_turn)(req).await
             },
             CronPayload::CreateTask {
+                list_id,
                 subject,
                 description,
+                is_intent,
                 autonomy_tier,
-                list_id,
+                principal_json,
+                blocked_by,
             } => {
                 if let Some(ref on_create) = self.on_create_task {
                     let req = CreateTaskRequest {
+                        list_id: list_id.clone(),
                         subject: subject.clone(),
                         description: description.clone(),
+                        is_intent: *is_intent,
                         autonomy_tier: autonomy_tier.clone(),
-                        list_id: list_id.clone(),
+                        principal_json: principal_json.clone(),
+                        blocked_by: blocked_by.clone(),
                     };
                     on_create(req).await.map(|r| AgentTurnResult {
                         output: format!("task created: {}", r.task_id),
@@ -771,6 +780,17 @@ fn validate_job_spec(job: &CronJob) -> Result<()> {
             ));
         },
         _ => {},
+    }
+    if let CronPayload::CreateTask {
+        list_id, subject, ..
+    } = &job.payload
+    {
+        if list_id.trim().is_empty() {
+            return Err(Error::message("createTask payload requires non-empty list_id"));
+        }
+        if subject.trim().is_empty() {
+            return Err(Error::message("createTask payload requires non-empty subject"));
+        }
     }
     if let CronPayload::AgentTurn {
         deliver: true,
@@ -1656,10 +1676,13 @@ mod tests {
     #[tokio::test]
     async fn create_task_payload_serde_roundtrip() {
         let p = CronPayload::CreateTask {
+            list_id: "releases".into(),
             subject: "Ship release".into(),
             description: "Tag v1.2.3 and push".into(),
+            is_intent: true,
             autonomy_tier: "confirm".into(),
-            list_id: Some("releases".into()),
+            principal_json: Some("{\"channel\":\"web\",\"sender\":\"alice\"}".into()),
+            blocked_by: vec!["a".into(), "b".into()],
         };
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("createTask"), "tag not present: {json}");
@@ -1670,7 +1693,7 @@ mod tests {
     #[tokio::test]
     async fn create_task_payload_defaults_autonomy_tier() {
         // autonomy_tier should default to "auto" when omitted.
-        let json = r#"{"kind":"createTask","subject":"hello","description":""}"#;
+        let json = r#"{"kind":"createTask","list_id":"default","subject":"hello","description":""}"#;
         let p: CronPayload = serde_json::from_str(json).unwrap();
         match p {
             CronPayload::CreateTask { autonomy_tier, .. } => {
@@ -1715,10 +1738,13 @@ mod tests {
                 name: "make-task".into(),
                 schedule: CronSchedule::At { at_ms: 1 },
                 payload: CronPayload::CreateTask {
+                    list_id: "default".into(),
                     subject: "do-work".into(),
                     description: "".into(),
+                    is_intent: false,
                     autonomy_tier: "auto".into(),
-                    list_id: None,
+                    principal_json: None,
+                    blocked_by: vec![],
                 },
                 session_target: SessionTarget::Isolated,
                 delete_after_run: true,
@@ -1749,10 +1775,13 @@ mod tests {
                 name: "unconfigured-create".into(),
                 schedule: CronSchedule::At { at_ms: 1 },
                 payload: CronPayload::CreateTask {
+                    list_id: "default".into(),
                     subject: "work".into(),
                     description: "".into(),
+                    is_intent: false,
                     autonomy_tier: "auto".into(),
-                    list_id: None,
+                    principal_json: None,
+                    blocked_by: vec![],
                 },
                 session_target: SessionTarget::Isolated,
                 delete_after_run: false,

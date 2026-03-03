@@ -66,17 +66,25 @@ pub enum CronPayload {
     },
     /// Create a new dispatch-managed intent task in the task store.
     CreateTask {
+        /// Target task list ID.
+        list_id: String,
         /// Short imperative title for the new task.
         subject: String,
         /// Detailed description (optional).
         #[serde(default)]
         description: String,
+        /// Whether this task should be managed by the intent dispatch loop.
+        #[serde(default)]
+        is_intent: bool,
         /// Autonomy tier granted to shift agents: "auto" | "confirm" | "approve".
         #[serde(default = "default_autonomy_tier")]
         autonomy_tier: String,
-        /// Target task list ID (defaults to "default").
+        /// Optional serialized TaskPrincipal JSON string.
         #[serde(skip_serializing_if = "Option::is_none")]
-        list_id: Option<String>,
+        principal_json: Option<String>,
+        /// Optional dependency task IDs.
+        #[serde(default)]
+        blocked_by: Vec<String>,
     },
 }
 

@@ -2077,12 +2077,23 @@ pub async fn prepare_gateway(
                     "approve" => moltis_tasks::AutonomyTier::Approve,
                     _ => moltis_tasks::AutonomyTier::Auto,
                 };
-                let list_id = req.list_id.as_deref().unwrap_or("default");
+                let principal = req
+                    .principal_json
+                    .as_deref()
+                    .map(serde_json::from_str::<moltis_tasks::TaskPrincipal>)
+                    .transpose()
+                    .map_err(|e| moltis_cron::Error::message(format!("invalid principal_json: {e}")))?;
                 let mut spec = moltis_tasks::TaskSpec::new(req.subject, req.description);
-                spec.is_intent = true;
+                spec.is_intent = req.is_intent;
                 spec.autonomy_tier = tier;
+                spec.principal = principal;
+                let blocked_by = req
+                    .blocked_by
+                    .into_iter()
+                    .map(moltis_tasks::TaskId::from)
+                    .collect();
                 let task = store
-                    .create(list_id, spec, vec![])
+                    .create(&req.list_id, spec, blocked_by)
                     .await
                     .map_err(|e| moltis_cron::Error::message(e.to_string()))?;
                 Ok(moltis_cron::service::CreateTaskResult { task_id: task.id.0 })
