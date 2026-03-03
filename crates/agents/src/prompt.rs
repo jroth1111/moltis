@@ -995,6 +995,7 @@ mod tests {
                 remote_ip: Some("203.0.113.42".into()),
                 location: None,
                 dispatch_deny: vec![],
+                dispatch_autonomy_tier: None,
             },
             sandbox: Some(PromptSandboxRuntimeContext {
                 exec_sandboxed: true,
