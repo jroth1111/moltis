@@ -349,7 +349,9 @@ enum ContextCompactionAction {
 }
 
 #[must_use]
-fn context_compaction_config_from_chat(chat: &moltis_config::ChatConfig) -> ContextCompactionConfig {
+fn context_compaction_config_from_chat(
+    chat: &moltis_config::ChatConfig,
+) -> ContextCompactionConfig {
     let strategy = match chat
         .context_compaction_strategy
         .trim()

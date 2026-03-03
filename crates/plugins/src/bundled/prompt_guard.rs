@@ -101,7 +101,10 @@ mod tests {
             tool_count: 0,
             iteration: 1,
         };
-        let result = hook.handle(HookEvent::BeforeLLMCall, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeLLMCall, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Block(_)));
     }
 
@@ -118,7 +121,10 @@ mod tests {
             tool_count: 0,
             iteration: 1,
         };
-        let result = hook.handle(HookEvent::BeforeLLMCall, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeLLMCall, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Continue));
     }
 
@@ -144,7 +150,10 @@ mod tests {
             tool_count: 0,
             iteration: 1,
         };
-        let result = hook.handle(HookEvent::BeforeLLMCall, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeLLMCall, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Continue));
     }
 

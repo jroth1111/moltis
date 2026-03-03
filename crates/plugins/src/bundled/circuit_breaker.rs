@@ -144,8 +144,7 @@ impl HookHandler for CircuitBreakerHook {
                 output_tokens,
                 ..
             } => {
-                let failed =
-                    *output_tokens == 0 && text.is_none() && tool_calls.is_empty();
+                let failed = *output_tokens == 0 && text.is_none() && tool_calls.is_empty();
                 if failed {
                     let mut states = self.states.write().await;
                     let mut counts = self.failure_counts.write().await;
@@ -324,7 +323,9 @@ mod tests {
             output_tokens: 0,
             iteration: 1,
         };
-        hook.handle(HookEvent::AfterLLMCall, &payload).await.unwrap();
+        hook.handle(HookEvent::AfterLLMCall, &payload)
+            .await
+            .unwrap();
         let snapshot = hook.snapshot().await;
         let state = snapshot.iter().find(|s| s.provider == "p").unwrap();
         assert_eq!(state.state, "closed");

@@ -14,7 +14,7 @@ use {
     },
     futures::StreamExt,
     sysinfo::System,
-    tokio::sync::{Mutex, RwLock},
+    tokio::sync::{Mutex, RwLock, broadcast},
     tracing::{debug, info, warn},
 };
 
@@ -267,21 +267,63 @@ impl BrowserPool {
 
     /// Enable network interception and optionally HAR recording for a session.
     ///
-    /// Calls `Fetch.enable` on the active page and stores state in the instance.
+    /// Calls `Fetch.enable` on the active page, subscribes to `EventRequestPaused`
+    /// events, and spawns a background task that auto-continues each paused request
+    /// (so they are never left hanging) and feeds data into the HAR recorder if one
+    /// is active.
     pub async fn enable_interception(
         &self,
         session_id: &str,
         patterns: Vec<String>,
         extra_headers: HashMap<String, String>,
     ) -> Result<(), Error> {
+        use chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused;
+
         let page = self.get_page(session_id).await?;
         crate::network::enable_interception(&page, patterns).await?;
 
+        // Subscribe to CDP EventRequestPaused events before storing state.
+        let event_stream = page
+            .event_listener::<EventRequestPaused>()
+            .await
+            .map_err(|e| Error::Cdp(format!("intercept event listener: {e}")))?;
+
+        let (paused_tx, _rx) = broadcast::channel::<EventRequestPaused>(32);
+        let paused_tx_clone = paused_tx.clone();
+        let page_clone = page.clone();
+
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(session_id) {
+            let instance_arc = Arc::clone(instance);
             let mut inst = instance.lock().await;
             inst.interception.enabled = true;
             inst.interception.extra_headers = extra_headers;
+
+            let task = tokio::spawn(async move {
+                let mut stream = event_stream;
+                while let Some(event) = stream.next().await {
+                    // Record into HAR if active — lock briefly, release before CDP call.
+                    {
+                        let mut inst = instance_arc.lock().await;
+                        if let Some(ref mut rec) = inst.interception.recorder {
+                            rec.record(crate::network::HarEntry::from_event(&event));
+                        }
+                    }
+                    // Forward to external subscribers (ignore if none).
+                    let _ = paused_tx_clone.send(event.clone());
+                    // Auto-continue so the request is never left hanging.
+                    let _ = crate::network::continue_request(
+                        &page_clone,
+                        event.request_id.clone(),
+                        None,
+                    )
+                    .await;
+                }
+                debug!("intercept event stream closed");
+            });
+
+            inst.interception.paused_tx = Some(paused_tx);
+            inst.interception._task = Some(task);
         }
 
         Ok(())
@@ -295,6 +337,10 @@ impl BrowserPool {
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(session_id) {
             let mut inst = instance.lock().await;
+            if let Some(task) = inst.interception._task.take() {
+                task.abort();
+            }
+            inst.interception.paused_tx = None;
             inst.interception.enabled = false;
         }
 

@@ -105,14 +105,14 @@ impl DomainApprovalManager {
     ) -> (String, oneshot::Receiver<DomainDecision>) {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .write()
-            .await
-            .insert(id.clone(), PendingDomainRequest {
+        self.pending.write().await.insert(
+            id.clone(),
+            PendingDomainRequest {
                 tx,
                 domain: domain.to_string(),
                 session: session.to_string(),
-            });
+            },
+        );
         debug!(id = %id, "domain approval request created");
         #[cfg(feature = "metrics")]
         counter!("domain_approval_requests_total").increment(1);

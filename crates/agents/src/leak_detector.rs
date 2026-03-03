@@ -320,7 +320,9 @@ mod tests {
         let input = format!("here: {key}");
         let matches = detector.scan(&input);
         assert!(
-            matches.iter().any(|m| m.pattern_name == "anthropic_api_key"),
+            matches
+                .iter()
+                .any(|m| m.pattern_name == "anthropic_api_key"),
             "should detect Anthropic key: {matches:?}"
         );
     }

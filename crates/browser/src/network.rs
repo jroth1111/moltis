@@ -5,6 +5,7 @@
 
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -136,12 +137,31 @@ impl HarRecorder {
 
     /// Serialise all recorded entries to a HAR 1.2 JSON document.
     pub fn to_har_json(&self) -> serde_json::Value {
+        // Local helper: convert Unix-ms timestamp to ISO-8601 for HAR 1.2.
+        fn ms_to_rfc3339(ms: u64) -> String {
+            use time::OffsetDateTime;
+            let ns = ms as i128 * 1_000_000;
+            OffsetDateTime::from_unix_timestamp_nanos(ns)
+                .map(|dt| {
+                    format!(
+                        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                        dt.year(),
+                        dt.month() as u8,
+                        dt.day(),
+                        dt.hour(),
+                        dt.minute(),
+                        dt.second(),
+                        dt.millisecond(),
+                    )
+                })
+                .unwrap_or_else(|_| format!("{ms}"))
+        }
         let entries: Vec<serde_json::Value> = self
             .entries
             .iter()
             .map(|e| {
                 json!({
-                    "startedDateTime": e.started_at,
+                    "startedDateTime": ms_to_rfc3339(e.started_at),
                     "time": e.duration_ms,
                     "request": {
                         "method": e.method,
@@ -189,7 +209,7 @@ impl HarRecorder {
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "pages": [{
-                    "startedDateTime": self.started_at,
+                    "startedDateTime": ms_to_rfc3339(self.started_at),
                     "id": "page_1",
                     "title": "",
                     "pageTimings": {},
@@ -211,7 +231,7 @@ impl HarRecorder {
 }
 
 /// Tracks the network interception state for a browser instance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InterceptionState {
     /// Whether `Fetch.enable` has been called and interception is active.
     pub enabled: bool,
@@ -219,6 +239,22 @@ pub struct InterceptionState {
     pub recorder: Option<HarRecorder>,
     /// Extra headers injected into every intercepted request.
     pub extra_headers: HashMap<String, String>,
+    /// Broadcast channel for forwarding paused-request events to callers.
+    pub paused_tx: Option<tokio::sync::broadcast::Sender<EventRequestPaused>>,
+    /// Background task that drains CDP `EventRequestPaused` events.
+    pub _task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Default for InterceptionState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            recorder: None,
+            extra_headers: HashMap::new(),
+            paused_tx: None,
+            _task: None,
+        }
+    }
 }
 
 // ── CDP helpers ──────────────────────────────────────────────────────────────
@@ -371,6 +407,12 @@ mod tests {
         );
         assert_eq!(entries[0]["response"]["status"].as_u64(), Some(200));
         assert_eq!(entries[0]["time"].as_u64(), Some(42));
+        assert!(
+            entries[0]["startedDateTime"]
+                .as_str()
+                .is_some_and(|s| s.contains('T')),
+            "startedDateTime must be ISO-8601"
+        );
     }
 
     #[test]

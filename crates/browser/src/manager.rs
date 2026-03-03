@@ -876,6 +876,8 @@ impl BrowserManager {
             let from = self.pool.get_mouse_pos(&sid).await;
             crate::stealth::behavior::bezier_mouse_move(&page, from, (x, y)).await?;
             self.pool.set_mouse_pos(&sid, (x, y)).await;
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!(moltis_metrics::browser::BEHAVIORAL_CLICKS_TOTAL).increment(1);
         } else {
             crate::actions::hover_instant(&page, x, y).await?;
         }
@@ -906,6 +908,8 @@ impl BrowserManager {
             let from = self.pool.get_mouse_pos(&sid).await;
             crate::stealth::behavior::bezier_mouse_move(&page, from, (x, y)).await?;
             self.pool.set_mouse_pos(&sid, (x, y)).await;
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!(moltis_metrics::browser::BEHAVIORAL_CLICKS_TOTAL).increment(1);
         } else {
             crate::actions::hover_instant(&page, x, y).await?;
         }

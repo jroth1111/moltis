@@ -287,7 +287,7 @@ pub fn sanitize_with_leak_detection(text: &str, sensitivity: f64) -> String {
                 "blocked content due to potential credential leak"
             );
             "[BLOCKED: potential credential leak]".to_string()
-        }
+        },
     }
 }
 
