@@ -235,13 +235,16 @@ async fn fetch_valid_copilot_token(
     }
 
     let copilot_resp: CopilotTokenResponse = resp.json().await?;
-    let _ = token_store.save("github-copilot-api", &OAuthTokens {
-        access_token: Secret::new(copilot_resp.token.clone()),
-        refresh_token: None,
-        id_token: None,
-        account_id: None,
-        expires_at: Some(copilot_resp.expires_at),
-    });
+    let _ = token_store.save(
+        "github-copilot-api",
+        &OAuthTokens {
+            access_token: Secret::new(copilot_resp.token.clone()),
+            refresh_token: None,
+            id_token: None,
+            account_id: None,
+            expires_at: Some(copilot_resp.expires_at),
+        },
+    );
 
     Ok(copilot_resp.token)
 }
@@ -514,7 +517,7 @@ impl LlmProvider for GitHubCopilotProvider {
             text,
             tool_calls,
             usage,
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -803,7 +806,7 @@ mod tests {
                 text,
                 tool_calls,
                 usage,
-            ..Default::default()
+                ..Default::default()
             })
         }
     }

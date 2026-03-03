@@ -181,7 +181,7 @@ impl LlmProvider for AsyncOpenAiProvider {
             text,
             tool_calls: vec![],
             usage,
-        ..Default::default()
+            ..Default::default()
         })
     }
 

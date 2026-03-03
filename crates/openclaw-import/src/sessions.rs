@@ -676,12 +676,17 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "test-session", &[
-            r#"{"type":"session-meta","agentId":"main"}"#,
-            r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
-            r#"{"type":"message","message":{"role":"assistant","content":"Hi there!"}}"#,
-            r#"{"type":"custom","customType":"model-snapshot","data":{}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "test-session",
+            &[
+                r#"{"type":"session-meta","agentId":"main"}"#,
+                r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":"Hi there!"}}"#,
+                r#"{"type":"custom","customType":"model-snapshot","data":{}}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -713,11 +718,16 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session_legacy_layout(home, "main", "legacy-session", &[
-            r#"{"type":"session-meta","agentId":"main"}"#,
-            r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
-            r#"{"type":"message","message":{"role":"assistant","content":"Hi there!"}}"#,
-        ]);
+        setup_session_legacy_layout(
+            home,
+            "main",
+            "legacy-session",
+            &[
+                r#"{"type":"session-meta","agentId":"main"}"#,
+                r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":"Hi there!"}}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -734,10 +744,15 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "tools", &[
-            r#"{"type":"message","message":{"role":"user","content":"Run ls"}}"#,
-            r#"{"type":"message","message":{"role":"tool","content":"file.txt","toolUseId":"call_1"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "tools",
+            &[
+                r#"{"type":"message","message":{"role":"user","content":"Run ls"}}"#,
+                r#"{"type":"message","message":{"role":"tool","content":"file.txt","toolUseId":"call_1"}}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -760,9 +775,12 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "existing", &[
-            r#"{"type":"message","message":{"role":"user","content":"test"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "existing",
+            &[r#"{"type":"message","message":{"role":"user","content":"test"}}"#],
+        );
 
         // First import
         let detection = make_detection(home);
@@ -805,12 +823,18 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "s1", &[
-            r#"{"type":"message","message":{"role":"user","content":"hi from main"}}"#,
-        ]);
-        setup_session(home, "secondary", "s2", &[
-            r#"{"type":"message","message":{"role":"user","content":"hi from secondary"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "s1",
+            &[r#"{"type":"message","message":{"role":"user","content":"hi from main"}}"#],
+        );
+        setup_session(
+            home,
+            "secondary",
+            "s2",
+            &[r#"{"type":"message","message":{"role":"user","content":"hi from secondary"}}"#],
+        );
 
         let mut detection = make_detection(home);
         detection.agent_ids = vec!["main".to_string(), "secondary".to_string()];
@@ -844,9 +868,12 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "meta-test", &[
-            r#"{"type":"message","message":{"role":"user","content":"hello"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "meta-test",
+            &[r#"{"type":"message","message":{"role":"user","content":"hello"}}"#],
+        );
 
         let detection = make_detection(home);
         import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -866,11 +893,16 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "messy", &[
-            r#"not valid json"#,
-            r#"{"type":"message","message":{"role":"user","content":"valid"}}"#,
-            r#"{"broken":true}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "messy",
+            &[
+                r#"not valid json"#,
+                r#"{"type":"message","message":{"role":"user","content":"valid"}}"#,
+                r#"{"broken":true}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -887,12 +919,17 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "chat", &[
-            r#"{"type":"session-meta","agentId":"main"}"#,
-            r#"{"type":"message","message":{"role":"user","content":"What is Rust?"}}"#,
-            r#"{"type":"message","message":{"role":"assistant","content":"Rust is a systems programming language."}}"#,
-            r#"{"type":"custom","customType":"model-snapshot","data":{"model":"claude-opus-4-6"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "chat",
+            &[
+                r#"{"type":"session-meta","agentId":"main"}"#,
+                r#"{"type":"message","message":{"role":"user","content":"What is Rust?"}}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":"Rust is a systems programming language."}}"#,
+                r#"{"type":"custom","customType":"model-snapshot","data":{"model":"claude-opus-4-6"}}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -918,10 +955,15 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "model-test", &[
-            r#"{"type":"custom","customType":"model-snapshot","data":{"model":"gpt-4o"}}"#,
-            r#"{"type":"message","message":{"role":"user","content":"test"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "model-test",
+            &[
+                r#"{"type":"custom","customType":"model-snapshot","data":{"model":"gpt-4o"}}"#,
+                r#"{"type":"message","message":{"role":"user","content":"test"}}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -941,9 +983,12 @@ mod tests {
         let mem = tmp.path().join("memory").join("sessions");
 
         // Initial import with 1 message
-        setup_session(home, "main", "growing", &[
-            r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "growing",
+            &[r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#],
+        );
 
         let detection = make_detection(home);
         let report1 = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -954,10 +999,15 @@ mod tests {
         assert_eq!(content1.lines().count(), 1);
 
         // Append a new message to the source
-        setup_session(home, "main", "growing", &[
-            r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
-            r#"{"type":"message","message":{"role":"assistant","content":"Hi there!"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "growing",
+            &[
+                r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":"Hi there!"}}"#,
+            ],
+        );
 
         // Re-import should detect growth and update
         let report2 = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -977,9 +1027,12 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "stable", &[
-            r#"{"type":"message","message":{"role":"user","content":"test"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "stable",
+            &[r#"{"type":"message","message":{"role":"user","content":"test"}}"#],
+        );
 
         let detection = make_detection(home);
         let report1 = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -999,9 +1052,12 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "preserve", &[
-            r#"{"type":"message","message":{"role":"user","content":"first"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "preserve",
+            &[r#"{"type":"message","message":{"role":"user","content":"first"}}"#],
+        );
 
         let detection = make_detection(home);
         import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -1017,10 +1073,15 @@ mod tests {
         assert_eq!(original.version, 0);
 
         // Append and re-import
-        setup_session(home, "main", "preserve", &[
-            r#"{"type":"message","message":{"role":"user","content":"first"}}"#,
-            r#"{"type":"message","message":{"role":"assistant","content":"second"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "preserve",
+            &[
+                r#"{"type":"message","message":{"role":"user","content":"first"}}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":"second"}}"#,
+            ],
+        );
 
         import_sessions(&detection, &dest, &mem, &default_mapping());
 
@@ -1042,9 +1103,12 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "transcript", &[
-            r#"{"type":"message","message":{"role":"user","content":"What is Rust?"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "transcript",
+            &[r#"{"type":"message","message":{"role":"user","content":"What is Rust?"}}"#],
+        );
 
         let detection = make_detection(home);
         import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -1055,10 +1119,15 @@ mod tests {
         assert!(!content1.contains("systems programming language"));
 
         // Append response and re-import
-        setup_session(home, "main", "transcript", &[
-            r#"{"type":"message","message":{"role":"user","content":"What is Rust?"}}"#,
-            r#"{"type":"message","message":{"role":"assistant","content":"A systems programming language."}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "transcript",
+            &[
+                r#"{"type":"message","message":{"role":"user","content":"What is Rust?"}}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":"A systems programming language."}}"#,
+            ],
+        );
 
         import_sessions(&detection, &dest, &mem, &default_mapping());
 
@@ -1075,9 +1144,12 @@ mod tests {
         let mem = tmp.path().join("memory").join("sessions");
         std::fs::create_dir_all(&dest).unwrap();
 
-        setup_session(home, "main", "legacy", &[
-            r#"{"type":"message","message":{"role":"user","content":"old message"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "legacy",
+            &[r#"{"type":"message","message":{"role":"user","content":"old message"}}"#],
+        );
 
         // Write legacy metadata without source_line_count (will deserialize as 0)
         let legacy_metadata = serde_json::json!({
@@ -1131,10 +1203,15 @@ mod tests {
         let dest = tmp.path().join("sessions");
         let mem = tmp.path().join("memory").join("sessions");
 
-        setup_session(home, "main", "timed", &[
-            r#"{"type":"message","timestamp":"2026-01-28T06:46:35.768Z","message":{"role":"user","content":"hello from old openclaw","timestamp":1769582795764}}"#,
-            r#"{"type":"message","timestamp":"2026-01-28T06:46:41.626Z","message":{"role":"assistant","content":"this is the assistant reply","timestamp":1769582801626}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "timed",
+            &[
+                r#"{"type":"message","timestamp":"2026-01-28T06:46:35.768Z","message":{"role":"user","content":"hello from old openclaw","timestamp":1769582795764}}"#,
+                r#"{"type":"message","timestamp":"2026-01-28T06:46:41.626Z","message":{"role":"assistant","content":"this is the assistant reply","timestamp":1769582801626}}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -1199,10 +1276,15 @@ mod tests {
         );
 
         // Create matching JSONL file named by UUID
-        setup_session(home, "main", session_uuid, &[
-            r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
-            r#"{"type":"message","message":{"role":"assistant","content":"Hi!"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            session_uuid,
+            &[
+                r#"{"type":"message","message":{"role":"user","content":"Hello"}}"#,
+                r#"{"type":"message","message":{"role":"assistant","content":"Hi!"}}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -1244,9 +1326,12 @@ mod tests {
             .to_string(),
         );
 
-        setup_session(home, "main", session_uuid, &[
-            r#"{"type":"message","message":{"role":"user","content":"Hi via Telegram"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            session_uuid,
+            &[r#"{"type":"message","message":{"role":"user","content":"Hi via Telegram"}}"#],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -1281,9 +1366,14 @@ mod tests {
             .to_string(),
         );
 
-        setup_session(home, "main", session_uuid, &[
-            r#"{"type":"message","message":{"role":"assistant","content":"Daily summary done"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            session_uuid,
+            &[
+                r#"{"type":"message","message":{"role":"assistant","content":"Daily summary done"}}"#,
+            ],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());
@@ -1305,9 +1395,12 @@ mod tests {
         let mem = tmp.path().join("memory").join("sessions");
 
         // No sessions.json — just a JSONL file with a UUID-like name
-        setup_session(home, "main", "abcd1234-dead-beef-cafe-112233445566", &[
-            r#"{"type":"message","message":{"role":"user","content":"test"}}"#,
-        ]);
+        setup_session(
+            home,
+            "main",
+            "abcd1234-dead-beef-cafe-112233445566",
+            &[r#"{"type":"message","message":{"role":"user","content":"test"}}"#],
+        );
 
         let detection = make_detection(home);
         let report = import_sessions(&detection, &dest, &mem, &default_mapping());

@@ -273,7 +273,7 @@ impl LlmProvider for KimiCodeProvider {
             text,
             tool_calls,
             usage,
-        ..Default::default()
+            ..Default::default()
         })
     }
 
@@ -559,7 +559,7 @@ mod tests {
                 text,
                 tool_calls,
                 usage,
-            ..Default::default()
+                ..Default::default()
             })
         }
     }

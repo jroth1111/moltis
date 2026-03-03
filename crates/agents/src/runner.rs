@@ -15,7 +15,9 @@ use crate::{
         ChatMessage, CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage, UserContent,
         values_to_chat_messages,
     },
-    response_sanitizer::{clean_response, recover_tool_calls_from_content, sanitize_with_leak_detection},
+    response_sanitizer::{
+        clean_response, recover_tool_calls_from_content, sanitize_with_leak_detection,
+    },
     tool_parsing::{
         looks_like_failed_tool_call, new_synthetic_tool_call_id, parse_tool_calls_from_text,
     },
@@ -241,7 +243,10 @@ fn next_retry_delay_ms(
             return None;
         }
         *server_retries_remaining -= 1;
-        return Some(apply_jitter(SERVER_RETRY_DELAY.as_millis() as u64, RATE_LIMIT_MAX_RETRY_MS));
+        return Some(apply_jitter(
+            SERVER_RETRY_DELAY.as_millis() as u64,
+            RATE_LIMIT_MAX_RETRY_MS,
+        ));
     }
 
     None
@@ -749,56 +754,58 @@ pub async fn run_agent_loop_with_context(
             cb(RunnerEvent::Thinking);
         }
 
-        let mut response: CompletionResponse =
-            match provider.complete(&messages, schemas_for_api).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if let Some(ref hooks) = hook_registry {
-                        let payload = HookPayload::AfterLLMCall {
-                            session_key: session_key_for_hooks.clone(),
-                            provider: provider.name().to_string(),
-                            model: provider.id().to_string(),
-                            text: None,
-                            tool_calls: vec![],
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            iteration: iterations,
-                            trace_id: trace_id.clone(),
-                        };
-                        if let Err(dispatch_err) = hooks.dispatch(&payload).await {
-                            warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
-                        }
+        let mut response: CompletionResponse = match provider
+            .complete(&messages, schemas_for_api)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if let Some(ref hooks) = hook_registry {
+                    let payload = HookPayload::AfterLLMCall {
+                        session_key: session_key_for_hooks.clone(),
+                        provider: provider.name().to_string(),
+                        model: provider.id().to_string(),
+                        text: None,
+                        tool_calls: vec![],
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        iteration: iterations,
+                        trace_id: trace_id.clone(),
+                    };
+                    if let Err(dispatch_err) = hooks.dispatch(&payload).await {
+                        warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
                     }
-                    if is_context_window_error(&msg) {
-                        return Err(AgentRunError::ContextWindowExceeded(msg));
-                    }
-                    if let Some(delay_ms) = next_retry_delay_ms(
-                        &msg,
-                        &mut server_retries_remaining,
-                        &mut rate_limit_retries_remaining,
-                        &mut rate_limit_backoff_ms,
-                    ) {
-                        iterations -= 1;
-                        warn!(
-                            error = %msg,
+                }
+                if is_context_window_error(&msg) {
+                    return Err(AgentRunError::ContextWindowExceeded(msg));
+                }
+                if let Some(delay_ms) = next_retry_delay_ms(
+                    &msg,
+                    &mut server_retries_remaining,
+                    &mut rate_limit_retries_remaining,
+                    &mut rate_limit_backoff_ms,
+                ) {
+                    iterations -= 1;
+                    warn!(
+                        error = %msg,
+                        delay_ms,
+                        server_retries_remaining,
+                        rate_limit_retries_remaining,
+                        "transient LLM error, retrying after delay"
+                    );
+                    if let Some(cb) = on_event {
+                        cb(RunnerEvent::RetryingAfterError {
+                            error: msg,
                             delay_ms,
-                            server_retries_remaining,
-                            rate_limit_retries_remaining,
-                            "transient LLM error, retrying after delay"
-                        );
-                        if let Some(cb) = on_event {
-                            cb(RunnerEvent::RetryingAfterError {
-                                error: msg,
-                                delay_ms,
-                            });
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        continue;
+                        });
                     }
-                    return Err(AgentRunError::Other(e));
-                },
-            };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                return Err(AgentRunError::Other(e));
+            },
+        };
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::ThinkingDone);
@@ -833,15 +840,15 @@ pub async fn run_agent_loop_with_context(
                     "LLM response has low confidence score"
                 );
             } else {
-                debug!(
-                    iteration = iterations,
-                    confidence,
-                    "LLM confidence score"
-                );
+                debug!(iteration = iterations, confidence, "LLM confidence score");
             }
         }
         if let Some(ref reasoning) = response.reasoning {
-            trace!(iteration = iterations, reasoning_len = reasoning.len(), "LLM reasoning received");
+            trace!(
+                iteration = iterations,
+                reasoning_len = reasoning.len(),
+                "LLM reasoning received"
+            );
         }
 
         // Fallback: parse tool calls from model text if the provider returned
@@ -2016,7 +2023,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -2068,7 +2075,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             } else {
                 Ok(CompletionResponse {
@@ -2079,7 +2086,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -2151,7 +2158,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -2329,7 +2336,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             } else {
                 let tool_content = messages
@@ -2354,7 +2361,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -2503,7 +2510,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             } else {
                 let assistant_tool_text = messages
@@ -2548,7 +2555,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -2719,7 +2726,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -2868,7 +2875,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             } else {
                 Ok(CompletionResponse {
@@ -2879,7 +2886,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -3357,7 +3364,7 @@ mod tests {
                         output_tokens: 5,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             } else {
                 // Second call: verify tool result was sanitized (image stripped)
@@ -3391,7 +3398,7 @@ mod tests {
                         output_tokens: 10,
                         ..Default::default()
                     },
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -3647,7 +3654,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -3734,7 +3741,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -3794,7 +3801,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -3894,7 +3901,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -3945,7 +3952,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -3995,7 +4002,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -4034,7 +4041,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -4083,7 +4090,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -4156,7 +4163,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -4245,7 +4252,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -4311,7 +4318,7 @@ mod tests {
                 text: Some("fallback".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -4398,7 +4405,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await
         .unwrap();
@@ -4516,15 +4523,24 @@ mod tests {
 
             // Some(2_000) → base 4_000; jitter range [3_000, 5_000].
             let v = next_rate_limit_retry_ms(Some(2_000));
-            assert!(v >= 3_000 && v <= 5_000, "Some(2_000) case out of range: {v}");
+            assert!(
+                v >= 3_000 && v <= 5_000,
+                "Some(2_000) case out of range: {v}"
+            );
 
             // Some(30_000) → base clamped to 60_000; jitter range [45_000, 60_000].
             let v = next_rate_limit_retry_ms(Some(30_000));
-            assert!(v >= 45_000 && v <= 60_000, "Some(30_000) case out of range: {v}");
+            assert!(
+                v >= 45_000 && v <= 60_000,
+                "Some(30_000) case out of range: {v}"
+            );
 
             // Some(60_000) → base clamped to 60_000; jitter range [45_000, 60_000].
             let v = next_rate_limit_retry_ms(Some(60_000));
-            assert!(v >= 45_000 && v <= 60_000, "Some(60_000) case out of range: {v}");
+            assert!(
+                v >= 45_000 && v <= 60_000,
+                "Some(60_000) case out of range: {v}"
+            );
         }
     }
 
@@ -4568,7 +4584,7 @@ mod tests {
                     text: Some("Recovered!".into()),
                     tool_calls: vec![],
                     usage: Usage::default(),
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -4622,7 +4638,7 @@ mod tests {
                     text: Some("Recovered from rate limit".into()),
                     tool_calls: vec![],
                     usage: Usage::default(),
-                ..Default::default()
+                    ..Default::default()
                 })
             }
         }
@@ -4683,7 +4699,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "should recover after retry: {result:?}");
@@ -4752,7 +4768,7 @@ mod tests {
             None,
             None,
             None,
-        None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "should recover after retries: {result:?}");

@@ -438,7 +438,7 @@ mod tests {
                     output_tokens: 1,
                     ..Default::default()
                 },
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -740,7 +740,7 @@ mod tests {
                     output_tokens: 1,
                     ..Default::default()
                 },
-            ..Default::default()
+                ..Default::default()
             })
         }
 
@@ -851,10 +851,7 @@ mod tests {
 
     #[test]
     fn parse_retry_after_integer() {
-        assert_eq!(
-            parse_retry_after_ms("retry-after: 60"),
-            Some(60_000)
-        );
+        assert_eq!(parse_retry_after_ms("retry-after: 60"), Some(60_000));
     }
 
     #[test]
@@ -890,9 +887,17 @@ mod tests {
         .with_circuit_breaker(1, Duration::from_millis(50));
 
         let _ = chain.complete(&[], &[]).await;
-        assert!(chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
+        assert!(
+            chain.chain[0]
+                .state
+                .is_tripped(1, Duration::from_millis(50))
+        );
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
+        assert!(
+            !chain.chain[0]
+                .state
+                .is_tripped(1, Duration::from_millis(50))
+        );
     }
 }

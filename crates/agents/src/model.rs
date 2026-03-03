@@ -523,11 +523,14 @@ mod tests {
 
     #[test]
     fn to_openai_assistant_with_tools() {
-        let msg = ChatMessage::assistant_with_tools(Some("thinking".into()), vec![ToolCall {
-            id: "call_1".into(),
-            name: "exec".into(),
-            arguments: serde_json::json!({"cmd": "ls"}),
-        }]);
+        let msg = ChatMessage::assistant_with_tools(
+            Some("thinking".into()),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "exec".into(),
+                arguments: serde_json::json!({"cmd": "ls"}),
+            }],
+        );
         let val = msg.to_openai_value();
         assert_eq!(val["role"], "assistant");
         assert_eq!(val["content"], "thinking");
@@ -761,7 +764,6 @@ mod tests {
         assert_eq!(meta.context_length, 42_000);
     }
 
-
     // ── CompletionResponse confidence field tests ───────────────────────
 
     #[test]
@@ -785,7 +787,10 @@ mod tests {
             confidence: None,
             reasoning: Some("I thought about this...".into()),
         };
-        assert_eq!(response.reasoning, Some("I thought about this...".to_string()));
+        assert_eq!(
+            response.reasoning,
+            Some("I thought about this...".to_string())
+        );
     }
 
     #[test]

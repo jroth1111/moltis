@@ -694,13 +694,16 @@ mod tests {
             provider,
             Arc::new(ToolRegistry::new()),
         )
-        .with_agents_config(agents_config_with_presets(Some("default"), &[(
-            "research",
-            AgentPresetConfig {
-                delegate_only: true,
-                ..Default::default()
-            },
-        )]));
+        .with_agents_config(agents_config_with_presets(
+            Some("default"),
+            &[(
+                "research",
+                AgentPresetConfig {
+                    delegate_only: true,
+                    ..Default::default()
+                },
+            )],
+        ));
 
         let (name, preset) = spawn_tool
             .resolve_preset(&serde_json::json!({ "preset": "research" }))
@@ -721,13 +724,16 @@ mod tests {
             provider,
             Arc::new(ToolRegistry::new()),
         )
-        .with_agents_config(agents_config_with_presets(Some("default"), &[(
-            "default",
-            AgentPresetConfig {
-                allow_tools: vec!["task_list".to_string()],
-                ..Default::default()
-            },
-        )]));
+        .with_agents_config(agents_config_with_presets(
+            Some("default"),
+            &[(
+                "default",
+                AgentPresetConfig {
+                    allow_tools: vec!["task_list".to_string()],
+                    ..Default::default()
+                },
+            )],
+        ));
 
         let (name, preset) = spawn_tool
             .resolve_preset(&serde_json::json!({}))

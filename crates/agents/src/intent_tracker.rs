@@ -87,22 +87,19 @@ impl IntentTracker {
 fn extract_keywords(text: &str) -> HashSet<String> {
     // Common English stop words to filter out
     const STOP_WORDS: &[&str] = &[
-        "a", "an", "the", "and", "or", "but", "is", "are", "was", "were",
-        "be", "been", "being", "have", "has", "had", "do", "does", "did",
-        "will", "would", "could", "should", "may", "might", "must", "shall",
-        "can", "need", "dare", "ought", "used", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "as", "into", "through", "during",
-        "before", "after", "above", "below", "between", "under", "again",
-        "further", "then", "once", "here", "there", "when", "where", "why",
-        "how", "all", "each", "few", "more", "most", "other", "some", "such",
-        "no", "nor", "not", "only", "own", "same", "so", "than", "too",
-        "very", "just", "also", "now", "that", "this", "these", "those",
-        "i", "you", "he", "she", "it", "we", "they", "what", "which", "who",
-        "me", "him", "her", "us", "them", "my", "your", "his", "its", "our",
-        "their", "please", "help", "want", "let", "get", "make", "go", "see",
-        "know", "take", "come", "think", "look", "use", "find", "give", "tell",
-        "work", "call", "try", "ask", "need", "feel", "become", "leave", "put",
-        "means", "any", "if", "about", "up", "out", "over", "down", "off",
+        "a", "an", "the", "and", "or", "but", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may",
+        "might", "must", "shall", "can", "need", "dare", "ought", "used", "to", "of", "in", "for",
+        "on", "with", "at", "by", "from", "as", "into", "through", "during", "before", "after",
+        "above", "below", "between", "under", "again", "further", "then", "once", "here", "there",
+        "when", "where", "why", "how", "all", "each", "few", "more", "most", "other", "some",
+        "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "just",
+        "also", "now", "that", "this", "these", "those", "i", "you", "he", "she", "it", "we",
+        "they", "what", "which", "who", "me", "him", "her", "us", "them", "my", "your", "his",
+        "its", "our", "their", "please", "help", "want", "let", "get", "make", "go", "see", "know",
+        "take", "come", "think", "look", "use", "find", "give", "tell", "work", "call", "try",
+        "ask", "need", "feel", "become", "leave", "put", "means", "any", "if", "about", "up",
+        "out", "over", "down", "off",
     ];
 
     text.to_lowercase()
@@ -165,15 +162,24 @@ mod tests {
 
     #[test]
     fn test_compute_drift_score_identical() {
-        let a: HashSet<String> = ["write", "function", "rust"].iter().map(|s| s.to_string()).collect();
-        let b: HashSet<String> = ["write", "function", "rust"].iter().map(|s| s.to_string()).collect();
+        let a: HashSet<String> = ["write", "function", "rust"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let b: HashSet<String> = ["write", "function", "rust"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let score = compute_drift_score(&a, &b);
         assert!((score - 0.0).abs() < 0.001);
     }
 
     #[test]
     fn test_compute_drift_score_completely_different() {
-        let a: HashSet<String> = ["write", "function"].iter().map(|s| s.to_string()).collect();
+        let a: HashSet<String> = ["write", "function"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let b: HashSet<String> = ["delete", "file"].iter().map(|s| s.to_string()).collect();
         let score = compute_drift_score(&a, &b);
         assert!((score - 1.0).abs() < 0.001);
@@ -181,8 +187,14 @@ mod tests {
 
     #[test]
     fn test_compute_drift_score_partial_overlap() {
-        let a: HashSet<String> = ["write", "function", "rust"].iter().map(|s| s.to_string()).collect();
-        let b: HashSet<String> = ["write", "function", "python"].iter().map(|s| s.to_string()).collect();
+        let a: HashSet<String> = ["write", "function", "rust"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let b: HashSet<String> = ["write", "function", "python"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let score = compute_drift_score(&a, &b);
         // intersection: write, function (2)
         // union: write, function, rust, python (4)
@@ -193,10 +205,8 @@ mod tests {
     #[test]
     fn test_intent_tracker_no_drift() {
         let mut tracker = IntentTracker::new("Write a Rust function to parse JSON");
-        let (score, is_drifted) = tracker.check_drift(
-            "Create a Rust function that can parse JSON data",
-            None
-        );
+        let (score, is_drifted) =
+            tracker.check_drift("Create a Rust function that can parse JSON data", None);
         assert!(score < 0.7);
         assert!(!is_drifted);
     }
@@ -204,22 +214,15 @@ mod tests {
     #[test]
     fn test_intent_tracker_with_drift() {
         let mut tracker = IntentTracker::new("Write a Rust function to parse JSON");
-        let (score, is_drifted) = tracker.check_drift(
-            "Delete all files in the directory",
-            None
-        );
+        let (score, is_drifted) = tracker.check_drift("Delete all files in the directory", None);
         assert!(score > 0.7);
         assert!(is_drifted);
     }
 
     #[test]
     fn test_intent_tracker_custom_threshold() {
-        let mut tracker = IntentTracker::new("Write a Rust function")
-            .with_drift_threshold(0.3);
-        let (score, is_drifted) = tracker.check_drift(
-            "Write a Python function",
-            None
-        );
+        let mut tracker = IntentTracker::new("Write a Rust function").with_drift_threshold(0.3);
+        let (score, is_drifted) = tracker.check_drift("Write a Python function", None);
         // Partial overlap but below 0.3 drift threshold
         assert!(score > 0.3);
         assert!(is_drifted);
