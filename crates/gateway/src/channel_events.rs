@@ -131,7 +131,10 @@ async fn dispatch_event_triggered_cron_jobs(state: &GatewayState, channel: &str,
         },
     };
 
-    let pairs: Vec<(moltis_cron::types::CronJobId, moltis_cron::types::CronSchedule)> = jobs
+    let pairs: Vec<(
+        moltis_cron::types::CronJobId,
+        moltis_cron::types::CronSchedule,
+    )> = jobs
         .into_iter()
         .filter(|job| job.enabled)
         .map(|job| (job.id, job.schedule))
@@ -142,7 +145,12 @@ async fn dispatch_event_triggered_cron_jobs(state: &GatewayState, channel: &str,
 
     let matched = matcher.match_message(Some(channel), text).await;
     for job_id in matched {
-        if let Err(e) = state.services.cron.run(serde_json::json!({ "id": &job_id })).await {
+        if let Err(e) = state
+            .services
+            .cron
+            .run(serde_json::json!({ "id": &job_id }))
+            .await
+        {
             warn!(%job_id, error = %e, "event trigger: failed to fire cron job");
         }
     }
@@ -189,10 +197,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 }
             }
 
-            broadcast(state, "channel", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "channel",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
         }
     }
@@ -234,10 +247,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 "channel": &meta,
                 "sessionKey": &session_key,
             });
-            broadcast(state, "chat", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "chat",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
 
             // Persist channel binding so web UI messages on this session
@@ -447,10 +465,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     return;
                 },
             };
-            broadcast(state, "channel", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "channel",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
         } else {
             warn!("request_disable_account: gateway not ready");
@@ -731,10 +754,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
             "sessionKey": &session_key,
             "hasAttachments": true,
         });
-        broadcast(state, "chat", payload, BroadcastOpts {
-            drop_if_slow: true,
-            ..Default::default()
-        })
+        broadcast(
+            state,
+            "chat",
+            payload,
+            BroadcastOpts {
+                drop_if_slow: true,
+                ..Default::default()
+            },
+        )
         .await;
 
         // Persist channel binding (ensure session row exists first —
@@ -1842,7 +1870,9 @@ mod tests {
         }
     }
 
-    fn build_sink_with_jobs(jobs: Vec<CronJob>) -> (GatewayChannelEventSink, Arc<Mutex<Vec<String>>>) {
+    fn build_sink_with_jobs(
+        jobs: Vec<CronJob>,
+    ) -> (GatewayChannelEventSink, Arc<Mutex<Vec<String>>>) {
         let run_ids = Arc::new(Mutex::new(Vec::new()));
         let cron_service = Arc::new(MockCronService {
             jobs: serde_json::to_value(jobs).unwrap(),
@@ -1976,7 +2006,8 @@ mod tests {
             audio_filename: None,
         };
 
-        sink.dispatch_to_chat("Need BILLING support", reply_to, meta).await;
+        sink.dispatch_to_chat("Need BILLING support", reply_to, meta)
+            .await;
 
         let ids = run_ids.lock().await;
         assert_eq!(&*ids, &vec!["job-billing".to_string()]);
