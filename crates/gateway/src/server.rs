@@ -5009,11 +5009,7 @@ async fn ws_upgrade_handler(
 ) -> impl IntoResponse {
     // Reject new connections during graceful shutdown.
     if state.gateway.is_shutting_down() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server is shutting down",
-        )
-            .into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, "server is shutting down").into_response();
     }
 
     // ── CSWSH protection ────────────────────────────────────────────────

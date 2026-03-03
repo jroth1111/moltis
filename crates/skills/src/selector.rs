@@ -16,11 +16,13 @@ pub fn score_skill(skill: &SkillMetadata, message: &str) -> u32 {
     }
 
     // Description keyword match (+3 per word, cap at 9)
-    let desc_words: Vec<&str> = skill.description
+    let desc_words: Vec<&str> = skill
+        .description
         .split_whitespace()
         .filter(|w| w.len() > 4)
         .collect();
-    let word_matches = desc_words.iter()
+    let word_matches = desc_words
+        .iter()
         .filter(|&&w| lower.contains(&w.to_lowercase()))
         .count()
         .min(3); // cap at 3 words
@@ -43,7 +45,11 @@ pub fn select_skills<'a>(
         .enumerate()
         .filter_map(|(i, s)| {
             let score = score_skill(s, message);
-            if score > 0 { Some((score, i)) } else { None }
+            if score > 0 {
+                Some((score, i))
+            } else {
+                None
+            }
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
