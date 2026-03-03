@@ -3448,6 +3448,29 @@ pub async fn prepare_gateway(
                 }
             });
         }
+        // Background: reclaim Active tasks with expired leases (zombie agents).
+        {
+            let store_for_zombie = Arc::clone(&task_store);
+            let poll_secs = config.tasks.zombie_poll_interval_secs;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(1)));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    match store_for_zombie.expire_zombie_leases_all().await {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "reclaimed zombie tasks with expired leases")
+                        },
+                        Ok(_) => {},
+                        Err(e) => {
+                            tracing::warn!(error = %e, "zombie lease sweep failed")
+                        },
+                    }
+                }
+            });
+        }
+
         // Register the session-backed task board used by autonomous workflows.
         // TODO: remove once all agents migrate to `task_list`.
         #[allow(deprecated)]
@@ -3557,7 +3580,8 @@ pub async fn prepare_gateway(
             )
             .with_on_event(on_spawn_event)
             .with_agents_config(agents_config)
-            .with_task_store(Arc::clone(&task_store));
+            .with_task_store(Arc::clone(&task_store))
+            .with_tasks_config(config.tasks.clone());
             tool_registry.register(Box::new(spawn_tool));
         }
 
