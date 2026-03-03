@@ -1437,6 +1437,17 @@ fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
     let configured = ToolPolicy {
         allow: config.tools.policy.allow.clone(),
         deny: config.tools.policy.deny.clone(),
+        approval_required: config
+            .tools
+            .policy
+            .approval_required
+            .iter()
+            .map(|pattern| moltis_tools::policy::ApprovalPattern {
+                tool: pattern.tool.clone(),
+                condition: pattern.condition.clone(),
+                description: pattern.description.clone(),
+            })
+            .collect(),
     };
     effective.merge_with(&configured)
 }
@@ -1459,7 +1470,10 @@ fn apply_runtime_tool_filters(
     // runtime can unintentionally remove unrelated tools (for example, leaving
     // only `web_fetch` and preventing `create_skill` from being called).
     // Tool availability here is controlled by configured runtime policy.
-    base_registry.clone_allowed_by(|name| policy.is_allowed(name))
+    // Fail closed: tools marked as `approval_required` are not exposed unless
+    // runtime approval gating is actively enforced at execution-time.
+    base_registry
+        .clone_allowed_by(|name| policy.is_allowed(name) && policy.requires_approval(name).is_none())
 }
 
 // ── Disabled Models Store ────────────────────────────────────────────────────
@@ -10411,10 +10425,18 @@ mod tests {
         let mut cfg = moltis_config::MoltisConfig::default();
         cfg.tools.policy.profile = Some("full".into());
         cfg.tools.policy.deny = vec!["exec".into()];
+        cfg.tools.policy.approval_required.push(
+            moltis_config::schema::ApprovalPatternConfig {
+                tool: "web_fetch".into(),
+                condition: None,
+                description: Some("Requires human approval".into()),
+            },
+        );
 
         let policy = effective_tool_policy(&cfg);
         assert!(!policy.is_allowed("exec"));
         assert!(policy.is_allowed("web_fetch"));
+        assert!(policy.requires_approval("web_fetch").is_some());
     }
 
     #[test]
@@ -10484,6 +10506,31 @@ mod tests {
 
         let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
         assert!(filtered.get("create_skill").is_some());
+        assert!(filtered.get("web_fetch").is_some());
+    }
+
+    #[test]
+    fn runtime_filters_fail_closed_for_approval_required_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "web_fetch".to_string(),
+        }));
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.policy.allow = vec!["exec".into(), "web_fetch".into()];
+        cfg.tools.policy.approval_required.push(
+            moltis_config::schema::ApprovalPatternConfig {
+                tool: "exec".into(),
+                condition: None,
+                description: Some("Requires human approval".into()),
+            },
+        );
+
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false);
+        assert!(filtered.get("exec").is_none());
         assert!(filtered.get("web_fetch").is_some());
     }
 
