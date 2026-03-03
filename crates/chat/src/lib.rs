@@ -2720,32 +2720,6 @@ impl LiveChatService {
     }
 }
 
-async fn mark_self_repair_started(state_store: Option<&SessionStateStore>, session_key: &str) {
-    if let Some(store) = state_store
-        && let Err(error) =
-            moltis_agents::self_repair::mark_session_started(store, session_key).await
-    {
-        warn!(
-            session = %session_key,
-            error = %error,
-            "failed to mark session as running for self-repair"
-        );
-    }
-}
-
-async fn mark_self_repair_finished(state_store: Option<&SessionStateStore>, session_key: &str) {
-    if let Some(store) = state_store
-        && let Err(error) =
-            moltis_agents::self_repair::mark_session_finished(store, session_key).await
-    {
-        warn!(
-            session = %session_key,
-            error = %error,
-            "failed to clear session running state for self-repair"
-        );
-    }
-}
-
 /// RAII guard that ensures self-repair cleanup happens when dropped.
 /// Uses a tokio spawn to handle async cleanup since Drop is sync.
 struct SelfRepairGuard {
@@ -3267,7 +3241,9 @@ impl ChatService for LiveChatService {
                     .write()
                     .await
                     .insert(session_key_clone.clone(), ReplyMedium::Text);
-                mark_self_repair_started(state_store.as_deref(), &session_key_clone).await;
+                let _self_repair_guard =
+                    SelfRepairGuard::new(state_store.as_ref(), &session_key_clone);
+                _self_repair_guard.mark_started().await;
 
                 let assistant_output = run_explicit_shell_command(
                     &state,
@@ -3306,7 +3282,6 @@ impl ChatService for LiveChatService {
                 {
                     warn!("failed to persist /sh assistant message: {e}");
                 }
-                mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
                 if let Ok(count) = session_store.count(&session_key_clone).await {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
@@ -4109,7 +4084,9 @@ impl ChatService for LiveChatService {
                 )
                 .await;
             }
-            mark_self_repair_started(state_store.as_deref(), &session_key_clone).await;
+            let _self_repair_guard =
+                SelfRepairGuard::new(state_store.as_ref(), &session_key_clone);
+            _self_repair_guard.mark_started().await;
             let agent_fut = async {
                 if stream_only {
                     run_streaming(
@@ -4233,7 +4210,8 @@ impl ChatService for LiveChatService {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
             }
-            mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
+            // Guard dropped here → mark_self_repair_finished runs in background.
+            drop(_self_repair_guard);
 
             active_runs.write().await.remove(&run_id_clone);
             let mut runs_by_session = active_runs_by_session.write().await;
@@ -4454,7 +4432,9 @@ impl ChatService for LiveChatService {
 
         // send_sync is text-only (used by API calls and channels).
         let user_content = UserContent::text(&text);
-        mark_self_repair_started(self.state_store.as_deref(), &session_key).await;
+        let _self_repair_guard =
+            SelfRepairGuard::new(self.state_store.as_ref(), &session_key);
+        _self_repair_guard.mark_started().await;
         let result = if stream_only {
             run_streaming(
                 &state,
@@ -4508,7 +4488,7 @@ impl ChatService for LiveChatService {
             )
             .await
         };
-        mark_self_repair_finished(self.state_store.as_deref(), &session_key).await;
+        drop(_self_repair_guard);
 
         // Persist assistant response (even empty ones — needed for LLM history coherence).
         if let Some(ref assistant_output) = result {
@@ -4615,7 +4595,10 @@ impl ChatService for LiveChatService {
         );
 
         if aborted && let Some(ref key) = resolved_session_key {
-            mark_self_repair_finished(self.state_store.as_deref(), key).await;
+            // Directly call finish since there's no guard in the abort path.
+            if let Some(ref store) = self.state_store {
+                let _ = moltis_agents::self_repair::mark_session_finished(store, key).await;
+            }
             self.active_thinking_text.write().await.remove(key);
             self.active_tool_calls.write().await.remove(key);
             self.active_reply_medium.write().await.remove(key);
@@ -6967,6 +6950,16 @@ async fn run_with_tools(
                     "toolCallsMade": tool_calls_made,
                     "seq": seq,
                 }),
+                RunnerEvent::IntentDrift { drift_score, iteration } => {
+                    serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "intent_drift",
+                        "driftScore": drift_score,
+                        "iteration": iteration,
+                        "seq": seq,
+                    })
+                },
                 RunnerEvent::RetryingAfterError { error, delay_ms } => {
                     let error_obj =
                         parse_chat_error(&error, Some(provider_name_for_events.as_str()));
