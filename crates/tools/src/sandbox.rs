@@ -597,8 +597,9 @@ pub trait Sandbox: Send + Sync {
     /// Clean up sandbox resources.
     async fn cleanup(&self, id: &SandboxId) -> Result<()>;
 
-    /// Whether this backend provides actual isolation.
-    /// Returns `false` for `NoSandbox` (pass-through to host).
+    /// Whether this backend provides actual container/WASM isolation.
+    /// Returns `false` for backends that execute directly on the host
+    /// (`NoSandbox`, `RestrictedHostSandbox`).
     fn is_real(&self) -> bool {
         true
     }
@@ -2136,8 +2137,10 @@ impl Sandbox for RestrictedHostSandbox {
         "restricted-host"
     }
 
+    /// `restricted-host` applies OS-level isolation (env clearing, rlimits)
+    /// but commands still run directly on the host — no container boundary.
     fn is_real(&self) -> bool {
-        true
+        false
     }
 
     async fn ensure_ready(&self, _id: &SandboxId, _image_override: Option<&str>) -> Result<()> {
@@ -6932,8 +6935,9 @@ mod tests {
 
         #[test]
         fn test_restricted_host_sandbox_is_real() {
+            // restricted-host runs directly on the host — not a real container backend.
             let sandbox = RestrictedHostSandbox::new(SandboxConfig::default());
-            assert!(sandbox.is_real());
+            assert!(!sandbox.is_real());
         }
 
         #[tokio::test]

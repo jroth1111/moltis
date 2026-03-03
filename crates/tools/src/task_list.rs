@@ -116,8 +116,12 @@ fn would_create_cycle(tasks: &HashMap<String, Task>, task_id: &str, new_deps: &[
     false
 }
 
+/// Identities injected by the runtime that are allowed to perform privileged
+/// task operations.  Listed as a named constant so callers are auditable.
+const PRIVILEGED_IDENTITIES: &[&str] = &["admin", "system"];
+
 fn is_privileged_caller(caller_identity: &str) -> bool {
-    matches!(caller_identity, "admin" | "system")
+    PRIVILEGED_IDENTITIES.contains(&caller_identity)
 }
 
 fn require_mutation_caller<'a>(params: &'a serde_json::Value) -> crate::Result<&'a str> {
