@@ -345,22 +345,20 @@ impl SessionStore {
                     let value = serde_json::to_value(&synthetic)?;
                     valid_lines.push(serde_json::to_string(&value)?);
                     appended_assistant_messages = 1;
+                } else if let Some(text) = tail_user_text {
+                    replay_candidate = Some(text);
                 } else {
-                    if let Some(text) = tail_user_text {
-                        replay_candidate = Some(text);
-                    } else {
-                        let synthetic = crate::message::PersistedMessage::assistant(
-                            "Recovered from an interrupted run. Automatic replay could not be prepared because the latest user message had no text payload.",
-                            "recovery",
-                            "system",
-                            0,
-                            0,
-                            None,
-                        );
-                        let value = serde_json::to_value(&synthetic)?;
-                        valid_lines.push(serde_json::to_string(&value)?);
-                        appended_assistant_messages = 1;
-                    }
+                    let synthetic = crate::message::PersistedMessage::assistant(
+                        "Recovered from an interrupted run. Automatic replay could not be prepared because the latest user message had no text payload.",
+                        "recovery",
+                        "system",
+                        0,
+                        0,
+                        None,
+                    );
+                    let value = serde_json::to_value(&synthetic)?;
+                    valid_lines.push(serde_json::to_string(&value)?);
+                    appended_assistant_messages = 1;
                 }
             }
 
