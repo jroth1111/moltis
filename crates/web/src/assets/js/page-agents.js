@@ -42,6 +42,14 @@ function AgentForm({ agent, onSave, onCancel }) {
 	var [emoji, setEmoji] = useState(agent?.emoji || "");
 	var [theme, setTheme] = useState(agent?.theme || "");
 	var [soul, setSoul] = useState("");
+	var [allowToolsInput, setAllowToolsInput] = useState(
+		Array.isArray(agent?.allowed_tools) ? agent.allowed_tools.join(", ") : "",
+	);
+	var [denyToolsInput, setDenyToolsInput] = useState(
+		Array.isArray(agent?.denied_tools) ? agent.denied_tools.join(", ") : "",
+	);
+	var [delegateOnly, setDelegateOnly] = useState(Boolean(agent?.delegate_only));
+	var [spawnPromptSuffix, setSpawnPromptSuffix] = useState(agent?.system_prompt_suffix || "");
 	var [saving, setSaving] = useState(false);
 	var [error, setError] = useState(null);
 
@@ -89,9 +97,23 @@ function AgentForm({ agent, onSave, onCancel }) {
 		if (!preset) return;
 		setId(presetName);
 		setName(titleCasePreset(presetName));
-		if (typeof preset.system_prompt_suffix === "string" && preset.system_prompt_suffix.trim()) {
-			setSoul(preset.system_prompt_suffix.trim());
+		if (Array.isArray(preset.allow_tools)) {
+			setAllowToolsInput(preset.allow_tools.join(", "));
 		}
+		if (Array.isArray(preset.deny_tools)) {
+			setDenyToolsInput(preset.deny_tools.join(", "));
+		}
+		setDelegateOnly(Boolean(preset.delegate_only));
+		if (typeof preset.system_prompt_suffix === "string" && preset.system_prompt_suffix.trim()) {
+			setSpawnPromptSuffix(preset.system_prompt_suffix.trim());
+		}
+	}
+
+	function parseToolsCsv(value) {
+		return String(value || "")
+			.split(",")
+			.map((part) => part.trim())
+			.filter(Boolean);
 	}
 
 	function buildParams() {
@@ -99,6 +121,10 @@ function AgentForm({ agent, onSave, onCancel }) {
 			name: name.trim(),
 			emoji: emoji.trim() || null,
 			theme: theme.trim() || null,
+			allowed_tools: parseToolsCsv(allowToolsInput),
+			denied_tools: parseToolsCsv(denyToolsInput),
+			delegate_only: delegateOnly,
+			system_prompt_suffix: spawnPromptSuffix.trim() || null,
 		};
 		base.id = isEdit ? agent.id : id.trim();
 		return base;
@@ -223,6 +249,49 @@ function AgentForm({ agent, onSave, onCancel }) {
 					onInput=${(e) => setSoul(e.target.value)}
 					placeholder="You are a creative writing assistant\u2026"
 					rows="4"
+					style="resize:vertical;font-family:var(--font-mono);font-size:0.75rem;"
+				/>
+			</label>
+
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-[var(--muted)]">Allowed Tools (comma separated)</span>
+				<input
+					type="text"
+					class="provider-key-input"
+					value=${allowToolsInput}
+					onInput=${(e) => setAllowToolsInput(e.target.value)}
+					placeholder="read_file, web_search, memory_search"
+				/>
+			</label>
+
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-[var(--muted)]">Denied Tools (comma separated)</span>
+				<input
+					type="text"
+					class="provider-key-input"
+					value=${denyToolsInput}
+					onInput=${(e) => setDenyToolsInput(e.target.value)}
+					placeholder="exec, write_file"
+				/>
+			</label>
+
+			<label class="flex items-center gap-2 text-xs text-[var(--muted)]">
+				<input
+					type="checkbox"
+					checked=${delegateOnly}
+					onInput=${(e) => setDelegateOnly(!!e.target.checked)}
+				/>
+				<span>Delegate-only agent (can only spawn/delegate)</span>
+			</label>
+
+			<label class="flex flex-col gap-1">
+				<span class="text-xs text-[var(--muted)]">Spawn Prompt Suffix</span>
+				<textarea
+					class="provider-key-input"
+					value=${spawnPromptSuffix}
+					onInput=${(e) => setSpawnPromptSuffix(e.target.value)}
+					placeholder="Additional instructions for sub-agent spawns\u2026"
+					rows="3"
 					style="resize:vertical;font-family:var(--font-mono);font-size:0.75rem;"
 				/>
 			</label>
