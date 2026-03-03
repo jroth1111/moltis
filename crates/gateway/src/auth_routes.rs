@@ -1032,6 +1032,8 @@ async fn run_vault_env_migration(state: &AuthState) {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
 
     fn headers_with_host(host: &str) -> axum::http::HeaderMap {
         let mut h = axum::http::HeaderMap::new();
@@ -1132,5 +1134,103 @@ mod tests {
             "clear cookie should include Domain=localhost, got: {cookie}"
         );
         assert!(cookie.contains("Max-Age=0"));
+    }
+
+    // ── API key scope validation tests ──────────────────────────────────────
+
+    /// Build an [`AuthState`] with an in-memory credential store that has a
+    /// password set and return it alongside a valid session token.
+    async fn test_auth_state() -> (AuthState, String) {
+        use crate::auth::{AuthMode, ResolvedAuth};
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = Arc::new(
+            CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
+                .await
+                .unwrap(),
+        );
+        store.set_initial_password("testpassword").await.unwrap();
+        let token = store.create_session().await.unwrap();
+
+        let gateway_state = GatewayState::new(
+            ResolvedAuth {
+                mode: AuthMode::Token,
+                token: None,
+                password: None,
+            },
+            crate::services::GatewayServices::noop(),
+        );
+
+        let auth_state = AuthState {
+            credential_store: store,
+            webauthn_registry: None,
+            gateway_state,
+        };
+
+        (auth_state, token)
+    }
+
+    /// Send a POST to `/api-keys` with the given JSON body and return the response.
+    async fn post_api_keys(
+        state: AuthState,
+        token: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<axum::body::Body> {
+        let app = auth_router().with_state(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api-keys")
+            .header("content-type", "application/json")
+            .header("cookie", format!("{SESSION_COOKIE}={token}"))
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        app.oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_api_key_rejects_empty_scopes() {
+        let (state, token) = test_auth_state().await;
+        let resp = post_api_keys(
+            state,
+            &token,
+            serde_json::json!({"label": "k", "scopes": []}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("at least one scope is required"),
+            "expected scope error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_api_key_rejects_missing_scopes() {
+        let (state, token) = test_auth_state().await;
+        let resp = post_api_keys(state, &token, serde_json::json!({"label": "k"})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("at least one scope is required"),
+            "expected scope error, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_api_key_accepts_valid_scopes() {
+        let (state, token) = test_auth_state().await;
+        let resp = post_api_keys(
+            state,
+            &token,
+            serde_json::json!({"label": "k", "scopes": ["operator.read"]}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("id").is_some(), "response must include id");
+        assert!(json.get("key").is_some(), "response must include key");
     }
 }
