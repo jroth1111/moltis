@@ -504,6 +504,39 @@ mod tests {
         assert_eq!(safe, "my_session_2024");
     }
 
+    #[cfg(feature = "session-encrypt")]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn session_state_encrypt_decrypt_round_trip() {
+        let state = make_state("https://encrypt-roundtrip.test");
+
+        // Use a unique name to avoid collisions with other tests.
+        let name = "test-encrypt-rt";
+
+        // Save encrypted.
+        let path = save_to_disk(&state, name, true).unwrap();
+
+        // The file on disk should start with "ENC:".
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.starts_with("ENC:"),
+            "encrypted file must start with ENC: prefix"
+        );
+
+        // Load and verify round-trip fidelity.
+        let loaded = load_from_disk(name).unwrap();
+        assert_eq!(loaded.version, state.version);
+        assert_eq!(loaded.url, state.url);
+        assert_eq!(loaded.captured_at, state.captured_at);
+        assert_eq!(loaded.cookies.len(), 1);
+        assert_eq!(loaded.cookies[0].name, "session");
+        assert_eq!(loaded.cookies[0].value, "abc123");
+        assert_eq!(loaded.storage[0].local["theme"], "dark");
+
+        // Clean up.
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn test_cookie_entry_from_roundtrip_fields() {
         let entry = CookieEntry {
