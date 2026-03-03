@@ -856,12 +856,16 @@ mod tests {
         let a = task_tool
             .execute(serde_json::json!({"action": "create", "subject": "A"}))
             .await?;
-        let a_id = a["task"]["id"].as_str().ok_or_else(|| std::io::Error::other("missing id"))?;
+        let a_id = a["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing id"))?;
 
         let b = task_tool
             .execute(serde_json::json!({"action": "create", "subject": "B"}))
             .await?;
-        let b_id = b["task"]["id"].as_str().ok_or_else(|| std::io::Error::other("missing id"))?;
+        let b_id = b["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing id"))?;
 
         // Set A blocked_by B (valid)
         task_tool

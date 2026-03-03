@@ -42,19 +42,16 @@ pub async fn compact_session(
     base_dir: Option<PathBuf>,
 ) -> Result<CompactionResult> {
     match strategy {
-        CompactionStrategy::Truncate { keep_recent } => {
-            truncate_strategy(messages, keep_recent)
-        }
+        CompactionStrategy::Truncate { keep_recent } => truncate_strategy(messages, keep_recent),
         CompactionStrategy::MoveToWorkspace { keep_recent } => {
-            move_to_workspace_strategy(messages, keep_recent, session_key, base_dir)
-                .await
-        }
+            move_to_workspace_strategy(messages, keep_recent, session_key, base_dir).await
+        },
         CompactionStrategy::Summarize { keep_recent } => {
             // For Summarize: use truncate as a safe fallback when no provider is available.
             // Full LLM-based summarization requires an LlmProvider, which is orchestrated
             // at a higher level (see chat/src/lib.rs which calls silent_turn.rs directly).
             truncate_strategy(messages, keep_recent)
-        }
+        },
     }
 }
 
@@ -136,8 +133,17 @@ mod tests {
 
     #[tokio::test]
     async fn truncate_keeps_last_n() {
-        let messages: Vec<Value> = (0..10).map(|i| json!({"role": "user", "content": format!("msg-{i}")})).collect();
-        let result = compact_session(&messages, CompactionStrategy::Truncate { keep_recent: 3 }, "test", None).await.unwrap();
+        let messages: Vec<Value> = (0..10)
+            .map(|i| json!({"role": "user", "content": format!("msg-{i}")}))
+            .collect();
+        let result = compact_session(
+            &messages,
+            CompactionStrategy::Truncate { keep_recent: 3 },
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.messages.len(), 3);
         assert_eq!(result.messages_removed, 7);
         assert_eq!(result.strategy_used, "truncate");
@@ -147,8 +153,17 @@ mod tests {
 
     #[tokio::test]
     async fn truncate_noop_when_short() {
-        let messages: Vec<Value> = (0..3).map(|i| json!({"role": "user", "content": format!("msg-{i}")})).collect();
-        let result = compact_session(&messages, CompactionStrategy::Truncate { keep_recent: 10 }, "test", None).await.unwrap();
+        let messages: Vec<Value> = (0..3)
+            .map(|i| json!({"role": "user", "content": format!("msg-{i}")}))
+            .collect();
+        let result = compact_session(
+            &messages,
+            CompactionStrategy::Truncate { keep_recent: 10 },
+            "test",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.messages.len(), 3);
         assert_eq!(result.messages_removed, 0);
         assert_eq!(result.strategy_used, "truncate");
@@ -157,20 +172,29 @@ mod tests {
     #[tokio::test]
     async fn move_to_workspace_creates_archive() {
         let dir = tempfile::tempdir().unwrap();
-        let messages: Vec<Value> = (0..10).map(|i| json!({"role": "user", "content": format!("msg-{i}")})).collect();
+        let messages: Vec<Value> = (0..10)
+            .map(|i| json!({"role": "user", "content": format!("msg-{i}")}))
+            .collect();
         let result = compact_session(
             &messages,
             CompactionStrategy::MoveToWorkspace { keep_recent: 3 },
             "test:session",
             Some(dir.path().to_path_buf()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         // Should have system notice + 3 kept messages = 4 total
         assert_eq!(result.messages.len(), 4);
         assert_eq!(result.messages_removed, 7);
         assert_eq!(result.strategy_used, "move_to_workspace");
         assert_eq!(result.messages[0]["role"], "system");
-        assert!(result.messages[0]["content"].as_str().unwrap().contains("Archived 7 messages"));
+        assert!(
+            result.messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Archived 7 messages")
+        );
         assert_eq!(result.messages[1]["content"], "msg-7");
 
         // Archive file must exist
@@ -188,13 +212,17 @@ mod tests {
 
     #[tokio::test]
     async fn move_to_workspace_falls_back_to_truncate_without_base_dir() {
-        let messages: Vec<Value> = (0..10).map(|i| json!({"role": "user", "content": format!("msg-{i}")})).collect();
+        let messages: Vec<Value> = (0..10)
+            .map(|i| json!({"role": "user", "content": format!("msg-{i}")}))
+            .collect();
         let result = compact_session(
             &messages,
             CompactionStrategy::MoveToWorkspace { keep_recent: 3 },
             "test",
             None,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         // Falls back to truncate when no base_dir
         assert_eq!(result.messages.len(), 3);
         assert_eq!(result.messages_removed, 7);

@@ -349,7 +349,9 @@ enum ContextCompactionAction {
 }
 
 #[must_use]
-fn context_compaction_config_from_chat(chat: &moltis_config::ChatConfig) -> ContextCompactionConfig {
+fn context_compaction_config_from_chat(
+    chat: &moltis_config::ChatConfig,
+) -> ContextCompactionConfig {
     let strategy = match chat
         .context_compaction_strategy
         .trim()
@@ -2372,7 +2374,11 @@ fn pick_next_with_starvation(
     } else {
         // Take from the highest-priority end; bump the counter only for
         // above-normal priority picks so normal/low picks reset it.
-        let new_count = if high_priority > 0 { consecutive_high_serves + 1 } else { 0 };
+        let new_count = if high_priority > 0 {
+            consecutive_high_serves + 1
+        } else {
+            0
+        };
         (0, new_count)
     }
 }
@@ -3080,11 +3086,8 @@ impl ChatService for LiveChatService {
                                 .await
                                 .get(&session_key_clone)
                                 .unwrap_or(&0);
-                            let (pick_idx, new_consecutive) = pick_next_with_starvation(
-                                &queued,
-                                consecutive,
-                                starvation_bound,
-                            );
+                            let (pick_idx, new_consecutive) =
+                                pick_next_with_starvation(&queued, consecutive, starvation_bound);
                             let selected = queued.remove(pick_idx);
                             *consecutive_high_priority_serves
                                 .write()
@@ -3736,8 +3739,7 @@ impl ChatService for LiveChatService {
         let agent_timeout_secs = moltis_config::discover_and_load().tools.agent_timeout_secs;
 
         let message_queue = Arc::clone(&self.message_queue);
-        let consecutive_high_priority_serves =
-            Arc::clone(&self.consecutive_high_priority_serves);
+        let consecutive_high_priority_serves = Arc::clone(&self.consecutive_high_priority_serves);
         let state_for_drain = Arc::clone(&self.state);
         let deferred_channel_target = deferred_channel_target.clone();
 
@@ -3927,11 +3929,8 @@ impl ChatService for LiveChatService {
                             .await
                             .get(&session_key_clone)
                             .unwrap_or(&0);
-                        let (pick_idx, new_consecutive) = pick_next_with_starvation(
-                            &queued,
-                            consecutive,
-                            starvation_bound,
-                        );
+                        let (pick_idx, new_consecutive) =
+                            pick_next_with_starvation(&queued, consecutive, starvation_bound);
                         let selected = queued.remove(pick_idx);
                         *consecutive_high_priority_serves
                             .write()
@@ -10496,9 +10495,18 @@ mod tests {
     #[test]
     fn pick_next_with_starvation_no_bound_always_picks_highest() {
         let queued = vec![
-            QueuedMessage { params: serde_json::json!({"text": "high"}), priority: 50 },
-            QueuedMessage { params: serde_json::json!({"text": "normal"}), priority: 0 },
-            QueuedMessage { params: serde_json::json!({"text": "low"}), priority: -50 },
+            QueuedMessage {
+                params: serde_json::json!({"text": "high"}),
+                priority: 50,
+            },
+            QueuedMessage {
+                params: serde_json::json!({"text": "normal"}),
+                priority: 0,
+            },
+            QueuedMessage {
+                params: serde_json::json!({"text": "low"}),
+                priority: -50,
+            },
         ];
         // bound = 0 means disabled: always picks index 0 (highest priority).
         let (idx, new_count) = pick_next_with_starvation(&queued, 10, 0);
@@ -10510,8 +10518,14 @@ mod tests {
     #[test]
     fn pick_next_with_starvation_forces_low_after_bound() {
         let queued = vec![
-            QueuedMessage { params: serde_json::json!({"text": "high"}), priority: 50 },
-            QueuedMessage { params: serde_json::json!({"text": "low"}), priority: -50 },
+            QueuedMessage {
+                params: serde_json::json!({"text": "high"}),
+                priority: 50,
+            },
+            QueuedMessage {
+                params: serde_json::json!({"text": "low"}),
+                priority: -50,
+            },
         ];
         // After 5 consecutive high-priority serves with bound = 5, picks last (low).
         let (idx, new_count) = pick_next_with_starvation(&queued, 5, 5);
@@ -10523,8 +10537,14 @@ mod tests {
     fn pick_next_with_starvation_no_lower_tier_keeps_high() {
         // All messages at same priority — no lower tier to force.
         let queued = vec![
-            QueuedMessage { params: serde_json::json!({"text": "a"}), priority: 50 },
-            QueuedMessage { params: serde_json::json!({"text": "b"}), priority: 50 },
+            QueuedMessage {
+                params: serde_json::json!({"text": "a"}),
+                priority: 50,
+            },
+            QueuedMessage {
+                params: serde_json::json!({"text": "b"}),
+                priority: 50,
+            },
         ];
         let (idx, _) = pick_next_with_starvation(&queued, 99, 5);
         assert_eq!(idx, 0, "with no lower tier, should still pick head");
@@ -10533,8 +10553,14 @@ mod tests {
     #[test]
     fn pick_next_with_starvation_below_bound_increments_count() {
         let queued = vec![
-            QueuedMessage { params: serde_json::json!({"text": "high"}), priority: 50 },
-            QueuedMessage { params: serde_json::json!({"text": "low"}), priority: -50 },
+            QueuedMessage {
+                params: serde_json::json!({"text": "high"}),
+                priority: 50,
+            },
+            QueuedMessage {
+                params: serde_json::json!({"text": "low"}),
+                priority: -50,
+            },
         ];
         // 3 serves, bound = 5 → not yet triggered
         let (idx, new_count) = pick_next_with_starvation(&queued, 3, 5);

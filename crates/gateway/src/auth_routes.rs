@@ -486,7 +486,7 @@ async fn create_api_key_handler(
         Some(ref s) if !s.is_empty() => s,
         _ => {
             return (StatusCode::BAD_REQUEST, "at least one scope is required").into_response();
-        }
+        },
     };
 
     // Validate each scope value.

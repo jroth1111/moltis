@@ -343,10 +343,13 @@ impl CachingWasmToolRunner {
                 let now = Instant::now();
                 cache.retain(|_, entry| entry.expires_at > now);
             }
-            cache.insert(key, CachedResult {
-                value,
-                expires_at: Instant::now() + self.cache_ttl,
-            });
+            cache.insert(
+                key,
+                CachedResult {
+                    value,
+                    expires_at: Instant::now() + self.cache_ttl,
+                },
+            );
         }
     }
 }
@@ -476,10 +479,10 @@ pub fn register_wasm_tools(
             let (fuel, memory) = wasm_limits.resolve_store_limits("web_search");
             let mut secret_headers: SecretHeaders = HashMap::new();
             if let Some(key) = search_api_key.filter(|k| !k.trim().is_empty()) {
-                secret_headers.insert("api.search.brave.com".to_string(), vec![(
-                    "X-Subscription-Token".to_string(),
-                    key.to_string(),
-                )]);
+                secret_headers.insert(
+                    "api.search.brave.com".to_string(),
+                    vec![("X-Subscription-Token".to_string(), key.to_string())],
+                );
             }
             let domain_allowlist = Some(vec!["api.search.brave.com".to_string()]);
             match HttpHostImpl::new(

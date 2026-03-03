@@ -238,22 +238,25 @@ async fn handle_connect(
                 .increment(1);
             let resp = "HTTP/1.1 403 Forbidden\r\n\r\n";
             reader.get_mut().write_all(resp.as_bytes()).await?;
-            emit_audit(&audit_tx, NetworkAuditEntry {
-                timestamp: time::OffsetDateTime::now_utc(),
-                session: session.clone(),
-                domain: domain.clone(),
-                port,
-                protocol: NetworkProtocol::HttpConnect,
-                action: FilterOutcome::Denied,
-                method: None,
-                url: None,
-                status: None,
-                bytes_sent: 0,
-                bytes_received: 0,
-                duration_ms: start.elapsed().as_millis() as u64,
-                error: None,
-                approval_source: None,
-            });
+            emit_audit(
+                &audit_tx,
+                NetworkAuditEntry {
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    session: session.clone(),
+                    domain: domain.clone(),
+                    port,
+                    protocol: NetworkProtocol::HttpConnect,
+                    action: FilterOutcome::Denied,
+                    method: None,
+                    url: None,
+                    status: None,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                    approval_source: None,
+                },
+            );
             return Ok(());
         },
         FilterAction::NeedsApproval => {
@@ -273,22 +276,25 @@ async fn handle_connect(
                         .increment(1);
                     let resp = "HTTP/1.1 403 Forbidden\r\n\r\n";
                     reader.get_mut().write_all(resp.as_bytes()).await?;
-                    emit_audit(&audit_tx, NetworkAuditEntry {
-                        timestamp: time::OffsetDateTime::now_utc(),
-                        session: session.clone(),
-                        domain: domain.clone(),
-                        port,
-                        protocol: NetworkProtocol::HttpConnect,
-                        action: FilterOutcome::Denied,
-                        method: None,
-                        url: None,
-                        status: None,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        error: None,
-                        approval_source: None,
-                    });
+                    emit_audit(
+                        &audit_tx,
+                        NetworkAuditEntry {
+                            timestamp: time::OffsetDateTime::now_utc(),
+                            session: session.clone(),
+                            domain: domain.clone(),
+                            port,
+                            protocol: NetworkProtocol::HttpConnect,
+                            action: FilterOutcome::Denied,
+                            method: None,
+                            url: None,
+                            status: None,
+                            bytes_sent: 0,
+                            bytes_received: 0,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            error: None,
+                            approval_source: None,
+                        },
+                    );
                     return Ok(());
                 },
                 DomainDecision::Timeout => {
@@ -297,22 +303,25 @@ async fn handle_connect(
                         .increment(1);
                     let resp = "HTTP/1.1 403 Forbidden\r\n\r\n";
                     reader.get_mut().write_all(resp.as_bytes()).await?;
-                    emit_audit(&audit_tx, NetworkAuditEntry {
-                        timestamp: time::OffsetDateTime::now_utc(),
-                        session: session.clone(),
-                        domain: domain.clone(),
-                        port,
-                        protocol: NetworkProtocol::HttpConnect,
-                        action: FilterOutcome::Timeout,
-                        method: None,
-                        url: None,
-                        status: None,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        error: None,
-                        approval_source: None,
-                    });
+                    emit_audit(
+                        &audit_tx,
+                        NetworkAuditEntry {
+                            timestamp: time::OffsetDateTime::now_utc(),
+                            session: session.clone(),
+                            domain: domain.clone(),
+                            port,
+                            protocol: NetworkProtocol::HttpConnect,
+                            action: FilterOutcome::Timeout,
+                            method: None,
+                            url: None,
+                            status: None,
+                            bytes_sent: 0,
+                            bytes_received: 0,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            error: None,
+                            approval_source: None,
+                        },
+                    );
                     return Ok(());
                 },
             }
@@ -340,22 +349,25 @@ async fn handle_connect(
             } else {
                 FilterOutcome::Allowed
             };
-            emit_audit(&audit_tx, NetworkAuditEntry {
-                timestamp: time::OffsetDateTime::now_utc(),
-                session: session.clone(),
-                domain: domain.clone(),
-                port,
-                protocol: NetworkProtocol::HttpConnect,
-                action,
-                method: None,
-                url: None,
-                status: None,
-                bytes_sent: 0,
-                bytes_received: 0,
-                duration_ms: start.elapsed().as_millis() as u64,
-                error: Some(e.to_string()),
-                approval_source: effective_source.clone(),
-            });
+            emit_audit(
+                &audit_tx,
+                NetworkAuditEntry {
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    session: session.clone(),
+                    domain: domain.clone(),
+                    port,
+                    protocol: NetworkProtocol::HttpConnect,
+                    action,
+                    method: None,
+                    url: None,
+                    status: None,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: Some(e.to_string()),
+                    approval_source: effective_source.clone(),
+                },
+            );
             return Ok(());
         },
     };
@@ -398,22 +410,25 @@ async fn handle_connect(
     } else {
         FilterOutcome::Allowed
     };
-    emit_audit(&audit_tx, NetworkAuditEntry {
-        timestamp: time::OffsetDateTime::now_utc(),
-        session,
-        domain,
-        port,
-        protocol: NetworkProtocol::HttpConnect,
-        action: audit_action,
-        method: None,
-        url: None,
-        status: None,
-        bytes_sent,
-        bytes_received,
-        duration_ms: start.elapsed().as_millis() as u64,
-        error,
-        approval_source: effective_source,
-    });
+    emit_audit(
+        &audit_tx,
+        NetworkAuditEntry {
+            timestamp: time::OffsetDateTime::now_utc(),
+            session,
+            domain,
+            port,
+            protocol: NetworkProtocol::HttpConnect,
+            action: audit_action,
+            method: None,
+            url: None,
+            status: None,
+            bytes_sent,
+            bytes_received,
+            duration_ms: start.elapsed().as_millis() as u64,
+            error,
+            approval_source: effective_source,
+        },
+    );
 
     Ok(())
 }
@@ -450,22 +465,25 @@ async fn handle_http_forward(
             counter!("proxy_requests_total", "method" => "HTTP", "result" => "denied").increment(1);
             let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
             reader.get_mut().write_all(resp.as_bytes()).await?;
-            emit_audit(&audit_tx, NetworkAuditEntry {
-                timestamp: time::OffsetDateTime::now_utc(),
-                session: session.clone(),
-                domain: domain.clone(),
-                port,
-                protocol: NetworkProtocol::HttpForward,
-                action: FilterOutcome::Denied,
-                method: Some(method.to_string()),
-                url: Some(target.to_string()),
-                status: None,
-                bytes_sent: 0,
-                bytes_received: 0,
-                duration_ms: start.elapsed().as_millis() as u64,
-                error: None,
-                approval_source: None,
-            });
+            emit_audit(
+                &audit_tx,
+                NetworkAuditEntry {
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    session: session.clone(),
+                    domain: domain.clone(),
+                    port,
+                    protocol: NetworkProtocol::HttpForward,
+                    action: FilterOutcome::Denied,
+                    method: Some(method.to_string()),
+                    url: Some(target.to_string()),
+                    status: None,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                    approval_source: None,
+                },
+            );
             return Ok(());
         },
         FilterAction::NeedsApproval => {
@@ -484,22 +502,25 @@ async fn handle_http_forward(
                         .increment(1);
                     let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
                     reader.get_mut().write_all(resp.as_bytes()).await?;
-                    emit_audit(&audit_tx, NetworkAuditEntry {
-                        timestamp: time::OffsetDateTime::now_utc(),
-                        session: session.clone(),
-                        domain: domain.clone(),
-                        port,
-                        protocol: NetworkProtocol::HttpForward,
-                        action: FilterOutcome::Denied,
-                        method: Some(method.to_string()),
-                        url: Some(target.to_string()),
-                        status: None,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        error: None,
-                        approval_source: None,
-                    });
+                    emit_audit(
+                        &audit_tx,
+                        NetworkAuditEntry {
+                            timestamp: time::OffsetDateTime::now_utc(),
+                            session: session.clone(),
+                            domain: domain.clone(),
+                            port,
+                            protocol: NetworkProtocol::HttpForward,
+                            action: FilterOutcome::Denied,
+                            method: Some(method.to_string()),
+                            url: Some(target.to_string()),
+                            status: None,
+                            bytes_sent: 0,
+                            bytes_received: 0,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            error: None,
+                            approval_source: None,
+                        },
+                    );
                     return Ok(());
                 },
                 DomainDecision::Timeout => {
@@ -508,22 +529,25 @@ async fn handle_http_forward(
                         .increment(1);
                     let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
                     reader.get_mut().write_all(resp.as_bytes()).await?;
-                    emit_audit(&audit_tx, NetworkAuditEntry {
-                        timestamp: time::OffsetDateTime::now_utc(),
-                        session: session.clone(),
-                        domain: domain.clone(),
-                        port,
-                        protocol: NetworkProtocol::HttpForward,
-                        action: FilterOutcome::Timeout,
-                        method: Some(method.to_string()),
-                        url: Some(target.to_string()),
-                        status: None,
-                        bytes_sent: 0,
-                        bytes_received: 0,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        error: None,
-                        approval_source: None,
-                    });
+                    emit_audit(
+                        &audit_tx,
+                        NetworkAuditEntry {
+                            timestamp: time::OffsetDateTime::now_utc(),
+                            session: session.clone(),
+                            domain: domain.clone(),
+                            port,
+                            protocol: NetworkProtocol::HttpForward,
+                            action: FilterOutcome::Timeout,
+                            method: Some(method.to_string()),
+                            url: Some(target.to_string()),
+                            status: None,
+                            bytes_sent: 0,
+                            bytes_received: 0,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            error: None,
+                            approval_source: None,
+                        },
+                    );
                     return Ok(());
                 },
             }
@@ -562,22 +586,25 @@ async fn handle_http_forward(
             } else {
                 FilterOutcome::Allowed
             };
-            emit_audit(&audit_tx, NetworkAuditEntry {
-                timestamp: time::OffsetDateTime::now_utc(),
-                session: session.clone(),
-                domain: domain.clone(),
-                port,
-                protocol: NetworkProtocol::HttpForward,
-                action: audit_action,
-                method: Some(method.to_string()),
-                url: Some(target.to_string()),
-                status: None,
-                bytes_sent: 0,
-                bytes_received: 0,
-                duration_ms: start.elapsed().as_millis() as u64,
-                error: Some(e.to_string()),
-                approval_source: effective_source.clone(),
-            });
+            emit_audit(
+                &audit_tx,
+                NetworkAuditEntry {
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    session: session.clone(),
+                    domain: domain.clone(),
+                    port,
+                    protocol: NetworkProtocol::HttpForward,
+                    action: audit_action,
+                    method: Some(method.to_string()),
+                    url: Some(target.to_string()),
+                    status: None,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: Some(e.to_string()),
+                    approval_source: effective_source.clone(),
+                },
+            );
             return Ok(());
         },
     };
@@ -623,22 +650,25 @@ async fn handle_http_forward(
     } else {
         FilterOutcome::Allowed
     };
-    emit_audit(&audit_tx, NetworkAuditEntry {
-        timestamp: time::OffsetDateTime::now_utc(),
-        session,
-        domain,
-        port,
-        protocol: NetworkProtocol::HttpForward,
-        action: audit_action,
-        method: Some(method.to_string()),
-        url: Some(target.to_string()),
-        status: None,
-        bytes_sent,
-        bytes_received,
-        duration_ms: start.elapsed().as_millis() as u64,
-        error,
-        approval_source: effective_source,
-    });
+    emit_audit(
+        &audit_tx,
+        NetworkAuditEntry {
+            timestamp: time::OffsetDateTime::now_utc(),
+            session,
+            domain,
+            port,
+            protocol: NetworkProtocol::HttpForward,
+            action: audit_action,
+            method: Some(method.to_string()),
+            url: Some(target.to_string()),
+            status: None,
+            bytes_sent,
+            bytes_received,
+            duration_ms: start.elapsed().as_millis() as u64,
+            error,
+            approval_source: effective_source,
+        },
+    );
 
     Ok(())
 }

@@ -952,7 +952,10 @@ mod tests {
     async fn test_recall_failures_returns_empty_when_no_failures() {
         let (manager, _tmp) = setup_manager().await;
         let tool = MemoryRecallFailuresTool::new(manager);
-        let result = tool.execute(json!({"query": "missing crate"})).await.unwrap();
+        let result = tool
+            .execute(json!({"query": "missing crate"}))
+            .await
+            .unwrap();
         assert_eq!(result["count"], 0);
         assert!(result["results"].as_array().unwrap().is_empty());
     }
