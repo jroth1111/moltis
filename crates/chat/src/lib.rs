@@ -8905,9 +8905,11 @@ mod tests {
 
     #[test]
     fn context_compaction_config_uses_strategy_and_keep_recent() {
-        let mut chat = moltis_config::ChatConfig::default();
-        chat.context_compaction_strategy = "move_to_workspace".to_string();
-        chat.context_compaction_keep_recent = 7;
+        let chat = moltis_config::ChatConfig {
+            context_compaction_strategy: "move_to_workspace".to_string(),
+            context_compaction_keep_recent: 7,
+            ..Default::default()
+        };
 
         let parsed = context_compaction_config_from_chat(&chat);
         assert_eq!(parsed.strategy, ContextCompactionStrategy::MoveToWorkspace);
@@ -8916,9 +8918,11 @@ mod tests {
 
     #[test]
     fn context_compaction_config_defaults_invalid_values_to_safe_truncate() {
-        let mut chat = moltis_config::ChatConfig::default();
-        chat.context_compaction_strategy = "invalid".to_string();
-        chat.context_compaction_keep_recent = 0;
+        let chat = moltis_config::ChatConfig {
+            context_compaction_strategy: "invalid".to_string(),
+            context_compaction_keep_recent: 0,
+            ..Default::default()
+        };
 
         let parsed = context_compaction_config_from_chat(&chat);
         assert_eq!(parsed.strategy, ContextCompactionStrategy::Truncate);
