@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use {
     crate::error::Error,
@@ -248,9 +248,11 @@ pub struct ApprovalManager {
     pub security_level: SecurityLevel,
     pub allowlist: Vec<String>,
     pub timeout: Duration,
-    pending: Arc<RwLock<std::collections::HashMap<String, PendingApproval>>>,
-    approved_commands: Arc<RwLock<HashSet<String>>>,
+    pending: Arc<RwLock<HashMap<String, PendingApproval>>>,
+    approved_commands: Arc<RwLock<HashMap<String, tokio::time::Instant>>>,
 }
+
+const APPROVED_COMMAND_TTL: Duration = Duration::from_secs(3600);
 
 impl Default for ApprovalManager {
     fn default() -> Self {
@@ -259,8 +261,8 @@ impl Default for ApprovalManager {
             security_level: SecurityLevel::Allowlist,
             allowlist: Vec::new(),
             timeout: Duration::from_secs(120),
-            pending: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            approved_commands: Arc::new(RwLock::new(HashSet::new())),
+            pending: Arc::new(RwLock::new(HashMap::new())),
+            approved_commands: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -299,7 +301,7 @@ impl ApprovalManager {
                     return Ok(ApprovalAction::Proceed);
                 }
                 // Check previously approved.
-                if self.approved_commands.read().await.contains(command) {
+                if self.is_recently_approved(command).await {
                     return Ok(ApprovalAction::Proceed);
                 }
                 Ok(ApprovalAction::NeedsApproval)
@@ -328,7 +330,10 @@ impl ApprovalManager {
             if decision == ApprovalDecision::Approved
                 && let Some(cmd) = command
             {
-                self.approved_commands.write().await.insert(cmd.to_string());
+                self.approved_commands
+                    .write()
+                    .await
+                    .insert(cmd.to_string(), tokio::time::Instant::now());
             }
             let _ = pending.tx.send(decision);
             debug!(id, "approval resolved");
@@ -358,6 +363,12 @@ impl ApprovalManager {
                 ApprovalDecision::Timeout
             },
         }
+    }
+
+    async fn is_recently_approved(&self, command: &str) -> bool {
+        let mut approved = self.approved_commands.write().await;
+        approved.retain(|_, approved_at| approved_at.elapsed() < APPROVED_COMMAND_TTL);
+        approved.contains_key(command)
     }
 }
 
@@ -570,6 +581,34 @@ mod tests {
         let mgr = ApprovalManager::default();
         let action = mgr.check_command("rm -rf /").await.unwrap();
         assert_eq!(action, ApprovalAction::NeedsApproval);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_approval_cache_allows_unexpired_command() {
+        let mgr = ApprovalManager::default();
+        let command = "curl https://example.com";
+        mgr.approved_commands
+            .write()
+            .await
+            .insert(command.to_string(), tokio::time::Instant::now());
+
+        let action = mgr.check_command(command).await.unwrap();
+        assert_eq!(action, ApprovalAction::Proceed);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_approval_cache_expires_command() {
+        let mgr = ApprovalManager::default();
+        let command = "curl https://example.com";
+        let expired = tokio::time::Instant::now() - APPROVED_COMMAND_TTL - Duration::from_secs(1);
+        mgr.approved_commands
+            .write()
+            .await
+            .insert(command.to_string(), expired);
+
+        let action = mgr.check_command(command).await.unwrap();
+        assert_eq!(action, ApprovalAction::NeedsApproval);
+        assert!(!mgr.approved_commands.read().await.contains_key(command));
     }
 
     #[tokio::test]
