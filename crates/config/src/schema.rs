@@ -1239,6 +1239,11 @@ pub struct ChatConfig {
     /// When the queue is full, new messages are rejected with an error.
     #[serde(default = "default_message_queue_max_size")]
     pub message_queue_max_size: usize,
+    /// Starvation bound for queue priority replay.
+    /// When higher-priority traffic is continuous, replay at least one lower-priority
+    /// message after this many consecutive higher-priority replays.
+    #[serde(default = "default_priority_starvation_bound")]
+    pub priority_starvation_bound: usize,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1257,6 +1262,10 @@ fn default_message_queue_max_size() -> usize {
     100
 }
 
+fn default_priority_starvation_bound() -> usize {
+    5
+}
+
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
@@ -1268,6 +1277,7 @@ impl Default for ChatConfig {
             context_compaction_keep_recent: default_compaction_keep_recent(),
             research: ResearchConfig::default(),
             message_queue_max_size: default_message_queue_max_size(),
+            priority_starvation_bound: default_priority_starvation_bound(),
         }
     }
 }
@@ -2425,6 +2435,18 @@ system_prompt_suffix = "Focus on evidence."
     fn chat_config_toml_parses_queue_max_size() {
         let cfg: ChatConfig = toml::from_str("message_queue_max_size = 42").unwrap();
         assert_eq!(cfg.message_queue_max_size, 42);
+    }
+
+    #[test]
+    fn chat_config_default_priority_starvation_bound_is_5() {
+        let cfg = ChatConfig::default();
+        assert_eq!(cfg.priority_starvation_bound, 5);
+    }
+
+    #[test]
+    fn chat_config_toml_parses_priority_starvation_bound() {
+        let cfg: ChatConfig = toml::from_str("priority_starvation_bound = 9").unwrap();
+        assert_eq!(cfg.priority_starvation_bound, 9);
     }
 
     #[test]

@@ -1829,7 +1829,11 @@ pub async fn prepare_gateway(
         tokio::spawn(async move {
             if let Some(state) = st.get() {
                 let chat = state.chat().await;
-                let params = serde_json::json!({ "text": text });
+                let params = serde_json::json!({
+                    "text": text,
+                    "_source": "cron",
+                    "_queue_priority": "maintenance",
+                });
                 if let Err(e) = chat.send(params).await {
                     tracing::error!("cron system event failed: {e}");
                 }
@@ -1941,6 +1945,8 @@ pub async fn prepare_gateway(
             let mut params = serde_json::json!({
                 "text": prompt_text,
                 "_session_key": session_key,
+                "_source": "cron",
+                "_queue_priority": "maintenance",
             });
             if let Some(ref model) = req.model {
                 params["model"] = serde_json::Value::String(model.clone());
@@ -3403,6 +3409,7 @@ pub async fn prepare_gateway(
                 let mut params = serde_json::json!({
                     "text": req.message,
                     "_session_key": req.key,
+                    "_queue_priority": "background",
                 });
                 if let Some(model) = req.model {
                     params["model"] = serde_json::json!(model);

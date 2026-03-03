@@ -2332,18 +2332,119 @@ impl ModelService for LiveModelService {
 #[derive(Debug, Clone)]
 struct QueuedMessage {
     params: Value,
+    priority: QueuePriority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QueuePriority {
+    Interactive,
+    Background,
+    Maintenance,
+}
+
+impl QueuePriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Background => "background",
+            Self::Maintenance => "maintenance",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "interactive" => Some(Self::Interactive),
+            "background" => Some(Self::Background),
+            "maintenance" => Some(Self::Maintenance),
+            _ => None,
+        }
+    }
+}
+
+fn resolve_queue_priority(params: &Value) -> QueuePriority {
+    if let Some(explicit) = params
+        .get("_queue_priority")
+        .and_then(Value::as_str)
+        .and_then(QueuePriority::parse)
+    {
+        return explicit;
+    }
+    if params
+        .get("_source")
+        .and_then(Value::as_str)
+        .is_some_and(|src| src == "cron")
+    {
+        return QueuePriority::Maintenance;
+    }
+    if params
+        .get("_cron")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return QueuePriority::Maintenance;
+    }
+    if params
+        .get("_session_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| key.starts_with("cron:"))
+    {
+        return QueuePriority::Maintenance;
+    }
+    if params.get("_session_key").is_some() {
+        return QueuePriority::Background;
+    }
+    QueuePriority::Interactive
 }
 
 fn enqueue_with_limit(
     entry: &mut Vec<QueuedMessage>,
     params: Value,
+    priority: QueuePriority,
     max_queue_size: usize,
 ) -> Option<usize> {
     if entry.len() >= max_queue_size {
         return None;
     }
-    entry.push(QueuedMessage { params });
+    entry.push(QueuedMessage { params, priority });
     Some(entry.len())
+}
+
+fn dequeue_followup_with_priority(
+    mut queued: Vec<QueuedMessage>,
+    starvation_bound: usize,
+    streak: &mut usize,
+) -> Option<(QueuedMessage, Vec<QueuedMessage>)> {
+    if queued.is_empty() {
+        return None;
+    }
+
+    let highest = queued.iter().map(|m| m.priority).min()?;
+    let has_lower = queued.iter().any(|m| m.priority > highest);
+    let bound = starvation_bound.max(1);
+
+    let pick_lower = has_lower && *streak >= bound;
+    let picked_index = if pick_lower {
+        queued
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.priority > highest)
+            .min_by_key(|(_, m)| m.priority)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    } else {
+        queued
+            .iter()
+            .position(|m| m.priority == highest)
+            .unwrap_or(0)
+    };
+
+    let picked = queued.remove(picked_index);
+    if has_lower && picked.priority == highest {
+        *streak = streak.saturating_add(1);
+    } else {
+        *streak = 0;
+    }
+    Some((picked, queued))
 }
 
 /// A tool call currently executing within an active agent run.
@@ -2370,6 +2471,9 @@ pub struct LiveChatService {
     session_locks: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
     /// Per-session message queue for messages arriving during an active run.
     message_queue: Arc<RwLock<HashMap<String, Vec<QueuedMessage>>>>,
+    /// Per-session streak of highest-priority followup replays used to enforce
+    /// starvation bounds across lower-priority queued messages.
+    message_queue_priority_streak: Arc<RwLock<HashMap<String, usize>>>,
     /// Per-session last-seen client sequence number for ordering diagnostics.
     last_client_seq: Arc<RwLock<HashMap<String, u64>>>,
     /// Per-session accumulated thinking text for active runs, so it can be
@@ -2406,6 +2510,7 @@ impl LiveChatService {
             hook_registry: None,
             session_locks: Arc::new(RwLock::new(HashMap::new())),
             message_queue: Arc::new(RwLock::new(HashMap::new())),
+            message_queue_priority_streak: Arc::new(RwLock::new(HashMap::new())),
             last_client_seq: Arc::new(RwLock::new(HashMap::new())),
             active_thinking_text: Arc::new(RwLock::new(HashMap::new())),
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
@@ -3000,9 +3105,11 @@ impl ChatService for LiveChatService {
                     let chat_cfg = moltis_config::discover_and_load().chat;
                     let queue_mode = chat_cfg.message_queue_mode;
                     let max_queue_size = chat_cfg.message_queue_max_size;
+                    let priority = resolve_queue_priority(&params);
                     info!(
                         session = %session_key,
                         mode = ?queue_mode,
+                        priority = priority.as_str(),
                         client_seq = ?client_seq,
                         "queueing message (run active)"
                     );
@@ -3010,7 +3117,7 @@ impl ChatService for LiveChatService {
                         let mut q = self.message_queue.write().await;
                         let entry = q.entry(session_key.clone()).or_default();
                         let Some(position) =
-                            enqueue_with_limit(entry, params.clone(), max_queue_size)
+                            enqueue_with_limit(entry, params.clone(), priority, max_queue_size)
                         else {
                             return Ok(serde_json::json!({
                                 "ok": false,
@@ -3028,6 +3135,7 @@ impl ChatService for LiveChatService {
                             "sessionKey": session_key,
                             "state": "queued",
                             "mode": format!("{queue_mode:?}").to_lowercase(),
+                            "priority": priority.as_str(),
                             "position": position,
                         }),
                         BroadcastOpts::default(),
@@ -3037,6 +3145,7 @@ impl ChatService for LiveChatService {
                         "ok": true,
                         "queued": true,
                         "mode": format!("{queue_mode:?}").to_lowercase(),
+                        "priority": priority.as_str(),
                     }));
                 },
             };
@@ -3074,6 +3183,7 @@ impl ChatService for LiveChatService {
             let tool_registry = Arc::clone(&self.tool_registry);
             let session_key_clone = session_key.clone();
             let message_queue = Arc::clone(&self.message_queue);
+            let message_queue_priority_streak = Arc::clone(&self.message_queue_priority_streak);
             let state_for_drain = Arc::clone(&self.state);
             let accept_language = params
                 .get("_accept_language")
@@ -3156,15 +3266,27 @@ impl ChatService for LiveChatService {
                     .remove(&session_key_clone)
                     .unwrap_or_default();
                 if !queued.is_empty() {
-                    let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                    let chat_cfg = moltis_config::discover_and_load().chat;
+                    let queue_mode = chat_cfg.message_queue_mode;
+                    let starvation_bound = chat_cfg.priority_starvation_bound;
                     let chat = state_for_drain.chat_service().await;
                     match queue_mode {
                         MessageQueueMode::Followup => {
-                            let mut iter = queued.into_iter();
-                            let Some(first) = iter.next() else {
-                                return;
+                            let (first, rest) = {
+                                let mut streaks = message_queue_priority_streak.write().await;
+                                let streak = streaks.entry(session_key_clone.clone()).or_insert(0);
+                                let Some((first, rest)) = dequeue_followup_with_priority(
+                                    queued,
+                                    starvation_bound,
+                                    streak,
+                                ) else {
+                                    return;
+                                };
+                                if rest.is_empty() {
+                                    streaks.remove(&session_key_clone);
+                                }
+                                (first, rest)
                             };
-                            let rest: Vec<QueuedMessage> = iter.collect();
                             if !rest.is_empty() {
                                 message_queue
                                     .write()
@@ -3173,7 +3295,12 @@ impl ChatService for LiveChatService {
                                     .or_default()
                                     .extend(rest);
                             }
-                            info!(session = %session_key_clone, "replaying queued message (followup)");
+                            info!(
+                                session = %session_key_clone,
+                                priority = first.priority.as_str(),
+                                starvation_bound,
+                                "replaying queued message (followup)"
+                            );
                             let mut replay_params = first.params;
                             replay_params["_queued_replay"] = serde_json::json!(true);
                             if let Err(e) = chat.send(replay_params).await {
@@ -3745,16 +3872,19 @@ impl ChatService for LiveChatService {
                 let chat_cfg = moltis_config::discover_and_load().chat;
                 let queue_mode = chat_cfg.message_queue_mode;
                 let max_queue_size = chat_cfg.message_queue_max_size;
+                let priority = resolve_queue_priority(&params);
                 info!(
                     session = %session_key,
                     mode = ?queue_mode,
+                    priority = priority.as_str(),
                     client_seq = ?client_seq,
                     "queueing message (run active)"
                 );
                 let position = {
                     let mut q = self.message_queue.write().await;
                     let entry = q.entry(session_key.clone()).or_default();
-                    let Some(position) = enqueue_with_limit(entry, params.clone(), max_queue_size)
+                    let Some(position) =
+                        enqueue_with_limit(entry, params.clone(), priority, max_queue_size)
                     else {
                         return Ok(serde_json::json!({
                             "ok": false,
@@ -3772,6 +3902,7 @@ impl ChatService for LiveChatService {
                         "sessionKey": session_key,
                         "state": "queued",
                         "mode": format!("{queue_mode:?}").to_lowercase(),
+                        "priority": priority.as_str(),
                         "position": position,
                     }),
                     BroadcastOpts::default(),
@@ -3781,6 +3912,7 @@ impl ChatService for LiveChatService {
                     "ok": true,
                     "queued": true,
                     "mode": format!("{queue_mode:?}").to_lowercase(),
+                    "priority": priority.as_str(),
                 }));
             },
         };
@@ -3810,6 +3942,7 @@ impl ChatService for LiveChatService {
         let agent_timeout_secs = moltis_config::discover_and_load().tools.agent_timeout_secs;
 
         let message_queue = Arc::clone(&self.message_queue);
+        let message_queue_priority_streak = Arc::clone(&self.message_queue_priority_streak);
         let state_for_drain = Arc::clone(&self.state);
         let deferred_channel_target = deferred_channel_target.clone();
 
@@ -3989,17 +4122,29 @@ impl ChatService for LiveChatService {
                 .remove(&session_key_clone)
                 .unwrap_or_default();
             if !queued.is_empty() {
-                let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                let chat_cfg = moltis_config::discover_and_load().chat;
+                let queue_mode = chat_cfg.message_queue_mode;
+                let starvation_bound = chat_cfg.priority_starvation_bound;
                 let chat = state_for_drain.chat_service().await;
                 match queue_mode {
                     MessageQueueMode::Followup => {
-                        let mut iter = queued.into_iter();
-                        let Some(first) = iter.next() else {
-                            return;
+                        let (first, rest) = {
+                            let mut streaks = message_queue_priority_streak.write().await;
+                            let streak = streaks.entry(session_key_clone.clone()).or_insert(0);
+                            let Some((first, rest)) = dequeue_followup_with_priority(
+                                queued,
+                                starvation_bound,
+                                streak,
+                            ) else {
+                                return;
+                            };
+                            if rest.is_empty() {
+                                streaks.remove(&session_key_clone);
+                            }
+                            (first, rest)
                         };
                         // Put remaining messages back so the replayed run's
                         // own drain loop picks them up after it completes.
-                        let rest: Vec<QueuedMessage> = iter.collect();
                         if !rest.is_empty() {
                             message_queue
                                 .write()
@@ -4008,7 +4153,12 @@ impl ChatService for LiveChatService {
                                 .or_default()
                                 .extend(rest);
                         }
-                        info!(session = %session_key_clone, "replaying queued message (followup)");
+                        info!(
+                            session = %session_key_clone,
+                            priority = first.priority.as_str(),
+                            starvation_bound,
+                            "replaying queued message (followup)"
+                        );
                         let mut replay_params = first.params;
                         replay_params["_queued_replay"] = serde_json::json!(true);
                         if let Err(e) = chat.send(replay_params).await {
@@ -4361,6 +4511,10 @@ impl ChatService for LiveChatService {
             .await
             .remove(session_key)
             .unwrap_or_default();
+        self.message_queue_priority_streak
+            .write()
+            .await
+            .remove(session_key);
         let count = removed.len();
         info!(session = %session_key, count, "cancel_queued: cleared message queue");
 
@@ -10315,6 +10469,20 @@ mod tests {
         Arc::new(RwLock::new(HashMap::new()))
     }
 
+    fn queued_text(text: &str) -> QueuedMessage {
+        QueuedMessage {
+            params: serde_json::json!({ "text": text }),
+            priority: QueuePriority::Interactive,
+        }
+    }
+
+    fn queued_with_priority(text: &str, priority: QueuePriority) -> QueuedMessage {
+        QueuedMessage {
+            params: serde_json::json!({ "text": text }),
+            priority,
+        }
+    }
+
     fn make_target(message_id: &str) -> Value {
         serde_json::json!({
             "channel_type": "telegram",
@@ -10332,12 +10500,8 @@ mod tests {
         // Enqueue two messages.
         {
             let mut q = queue.write().await;
-            q.entry(key.to_string()).or_default().push(QueuedMessage {
-                params: serde_json::json!({"text": "hello"}),
-            });
-            q.entry(key.to_string()).or_default().push(QueuedMessage {
-                params: serde_json::json!({"text": "world"}),
-            });
+            q.entry(key.to_string()).or_default().push(queued_text("hello"));
+            q.entry(key.to_string()).or_default().push(queued_text("world"));
         }
 
         // Drain.
@@ -10355,12 +10519,15 @@ mod tests {
         let msgs = [
             QueuedMessage {
                 params: serde_json::json!({"text": "first", "model": "gpt-4"}),
+                priority: QueuePriority::Interactive,
             },
             QueuedMessage {
                 params: serde_json::json!({"text": "second"}),
+                priority: QueuePriority::Interactive,
             },
             QueuedMessage {
                 params: serde_json::json!({"text": "third", "_conn_id": "c1"}),
+                priority: QueuePriority::Interactive,
             },
         ];
 
@@ -10427,23 +10594,16 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "a"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "b"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "c"}),
-            });
+            entry.push(queued_text("a"));
+            entry.push(queued_text("b"));
+            entry.push(queued_text("c"));
         }
 
         // Drain and apply the send-first/requeue-rest logic.
         let queued = queue.write().await.remove(key).unwrap_or_default();
-
-        let mut iter = queued.into_iter();
-        let first = iter.next().expect("queued is non-empty");
-        let rest: Vec<QueuedMessage> = iter.collect();
+        let mut streak = 0usize;
+        let (first, rest) =
+            dequeue_followup_with_priority(queued, 5, &mut streak).expect("queued is non-empty");
 
         // The first message is the one to send.
         assert_eq!(first.params["text"], "a");
@@ -10479,25 +10639,28 @@ mod tests {
                     "text": "a",
                     "_channel_reply_target": make_target("m1"),
                 }),
+                priority: QueuePriority::Interactive,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({
                     "text": "b",
                     "_channel_reply_target": make_target("m2"),
                 }),
+                priority: QueuePriority::Interactive,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({
                     "text": "c",
                     "_channel_reply_target": make_target("m3"),
                 }),
+                priority: QueuePriority::Interactive,
             });
         }
 
         let queued = queue.write().await.remove(key).unwrap_or_default();
-        let mut iter = queued.into_iter();
-        let first = iter.next().expect("queued is non-empty");
-        let rest: Vec<QueuedMessage> = iter.collect();
+        let mut streak = 0usize;
+        let (first, rest) =
+            dequeue_followup_with_priority(queued, 5, &mut streak).expect("queued is non-empty");
 
         assert_eq!(first.params["_channel_reply_target"]["message_id"], "m1");
 
@@ -10531,18 +10694,21 @@ mod tests {
                     "text": "first",
                     "_channel_reply_target": make_target("m1"),
                 }),
+                priority: QueuePriority::Interactive,
             },
             QueuedMessage {
                 params: serde_json::json!({
                     "text": "second",
                     "_channel_reply_target": make_target("m2"),
                 }),
+                priority: QueuePriority::Interactive,
             },
             QueuedMessage {
                 params: serde_json::json!({
                     "text": "third",
                     "_channel_reply_target": make_target("m3"),
                 }),
+                priority: QueuePriority::Interactive,
             },
         ];
 
@@ -10588,12 +10754,8 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "a"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "b"}),
-            });
+            entry.push(queued_text("a"));
+            entry.push(queued_text("b"));
         }
 
         // Cancel (same logic as cancel_queued: remove + unwrap_or_default).
@@ -10608,21 +10770,34 @@ mod tests {
     fn enqueue_with_limit_accepts_until_capacity() {
         let mut entry = Vec::new();
 
-        let first = enqueue_with_limit(&mut entry, serde_json::json!({"text": "a"}), 2);
+        let first = enqueue_with_limit(
+            &mut entry,
+            serde_json::json!({"text": "a"}),
+            QueuePriority::Interactive,
+            2,
+        );
         assert_eq!(first, Some(1));
 
-        let second = enqueue_with_limit(&mut entry, serde_json::json!({"text": "b"}), 2);
+        let second = enqueue_with_limit(
+            &mut entry,
+            serde_json::json!({"text": "b"}),
+            QueuePriority::Interactive,
+            2,
+        );
         assert_eq!(second, Some(2));
         assert_eq!(entry.len(), 2);
     }
 
     #[test]
     fn enqueue_with_limit_rejects_when_full_without_mutating() {
-        let mut entry = vec![QueuedMessage {
-            params: serde_json::json!({"text": "already"}),
-        }];
+        let mut entry = vec![queued_text("already")];
 
-        let result = enqueue_with_limit(&mut entry, serde_json::json!({"text": "new"}), 1);
+        let result = enqueue_with_limit(
+            &mut entry,
+            serde_json::json!({"text": "new"}),
+            QueuePriority::Interactive,
+            1,
+        );
         assert_eq!(result, None);
         assert_eq!(entry.len(), 1);
         assert_eq!(entry[0].params["text"], "already");
@@ -10636,15 +10811,9 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "x"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "y"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "z"}),
-            });
+            entry.push(queued_text("x"));
+            entry.push(queued_text("y"));
+            entry.push(queued_text("z"));
         }
 
         let removed = queue.write().await.remove(key).unwrap_or_default();
@@ -10665,6 +10834,93 @@ mod tests {
 
         let result = serde_json::json!({ "cleared": removed.len() });
         assert_eq!(result["cleared"], 0);
+    }
+
+    #[test]
+    fn resolve_queue_priority_defaults_to_interactive() {
+        let params = serde_json::json!({ "text": "hi" });
+        assert_eq!(resolve_queue_priority(&params), QueuePriority::Interactive);
+    }
+
+    #[test]
+    fn resolve_queue_priority_classifies_background_and_maintenance() {
+        let background = serde_json::json!({ "_session_key": "session:abc" });
+        assert_eq!(
+            resolve_queue_priority(&background),
+            QueuePriority::Background
+        );
+
+        let maintenance = serde_json::json!({
+            "_session_key": "cron:nightly",
+            "_source": "cron",
+        });
+        assert_eq!(
+            resolve_queue_priority(&maintenance),
+            QueuePriority::Maintenance
+        );
+    }
+
+    #[test]
+    fn dequeue_followup_prefers_highest_priority_first() {
+        let queued = vec![
+            queued_with_priority("b1", QueuePriority::Background),
+            queued_with_priority("i1", QueuePriority::Interactive),
+            queued_with_priority("m1", QueuePriority::Maintenance),
+        ];
+        let mut streak = 0usize;
+        let (picked, rest) =
+            dequeue_followup_with_priority(queued, 5, &mut streak).expect("message available");
+        assert_eq!(picked.params["text"], "i1");
+        assert_eq!(picked.priority, QueuePriority::Interactive);
+        assert_eq!(streak, 1);
+        assert_eq!(rest.len(), 2);
+    }
+
+    #[test]
+    fn dequeue_followup_honors_starvation_bound() {
+        let mut streak = 0usize;
+        let queue = vec![
+            queued_with_priority("i1", QueuePriority::Interactive),
+            queued_with_priority("b1", QueuePriority::Background),
+        ];
+        let (first, mut rest) =
+            dequeue_followup_with_priority(queue, 2, &mut streak).expect("first pick");
+        assert_eq!(first.params["text"], "i1");
+        assert_eq!(streak, 1);
+
+        rest.push(queued_with_priority("i2", QueuePriority::Interactive));
+        let (second, mut rest) =
+            dequeue_followup_with_priority(rest, 2, &mut streak).expect("second pick");
+        assert_eq!(second.params["text"], "i2");
+        assert_eq!(streak, 2);
+
+        rest.push(queued_with_priority("i3", QueuePriority::Interactive));
+        let (third, _rest) =
+            dequeue_followup_with_priority(rest, 2, &mut streak).expect("third pick");
+        assert_eq!(third.params["text"], "b1");
+        assert_eq!(third.priority, QueuePriority::Background);
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn dequeue_followup_preserves_fifo_within_same_priority() {
+        let mut streak = 0usize;
+        let queued = vec![
+            queued_with_priority("b1", QueuePriority::Background),
+            queued_with_priority("b2", QueuePriority::Background),
+            queued_with_priority("m1", QueuePriority::Maintenance),
+        ];
+        let (first, rest) =
+            dequeue_followup_with_priority(queued, 3, &mut streak).expect("first pick");
+        assert_eq!(first.params["text"], "b1");
+        assert_eq!(first.priority, QueuePriority::Background);
+        assert_eq!(streak, 1);
+
+        let mut second_streak = 0usize;
+        let (second, _) = dequeue_followup_with_priority(rest, 3, &mut second_streak)
+            .expect("second pick");
+        assert_eq!(second.params["text"], "b2");
+        assert_eq!(second.priority, QueuePriority::Background);
     }
 
     #[test]

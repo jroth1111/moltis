@@ -368,6 +368,7 @@ fn build_schema_map() -> KnownKeys {
                 ("context_compaction_strategy", Leaf),
                 ("context_compaction_keep_recent", Leaf),
                 ("message_queue_max_size", Leaf),
+                ("priority_starvation_bound", Leaf),
                 (
                     "research",
                     Struct(HashMap::from([
