@@ -346,6 +346,9 @@ struct ContextCompactionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextCompactionAction {
     None,
+    /// Early memory flush at ~70% occupancy — no summarization, only persists
+    /// important memories before they might be lost to compaction.
+    PreCompact,
     Compact,
     ArchiveTier,
     TruncateTier,
@@ -375,6 +378,7 @@ fn context_compaction_action_for_usage(
     estimated_next_input: u64,
     context_window: u64,
 ) -> ContextCompactionAction {
+    let pre_compact_threshold = (context_window * 70) / 100;
     let compact_threshold = (context_window * 80) / 100;
     let archive_threshold = (context_window * 90) / 100;
     let truncate_threshold = (context_window * 95) / 100;
@@ -384,6 +388,8 @@ fn context_compaction_action_for_usage(
         ContextCompactionAction::ArchiveTier
     } else if estimated_next_input >= compact_threshold {
         ContextCompactionAction::Compact
+    } else if estimated_next_input >= pre_compact_threshold {
+        ContextCompactionAction::PreCompact
     } else {
         ContextCompactionAction::None
     }
@@ -2488,6 +2494,9 @@ pub struct LiveChatService {
     state_store: Option<Arc<SessionStateStore>>,
     /// Failover configuration for automatic model/provider failover.
     failover_config: moltis_config::schema::FailoverConfig,
+    /// Per-session flag: whether the PreCompact memory flush has already fired
+    /// in the current compaction window.  Reset when a full Compact fires.
+    pre_compact_flushed: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 impl LiveChatService {
@@ -2517,6 +2526,7 @@ impl LiveChatService {
             active_reply_medium: Arc::new(RwLock::new(HashMap::new())),
             state_store: None,
             failover_config: moltis_config::schema::FailoverConfig::default(),
+            pre_compact_flushed: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -3660,10 +3670,13 @@ impl ChatService for LiveChatService {
             .and_then(|v| v.as_str())
             .map(String::from);
         let trace_id = trace_id.clone();
-        // Three-tier context management:
-        //   80% (compact)  — LLM fact-extraction + narrative summary replaces history.
-        //   90% (archive tier) — strategy-driven truncate/archive while preserving recency.
-        //   95% (truncate) — emergency: keep last 6 messages, no LLM call needed.
+        // Four-tier context management:
+        //   70% (pre-compact) — silent memory flush only; no summarization. Runs once
+        //                       per compaction window to capture memories before the
+        //                       compact window is reached.
+        //   80% (compact)     — LLM fact-extraction + narrative summary replaces history.
+        //   90% (archive tier)— strategy-driven truncate/archive while preserving recency.
+        //   95% (truncate)    — emergency: keep last 6 messages, no LLM call needed.
         let context_window = provider.context_window() as u64;
         let token_usage = session_token_usage_from_messages(&history);
         let compaction_config =
@@ -3842,7 +3855,75 @@ impl ChatService for LiveChatService {
                     }
                 }
             },
+            ContextCompactionAction::PreCompact => {
+                // Run the silent memory turn once per compaction window to persist
+                // important memories before the context might be fully compacted.
+                // The dedup flag prevents repeated flushes on successive turns at 70-80%.
+                let already_flushed = self
+                    .pre_compact_flushed
+                    .read()
+                    .await
+                    .get(&session_key)
+                    .copied()
+                    .unwrap_or(false);
+                if already_flushed {
+                    debug!(
+                        session = %session_key,
+                        "near-compaction: memory flush already ran this window, skipping"
+                    );
+                } else {
+                    self.pre_compact_flushed
+                        .write()
+                        .await
+                        .insert(session_key.clone(), true);
+                    debug!(
+                        session = %session_key,
+                        estimated_next_input,
+                        context_window,
+                        "near-compaction threshold: running early memory flush (no summarization)"
+                    );
+                    if let Some(mm) = self.state.memory_manager()
+                        && let Ok(flush_provider) =
+                            self.resolve_provider(&session_key, &history).await
+                    {
+                        let chat_history_for_memory = values_to_chat_messages(&history);
+                        let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> =
+                            Arc::new(AgentScopedMemoryWriter::new(
+                                Arc::clone(mm),
+                                session_agent_id.clone(),
+                            ));
+                        match moltis_agents::silent_turn::run_silent_memory_turn(
+                            flush_provider,
+                            &chat_history_for_memory,
+                            writer,
+                        )
+                        .await
+                        {
+                            Ok(paths) => {
+                                if !paths.is_empty() {
+                                    info!(
+                                        session = %session_key,
+                                        files = paths.len(),
+                                        "near-compaction: silent memory turn wrote files"
+                                    );
+                                }
+                            },
+                            Err(e) => warn!(
+                                session = %session_key,
+                                error = %e,
+                                "near-compaction: silent memory turn failed"
+                            ),
+                        }
+                    }
+                }
+            },
             ContextCompactionAction::Compact => {
+                // Reset the pre-compact dedup flag — a fresh compaction window begins.
+                self.pre_compact_flushed
+                    .write()
+                    .await
+                    .remove(&session_key);
+
                 let pre_compact_msg_count = history.len();
                 let pre_compact_total = token_usage
                     .current_request_input_tokens
@@ -9234,8 +9315,16 @@ mod tests {
     #[test]
     fn context_compaction_action_orchestrates_threshold_tiers() {
         assert_eq!(
-            context_compaction_action_for_usage(79, 100),
+            context_compaction_action_for_usage(69, 100),
             ContextCompactionAction::None
+        );
+        assert_eq!(
+            context_compaction_action_for_usage(70, 100),
+            ContextCompactionAction::PreCompact
+        );
+        assert_eq!(
+            context_compaction_action_for_usage(79, 100),
+            ContextCompactionAction::PreCompact
         );
         assert_eq!(
             context_compaction_action_for_usage(80, 100),
