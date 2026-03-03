@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
-use anyhow::Result;
-use async_trait::async_trait;
-use moltis_agents::tool_registry::AgentTool;
-use serde_json::{Value, json};
-use tracing::info;
+use {
+    anyhow::Result,
+    async_trait::async_trait,
+    moltis_agents::tool_registry::AgentTool,
+    serde_json::{Value, json},
+    tracing::info,
+};
 
 use crate::funnel::{self, FunnelState, TinderMatch};
 

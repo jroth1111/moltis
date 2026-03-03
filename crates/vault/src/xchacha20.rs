@@ -34,13 +34,10 @@ impl Cipher for XChaCha20Poly1305Cipher {
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
+            .encrypt(nonce, Payload {
+                msg: plaintext,
+                aad,
+            })
             .map_err(|e| VaultError::CipherError(e.to_string()))?;
 
         let mut result = Vec::with_capacity(NONCE_LEN + ciphertext.len());

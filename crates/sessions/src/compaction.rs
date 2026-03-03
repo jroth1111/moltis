@@ -128,8 +128,7 @@ async fn move_to_workspace_strategy(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
+    use {super::*, serde_json::json};
 
     #[tokio::test]
     async fn truncate_keeps_last_n() {

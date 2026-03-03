@@ -1,9 +1,11 @@
 //! Shared pattern scanner using Aho-Corasick for literal matching
 //! and a regex for high-entropy string detection.
 
-use aho_corasick::{AhoCorasick, MatchKind};
-use regex::Regex;
-use unicode_normalization::UnicodeNormalization;
+use {
+    aho_corasick::{AhoCorasick, MatchKind},
+    regex::Regex,
+    unicode_normalization::UnicodeNormalization,
+};
 
 pub struct PatternScanner {
     literals: Option<AhoCorasick>,
