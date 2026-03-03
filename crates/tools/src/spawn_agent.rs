@@ -839,6 +839,7 @@ mod tests {
         let policy = crate::policy::ToolPolicy {
             allow: vec!["*".into()],
             deny: vec!["exec".into()],
+            approval_required: Vec::new(),
         };
         let spawn_tool = SpawnAgentTool::new(
             make_empty_provider_registry(),
@@ -871,6 +872,7 @@ mod tests {
         let runtime_policy = Arc::new(std::sync::RwLock::new(crate::policy::ToolPolicy {
             allow: vec!["*".into()],
             deny: vec!["exec".into()],
+            approval_required: Vec::new(),
         }));
         let runtime_policy_for_resolver = Arc::clone(&runtime_policy);
         let resolver: crate::policy::ToolPolicyResolver = Arc::new(move || {
@@ -901,6 +903,7 @@ mod tests {
             *guard = crate::policy::ToolPolicy {
                 allow: vec!["*".into()],
                 deny: vec!["web_fetch".into()],
+                approval_required: Vec::new(),
             };
         }
 

@@ -1436,34 +1436,6 @@ fn prompt_sandbox_no_network_state(backend: &str, configured_no_network: bool) -
     }
 }
 
-<<<<<<< HEAD
-fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
-    let mut effective = ToolPolicy::default();
-    if let Some(profile) = config.tools.policy.profile.as_deref()
-        && !profile.is_empty()
-    {
-        effective = effective.merge_with(&profile_tools(profile));
-    }
-    let configured = ToolPolicy {
-        allow: config.tools.policy.allow.clone(),
-        deny: config.tools.policy.deny.clone(),
-        approval_required: config
-            .tools
-            .policy
-            .approval_required
-            .iter()
-            .map(|pattern| moltis_tools::policy::ApprovalPattern {
-                tool: pattern.tool.clone(),
-                condition: pattern.condition.clone(),
-                description: pattern.description.clone(),
-            })
-            .collect(),
-    };
-    effective.merge_with(&configured)
-}
-
-=======
->>>>>>> fix/audit-hardening-phase1
 fn apply_runtime_tool_filters(
     base: &ToolRegistry,
     config: &moltis_config::MoltisConfig,

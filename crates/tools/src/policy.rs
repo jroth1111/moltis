@@ -249,6 +249,17 @@ pub fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy
     let configured = ToolPolicy {
         allow: config.tools.policy.allow.clone(),
         deny: config.tools.policy.deny.clone(),
+        approval_required: config
+            .tools
+            .policy
+            .approval_required
+            .iter()
+            .map(|pattern| ApprovalPattern {
+                tool: pattern.tool.clone(),
+                condition: pattern.condition.clone(),
+                description: pattern.description.clone(),
+            })
+            .collect(),
     };
     effective.merge_with(&configured)
 }
