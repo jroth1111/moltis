@@ -295,14 +295,18 @@ impl MsTeamsPlugin {
             return Ok(());
         }
 
-        sink.dispatch_to_chat(&text, reply_to, ChannelMessageMeta {
-            channel_type: ChannelType::MsTeams,
-            sender_name,
-            username: None,
-            message_kind: Some(ChannelMessageKind::Text),
-            model: config.model.clone(),
-            audio_filename: None,
-        })
+        sink.dispatch_to_chat(
+            &text,
+            reply_to,
+            ChannelMessageMeta {
+                channel_type: ChannelType::MsTeams,
+                sender_name,
+                username: None,
+                message_kind: Some(ChannelMessageKind::Text),
+                model: config.model.clone(),
+                audio_filename: None,
+            },
+        )
         .await;
         Ok(())
     }
@@ -341,15 +345,18 @@ impl ChannelPlugin for MsTeamsPlugin {
 
         info!(account_id, "starting microsoft teams account");
         let mut accounts = self.accounts.write().unwrap_or_else(|e| e.into_inner());
-        accounts.insert(account_id.to_string(), AccountState {
-            account_id: account_id.to_string(),
-            config: cfg,
-            message_log: self.message_log.clone(),
-            event_sink: self.event_sink.clone(),
-            http: reqwest::Client::new(),
-            token_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            service_urls: Arc::new(RwLock::new(HashMap::new())),
-        });
+        accounts.insert(
+            account_id.to_string(),
+            AccountState {
+                account_id: account_id.to_string(),
+                config: cfg,
+                message_log: self.message_log.clone(),
+                event_sink: self.event_sink.clone(),
+                http: reqwest::Client::new(),
+                token_cache: Arc::new(tokio::sync::Mutex::new(None)),
+                service_urls: Arc::new(RwLock::new(HashMap::new())),
+            },
+        );
         Ok(())
     }
 
