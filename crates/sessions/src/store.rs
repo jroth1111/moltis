@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::PathBuf,
 };
 
@@ -411,8 +411,12 @@ impl SessionStore {
                 return Ok(0);
             }
 
-            let file = File::open(&path)?;
-            let reader = BufReader::new(file);
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            let mut lock = RwLock::new(file);
+            let mut guard = lock
+                .write()
+                .map_err(|e| Error::lock_failed(e.to_string()))?;
+            let reader = BufReader::new(guard.try_clone()?);
             let mut valid_lines: Vec<String> = Vec::new();
             let mut removed = 0usize;
 
@@ -434,21 +438,12 @@ impl SessionStore {
                 return Ok(0);
             }
 
-            let temp_path = path.with_extension(format!("jsonl.repair.{}", uuid::Uuid::new_v4()));
-            let tmp = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temp_path)?;
-            let mut lock = RwLock::new(tmp);
-            let mut guard = lock
-                .write()
-                .map_err(|e| Error::lock_failed(e.to_string()))?;
+            guard.set_len(0)?;
+            guard.seek(SeekFrom::Start(0))?;
             for line in &valid_lines {
                 writeln!(*guard, "{line}")?;
             }
             guard.sync_data()?;
-            drop(guard);
-            fs::rename(&temp_path, &path)?;
 
             Ok(removed)
         })
