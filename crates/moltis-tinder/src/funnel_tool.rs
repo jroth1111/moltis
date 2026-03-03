@@ -6,9 +6,7 @@ use moltis_agents::tool_registry::AgentTool;
 use serde_json::{Value, json};
 use tracing::info;
 
-use crate::funnel::{
-    self, FunnelState, TinderMatch,
-};
+use crate::funnel::{self, FunnelState, TinderMatch};
 
 pub struct TinderFunnelTool {
     pool: Arc<sqlx::SqlitePool>,
@@ -98,7 +96,7 @@ impl AgentTool for TinderFunnelTool {
                 funnel::upsert_match(&self.pool, &m).await?;
                 info!(match_id = %id, name = %name, "tinder match added");
                 Ok(json!({ "status": "ok", "match_id": id }))
-            }
+            },
             "advance" => {
                 let match_id = params["match_id"]
                     .as_str()
@@ -136,17 +134,16 @@ impl AgentTool for TinderFunnelTool {
                 funnel::update_funnel(&self.pool, match_id, target.clone()).await?;
                 info!(match_id = %match_id, to = %target, "funnel advanced");
                 Ok(json!({ "status": "ok", "match_id": match_id, "new_state": target.to_string() }))
-            }
+            },
             "list" => {
                 let state_filter = params["state"]
                     .as_str()
                     .map(|s| s.parse::<FunnelState>())
                     .transpose()?;
-                let matches =
-                    funnel::list_matches(&self.pool, state_filter.as_ref()).await?;
+                let matches = funnel::list_matches(&self.pool, state_filter.as_ref()).await?;
                 let items: Vec<Value> = matches.iter().map(|m| json!(m)).collect();
                 Ok(json!({ "status": "ok", "matches": items, "count": items.len() }))
-            }
+            },
             "stats" => {
                 let all = funnel::list_matches(&self.pool, None).await?;
                 let mut stats = serde_json::Map::new();
@@ -163,7 +160,7 @@ impl AgentTool for TinderFunnelTool {
                 }
                 stats.insert("total".to_string(), json!(all.len()));
                 Ok(json!({ "status": "ok", "stats": stats }))
-            }
+            },
             "note" => {
                 let match_id = params["match_id"]
                     .as_str()
@@ -183,7 +180,7 @@ impl AgentTool for TinderFunnelTool {
                 m.updated_at = now_ms();
                 funnel::upsert_match(&self.pool, &m).await?;
                 Ok(json!({ "status": "ok", "match_id": match_id }))
-            }
+            },
             other => Ok(json!({ "status": "error", "error": format!("unknown action: {other}") })),
         }
     }
