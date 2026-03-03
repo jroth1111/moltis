@@ -339,9 +339,12 @@ impl HookHandler for CircuitBreakerHook {
                     match state {
                         CircuitState::HalfOpen => {
                             counts.insert(key.clone(), class_threshold);
-                            states.insert(key.clone(), CircuitState::Open {
-                                opened_at: Instant::now(),
-                            });
+                            states.insert(
+                                key.clone(),
+                                CircuitState::Open {
+                                    opened_at: Instant::now(),
+                                },
+                            );
                             info!(
                                 provider = %provider,
                                 error_class = ?error_kind,
@@ -360,9 +363,12 @@ impl HookHandler for CircuitBreakerHook {
                             let count = counts.entry(key.clone()).or_insert(0);
                             *count += 1;
                             if *count >= class_threshold {
-                                states.insert(key.clone(), CircuitState::Open {
-                                    opened_at: Instant::now(),
-                                });
+                                states.insert(
+                                    key.clone(),
+                                    CircuitState::Open {
+                                        opened_at: Instant::now(),
+                                    },
+                                );
                                 info!(
                                     provider = %provider,
                                     error_class = ?error_kind,
