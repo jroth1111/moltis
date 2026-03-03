@@ -219,9 +219,9 @@ impl SpawnAgentTool {
         let Some(preset_name) = preset_name else {
             return Ok((None, None));
         };
-        let preset = agents.get_preset(&preset_name).cloned().ok_or_else(|| {
+        let preset = agents.get_preset(&preset_name).ok_or_else(|| {
             Error::message(format!(
-                "spawn preset '{preset_name}' not found in config.agents.presets"
+                "spawn preset '{preset_name}' not found in built-ins or config.agents.presets"
             ))
         })?;
         Ok((Some(preset_name), Some(preset)))

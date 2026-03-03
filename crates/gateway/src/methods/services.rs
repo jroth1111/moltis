@@ -472,6 +472,38 @@ pub(super) fn register(reg: &mut MethodRegistry) {
             }),
         );
         reg.register(
+            "agents.presets.list",
+            Box::new(|_ctx| {
+                Box::pin(async move {
+                    let config = moltis_config::discover_and_load();
+                    let mut presets = config
+                        .agents
+                        .effective_presets()
+                        .into_iter()
+                        .map(|(name, preset)| {
+                            serde_json::json!({
+                                "name": name,
+                                "model": preset.model,
+                                "allow_tools": preset.allow_tools,
+                                "deny_tools": preset.deny_tools,
+                                "delegate_only": preset.delegate_only,
+                                "system_prompt_suffix": preset.system_prompt_suffix,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    presets.sort_by(|a, b| {
+                        a.get("name")
+                            .and_then(|value| value.as_str())
+                            .cmp(&b.get("name").and_then(|value| value.as_str()))
+                    });
+                    Ok(serde_json::json!({
+                        "default_preset": config.agents.default_preset,
+                        "presets": presets,
+                    }))
+                })
+            }),
+        );
+        reg.register(
             "agents.create",
             Box::new(|ctx| {
                 Box::pin(async move {

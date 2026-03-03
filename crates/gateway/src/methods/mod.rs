@@ -64,6 +64,8 @@ const READ_METHODS: &[&str] = &[
     #[cfg(feature = "agent")]
     "agents.get",
     #[cfg(feature = "agent")]
+    "agents.presets.list",
+    #[cfg(feature = "agent")]
     "agents.identity.get",
     #[cfg(feature = "agent")]
     "agents.files.list",

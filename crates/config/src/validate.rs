@@ -1033,7 +1033,7 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
 
     // agents.default_preset should reference an existing preset key.
     if let Some(default_preset) = config.agents.default_preset.as_deref()
-        && !config.agents.presets.contains_key(default_preset)
+        && !config.agents.effective_presets().contains_key(default_preset)
     {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,

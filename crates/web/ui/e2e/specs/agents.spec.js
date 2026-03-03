@@ -79,6 +79,24 @@ test.describe("Agents settings page", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
+	test("create form preset picker populates fields", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await navigateAndWait(page, "/settings/agents");
+
+		await page.getByRole("button", { name: "New Agent", exact: true }).click();
+		await expect(page.getByText("Create Agent", { exact: true })).toBeVisible();
+
+		const presetSelect = page.locator('label:has-text("Use Preset") select');
+		await expect(presetSelect).toBeVisible();
+		await presetSelect.selectOption("researcher");
+
+		await expect(page.getByPlaceholder("e.g. writer, coder, researcher")).toHaveValue("researcher");
+		await expect(page.getByPlaceholder("Creative Writer")).toHaveValue("Researcher");
+		await expect(page.locator("textarea")).toHaveValue(/Prioritize evidence gathering/i);
+
+		expect(pageErrors).toEqual([]);
+	});
+
 	test("create form Cancel button returns to list", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/settings/agents");

@@ -36,6 +36,7 @@ export function teardownAgents() {
 
 function AgentForm({ agent, onSave, onCancel }) {
 	var isEdit = !!agent;
+	var [presetOptions, setPresetOptions] = useState([]);
 	var [id, setId] = useState(agent?.id || "");
 	var [name, setName] = useState(agent?.name || "");
 	var [emoji, setEmoji] = useState(agent?.emoji || "");
@@ -65,6 +66,33 @@ function AgentForm({ agent, onSave, onCancel }) {
 		}
 		load();
 	}, [isEdit, agent?.id]);
+
+	useEffect(() => {
+		if (isEdit) return;
+		sendRpc("agents.presets.list", {}).then((res) => {
+			if (!res?.ok) return;
+			var presets = Array.isArray(res?.payload?.presets) ? res.payload.presets : [];
+			setPresetOptions(presets);
+		});
+	}, [isEdit]);
+
+	function titleCasePreset(name) {
+		if (!name) return "";
+		return name
+			.split("-")
+			.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+			.join(" ");
+	}
+
+	function applyPreset(presetName) {
+		var preset = presetOptions.find((option) => option?.name === presetName);
+		if (!preset) return;
+		setId(presetName);
+		setName(titleCasePreset(presetName));
+		if (typeof preset.system_prompt_suffix === "string" && preset.system_prompt_suffix.trim()) {
+			setSoul(preset.system_prompt_suffix.trim());
+		}
+	}
 
 	function buildParams() {
 		var base = {
@@ -124,6 +152,28 @@ function AgentForm({ agent, onSave, onCancel }) {
 			${
 				!isEdit &&
 				html`
+				${
+					presetOptions.length > 0 &&
+					html`
+					<label class="flex flex-col gap-1">
+						<span class="text-xs text-[var(--muted)]">Use Preset</span>
+						<select
+							class="provider-key-input"
+							onChange=${(e) => applyPreset(e.target.value)}
+							value=""
+						>
+							<option value="">Select a preset\u2026</option>
+							${presetOptions.map(
+								(preset) => html`
+								<option key=${preset.name} value=${preset.name}>
+									${titleCasePreset(preset.name)}
+								</option>
+							`,
+							)}
+						</select>
+					</label>
+				`
+				}
 				<label class="flex flex-col gap-1">
 					<span class="text-xs text-[var(--muted)]">ID (slug, cannot change later)</span>
 					<input

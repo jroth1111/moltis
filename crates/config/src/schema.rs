@@ -230,9 +230,68 @@ pub struct AgentsConfig {
 }
 
 impl AgentsConfig {
+    /// Built-in spawn presets available even when the user does not define
+    /// `agents.presets` in `moltis.toml`.
+    #[must_use]
+    pub fn default_presets() -> HashMap<String, AgentPresetConfig> {
+        HashMap::from([
+            (
+                "researcher".to_string(),
+                AgentPresetConfig {
+                    allow_tools: vec![
+                        "web_search".to_string(),
+                        "web_fetch".to_string(),
+                        "memory_search".to_string(),
+                        "memory_save".to_string(),
+                    ],
+                    system_prompt_suffix: Some(
+                        "Prioritize evidence gathering, citations, and concise synthesis."
+                            .to_string(),
+                    ),
+                    ..AgentPresetConfig::default()
+                },
+            ),
+            (
+                "code-reviewer".to_string(),
+                AgentPresetConfig {
+                    allow_tools: vec!["read_file".to_string(), "exec".to_string()],
+                    deny_tools: vec!["write_file".to_string()],
+                    system_prompt_suffix: Some(
+                        "Focus on correctness risks, regressions, and concrete file-level findings."
+                            .to_string(),
+                    ),
+                    ..AgentPresetConfig::default()
+                },
+            ),
+            (
+                "project-manager".to_string(),
+                AgentPresetConfig {
+                    delegate_only: true,
+                    system_prompt_suffix: Some(
+                        "Coordinate work through delegation, track progress, and avoid direct implementation."
+                            .to_string(),
+                    ),
+                    ..AgentPresetConfig::default()
+                },
+            ),
+        ])
+    }
+
+    /// Return built-ins merged with user-defined presets.
+    /// User presets win when names collide.
+    #[must_use]
+    pub fn effective_presets(&self) -> HashMap<String, AgentPresetConfig> {
+        let mut merged = Self::default_presets();
+        merged.extend(self.presets.clone());
+        merged
+    }
+
     /// Return a preset by name.
-    pub fn get_preset(&self, name: &str) -> Option<&AgentPresetConfig> {
-        self.presets.get(name)
+    pub fn get_preset(&self, name: &str) -> Option<AgentPresetConfig> {
+        self.presets
+            .get(name)
+            .cloned()
+            .or_else(|| Self::default_presets().get(name).cloned())
     }
 }
 
@@ -2544,6 +2603,26 @@ system_prompt_suffix = "Focus on evidence."
         assert_eq!(
             preset.system_prompt_suffix.as_deref(),
             Some("Focus on evidence.")
+        );
+    }
+
+    #[test]
+    fn agents_effective_presets_include_builtins_and_user_overrides() {
+        let toml = r#"
+[agents.presets.researcher]
+allow_tools = ["web_fetch"]
+"#;
+        let config: MoltisConfig = toml::from_str(toml).unwrap();
+        let effective = config.agents.effective_presets();
+        assert!(effective.contains_key("project-manager"));
+        assert!(effective.contains_key("code-reviewer"));
+        assert!(effective.contains_key("researcher"));
+        assert_eq!(
+            effective
+                .get("researcher")
+                .map(|preset| preset.allow_tools.clone())
+                .unwrap_or_default(),
+            vec!["web_fetch".to_string()]
         );
     }
 
