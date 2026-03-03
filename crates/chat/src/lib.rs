@@ -2829,7 +2829,12 @@ async fn persist_handoff_context(
     };
 
     if let Err(error) = store
-        .set(session_key, HANDOFF_NAMESPACE, HANDOFF_LATEST_KEY, &serialized)
+        .set(
+            session_key,
+            HANDOFF_NAMESPACE,
+            HANDOFF_LATEST_KEY,
+            &serialized,
+        )
         .await
     {
         warn!(
@@ -4183,11 +4188,9 @@ impl ChatService for LiveChatService {
                         let (first, rest) = {
                             let mut streaks = message_queue_priority_streak.write().await;
                             let streak = streaks.entry(session_key_clone.clone()).or_insert(0);
-                            let Some((first, rest)) = dequeue_followup_with_priority(
-                                queued,
-                                starvation_bound,
-                                streak,
-                            ) else {
+                            let Some((first, rest)) =
+                                dequeue_followup_with_priority(queued, starvation_bound, streak)
+                            else {
                                 return;
                             };
                             if rest.is_empty() {
@@ -9741,20 +9744,31 @@ mod tests {
         };
         let serialized = serde_json::to_string(&handoff).expect("serialize handoff");
         state_store
-            .set("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY, &serialized)
+            .set(
+                "session:target",
+                HANDOFF_NAMESPACE,
+                HANDOFF_INBOUND_KEY,
+                &serialized,
+            )
             .await
             .expect("persist inbound handoff");
 
         let loaded = consume_inbound_handoff_context(Some(&state_store), "session:target")
             .await
             .expect("handoff should be loaded");
-        assert_eq!(loaded.last_action.as_deref(), Some("completed dependency scan"));
+        assert_eq!(
+            loaded.last_action.as_deref(),
+            Some("completed dependency scan")
+        );
 
         let after = state_store
             .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
             .await
             .expect("read inbound handoff after consume");
-        assert!(after.is_none(), "inbound handoff must be consumed exactly once");
+        assert!(
+            after.is_none(),
+            "inbound handoff must be consumed exactly once"
+        );
     }
 
     #[tokio::test]
@@ -10552,8 +10566,12 @@ mod tests {
         // Enqueue two messages.
         {
             let mut q = queue.write().await;
-            q.entry(key.to_string()).or_default().push(queued_text("hello"));
-            q.entry(key.to_string()).or_default().push(queued_text("world"));
+            q.entry(key.to_string())
+                .or_default()
+                .push(queued_text("hello"));
+            q.entry(key.to_string())
+                .or_default()
+                .push(queued_text("world"));
         }
 
         // Drain.
@@ -10969,8 +10987,8 @@ mod tests {
         assert_eq!(streak, 1);
 
         let mut second_streak = 0usize;
-        let (second, _) = dequeue_followup_with_priority(rest, 3, &mut second_streak)
-            .expect("second pick");
+        let (second, _) =
+            dequeue_followup_with_priority(rest, 3, &mut second_streak).expect("second pick");
         assert_eq!(second.params["text"], "b2");
         assert_eq!(second.priority, QueuePriority::Background);
     }

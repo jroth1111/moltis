@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use {
-    async_trait::async_trait, futures::future::BoxFuture, serde_json::Value, tracing::warn,
-};
+use {async_trait::async_trait, futures::future::BoxFuture, serde_json::Value, tracing::warn};
 
 use {
     moltis_agents::tool_registry::AgentTool,
@@ -598,7 +596,8 @@ mod tests {
                 Ok(serde_json::json!({ "text": "ok" }))
             })
         });
-        let tool = SessionsSendTool::new(metadata, send_fn).with_state_store(Arc::clone(&state_store));
+        let tool =
+            SessionsSendTool::new(metadata, send_fn).with_state_store(Arc::clone(&state_store));
 
         let result = tool
             .execute(serde_json::json!({

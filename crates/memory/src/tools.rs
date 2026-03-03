@@ -925,7 +925,8 @@ mod tests {
 
         assert_eq!(result["saved"], json!(true));
         assert_eq!(result["path"], json!("memory/failures.md"));
-        let content = std::fs::read_to_string(tmp.path().join("memory").join("failures.md")).unwrap();
+        let content =
+            std::fs::read_to_string(tmp.path().join("memory").join("failures.md")).unwrap();
         assert!(content.contains("Failure Signature: timeout:provider=openai"));
         assert!(content.contains("resolution: retry with fallback model and 10s timeout"));
         assert!(content.contains("context: trace_id=abc-123"));
@@ -945,7 +946,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = recall.execute(json!({ "query": "lock timeout", "limit": 5 })).await.unwrap();
+        let result = recall
+            .execute(json!({ "query": "lock timeout", "limit": 5 }))
+            .await
+            .unwrap();
         let items = result["results"].as_array().unwrap();
         assert!(!items.is_empty(), "expected at least one failure match");
         assert_eq!(items[0]["path"], json!("memory/failures.md"));

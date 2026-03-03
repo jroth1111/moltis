@@ -128,40 +128,41 @@ impl SessionStore {
     pub async fn read_with_stats(&self, key: &str) -> Result<ReadResult<serde_json::Value>> {
         let path = self.path_for(key);
 
-        let result = tokio::task::spawn_blocking(move || -> Result<ReadResult<serde_json::Value>> {
-            if !path.exists() {
-                return Ok(ReadResult {
-                    messages: vec![],
-                    skipped_lines: 0,
-                    total_lines: 0,
-                });
-            }
-            let file = File::open(&path)?;
-            let reader = BufReader::new(file);
-            let mut messages = Vec::new();
-            let mut skipped_lines = 0usize;
-            let mut total_lines = 0usize;
-            for line in reader.lines() {
-                let line = line?;
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<ReadResult<serde_json::Value>> {
+                if !path.exists() {
+                    return Ok(ReadResult {
+                        messages: vec![],
+                        skipped_lines: 0,
+                        total_lines: 0,
+                    });
                 }
-                total_lines = total_lines.saturating_add(1);
-                match serde_json::from_str(trimmed) {
-                    Ok(val) => messages.push(val),
-                    Err(_) => {
-                        skipped_lines = skipped_lines.saturating_add(1);
-                    },
+                let file = File::open(&path)?;
+                let reader = BufReader::new(file);
+                let mut messages = Vec::new();
+                let mut skipped_lines = 0usize;
+                let mut total_lines = 0usize;
+                for line in reader.lines() {
+                    let line = line?;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    total_lines = total_lines.saturating_add(1);
+                    match serde_json::from_str(trimmed) {
+                        Ok(val) => messages.push(val),
+                        Err(_) => {
+                            skipped_lines = skipped_lines.saturating_add(1);
+                        },
+                    }
                 }
-            }
-            Ok(ReadResult {
-                messages,
-                skipped_lines,
-                total_lines,
+                Ok(ReadResult {
+                    messages,
+                    skipped_lines,
+                    total_lines,
+                })
             })
-        })
-        .await??;
+            .await??;
 
         #[cfg(feature = "metrics")]
         if result.skipped_lines > 0 {
@@ -1505,21 +1506,25 @@ mod tests {
     async fn test_validate_session_integrity_sets_replay_candidate_for_tail_user() {
         let (store, _dir) = temp_store();
         store
-            .append("replay", &json!({"role": "user", "content": "please continue"}))
+            .append(
+                "replay",
+                &json!({"role": "user", "content": "please continue"}),
+            )
             .await
             .unwrap();
 
         let report = store.validate_session_integrity("replay").await.unwrap();
         assert!(report.recovered);
-        assert_eq!(
-            report.replay_candidate.as_deref(),
-            Some("please continue")
-        );
+        assert_eq!(report.replay_candidate.as_deref(), Some("please continue"));
         assert_eq!(report.appended_assistant_messages, 0);
         assert!(!report.replay_blocked_by_tool_side_effects);
 
         let after = store.read("replay").await.unwrap();
-        assert_eq!(after.len(), 1, "replay candidate should not rewrite history");
+        assert_eq!(
+            after.len(),
+            1,
+            "replay candidate should not rewrite history"
+        );
         assert_eq!(after[0]["role"], "user");
     }
 

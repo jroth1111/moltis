@@ -4,11 +4,7 @@
 //! When the primary fails with a retryable error (rate limit, auth, server error),
 //! it automatically tries the next provider in the chain.
 
-use std::{
-    pin::Pin,
-    sync::Arc,
-    time::Instant,
-};
+use std::{pin::Pin, sync::Arc, time::Instant};
 
 use {async_trait::async_trait, tokio_stream::Stream, tracing::warn};
 
