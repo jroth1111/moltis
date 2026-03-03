@@ -489,8 +489,7 @@ mod tests {
         let path = dir.path().join(format!("{name}.json"));
         std::fs::write(&path, &json)?;
 
-        let loaded: SessionState =
-            serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        let loaded: SessionState = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
         assert_eq!(loaded.url, "https://save-load.test");
         assert_eq!(loaded.cookies[0].value, "abc123");
         Ok(())
