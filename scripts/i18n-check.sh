@@ -33,8 +33,10 @@ function flattenKeys(value, prefix = "", out = new Set()) {
 }
 
 async function loadLocaleModule(filePath) {
-	const fileUrl = `${pathToFileURL(filePath).href}?v=${Date.now()}`;
-	const mod = await import(fileUrl);
+	const source = fs.readFileSync(filePath, "utf8");
+	const moduleSource = `${source}\n//# sourceURL=${pathToFileURL(filePath).href}`;
+	const encoded = Buffer.from(moduleSource, "utf8").toString("base64");
+	const mod = await import(`data:text/javascript;base64,${encoded}`);
 	return mod.default ?? {};
 }
 
