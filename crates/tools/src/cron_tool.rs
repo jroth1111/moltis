@@ -864,7 +864,13 @@ impl AgentTool for CronTool {
                                 "description": { "type": "string" },
                                 "is_intent": { "type": "boolean" },
                                 "autonomy_tier": { "type": "string", "enum": ["auto", "confirm", "approve"] },
-                                "principal_json": { "type": "string" },
+                                "principal_json": {
+                                    "description": "Optional serialized TaskPrincipal payload (JSON string or object).",
+                                    "anyOf": [
+                                        { "type": "string" },
+                                        { "type": "object" }
+                                    ]
+                                },
                                 "blocked_by": { "type": "array", "items": { "type": "string" } },
                                 "model": { "type": "string" },
                                 "timeout_secs": { "type": "integer" },
