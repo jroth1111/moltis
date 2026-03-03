@@ -3447,6 +3447,8 @@ pub async fn prepare_gateway(
             });
         }
         // Register the session-backed task board used by autonomous workflows.
+        // TODO: remove once all agents migrate to `task_list`.
+        #[allow(deprecated)]
         tool_registry.register(Box::new(
             moltis_plugins::bundled::task_board::TaskBoardTool::new(Arc::clone(
                 &session_state_store,

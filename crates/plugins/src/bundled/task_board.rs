@@ -14,6 +14,11 @@ use {
 use moltis_sessions::state_store::SessionStateStore;
 
 /// Agent tool for managing a shared task board via the session state store.
+#[deprecated(
+    since = "0.1.0",
+    note = "Use the `task_list` tool (backed by `moltis-tasks`) instead. \
+            TaskBoardTool will be removed in a future release."
+)]
 pub struct TaskBoardTool {
     state_store: Arc<SessionStateStore>,
 }
@@ -154,7 +159,7 @@ impl moltis_agents::tool_registry::AgentTool for TaskBoardTool {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, deprecated)]
 #[cfg(test)]
 mod tests {
     use super::*;
