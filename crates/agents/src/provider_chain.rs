@@ -332,25 +332,79 @@ impl LlmProvider for ProviderChain {
         // For streaming, we try the first non-tripped provider.
         // If the stream yields an Error event, we can't transparently retry
         // mid-stream, so we pick the best available provider upfront.
-        let mut selected = self.primary();
+        let mut selected = None;
+        let mut delayed_candidate: Option<(&ChainEntry, Duration)> = None;
+        let mut limiter_rejections: Vec<String> = Vec::new();
         for entry in &self.chain {
-            if !entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
-                selected = entry;
+            if entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
+                continue;
+            }
+
+            let provider_name = entry.provider.name().to_string();
+            let model_id = entry.provider.id().to_string();
+
+            if let Some(ref limiter) = self.rate_limiter {
+                match limiter.acquire(&provider_name, &model_id) {
+                    RateLimitDecision::Allowed => {
+                        selected = Some((entry, None));
+                        break;
+                    },
+                    RateLimitDecision::Wait(delay) => {
+                        if delayed_candidate.is_none() {
+                            delayed_candidate = Some((entry, delay));
+                        }
+                        continue;
+                    },
+                    RateLimitDecision::Rejected(retry_after) => {
+                        limiter_rejections.push(format!(
+                            "{}: local provider rate limiter active (retry_after={}ms)",
+                            entry.provider.id(),
+                            retry_after.as_millis()
+                        ));
+                        continue;
+                    },
+                }
+            } else {
+                selected = Some((entry, None));
                 break;
             }
         }
+
+        if selected.is_none()
+            && let Some((entry, delay)) = delayed_candidate
+        {
+            selected = Some((entry, Some(delay)));
+        }
+
+        let Some((selected, initial_delay)) = selected else {
+            let message = if limiter_rejections.is_empty() {
+                "all providers in failover chain unavailable for streaming".to_string()
+            } else {
+                format!(
+                    "all providers in failover chain unavailable for streaming: {}",
+                    limiter_rejections.join("; ")
+                )
+            };
+            return Box::pin(tokio_stream::once(StreamEvent::Error(message)));
+        };
 
         let provider_name = selected.provider.name().to_string();
         let model_id = selected.provider.id().to_string();
         let state = &selected.state;
         let health_tracker = Arc::clone(&self.health_tracker);
+        let limiter = self.rate_limiter.clone();
         let start = Instant::now();
         let mut first_delta_recorded = false;
-        let inner = selected.provider.stream_with_tools(messages, tools);
+        let provider = Arc::clone(&selected.provider);
 
-        let wrapped = {
+        let wrapped = async_stream::stream! {
+            if let Some(delay) = initial_delay {
+                tokio::time::sleep(delay).await;
+            }
+
             use tokio_stream::StreamExt;
-            inner.map(move |event| {
+            let mut inner = provider.stream_with_tools(messages, tools);
+            while let Some(event) = inner.next().await {
                 match &event {
                     StreamEvent::Delta(_) if !first_delta_recorded => {
                         first_delta_recorded = true;
@@ -399,6 +453,14 @@ impl LlmProvider for ProviderChain {
                             start.elapsed().as_millis() as u64,
                             provider_error_kind_label(kind),
                         );
+
+                        if matches!(kind, ProviderErrorKind::RateLimit | ProviderErrorKind::NonRetryableRateLimit)
+                            && let Some(retry_after_ms) = parse_retry_after_ms(msg)
+                            && let Some(ref limiter) = limiter
+                        {
+                            limiter.note_retry_after_ms(&provider_name, &model_id, retry_after_ms);
+                        }
+
                         #[cfg(feature = "metrics")]
                         {
                             counter!(
@@ -412,8 +474,9 @@ impl LlmProvider for ProviderChain {
                     },
                     _ => {},
                 }
-                event
-            })
+
+                yield event;
+            }
         };
         Box::pin(wrapped)
     }
@@ -600,6 +663,38 @@ mod tests {
 
         let resp = chain.complete(&[], &[]).await.unwrap();
         assert_eq!(resp.text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn streaming_rate_limiter_rejects_primary_then_uses_fallback() {
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
+        cfg.enabled = true;
+        cfg.wait_on_limit = false;
+        cfg.defaults.max_requests_per_window = 10;
+        cfg.providers.insert(
+            "failing".to_string(),
+            moltis_config::schema::ProviderRateLimitWindowConfig {
+                window_secs: 60,
+                max_requests_per_window: 0,
+            },
+        );
+        let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
+
+        let chain = ProviderChain::new(vec![
+            Arc::new(FailingProvider {
+                id: "primary",
+                error_msg: "500 internal server error",
+            }),
+            Arc::new(SuccessProvider { id: "fallback" }),
+        ])
+        .with_rate_limiter(Some(limiter));
+
+        let mut stream = chain.stream(vec![]);
+        let event = stream.next().await.expect("expected stream event");
+        assert!(
+            matches!(event, StreamEvent::Done(_)),
+            "expected fallback stream completion, got: {event:?}"
+        );
     }
 
     #[tokio::test]
