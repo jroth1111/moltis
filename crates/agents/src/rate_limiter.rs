@@ -121,11 +121,7 @@ impl ProviderRateLimiter {
         let now = Instant::now();
 
         if limit.max_requests == 0 {
-            let decision = if self.wait_on_limit {
-                RateLimitDecision::Wait(limit.window)
-            } else {
-                RateLimitDecision::Rejected(limit.window)
-            };
+            let decision = RateLimitDecision::Rejected(limit.window);
             #[cfg(feature = "metrics")]
             match decision {
                 RateLimitDecision::Wait(_) => {

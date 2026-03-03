@@ -121,6 +121,41 @@ fn next_retry_delay_ms(
     }
 }
 
+fn remaining_agent_budget(
+    run_started: std::time::Instant,
+    agent_timeout_secs: u64,
+) -> Option<std::time::Duration> {
+    if agent_timeout_secs == 0 {
+        return None;
+    }
+    std::time::Duration::from_secs(agent_timeout_secs).checked_sub(run_started.elapsed())
+}
+
+fn effective_provider_timeout(
+    provider_call_timeout_secs: u64,
+    remaining_budget: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let provider_timeout = (provider_call_timeout_secs > 0)
+        .then(|| std::time::Duration::from_secs(provider_call_timeout_secs));
+    match (provider_timeout, remaining_budget) {
+        (Some(provider), Some(remaining)) => Some(provider.min(remaining)),
+        (Some(provider), None) => Some(provider),
+        (None, Some(remaining)) => Some(remaining),
+        (None, None) => None,
+    }
+}
+
+fn timeout_hit_agent_budget(
+    provider_call_timeout_secs: u64,
+    remaining_budget: Option<std::time::Duration>,
+) -> bool {
+    match remaining_budget {
+        Some(remaining) if provider_call_timeout_secs == 0 => true,
+        Some(remaining) => remaining <= std::time::Duration::from_secs(provider_call_timeout_secs),
+        None => false,
+    }
+}
+
 /// Typed errors from the agent loop.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentRunError {
@@ -511,8 +546,10 @@ pub async fn run_agent_loop_with_context(
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
     let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
+    let agent_timeout_secs = config.tools.agent_timeout_secs;
     let provider_call_timeout_secs = config.tools.provider_call_timeout_secs;
     let tool_schemas = tools.list_schemas();
+    let run_started = std::time::Instant::now();
 
     let is_multimodal = matches!(user_content, UserContent::Multimodal(_));
     info!(
@@ -521,6 +558,7 @@ pub async fn run_agent_loop_with_context(
         native_tools,
         tools_count = tool_schemas.len(),
         is_multimodal,
+        agent_timeout_secs,
         provider_call_timeout_secs,
         "starting agent loop"
     );
@@ -568,6 +606,13 @@ pub async fn run_agent_loop_with_context(
             warn!("agent loop exceeded max iterations ({})", max_iterations);
             return Err(AgentRunError::Other(anyhow::anyhow!(
                 "agent loop exceeded max iterations"
+            )));
+        }
+        if agent_timeout_secs > 0
+            && remaining_agent_budget(run_started, agent_timeout_secs).is_none()
+        {
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "agent run timed out after {agent_timeout_secs}s"
             )));
         }
 
@@ -625,22 +670,27 @@ pub async fn run_agent_loop_with_context(
             cb(RunnerEvent::Thinking);
         }
 
-        let completion_result = if provider_call_timeout_secs > 0 {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(provider_call_timeout_secs),
-                provider.complete(&messages, schemas_for_api),
-            )
-            .await
+        let remaining_budget = remaining_agent_budget(run_started, agent_timeout_secs);
+        let completion_result = if let Some(timeout) =
+            effective_provider_timeout(provider_call_timeout_secs, remaining_budget)
+        {
+            match tokio::time::timeout(timeout, provider.complete(&messages, schemas_for_api)).await
             {
                 Ok(inner) => inner,
                 Err(_elapsed) => {
-                    warn!(
-                        timeout_secs = provider_call_timeout_secs,
-                        "provider call timed out"
-                    );
-                    Err(anyhow::anyhow!(
-                        "provider call timed out after {provider_call_timeout_secs}s"
-                    ))
+                    if timeout_hit_agent_budget(provider_call_timeout_secs, remaining_budget) {
+                        Err(anyhow::anyhow!(
+                            "agent run timed out after {agent_timeout_secs}s"
+                        ))
+                    } else {
+                        warn!(
+                            timeout_secs = provider_call_timeout_secs,
+                            "provider call timed out"
+                        );
+                        Err(anyhow::anyhow!(
+                            "provider call timed out after {provider_call_timeout_secs}s"
+                        ))
+                    }
                 },
             }
         } else {
@@ -651,6 +701,9 @@ pub async fn run_agent_loop_with_context(
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
+                if msg.starts_with("agent run timed out after ") {
+                    return Err(AgentRunError::Other(anyhow::anyhow!(msg)));
+                }
                 if let Some(ref hooks) = hook_registry {
                     let payload = HookPayload::AfterLLMCall {
                         session_key: session_key_for_hooks.clone(),
@@ -1088,7 +1141,10 @@ pub async fn run_agent_loop_streaming(
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
     let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
+    let agent_timeout_secs = config.tools.agent_timeout_secs;
+    let provider_call_timeout_secs = config.tools.provider_call_timeout_secs;
     let tool_schemas = tools.list_schemas();
+    let run_started = std::time::Instant::now();
 
     let is_multimodal = matches!(user_content, UserContent::Multimodal(_));
     info!(
@@ -1097,6 +1153,8 @@ pub async fn run_agent_loop_streaming(
         native_tools,
         tools_count = tool_schemas.len(),
         is_multimodal,
+        agent_timeout_secs,
+        provider_call_timeout_secs,
         "starting streaming agent loop"
     );
 
@@ -1171,6 +1229,13 @@ pub async fn run_agent_loop_streaming(
             );
             return Err(AgentRunError::Other(anyhow::anyhow!(
                 "agent loop exceeded max iterations"
+            )));
+        }
+        if agent_timeout_secs > 0
+            && remaining_agent_budget(run_started, agent_timeout_secs).is_none()
+        {
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "agent run timed out after {agent_timeout_secs}s"
             )));
         }
 
@@ -1254,7 +1319,34 @@ pub async fn run_agent_loop_streaming(
         let mut output_tokens: u32 = 0;
         let mut stream_error: Option<String> = None;
 
-        while let Some(event) = stream.next().await {
+        loop {
+            let remaining_budget = remaining_agent_budget(run_started, agent_timeout_secs);
+            let Some(event) = (if let Some(timeout) =
+                effective_provider_timeout(provider_call_timeout_secs, remaining_budget)
+            {
+                match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(event) => event,
+                    Err(_elapsed) => {
+                        stream_error = Some(
+                            if timeout_hit_agent_budget(
+                                provider_call_timeout_secs,
+                                remaining_budget,
+                            ) {
+                                format!("agent run timed out after {agent_timeout_secs}s")
+                            } else {
+                                format!(
+                                    "provider call timed out after {provider_call_timeout_secs}s"
+                                )
+                            },
+                        );
+                        break;
+                    },
+                }
+            } else {
+                stream.next().await
+            }) else {
+                break;
+            };
             match event {
                 StreamEvent::Delta(text) => {
                     #[cfg(feature = "metrics")]
@@ -1400,6 +1492,9 @@ pub async fn run_agent_loop_streaming(
 
         // Handle stream errors — retry on transient failures/rate limits.
         if let Some(err) = stream_error {
+            if err.starts_with("agent run timed out after ") {
+                return Err(AgentRunError::Other(anyhow::anyhow!(err)));
+            }
             if let Some(ref hooks) = hook_registry {
                 let payload = HookPayload::AfterLLMCall {
                     session_key: session_key_for_hooks.clone(),

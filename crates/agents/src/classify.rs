@@ -72,10 +72,7 @@ impl ProviderErrorKind {
     /// Whether this error kind should trigger provider failover.
     #[must_use]
     pub fn should_failover(self) -> bool {
-        matches!(
-            self.routing_action(),
-            ErrorRoutingAction::Retry | ErrorRoutingAction::Failover
-        )
+        matches!(self.routing_action(), ErrorRoutingAction::Failover)
     }
 }
 
@@ -327,5 +324,12 @@ mod tests {
             ProviderErrorKind::InvalidRequest.routing_action(),
             ErrorRoutingAction::SurfaceToUser
         );
+    }
+
+    #[test]
+    fn retry_actions_do_not_trigger_failover() {
+        assert!(!ProviderErrorKind::ServerError.should_failover());
+        assert!(!ProviderErrorKind::Timeout.should_failover());
+        assert!(ProviderErrorKind::RateLimit.should_failover());
     }
 }

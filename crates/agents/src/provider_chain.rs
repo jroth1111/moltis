@@ -104,37 +104,39 @@ impl LlmProvider for ProviderChain {
         #[cfg(feature = "metrics")]
         let start = Instant::now();
 
-        for entry in &self.chain {
+        'providers: for entry in &self.chain {
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
             let attempt_start = Instant::now();
 
             if let Some(ref limiter) = self.rate_limiter {
-                match limiter.acquire(&provider_name, &model_id) {
-                    RateLimitDecision::Allowed => {},
-                    RateLimitDecision::Wait(delay) => {
-                        warn!(
-                            provider = %provider_name,
-                            model = %model_id,
-                            delay_ms = delay.as_millis() as u64,
-                            "outbound provider limiter queued request"
-                        );
-                        tokio::time::sleep(delay).await;
-                    },
-                    RateLimitDecision::Rejected(retry_after) => {
-                        warn!(
-                            provider = %provider_name,
-                            model = %model_id,
-                            retry_after_ms = retry_after.as_millis() as u64,
-                            "outbound provider limiter rejected request; trying next provider"
-                        );
-                        errors.push(format!(
-                            "{}: local provider rate limiter active (retry_after={}ms)",
-                            entry.provider.id(),
-                            retry_after.as_millis()
-                        ));
-                        continue;
-                    },
+                loop {
+                    match limiter.acquire(&provider_name, &model_id) {
+                        RateLimitDecision::Allowed => break,
+                        RateLimitDecision::Wait(delay) => {
+                            warn!(
+                                provider = %provider_name,
+                                model = %model_id,
+                                delay_ms = delay.as_millis() as u64,
+                                "outbound provider limiter queued request"
+                            );
+                            tokio::time::sleep(delay).await;
+                        },
+                        RateLimitDecision::Rejected(retry_after) => {
+                            warn!(
+                                provider = %provider_name,
+                                model = %model_id,
+                                retry_after_ms = retry_after.as_millis() as u64,
+                                "outbound provider limiter rejected request; trying next provider"
+                            );
+                            errors.push(format!(
+                                "{}: local provider rate limiter active (retry_after={}ms)",
+                                entry.provider.id(),
+                                retry_after.as_millis()
+                            ));
+                            continue 'providers;
+                        },
+                    }
                 }
             }
 
@@ -317,6 +319,30 @@ impl LlmProvider for ProviderChain {
         let wrapped = async_stream::stream! {
             if let Some(delay) = initial_delay {
                 tokio::time::sleep(delay).await;
+                if let Some(ref limiter) = limiter {
+                    loop {
+                        match limiter.acquire(&provider_name, &model_id) {
+                            RateLimitDecision::Allowed => break,
+                            RateLimitDecision::Wait(next_delay) => {
+                                warn!(
+                                    provider = %provider_name,
+                                    model = %model_id,
+                                    delay_ms = next_delay.as_millis() as u64,
+                                    "outbound provider limiter queued streaming request"
+                                );
+                                tokio::time::sleep(next_delay).await;
+                            },
+                            RateLimitDecision::Rejected(retry_after) => {
+                                yield StreamEvent::Error(format!(
+                                    "{}: local provider rate limiter active (retry_after={}ms)",
+                                    provider.id(),
+                                    retry_after.as_millis()
+                                ));
+                                return;
+                            },
+                        }
+                    }
+                }
             }
 
             use tokio_stream::StreamExt;
@@ -342,6 +368,36 @@ impl LlmProvider for ProviderChain {
                         #[cfg(feature = "metrics")]
                         {
                             let duration_secs = start.elapsed().as_secs_f64();
+                            counter!(
+                                llm_metrics::COMPLETIONS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(1);
+                            counter!(
+                                llm_metrics::INPUT_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(usage.input_tokens));
+                            counter!(
+                                llm_metrics::OUTPUT_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(usage.output_tokens));
+                            counter!(
+                                llm_metrics::CACHE_READ_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(usage.cache_read_tokens));
+                            counter!(
+                                llm_metrics::CACHE_WRITE_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(usage.cache_write_tokens));
                             histogram!(
                                 llm_metrics::COMPLETION_DURATION_SECONDS,
                                 labels::PROVIDER => provider_name.clone(),
@@ -378,6 +434,12 @@ impl LlmProvider for ProviderChain {
 
                         #[cfg(feature = "metrics")]
                         {
+                            histogram!(
+                                llm_metrics::COMPLETION_DURATION_SECONDS,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .record(start.elapsed().as_secs_f64());
                             counter!(
                                 llm_metrics::COMPLETION_ERRORS_TOTAL,
                                 labels::PROVIDER => provider_name.clone(),
@@ -532,7 +594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failover_on_server_error() {
+    async fn no_failover_on_server_error() {
         let chain = ProviderChain::new(vec![
             Arc::new(FailingProvider {
                 id: "primary",
@@ -541,8 +603,8 @@ mod tests {
             Arc::new(SuccessProvider { id: "fallback" }),
         ]);
 
-        let resp = chain.complete(&[], &[]).await.unwrap();
-        assert_eq!(resp.text.as_deref(), Some("ok"));
+        let err = chain.complete(&[], &[]).await.unwrap_err();
+        assert!(err.to_string().contains("500 internal server error"));
     }
 
     #[tokio::test]
@@ -751,10 +813,7 @@ mod tests {
         ]);
 
         let err = chain.complete(&[], &[]).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("all providers in failover chain failed")
-        );
+        assert!(err.to_string().contains("503 service unavailable"));
     }
 
     #[test]
@@ -803,7 +862,8 @@ mod tests {
     fn should_failover_mapping() {
         assert!(ProviderErrorKind::RateLimit.should_failover());
         assert!(ProviderErrorKind::AuthError.should_failover());
-        assert!(ProviderErrorKind::ServerError.should_failover());
+        assert!(!ProviderErrorKind::ServerError.should_failover());
+        assert!(!ProviderErrorKind::Timeout.should_failover());
         assert!(ProviderErrorKind::BillingExhausted.should_failover());
         assert!(ProviderErrorKind::Unknown.should_failover());
         assert!(!ProviderErrorKind::ContextWindow.should_failover());
