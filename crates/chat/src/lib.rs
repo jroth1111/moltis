@@ -9601,15 +9601,20 @@ mod tests {
         moltis_agents::{model::LlmProvider, tool_registry::AgentTool},
         moltis_common::types::ReplyPayload,
         std::{
+            collections::VecDeque,
             pin::Pin,
             sync::{
                 Arc,
                 atomic::{AtomicUsize, Ordering},
+                LazyLock,
             },
             time::{Duration, Instant},
         },
         tokio_stream::Stream,
     };
+
+    static DATA_DIR_OVERRIDE_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
 
     struct DummyTool {
         name: String,
@@ -13039,6 +13044,54 @@ mod tests {
         }
     }
 
+    struct QueuedResponseProvider {
+        responses: std::sync::Mutex<VecDeque<String>>,
+    }
+
+    impl QueuedResponseProvider {
+        fn new(responses: Vec<String>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for QueuedResponseProvider {
+        fn name(&self) -> &str {
+            "queued-test"
+        }
+
+        fn id(&self) -> &str {
+            "queued-test-model"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[Value],
+        ) -> Result<moltis_agents::model::CompletionResponse> {
+            let text = self
+                .responses
+                .lock()
+                .expect("queued provider mutex poisoned")
+                .pop_front()
+                .unwrap_or_else(|| "{\"facts\":[]}".to_string());
+            Ok(moltis_agents::model::CompletionResponse {
+                text: Some(text),
+                tool_calls: vec![],
+                usage: Default::default(),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
     #[tokio::test]
     async fn provider_backed_rerank_client_returns_llm_text() {
         let provider: Arc<dyn LlmProvider> = Arc::new(RerankClientTestProvider {
@@ -13118,5 +13171,102 @@ mod tests {
         let selected = parse_auto_reconcile_decisions(raw);
         assert!(selected.contains(&0));
         assert!(!selected.contains(&1));
+    }
+
+    #[tokio::test]
+    async fn auto_memory_extraction_writes_searches_and_dedupes_subsequent_turn() {
+        let _guard = DATA_DIR_OVERRIDE_LOCK
+            .lock()
+            .expect("data dir lock poisoned");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+        struct DataDirReset;
+        impl Drop for DataDirReset {
+            fn drop(&mut self) {
+                moltis_config::clear_data_dir();
+            }
+        }
+        let _reset = DataDirReset;
+
+        let pool = sqlx::SqlitePool::connect(":memory:")
+            .await
+            .expect("sqlite memory pool");
+        moltis_memory::schema::run_migrations(&pool)
+            .await
+            .expect("memory migrations");
+
+        let workspace_memory_dir = moltis_config::agent_workspace_dir("main").join("memory");
+        let config = moltis_memory::config::MemoryConfig {
+            db_path: ":memory:".into(),
+            data_dir: Some(tmp.path().to_path_buf()),
+            memory_dirs: vec![workspace_memory_dir],
+            chunk_size: 512,
+            chunk_overlap: 64,
+            vector_weight: 0.0,
+            keyword_weight: 1.0,
+            ..Default::default()
+        };
+        let manager = Arc::new(moltis_memory::manager::MemoryManager::keyword_only(
+            config,
+            Box::new(moltis_memory::store_sqlite::SqliteMemoryStore::new(pool)),
+        ));
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(QueuedResponseProvider::new(vec![
+            r#"{"facts":["User prefers TypeScript for backend services"]}"#.to_string(),
+            r#"{"facts":["User prefers TypeScript for backend services"]}"#.to_string(),
+        ]));
+        let settings = AutoMemorySettings {
+            enabled: true,
+            min_chars: 1,
+            debounce: Duration::from_secs(1),
+            max_facts: 4,
+            model_id: None,
+            reconcile_enabled: true,
+            reconcile_min_interval: Duration::from_secs(0),
+            reconcile_similarity_threshold: 0.10,
+        };
+        let auto_reconcile_last_run = Arc::new(RwLock::new(HashMap::new()));
+        let providers_registry = Arc::new(RwLock::new(ProviderRegistry::empty()));
+
+        let first_written = run_auto_memory_extraction_task(
+            settings.clone(),
+            Arc::clone(&manager),
+            Arc::clone(&auto_reconcile_last_run),
+            Arc::clone(&providers_registry),
+            Arc::clone(&provider),
+            "session-main".to_string(),
+            "main".to_string(),
+            "run-1".to_string(),
+            "Please remember I prefer TypeScript for backend services.".to_string(),
+            "Noted. I'll keep that preference in mind.".to_string(),
+        )
+        .await
+        .expect("first extraction should succeed");
+        assert!(first_written);
+
+        let search_results = manager
+            .search("TypeScript", 10)
+            .await
+            .expect("search should succeed");
+        assert!(!search_results.is_empty(), "extracted memory should be searchable");
+
+        let second_written = run_auto_memory_extraction_task(
+            settings,
+            Arc::clone(&manager),
+            auto_reconcile_last_run,
+            providers_registry,
+            provider,
+            "session-main".to_string(),
+            "main".to_string(),
+            "run-2".to_string(),
+            "Reminder: I still prefer TypeScript for backend services.".to_string(),
+            "Confirmed and remembered.".to_string(),
+        )
+        .await
+        .expect("second extraction should succeed");
+        assert!(
+            !second_written,
+            "second identical extraction should be deduped"
+        );
     }
 }
