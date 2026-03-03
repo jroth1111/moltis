@@ -14,7 +14,7 @@ use {
     std::{collections::HashSet, path::Path, sync::Arc},
 };
 
-fn security_audit(event: &str, details: Value) {
+pub(crate) fn security_audit(event: &str, details: Value) {
     let dir = moltis_config::data_dir().join("logs");
     let path = dir.join("security-audit.jsonl");
     let now_ms = now_unix_ms();
