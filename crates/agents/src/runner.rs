@@ -243,6 +243,11 @@ pub enum RunnerEvent {
         error: String,
         delay_ms: u64,
     },
+    /// Agent response has drifted significantly from the original user intent.
+    IntentDrift {
+        drift_score: f64,
+        iteration: usize,
+    },
 }
 
 /// Detect an explicit shell command in the latest user turn.
@@ -595,6 +600,20 @@ pub async fn run_agent_loop_with_context(
     });
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
 
+    // Intent drift detection: track how far agent responses wander from the original goal.
+    let original_intent = match user_content {
+        UserContent::Text(t) => t.clone(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let mut intent_tracker = IntentTracker::new(&original_intent);
+
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
         &tool_schemas
@@ -943,6 +962,21 @@ pub async fn run_agent_loop_with_context(
                 request_usage: response.usage.clone(),
                 raw_llm_responses: Vec::new(),
             });
+        }
+
+        // Check intent drift when the agent is iterating with tool calls.
+        {
+            let current_intent = response.text.as_deref().unwrap_or("");
+            let (drift_score, is_drifted) =
+                intent_tracker.check_drift(current_intent, trace_id.as_deref());
+            if is_drifted {
+                if let Some(cb) = on_event {
+                    cb(RunnerEvent::IntentDrift {
+                        drift_score,
+                        iteration: iterations,
+                    });
+                }
+            }
         }
 
         // Append assistant message with tool calls.
@@ -1741,8 +1775,16 @@ pub async fn run_agent_loop_streaming(
                 .join(" ")
         );
         // check_drift logs warnings internally when drift is detected.
-        let (_drift_score, _is_drifted) =
+        let (drift_score, is_drifted) =
             intent_tracker.check_drift(&current_intent, trace_id.as_deref());
+        if is_drifted {
+            if let Some(cb) = on_event {
+                cb(RunnerEvent::IntentDrift {
+                    drift_score,
+                    iteration: iterations,
+                });
+            }
+        }
 
         // Append assistant message with tool calls.
         //
