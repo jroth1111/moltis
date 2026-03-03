@@ -2076,9 +2076,21 @@ pub async fn prepare_gateway(
         .timezone
         .as_ref()
         .map(|tz| tz.name().to_string());
-    let sandbox_router = Arc::new(moltis_tools::sandbox::SandboxRouter::new(
-        sandbox_config.clone(),
-    ));
+    let mut sandbox_router = moltis_tools::sandbox::SandboxRouter::new(sandbox_config.clone());
+
+    // Pre-warm sandbox pool when configured.
+    if sandbox_config.pool_min_warm > 0 {
+        let pool = moltis_tools::sandbox_pool::SandboxPool::new(
+            Arc::clone(sandbox_router.backend()),
+            sandbox_config.pool_min_warm,
+            sandbox_config.pool_max,
+            sandbox_config.image.as_deref(),
+        )
+        .await;
+        sandbox_router = sandbox_router.with_pool(Arc::new(pool));
+    }
+
+    let sandbox_router = Arc::new(sandbox_router);
 
     // ── Trusted-network proxy + audit ────────────────────────────────────
     #[cfg(feature = "trusted-network")]
