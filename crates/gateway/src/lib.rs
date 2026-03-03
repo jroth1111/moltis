@@ -62,9 +62,9 @@ pub mod state;
 pub mod tailscale;
 #[cfg(feature = "tailscale")]
 pub mod tailscale_routes;
+pub mod tinder_subsystem;
 #[cfg(feature = "tls")]
 pub mod tls;
-pub mod tinder_subsystem;
 pub mod tools_routes;
 pub mod tts_phrases;
 pub mod update_check;

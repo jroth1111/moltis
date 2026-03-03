@@ -195,9 +195,12 @@ mod tests {
     #[test]
     fn respects_limit() {
         let rl = ProviderRateLimiter::new(Duration::from_secs(60));
-        rl.set_limit("openai", ProviderLimit {
-            requests_per_window: 2,
-        });
+        rl.set_limit(
+            "openai",
+            ProviderLimit {
+                requests_per_window: 2,
+            },
+        );
 
         let now = Instant::now();
         assert_eq!(
@@ -225,9 +228,12 @@ mod tests {
     #[test]
     fn window_slides() {
         let rl = ProviderRateLimiter::new(Duration::from_secs(10));
-        rl.set_limit("anthropic", ProviderLimit {
-            requests_per_window: 1,
-        });
+        rl.set_limit(
+            "anthropic",
+            ProviderLimit {
+                requests_per_window: 1,
+            },
+        );
 
         let t0 = Instant::now();
         rl.record_at("anthropic", "claude", t0);
@@ -248,9 +254,12 @@ mod tests {
     #[test]
     fn different_models_independent() {
         let rl = ProviderRateLimiter::new(Duration::from_secs(60));
-        rl.set_limit("openai", ProviderLimit {
-            requests_per_window: 1,
-        });
+        rl.set_limit(
+            "openai",
+            ProviderLimit {
+                requests_per_window: 1,
+            },
+        );
 
         let now = Instant::now();
         rl.record_at("openai", "gpt-4", now);
@@ -271,9 +280,12 @@ mod tests {
     #[test]
     fn different_providers_independent() {
         let rl = ProviderRateLimiter::new(Duration::from_secs(60));
-        rl.set_limit("openai", ProviderLimit {
-            requests_per_window: 1,
-        });
+        rl.set_limit(
+            "openai",
+            ProviderLimit {
+                requests_per_window: 1,
+            },
+        );
 
         let now = Instant::now();
         rl.record_at("openai", "gpt-4", now);
@@ -292,9 +304,12 @@ mod tests {
     #[test]
     fn apply_retry_after_blocks_requests() {
         let rl = ProviderRateLimiter::new(Duration::from_secs(60));
-        rl.set_limit("openai", ProviderLimit {
-            requests_per_window: 10,
-        });
+        rl.set_limit(
+            "openai",
+            ProviderLimit {
+                requests_per_window: 10,
+            },
+        );
 
         let now = Instant::now();
         // Should be allowed before retry-after.
@@ -317,9 +332,12 @@ mod tests {
     #[test]
     fn zero_limit_blocks_everything() {
         let rl = ProviderRateLimiter::new(Duration::from_secs(60));
-        rl.set_limit("openai", ProviderLimit {
-            requests_per_window: 0,
-        });
+        rl.set_limit(
+            "openai",
+            ProviderLimit {
+                requests_per_window: 0,
+            },
+        );
 
         match rl.check("openai", "gpt-4") {
             RateLimitDecision::Wait(d) => {
@@ -332,9 +350,12 @@ mod tests {
     #[test]
     fn evict_stale_removes_old_keys() {
         let rl = ProviderRateLimiter::new(Duration::from_millis(10));
-        rl.set_limit("test", ProviderLimit {
-            requests_per_window: 100,
-        });
+        rl.set_limit(
+            "test",
+            ProviderLimit {
+                requests_per_window: 100,
+            },
+        );
 
         let t0 = Instant::now();
         for i in 0..10 {
@@ -356,9 +377,12 @@ mod tests {
     #[test]
     fn wait_duration_accuracy() {
         let rl = ProviderRateLimiter::new(Duration::from_secs(10));
-        rl.set_limit("p", ProviderLimit {
-            requests_per_window: 2,
-        });
+        rl.set_limit(
+            "p",
+            ProviderLimit {
+                requests_per_window: 2,
+            },
+        );
 
         let t0 = Instant::now();
         rl.record_at("p", "m", t0);
