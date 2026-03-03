@@ -9,9 +9,15 @@ use tokio::sync::broadcast;
 /// A change to a session that other UIs should know about.
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
-    Created { session_key: String },
-    Deleted { session_key: String },
-    Patched { session_key: String },
+    Created {
+        session_key: String,
+    },
+    Deleted {
+        session_key: String,
+    },
+    Patched {
+        session_key: String,
+    },
     /// Session was recovered from a corrupt/interrupted state.
     Recovered {
         session_key: String,

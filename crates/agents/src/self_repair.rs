@@ -303,8 +303,7 @@ pub fn start_background_task(
             }
 
             let ss_ref = session_store.as_deref();
-            match scan_and_repair(&store, &keys, stuck_threshold, max_repair_attempts, ss_ref)
-                .await
+            match scan_and_repair(&store, &keys, stuck_threshold, max_repair_attempts, ss_ref).await
             {
                 Ok(result) => {
                     if !result.recovered.is_empty()
@@ -387,10 +386,15 @@ mod tests {
         let (store, _, _dir) = make_store().await;
         mark_session_started(&store, "s1").await.unwrap();
         // Use a 10-minute threshold — freshly started session should not be stuck.
-        let result =
-            scan_and_repair(&store, &["s1".to_string()], DEFAULT_STUCK_THRESHOLD, 3, None)
-                .await
-                .unwrap();
+        let result = scan_and_repair(
+            &store,
+            &["s1".to_string()],
+            DEFAULT_STUCK_THRESHOLD,
+            3,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(result.recovered.is_empty());
         assert!(result.failed.is_empty());
     }
@@ -404,10 +408,15 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            scan_and_repair(&store, &["s1".to_string()], Duration::from_secs(60), 3, None)
-                .await
-                .unwrap();
+        let result = scan_and_repair(
+            &store,
+            &["s1".to_string()],
+            Duration::from_secs(60),
+            3,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.recovered, vec!["s1".to_string()]);
         // Should have cleared running_since
         assert!(!is_session_running(&store, "s1").await);
@@ -425,10 +434,15 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            scan_and_repair(&store, &["s1".to_string()], Duration::from_secs(60), 3, None)
-                .await
-                .unwrap();
+        let result = scan_and_repair(
+            &store,
+            &["s1".to_string()],
+            Duration::from_secs(60),
+            3,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(result.recovered.is_empty());
         assert_eq!(result.failed, vec!["s1".to_string()]);
         assert!(is_session_failed(&store, "s1").await);

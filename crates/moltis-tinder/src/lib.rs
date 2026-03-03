@@ -7,10 +7,10 @@ pub mod hooks;
 pub mod lock;
 pub(crate) mod util;
 
-pub use browser_tool::TinderBrowserTool;
-pub use funnel_tool::TinderFunnelTool;
-pub use hooks::FunnelGuardHook;
-pub use lock::SessionLock;
+pub use {
+    browser_tool::TinderBrowserTool, funnel_tool::TinderFunnelTool, hooks::FunnelGuardHook,
+    lock::SessionLock,
+};
 
 /// Run database migrations for the Tinder subsystem.
 pub async fn run_migrations(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {

@@ -190,9 +190,11 @@ pub fn attenuate_tools<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::types::{SkillMetadata, SkillRequirements};
-    use std::path::PathBuf;
+    use {
+        super::*,
+        crate::types::{SkillMetadata, SkillRequirements},
+        std::path::PathBuf,
+    };
 
     fn mock_skill(allowed_tools: Vec<String>) -> SkillMetadata {
         SkillMetadata {

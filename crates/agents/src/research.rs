@@ -1,9 +1,11 @@
 //! Research phase: run a tool-calling loop *before* the main agent response
 //! to gather relevant context. Triggered by configurable rules.
 
-use anyhow::Result;
-use std::sync::Arc;
-use tracing::{debug, info};
+use {
+    anyhow::Result,
+    std::sync::Arc,
+    tracing::{debug, info},
+};
 
 use crate::model::{ChatMessage, LlmProvider};
 
@@ -173,10 +175,10 @@ mod tests {
 
     #[test]
     fn trigger_keywords_case_insensitive_from_config() {
-        let t = ResearchTrigger::from_config(
-            "keywords",
-            &["Billing".to_string(), "INVOICE".to_string()],
-        );
+        let t = ResearchTrigger::from_config("keywords", &[
+            "Billing".to_string(),
+            "INVOICE".to_string(),
+        ]);
         assert!(t.should_run("i need billing help"));
         assert!(t.should_run("what is my invoice status"));
     }

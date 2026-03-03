@@ -16,20 +16,16 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{message::PersistedMessage, store::SessionStore, Result};
+use crate::{Result, message::PersistedMessage, store::SessionStore};
 
 /// Types of integrity issues found in a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrityIssue {
     /// A JSONL line could not be parsed (truncated or corrupted).
-    TruncatedLine {
-        line_number: usize,
-    },
+    TruncatedLine { line_number: usize },
     /// A user message at the given index has no following assistant response.
-    UserWithoutResponse {
-        message_index: usize,
-    },
+    UserWithoutResponse { message_index: usize },
     /// An assistant tool call has no matching tool/tool_result message.
     ToolCallWithoutResult {
         message_index: usize,
@@ -70,7 +66,11 @@ impl IntegrityReport {
     /// Metric label for the dominant recovery type.
     #[must_use]
     pub fn recovery_type_label(&self) -> &'static str {
-        if self.issues.iter().any(|i| matches!(i, IntegrityIssue::TruncatedLine { .. })) {
+        if self
+            .issues
+            .iter()
+            .any(|i| matches!(i, IntegrityIssue::TruncatedLine { .. }))
+        {
             "truncated_line"
         } else if self
             .issues
@@ -121,18 +121,18 @@ impl SessionStore {
                 match serde_json::from_str::<PersistedMessage>(trimmed) {
                     Ok(msg) => messages.push(msg),
                     Err(_) => {
-                        report
-                            .issues
-                            .push(IntegrityIssue::TruncatedLine { line_number: line_idx + 1 });
+                        report.issues.push(IntegrityIssue::TruncatedLine {
+                            line_number: line_idx + 1,
+                        });
                         truncated_count += 1;
                     },
                 }
             }
 
             if truncated_count > 0 {
-                report
-                    .actions
-                    .push(RecoveryAction::RemovedTruncatedLines { count: truncated_count });
+                report.actions.push(RecoveryAction::RemovedTruncatedLines {
+                    count: truncated_count,
+                });
             }
 
             // Phase 2: check for user messages without assistant responses.
@@ -199,7 +199,9 @@ impl SessionStore {
             }
             report
                 .actions
-                .push(RecoveryAction::InjectedSyntheticToolResults { count: synthetic_count });
+                .push(RecoveryAction::InjectedSyntheticToolResults {
+                    count: synthetic_count,
+                });
             modified = true;
         }
 
@@ -255,7 +257,11 @@ fn check_tool_calls_without_results(messages: &[PersistedMessage], report: &mut 
 
     // Find tool calls without matching results.
     for (idx, msg) in messages.iter().enumerate() {
-        if let PersistedMessage::Assistant { tool_calls: Some(calls), .. } = msg {
+        if let PersistedMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } = msg
+        {
             for call in calls {
                 if !result_ids.contains(call.id.as_str()) {
                     report.issues.push(IntegrityIssue::ToolCallWithoutResult {
@@ -305,7 +311,10 @@ mod tests {
     #[tokio::test]
     async fn empty_session_is_clean() {
         let (store, _dir) = temp_store();
-        let report = store.validate_session_integrity("nonexistent").await.unwrap();
+        let report = store
+            .validate_session_integrity("nonexistent")
+            .await
+            .unwrap();
         assert!(report.is_clean());
     }
 
@@ -351,10 +360,12 @@ mod tests {
 
         let report = store.validate_session_integrity("s1").await.unwrap();
         assert!(report.needs_retrigger);
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| matches!(i, IntegrityIssue::UserWithoutResponse { message_index: 0 })));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, IntegrityIssue::UserWithoutResponse { message_index: 0 }))
+        );
     }
 
     #[tokio::test]
@@ -411,7 +422,10 @@ mod tests {
             .append_typed("s1", &PersistedMessage::user("run ls"))
             .await
             .unwrap();
-        store.append_typed("s1", &assistant_with_tool).await.unwrap();
+        store
+            .append_typed("s1", &assistant_with_tool)
+            .await
+            .unwrap();
 
         let report = store.validate_session_integrity("s1").await.unwrap();
         assert!(report.issues.iter().any(|i| matches!(
@@ -453,7 +467,10 @@ mod tests {
             .append_typed("s1", &PersistedMessage::user("run ls"))
             .await
             .unwrap();
-        store.append_typed("s1", &assistant_with_tool).await.unwrap();
+        store
+            .append_typed("s1", &assistant_with_tool)
+            .await
+            .unwrap();
         store
             .append_typed(
                 "s1",
@@ -514,7 +531,10 @@ mod tests {
             seq: None,
             run_id: None,
         };
-        store.append_typed("s1", &assistant_with_tool).await.unwrap();
+        store
+            .append_typed("s1", &assistant_with_tool)
+            .await
+            .unwrap();
 
         // Append a truncated line.
         use std::io::Write;
@@ -530,16 +550,20 @@ mod tests {
         let report = store.repair_session("s1").await.unwrap();
 
         // Should have removed truncated lines.
-        assert!(report
-            .actions
-            .iter()
-            .any(|a| matches!(a, RecoveryAction::RemovedTruncatedLines { count: 1 })));
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::RemovedTruncatedLines { count: 1 }))
+        );
 
         // Should have injected a synthetic tool result.
-        assert!(report
-            .actions
-            .iter()
-            .any(|a| matches!(a, RecoveryAction::InjectedSyntheticToolResults { count: 1 })));
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::InjectedSyntheticToolResults { count: 1 }))
+        );
 
         // Verify the session is now valid.
         let messages = store.read_typed("s1").await.unwrap();

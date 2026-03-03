@@ -1,5 +1,5 @@
 use moltis_cron::types::{
-    CronJobCreate, CronPayload, CronSchedule, CronSandboxConfig, SessionTarget,
+    CronJobCreate, CronPayload, CronSandboxConfig, CronSchedule, SessionTarget,
 };
 
 /// Daily session: run tinder workflow every evening at 7pm.

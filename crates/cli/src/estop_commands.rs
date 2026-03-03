@@ -30,7 +30,14 @@ pub fn handle_estop(action: EstopAction, data_dir: &Path) -> anyhow::Result<()> 
         },
         EstopAction::Status => {
             let enabled = estop_path.exists();
-            println!("E-STOP {}", if enabled { "enabled" } else { "disabled" });
+            println!(
+                "E-STOP {}",
+                if enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
         },
     }
 

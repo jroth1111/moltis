@@ -5,21 +5,24 @@
 //! e.g., billing exhaustion trips immediately while transient server errors
 //! require several consecutive failures.
 
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use serde::Serialize;
-use {async_trait::async_trait, tokio::sync::RwLock, tracing::info};
+use {async_trait::async_trait, serde::Serialize, tokio::sync::RwLock, tracing::info};
 
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, labels};
 
-use moltis_agents::classify::{ProviderErrorKind, classify_error};
-use moltis_common::{
-    Result,
-    hooks::{HookAction, HookEvent, HookHandler, HookPayload},
+use {
+    moltis_agents::classify::{ProviderErrorKind, classify_error},
+    moltis_common::{
+        Result,
+        hooks::{HookAction, HookEvent, HookHandler, HookPayload},
+    },
 };
 
 // ── Enforcement level ───────────────────────────────────────────────────
@@ -336,12 +339,9 @@ impl HookHandler for CircuitBreakerHook {
                     match state {
                         CircuitState::HalfOpen => {
                             counts.insert(key.clone(), class_threshold);
-                            states.insert(
-                                key.clone(),
-                                CircuitState::Open {
-                                    opened_at: Instant::now(),
-                                },
-                            );
+                            states.insert(key.clone(), CircuitState::Open {
+                                opened_at: Instant::now(),
+                            });
                             info!(
                                 provider = %provider,
                                 error_class = ?error_kind,
@@ -360,12 +360,9 @@ impl HookHandler for CircuitBreakerHook {
                             let count = counts.entry(key.clone()).or_insert(0);
                             *count += 1;
                             if *count >= class_threshold {
-                                states.insert(
-                                    key.clone(),
-                                    CircuitState::Open {
-                                        opened_at: Instant::now(),
-                                    },
-                                );
+                                states.insert(key.clone(), CircuitState::Open {
+                                    opened_at: Instant::now(),
+                                });
                                 info!(
                                     provider = %provider,
                                     error_class = ?error_kind,
@@ -558,9 +555,7 @@ mod tests {
 
         // Record server error (not enough to trip).
         let server = make_after_payload("p", Some("500 internal server error"));
-        hook.handle(HookEvent::AfterLLMCall, &server)
-            .await
-            .unwrap();
+        hook.handle(HookEvent::AfterLLMCall, &server).await.unwrap();
 
         let snapshot = hook.snapshot().await;
         let billing_entry = snapshot
@@ -661,9 +656,7 @@ mod tests {
             .unwrap();
 
         let server = make_after_payload("p", Some("500 internal server error"));
-        hook.handle(HookEvent::AfterLLMCall, &server)
-            .await
-            .unwrap();
+        hook.handle(HookEvent::AfterLLMCall, &server).await.unwrap();
 
         assert!(hook.reset_provider("p").await);
         let snapshot = hook.snapshot().await;
