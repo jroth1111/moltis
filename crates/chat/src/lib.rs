@@ -3139,6 +3139,7 @@ impl ChatService for LiveChatService {
         // Internal-only dispatch sideband must not be accepted from external callers.
         if let Some(obj) = params.as_object_mut() {
             obj.remove("_dispatch_tool_deny");
+            obj.remove("_dispatch_autonomy_tier");
         }
 
         // Support both text-only and multimodal content.
