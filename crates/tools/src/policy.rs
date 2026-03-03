@@ -186,6 +186,24 @@ pub fn resolve_effective_policy(config: &serde_json::Value, context: &PolicyCont
     effective
 }
 
+/// Resolve the top-level tool policy from typed config (profile + allow/deny).
+///
+/// This is the simplified single-layer resolution used at session boundaries.
+/// For multi-layer context-aware resolution, use [`resolve_effective_policy`].
+pub fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
+    let mut effective = ToolPolicy::default();
+    if let Some(profile) = config.tools.policy.profile.as_deref()
+        && !profile.is_empty()
+    {
+        effective = effective.merge_with(&profile_tools(profile));
+    }
+    let configured = ToolPolicy {
+        allow: config.tools.policy.allow.clone(),
+        deny: config.tools.policy.deny.clone(),
+    };
+    effective.merge_with(&configured)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

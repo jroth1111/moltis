@@ -57,6 +57,8 @@ pub struct SpawnAgentTool {
     task_store: Option<Arc<TaskStore>>,
     /// Task orchestration config (lease durations, heartbeat interval).
     tasks_config: moltis_config::schema::TasksConfig,
+    /// Global tool policy — enforced on all sub-agent tool registries.
+    tool_policy: Option<crate::policy::ToolPolicy>,
 }
 
 impl SpawnAgentTool {
@@ -73,6 +75,7 @@ impl SpawnAgentTool {
             on_event: None,
             task_store: None,
             tasks_config: moltis_config::schema::TasksConfig::default(),
+            tool_policy: None,
         }
     }
 
@@ -101,6 +104,13 @@ impl SpawnAgentTool {
     /// Set task orchestration config (lease duration, heartbeat interval, etc.).
     pub fn with_tasks_config(mut self, cfg: moltis_config::schema::TasksConfig) -> Self {
         self.tasks_config = cfg;
+        self
+    }
+
+    /// Set the global tool policy enforced on all sub-agent tool registries.
+    /// Deny rules from this policy always win over per-spawn allow lists.
+    pub fn with_tool_policy(mut self, policy: crate::policy::ToolPolicy) -> Self {
+        self.tool_policy = Some(policy);
         self
     }
 
@@ -155,6 +165,11 @@ impl SpawnAgentTool {
         if !deny_tools.is_empty() {
             let deny: HashSet<&str> = deny_tools.iter().map(String::as_str).collect();
             sub_tools = sub_tools.clone_allowed_by(|name| !deny.contains(name));
+        }
+
+        // Apply global ToolPolicy — deny always wins over per-spawn allow lists.
+        if let Some(ref policy) = self.tool_policy {
+            sub_tools = sub_tools.clone_allowed_by(|name| policy.is_allowed(name));
         }
 
         sub_tools
@@ -790,6 +805,34 @@ mod tests {
         assert!(filtered.get("task_list").is_none());
         assert!(filtered.get("spawn_agent").is_none());
         assert!(filtered.get("web_fetch").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_sub_tools_respects_global_tool_policy() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "ok".into(),
+            model_id: "mock".into(),
+        });
+        let policy = crate::policy::ToolPolicy {
+            allow: vec!["*".into()],
+            deny: vec!["exec".into()],
+        };
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            registry_with_tools(&["spawn_agent", "exec", "web_fetch", "task_list"]),
+        )
+        .with_tool_policy(policy);
+
+        // Even though exec is in the allow list, global policy denies it.
+        let filtered = spawn_tool.build_sub_tools(
+            &["exec".to_string(), "web_fetch".to_string()],
+            &[],
+            false,
+        );
+        assert!(filtered.get("exec").is_none(), "global policy should deny exec");
+        assert!(filtered.get("web_fetch").is_some());
+        assert!(filtered.get("task_list").is_none(), "not in allow list");
     }
 
     #[tokio::test]

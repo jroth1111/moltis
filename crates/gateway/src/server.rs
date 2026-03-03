@@ -3587,7 +3587,8 @@ pub async fn prepare_gateway(
             .with_on_event(on_spawn_event)
             .with_agents_config(agents_config)
             .with_task_store(Arc::clone(&task_store))
-            .with_tasks_config(config.tasks.clone());
+            .with_tasks_config(config.tasks.clone())
+            .with_tool_policy(moltis_tools::policy::effective_tool_policy(&config));
             tool_registry.register(Box::new(spawn_tool));
         }
 

@@ -42,7 +42,7 @@ use {
         store::SessionStore,
     },
     moltis_skills::discover::SkillDiscoverer,
-    moltis_tools::policy::{ToolPolicy, profile_tools},
+    moltis_tools::policy::{ToolPolicy, effective_tool_policy},
 };
 
 pub mod chat_error;
@@ -1434,20 +1434,6 @@ fn prompt_sandbox_no_network_state(backend: &str, configured_no_network: bool) -
         // failover wrappers may switch backends dynamically.
         _ => None,
     }
-}
-
-fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
-    let mut effective = ToolPolicy::default();
-    if let Some(profile) = config.tools.policy.profile.as_deref()
-        && !profile.is_empty()
-    {
-        effective = effective.merge_with(&profile_tools(profile));
-    }
-    let configured = ToolPolicy {
-        allow: config.tools.policy.allow.clone(),
-        deny: config.tools.policy.deny.clone(),
-    };
-    effective.merge_with(&configured)
 }
 
 fn apply_runtime_tool_filters(
