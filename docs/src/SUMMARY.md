@@ -21,6 +21,7 @@
 - [MCP Servers](mcp.md)
 - [Memory](memory.md)
   - [Moltis vs OpenClaw](memory-comparison.md)
+  - [Memory Lifecycle and Controls](memory-lifecycle.md)
 - [Hooks](hooks.md)
 - [Local LLMs](local-llm.md)
 - [Sandbox](sandbox.md)

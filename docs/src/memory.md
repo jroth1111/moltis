@@ -229,6 +229,9 @@ This is the same approach used by OpenClaw. See the
 [comparison page](memory-comparison.md) for a detailed analysis of both
 systems.
 
+For turn-level auto-extract, reconcile, and operator rollback controls, see
+[Memory Lifecycle and Controls](memory-lifecycle.md).
+
 ## Architecture
 
 ```
