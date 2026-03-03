@@ -160,8 +160,7 @@ impl SpawnAgentTool {
                 .clone_allowed_by(|name| name != "spawn_agent" && allowed.contains(name))
         } else {
             // Auto-select tools based on task description.
-            let selected =
-                crate::tool_selector::select_tools_for_task(task, &self.tool_registry);
+            let selected = crate::tool_selector::select_tools_for_task(task, &self.tool_registry);
             selected.clone_without(&["spawn_agent"])
         };
 
@@ -363,7 +362,7 @@ impl AgentTool for SpawnAgentTool {
         // Build filtered tool registry from policy knobs.
         // When no explicit allow_tools are specified, the selector automatically
         // scopes tools based on the task description.
-        let sub_tools = self.build_sub_tools(&task, &allow_tools, &deny_tools, delegate_only);
+        let sub_tools = self.build_sub_tools(task, &allow_tools, &deny_tools, delegate_only);
 
         // Build system prompt.
         let mut system_prompt = if context.is_empty() {
@@ -842,7 +841,10 @@ mod tests {
             &[],
             false,
         );
-        assert!(filtered.get("exec").is_none(), "global policy should deny exec");
+        assert!(
+            filtered.get("exec").is_none(),
+            "global policy should deny exec"
+        );
         assert!(filtered.get("web_fetch").is_some());
         assert!(filtered.get("task_list").is_none(), "not in allow list");
     }

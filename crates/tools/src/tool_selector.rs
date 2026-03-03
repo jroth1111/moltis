@@ -124,10 +124,7 @@ mod tests {
         fn parameters_schema(&self) -> serde_json::Value {
             json!({"type": "object"})
         }
-        async fn execute(
-            &self,
-            _params: serde_json::Value,
-        ) -> anyhow::Result<serde_json::Value> {
+        async fn execute(&self, _params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
             Ok(json!("ok"))
         }
         fn categories(&self) -> &'static [&'static str] {
@@ -200,8 +197,7 @@ mod tests {
     #[test]
     fn test_multiple_keyword_overlap_gives_union() {
         let reg = test_registry();
-        let filtered =
-            select_tools_for_task("search the web and write code", &reg);
+        let filtered = select_tools_for_task("search the web and write code", &reg);
         assert!(filtered.get("web_fetch").is_some());
         assert!(filtered.get("web_search").is_some());
         assert!(filtered.get("exec").is_some());

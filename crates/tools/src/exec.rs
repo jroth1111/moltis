@@ -1454,8 +1454,12 @@ mod tests {
         let bc = Arc::new(TestBroadcaster::new());
         let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
 
-        let sandbox: Arc<dyn Sandbox> = Arc::new(RestrictedHostSandbox::new(SandboxConfig::default()));
-        let id = SandboxId { scope: SandboxScope::Session, key: "rh-test".into() };
+        let sandbox: Arc<dyn Sandbox> =
+            Arc::new(RestrictedHostSandbox::new(SandboxConfig::default()));
+        let id = SandboxId {
+            scope: SandboxScope::Session,
+            key: "rh-test".into(),
+        };
         let temp_dir = tempfile::tempdir().unwrap();
 
         // Pre-approve so the test doesn't hang.
@@ -1464,7 +1468,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let ids = mgr2.pending_ids().await;
             if let Some(id) = ids.first() {
-                mgr2.resolve(id, ApprovalDecision::Approved, Some("echo rh")).await;
+                mgr2.resolve(id, ApprovalDecision::Approved, Some("echo rh"))
+                    .await;
             }
         });
 
@@ -1472,10 +1477,15 @@ mod tests {
             .with_sandbox(sandbox, id)
             .with_approval(Arc::clone(&mgr), bc_dyn);
         tool.working_dir = Some(temp_dir.path().to_path_buf());
-        let _ = tool.execute(serde_json::json!({ "command": "echo rh" })).await;
+        let _ = tool
+            .execute(serde_json::json!({ "command": "echo rh" }))
+            .await;
 
         // Broadcaster must have been called — approval gate fired.
-        assert!(bc.called.load(Ordering::SeqCst), "approval broadcast must fire for restricted-host");
+        assert!(
+            bc.called.load(Ordering::SeqCst),
+            "approval broadcast must fire for restricted-host"
+        );
     }
 
     /// With `SecurityLevel::Deny` on a restricted-host session, exec must
@@ -1494,21 +1504,30 @@ mod tests {
         let bc = Arc::new(TestBroadcaster::new());
         let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
 
-        let sandbox: Arc<dyn Sandbox> = Arc::new(RestrictedHostSandbox::new(SandboxConfig::default()));
-        let id = SandboxId { scope: SandboxScope::Session, key: "rh-deny".into() };
+        let sandbox: Arc<dyn Sandbox> =
+            Arc::new(RestrictedHostSandbox::new(SandboxConfig::default()));
+        let id = SandboxId {
+            scope: SandboxScope::Session,
+            key: "rh-deny".into(),
+        };
         let temp_dir = tempfile::tempdir().unwrap();
 
         let mut tool = ExecTool::default()
             .with_sandbox(sandbox, id)
             .with_approval(Arc::clone(&mgr), bc_dyn);
         tool.working_dir = Some(temp_dir.path().to_path_buf());
-        let result = tool.execute(serde_json::json!({ "command": "echo denied" })).await;
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo denied" }))
+            .await;
 
         assert!(result.is_err(), "SecurityLevel::Deny must block exec");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("deny"), "error must mention deny: {msg}");
         // No broadcast should occur — Deny returns early before creating a request.
-        assert!(!bc.called.load(Ordering::SeqCst), "broadcast must not fire for Deny");
+        assert!(
+            !bc.called.load(Ordering::SeqCst),
+            "broadcast must not fire for Deny"
+        );
     }
 
     /// A real container backend (backend_name = "docker") with `sandbox_id`
@@ -1526,7 +1545,10 @@ mod tests {
 
         // CaptureWorkingDirSandbox has backend_name="docker" (real container backend).
         let sandbox: Arc<dyn Sandbox> = Arc::new(CaptureWorkingDirSandbox::default());
-        let id = SandboxId { scope: SandboxScope::Session, key: "docker-test".into() };
+        let id = SandboxId {
+            scope: SandboxScope::Session,
+            key: "docker-test".into(),
+        };
         let temp_dir = tempfile::tempdir().unwrap();
 
         let mut tool = ExecTool::default()
@@ -1534,9 +1556,17 @@ mod tests {
             .with_approval(Arc::clone(&mgr), bc_dyn);
         tool.working_dir = Some(temp_dir.path().to_path_buf());
         // Should succeed without triggering the approval flow.
-        let result = tool.execute(serde_json::json!({ "command": "echo container" })).await;
-        assert!(result.is_ok(), "container exec must succeed without approval");
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo container" }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "container exec must succeed without approval"
+        );
         // Broadcaster must NOT have been called — approval gate was skipped.
-        assert!(!bc.called.load(Ordering::SeqCst), "approval broadcast must not fire for container backend");
+        assert!(
+            !bc.called.load(Ordering::SeqCst),
+            "approval broadcast must not fire for container backend"
+        );
     }
 }

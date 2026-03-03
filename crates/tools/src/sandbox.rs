@@ -5295,12 +5295,7 @@ impl SandboxRouter {
     /// slot to the pool) instead of destroying the container.
     pub async fn cleanup_session(&self, session_key: &str) -> Result<()> {
         // If this session has a pool guard, release it (RAII returns the slot).
-        let had_pool_slot = self
-            .pool_guards
-            .write()
-            .await
-            .remove(session_key)
-            .is_some();
+        let had_pool_slot = self.pool_guards.write().await.remove(session_key).is_some();
         if had_pool_slot {
             debug!(session = session_key, "released pool slot");
         } else {

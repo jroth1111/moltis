@@ -5,8 +5,8 @@
 //! the slot to the pool on drop.
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use tokio::sync::mpsc;
@@ -117,11 +117,11 @@ impl SandboxPool {
                         slot.available.store(true, Ordering::Release);
                         info!(key = %sid, "pool slot warmed");
                         true
-                    }
+                    },
                     Err(e) => {
                         warn!(key = %sid, error = %e, "failed to warm pool slot");
                         false
-                    }
+                    },
                 }
             }));
         }
@@ -195,6 +195,7 @@ impl SandboxPool {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,11 +213,7 @@ mod tests {
             "mock"
         }
 
-        async fn ensure_ready(
-            &self,
-            _id: &SandboxId,
-            _image: Option<&str>,
-        ) -> crate::Result<()> {
+        async fn ensure_ready(&self, _id: &SandboxId, _image: Option<&str>) -> crate::Result<()> {
             self.ensure_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }

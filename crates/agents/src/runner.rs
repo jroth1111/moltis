@@ -53,7 +53,7 @@ pub fn classify_error(msg: &str) -> moltis_tasks::FailureClass {
     match classify_error_message(msg) {
         ProviderErrorKind::BillingExhausted | ProviderErrorKind::NonRetryableRateLimit => {
             moltis_tasks::FailureClass::ProviderPermanent
-        }
+        },
         ProviderErrorKind::RateLimit
         | ProviderErrorKind::ServerError
         | ProviderErrorKind::Timeout => moltis_tasks::FailureClass::ProviderTransient,
@@ -969,13 +969,11 @@ pub async fn run_agent_loop_with_context(
             let current_intent = response.text.as_deref().unwrap_or("");
             let (drift_score, is_drifted) =
                 intent_tracker.check_drift(current_intent, trace_id.as_deref());
-            if is_drifted {
-                if let Some(cb) = on_event {
-                    cb(RunnerEvent::IntentDrift {
-                        drift_score,
-                        iteration: iterations,
-                    });
-                }
+            if is_drifted && let Some(cb) = on_event {
+                cb(RunnerEvent::IntentDrift {
+                    drift_score,
+                    iteration: iterations,
+                });
             }
         }
 
@@ -1777,13 +1775,11 @@ pub async fn run_agent_loop_streaming(
         // check_drift logs warnings internally when drift is detected.
         let (drift_score, is_drifted) =
             intent_tracker.check_drift(&current_intent, trace_id.as_deref());
-        if is_drifted {
-            if let Some(cb) = on_event {
-                cb(RunnerEvent::IntentDrift {
-                    drift_score,
-                    iteration: iterations,
-                });
-            }
+        if is_drifted && let Some(cb) = on_event {
+            cb(RunnerEvent::IntentDrift {
+                drift_score,
+                iteration: iterations,
+            });
         }
 
         // Append assistant message with tool calls.

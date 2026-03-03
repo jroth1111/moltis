@@ -127,7 +127,11 @@ fn parse_rules_front_matter(content: &str) -> (Option<Vec<String>>, &str) {
         }
     }
 
-    let globs = if globs.is_empty() { None } else { Some(globs) };
+    let globs = if globs.is_empty() {
+        None
+    } else {
+        Some(globs)
+    };
     (globs, body)
 }
 
@@ -142,10 +146,10 @@ fn matches_any_glob(file_path: &Path, globs: &[String]) -> bool {
             return true;
         }
         // Also try matching against just the file name
-        if let Some(name) = file_path.file_name() {
-            if matcher.is_match(Path::new(name)) {
-                return true;
-            }
+        if let Some(name) = file_path.file_name()
+            && matcher.is_match(Path::new(name))
+        {
+            return true;
         }
     }
     false
@@ -155,28 +159,27 @@ fn matches_any_glob(file_path: &Path, globs: &[String]) -> bool {
 fn collect_rules_at(dir: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     let rules_file = dir.join(".rules.md");
-    if rules_file.is_file() {
-        if let Ok(content) = fs::read_to_string(&rules_file) {
-            if !content.trim().is_empty() {
-                out.push((rules_file, content));
-            }
-        }
+    if rules_file.is_file()
+        && let Ok(content) = fs::read_to_string(&rules_file)
+        && !content.trim().is_empty()
+    {
+        out.push((rules_file, content));
     }
     let rules_dir = dir.join(".claude").join("rules");
-    if rules_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&rules_dir) {
-            let mut paths: Vec<PathBuf> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
-                .collect();
-            paths.sort();
-            for path in paths {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if !content.trim().is_empty() {
-                        out.push((path, content));
-                    }
-                }
+    if rules_dir.is_dir()
+        && let Ok(entries) = fs::read_dir(&rules_dir)
+    {
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Ok(content) = fs::read_to_string(&path)
+                && !content.trim().is_empty()
+            {
+                out.push((path, content));
             }
         }
     }
@@ -189,10 +192,7 @@ fn collect_rules_at(dir: &Path) -> Vec<(PathBuf, String)> {
 /// collecting `.rules.md` and `.claude/rules/*.md` at each level. Rules with
 /// `globs:` front matter are only included when `file_path` matches at least
 /// one pattern. Results are ordered outermost first, innermost last.
-pub fn load_path_scoped_rules(
-    project_dir: &Path,
-    file_path: &Path,
-) -> Result<Vec<ScopedRule>> {
+pub fn load_path_scoped_rules(project_dir: &Path, file_path: &Path) -> Result<Vec<ScopedRule>> {
     let project_dir = project_dir.canonicalize()?;
     let file_path = file_path.canonicalize()?;
 
@@ -204,7 +204,10 @@ pub fn load_path_scoped_rules(
     let target_dir = if file_path.is_dir() {
         file_path.clone()
     } else {
-        file_path.parent().map(Path::to_path_buf).unwrap_or(file_path.clone())
+        file_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(file_path.clone())
     };
 
     // Build the list of directories from project_dir down to target_dir
@@ -223,10 +226,10 @@ pub fn load_path_scoped_rules(
         for (source_path, content) in collect_rules_at(dir) {
             let (globs, body) = parse_rules_front_matter(&content);
             // If globs are specified, only include if file matches
-            if let Some(ref patterns) = globs {
-                if !matches_any_glob(&file_path, patterns) {
-                    continue;
-                }
+            if let Some(ref patterns) = globs
+                && !matches_any_glob(&file_path, patterns)
+            {
+                continue;
             }
             if !body.trim().is_empty() {
                 info!(path = %source_path.display(), "loaded scoped rule");

@@ -2775,11 +2775,7 @@ impl LiveChatService {
     ///
     /// Extracts file-like paths from recent tool call arguments, loads applicable
     /// `.rules.md` files, and returns the accumulated rules text.
-    async fn resolve_scoped_rules(
-        &self,
-        session_key: &str,
-        project_dir: &Path,
-    ) -> Option<String> {
+    async fn resolve_scoped_rules(&self, session_key: &str, project_dir: &Path) -> Option<String> {
         // Load recent session history to extract file paths from tool arguments
         let messages = self.session_store.read_last_n(session_key, 50).await.ok()?;
         let mut file_paths: Vec<PathBuf> = Vec::new();
@@ -2806,9 +2802,7 @@ impl LiveChatService {
             .or_insert_with(PathRulesAccumulator::new);
 
         for path in &file_paths {
-            if let Ok(rules) =
-                moltis_projects::load_path_scoped_rules(project_dir, path)
-            {
+            if let Ok(rules) = moltis_projects::load_path_scoped_rules(project_dir, path) {
                 accumulator.add(&rules);
             }
         }
@@ -2824,24 +2818,24 @@ fn extract_file_paths_from_content(content: &Value, paths: &mut Vec<PathBuf>) {
             if looks_like_file_path(s) {
                 paths.push(PathBuf::from(s));
             }
-        }
+        },
         Value::Array(arr) => {
             for item in arr {
                 // Look for tool_use blocks
-                if let Some("tool_use") = item.get("type").and_then(|v| v.as_str()) {
-                    if let Some(input) = item.get("input") {
-                        extract_file_paths_from_value(input, paths);
-                    }
+                if let Some("tool_use") = item.get("type").and_then(|v| v.as_str())
+                    && let Some(input) = item.get("input")
+                {
+                    extract_file_paths_from_value(input, paths);
                 }
                 extract_file_paths_from_content(item, paths);
             }
-        }
+        },
         Value::Object(map) => {
             for v in map.values() {
                 extract_file_paths_from_content(v, paths);
             }
-        }
-        _ => {}
+        },
+        _ => {},
     }
 }
 
@@ -2852,18 +2846,18 @@ fn extract_file_paths_from_value(value: &Value, paths: &mut Vec<PathBuf>) {
             if looks_like_file_path(s) {
                 paths.push(PathBuf::from(s));
             }
-        }
+        },
         Value::Array(arr) => {
             for item in arr {
                 extract_file_paths_from_value(item, paths);
             }
-        }
+        },
         Value::Object(map) => {
             for v in map.values() {
                 extract_file_paths_from_value(v, paths);
             }
-        }
-        _ => {}
+        },
+        _ => {},
     }
 }
 
@@ -2901,16 +2895,15 @@ impl SelfRepairGuard {
 
     /// Mark the session as started. Must be awaited after creating the guard.
     async fn mark_started(&self) {
-        if let Some(ref store) = self.state_store {
-            if let Err(error) =
+        if let Some(ref store) = self.state_store
+            && let Err(error) =
                 moltis_agents::self_repair::mark_session_started(store, &self.session_key).await
-            {
-                warn!(
-                    session = %self.session_key,
-                    error = %error,
-                    "failed to mark session as running for self-repair"
-                );
-            }
+        {
+            warn!(
+                session = %self.session_key,
+                error = %error,
+                "failed to mark session as running for self-repair"
+            );
         }
     }
 }
@@ -2997,9 +2990,7 @@ async fn consume_inbound_handoff_context(
     state_store: Option<&Arc<SessionStateStore>>,
     session_key: &str,
 ) -> Option<HandoffContext> {
-    let Some(store) = state_store else {
-        return None;
-    };
+    let store = state_store?;
 
     let raw = match store
         .get(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
@@ -3016,9 +3007,7 @@ async fn consume_inbound_handoff_context(
         },
     };
 
-    let Some(raw) = raw else {
-        return None;
-    };
+    let raw = raw?;
 
     if let Err(error) = store
         .delete(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
@@ -4042,11 +4031,9 @@ impl ChatService for LiveChatService {
                             self.resolve_provider(&session_key, &history).await
                     {
                         let chat_history_for_memory = values_to_chat_messages(&history);
-                        let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> =
-                            Arc::new(AgentScopedMemoryWriter::new(
-                                Arc::clone(mm),
-                                session_agent_id.clone(),
-                            ));
+                        let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::new(
+                            AgentScopedMemoryWriter::new(Arc::clone(mm), session_agent_id.clone()),
+                        );
                         match moltis_agents::silent_turn::run_silent_memory_turn(
                             flush_provider,
                             &chat_history_for_memory,
@@ -4074,10 +4061,7 @@ impl ChatService for LiveChatService {
             },
             ContextCompactionAction::Compact => {
                 // Reset the pre-compact dedup flag — a fresh compaction window begins.
-                self.pre_compact_flushed
-                    .write()
-                    .await
-                    .remove(&session_key);
+                self.pre_compact_flushed.write().await.remove(&session_key);
 
                 let pre_compact_msg_count = history.len();
                 let pre_compact_total = token_usage
@@ -4264,8 +4248,7 @@ impl ChatService for LiveChatService {
                 )
                 .await;
             }
-            let _self_repair_guard =
-                SelfRepairGuard::new(state_store.as_ref(), &session_key_clone);
+            let _self_repair_guard = SelfRepairGuard::new(state_store.as_ref(), &session_key_clone);
             _self_repair_guard.mark_started().await;
             let agent_fut = async {
                 if stream_only {
@@ -4612,8 +4595,7 @@ impl ChatService for LiveChatService {
 
         // send_sync is text-only (used by API calls and channels).
         let user_content = UserContent::text(&text);
-        let _self_repair_guard =
-            SelfRepairGuard::new(self.state_store.as_ref(), &session_key);
+        let _self_repair_guard = SelfRepairGuard::new(self.state_store.as_ref(), &session_key);
         _self_repair_guard.mark_started().await;
         let result = if stream_only {
             run_streaming(
@@ -7136,7 +7118,10 @@ async fn run_with_tools(
                     "toolCallsMade": tool_calls_made,
                     "seq": seq,
                 }),
-                RunnerEvent::IntentDrift { drift_score, iteration } => {
+                RunnerEvent::IntentDrift {
+                    drift_score,
+                    iteration,
+                } => {
                     serde_json::json!({
                         "runId": run_id,
                         "sessionKey": sk,
@@ -12574,8 +12559,7 @@ mod tests {
         // Replicate the pre_compact_flushed dedup logic used by LiveChatService to
         // confirm it fires at most once per compaction window and resets when a full
         // Compact fires.
-        let flushed: Arc<RwLock<HashMap<String, bool>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let flushed: Arc<RwLock<HashMap<String, bool>>> = Arc::new(RwLock::new(HashMap::new()));
         let session = "s1".to_string();
 
         // Initially no flush has occurred for this session.
@@ -12594,6 +12578,9 @@ mod tests {
 
         // PreCompact may now fire again in the next window.
         let already = flushed.read().await.get(&session).copied().unwrap_or(false);
-        assert!(!already, "dedup flag must be cleared after Compact resets the window");
+        assert!(
+            !already,
+            "dedup flag must be cleared after Compact resets the window"
+        );
     }
 }

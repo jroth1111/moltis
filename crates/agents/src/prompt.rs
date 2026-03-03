@@ -416,17 +416,17 @@ fn append_project_context(prompt: &mut String, project_context: Option<&str>) {
 }
 
 fn append_scoped_rules(prompt: &mut String, scoped_rules: Option<&str>) {
-    if let Some(rules) = scoped_rules {
-        if !rules.trim().is_empty() {
-            prompt.push_str("## Path-Scoped Rules\n\n");
-            append_truncated_text_block(
-                prompt,
-                rules,
-                PATH_RULES_MAX_CHARS,
-                "\n*(Path-scoped rules truncated for prompt size.)*\n",
-            );
-            prompt.push('\n');
-        }
+    if let Some(rules) = scoped_rules
+        && !rules.trim().is_empty()
+    {
+        prompt.push_str("## Path-Scoped Rules\n\n");
+        append_truncated_text_block(
+            prompt,
+            rules,
+            PATH_RULES_MAX_CHARS,
+            "\n*(Path-scoped rules truncated for prompt size.)*\n",
+        );
+        prompt.push('\n');
     }
 }
 
@@ -827,8 +827,7 @@ mod tests {
             source: None,
         }];
         let prompt = build_system_prompt_with_session_runtime(
-            &tools, true, None, &skills, None, None, None, None, None, None, None,
-            None,
+            &tools, true, None, &skills, None, None, None, None, None, None, None, None,
         );
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("commit"));
@@ -1187,8 +1186,9 @@ mod tests {
 
     #[test]
     fn test_silent_replies_not_in_minimal_prompt() {
-        let prompt =
-            build_system_prompt_minimal_runtime(None, None, None, None, None, None, None, None, None);
+        let prompt = build_system_prompt_minimal_runtime(
+            None, None, None, None, None, None, None, None, None,
+        );
         assert!(!prompt.contains("## Silent Replies"));
     }
 
