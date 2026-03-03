@@ -196,11 +196,9 @@ impl IntentDriftDetector {
 
     /// Calculate semantic similarity between recent topics and original intent.
     fn calculate_similarity(&self) -> f64 {
-        if self.original_intent.primary_goal.is_none() {
+        let Some(goal) = self.original_intent.primary_goal.as_ref() else {
             return 1.0;
-        }
-
-        let goal = self.original_intent.primary_goal.as_ref().unwrap();
+        };
         let goal_lower = goal.to_lowercase();
         let goal_words: std::collections::HashSet<&str> = goal_lower
             .split_whitespace()
