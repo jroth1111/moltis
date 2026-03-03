@@ -63,4 +63,8 @@ pub trait MemoryStore: Send + Sync {
     ) -> anyhow::Result<Vec<SearchResult>>;
 
     async fn keyword_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>>;
+
+    // ---- scheduler / reconcile state ----
+    async fn get_state(&self, key: &str) -> anyhow::Result<Option<String>>;
+    async fn set_state(&self, key: &str, value: &str) -> anyhow::Result<()>;
 }

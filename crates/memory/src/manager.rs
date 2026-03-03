@@ -390,6 +390,16 @@ impl MemoryManager {
             db_size_bytes,
         })
     }
+
+    /// Read internal memory scheduler/reconcile state.
+    pub async fn get_state(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.store.get_state(key).await
+    }
+
+    /// Persist internal memory scheduler/reconcile state.
+    pub async fn set_state(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.store.set_state(key, value).await
+    }
 }
 
 /// Maximum content size per write (50 KB).

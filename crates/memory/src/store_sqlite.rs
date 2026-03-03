@@ -416,6 +416,28 @@ impl MemoryStore for SqliteMemoryStore {
             })
             .collect())
     }
+
+    async fn get_state(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM memory_state WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(value,)| value))
+    }
+
+    async fn set_state(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO memory_state (key, value, updated_at)
+             VALUES (?, ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -523,6 +545,40 @@ mod tests {
             .unwrap();
         assert_eq!(cached.len(), 3);
         assert!((cached[0] - 0.1).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_memory_state_roundtrip() {
+        let store = setup().await;
+        assert!(store
+            .get_state("auto_reconcile_last_ts::main")
+            .await
+            .unwrap()
+            .is_none());
+
+        store
+            .set_state("auto_reconcile_last_ts::main", "1710000000")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_state("auto_reconcile_last_ts::main")
+                .await
+                .unwrap(),
+            Some("1710000000".to_string())
+        );
+
+        store
+            .set_state("auto_reconcile_last_ts::main", "1710000900")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_state("auto_reconcile_last_ts::main")
+                .await
+                .unwrap(),
+            Some("1710000900".to_string())
+        );
     }
 
     #[tokio::test]
