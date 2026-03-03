@@ -173,7 +173,7 @@ impl ProviderRateLimiter {
         self.windows.retain(|_, window| {
             window
                 .back()
-                .map_or(false, |&t| now.duration_since(t) < self.window_duration)
+                .is_some_and(|&t| now.duration_since(t) < self.window_duration)
         });
     }
 }

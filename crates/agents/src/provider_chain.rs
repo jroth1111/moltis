@@ -340,12 +340,12 @@ impl LlmProvider for ProviderChain {
             if let Some(ref rl) = self.rate_limiter {
                 let provider_name = entry.provider.name();
                 let model_id = entry.provider.id();
-                if let RateLimitDecision::Wait(wait) = rl.check(provider_name, model_id) {
-                    if wait > RATE_LIMIT_WAIT_CAP {
-                        #[cfg(feature = "metrics")]
-                        counter!("moltis_provider_rate_limit_rejected").increment(1);
-                        continue;
-                    }
+                if let RateLimitDecision::Wait(wait) = rl.check(provider_name, model_id)
+                    && wait > RATE_LIMIT_WAIT_CAP
+                {
+                    #[cfg(feature = "metrics")]
+                    counter!("moltis_provider_rate_limit_rejected").increment(1);
+                    continue;
                 }
                 rl.record(provider_name, model_id);
             }
