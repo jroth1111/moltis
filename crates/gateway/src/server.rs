@@ -3830,10 +3830,10 @@ pub async fn prepare_gateway(
                             tracing::warn!("E-STOP enabled — agent actions blocked");
                         }
                     } else {
-                        if estop_path.exists() {
-                            if let Err(e) = std::fs::remove_file(&estop_path) {
-                                tracing::warn!("failed to remove estop file: {e}");
-                            }
+                        if estop_path.exists()
+                            && let Err(e) = std::fs::remove_file(&estop_path)
+                        {
+                            tracing::warn!("failed to remove estop file: {e}");
                         }
                         tracing::info!("E-STOP cleared — agent actions unblocked");
                     }
