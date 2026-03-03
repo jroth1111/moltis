@@ -554,6 +554,14 @@ fn approval_manager_from_config(config: &moltis_config::MoltisConfig) -> Approva
     manager
 }
 
+fn heartbeat_is_outside_active_hours(hb_cfg: &moltis_config::schema::HeartbeatConfig) -> bool {
+    !moltis_cron::heartbeat::is_within_active_hours(
+        &hb_cfg.active_hours.start,
+        &hb_cfg.active_hours.end,
+        &hb_cfg.active_hours.timezone,
+    )
+}
+
 // ── Shared app state ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -1866,6 +1874,19 @@ pub async fn prepare_gateway(
             let has_pending_events = is_heartbeat_turn && !eq.is_empty().await;
             if is_heartbeat_turn && !has_pending_events {
                 let hb_cfg = state.inner.read().await.heartbeat_config.clone();
+                if heartbeat_is_outside_active_hours(&hb_cfg) {
+                    tracing::info!(
+                        start = %hb_cfg.active_hours.start,
+                        end = %hb_cfg.active_hours.end,
+                        timezone = %hb_cfg.active_hours.timezone,
+                        "skipping heartbeat LLM turn: outside active hours"
+                    );
+                    return Ok(moltis_cron::service::AgentTurnResult {
+                        output: moltis_cron::heartbeat::HEARTBEAT_OK.to_string(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
                 let has_prompt_override = hb_cfg
                     .prompt
                     .as_deref()
@@ -6315,6 +6336,23 @@ mod tests {
         let manager = approval_manager_from_config(&cfg);
         assert_eq!(manager.mode, ApprovalMode::OnMiss);
         assert_eq!(manager.security_level, SecurityLevel::Allowlist);
+    }
+
+    #[test]
+    fn heartbeat_active_hours_helper_detects_disabled_window() {
+        let mut hb = moltis_config::schema::HeartbeatConfig::default();
+        hb.active_hours.start = "00:00".to_string();
+        hb.active_hours.end = "00:00".to_string();
+        hb.active_hours.timezone = "UTC".to_string();
+        assert!(heartbeat_is_outside_active_hours(&hb));
+    }
+
+    #[test]
+    fn heartbeat_active_hours_helper_treats_invalid_config_as_active() {
+        let mut hb = moltis_config::schema::HeartbeatConfig::default();
+        hb.active_hours.start = "invalid".to_string();
+        hb.active_hours.end = "24:00".to_string();
+        assert!(!heartbeat_is_outside_active_hours(&hb));
     }
 
     #[tokio::test]
