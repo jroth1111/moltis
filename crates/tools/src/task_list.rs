@@ -29,7 +29,7 @@ use {
     moltis_agents::tool_registry::AgentTool,
     moltis_tasks::{
         AutonomyTier, FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskSpec,
-        TaskStore, TerminalState, TransitionEvent,
+        TaskPrincipal, TaskStore, TerminalState, TransitionEvent,
     },
 };
 
@@ -295,6 +295,20 @@ impl AgentTool for TaskListTool {
                     "type": "string",
                     "enum": ["auto", "confirm", "approve"],
                     "description": "Maximum autonomy tier for shift agents. Only applies when is_intent is true. Default: auto."
+                },
+                "parent_task": {
+                    "type": "string",
+                    "description": "Optional parent intent task ID for shift tasks."
+                },
+                "principal": {
+                    "type": "object",
+                    "description": "Optional execution identity for autonomous dispatch.",
+                    "properties": {
+                        "channel": { "type": "string" },
+                        "sender": { "type": "string" },
+                        "account_id": { "type": "string" }
+                    },
+                    "required": ["channel", "sender"]
                 }
             },
             "required": ["action"]
@@ -303,7 +317,8 @@ impl AgentTool for TaskListTool {
 
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let action = require_str(&params, "action")?;
-        let list_id = str_param_any(&params, &["list_id", "listId"]).unwrap_or("default");
+        let list_id_input = str_param_any(&params, &["list_id", "listId"]).map(str::to_string);
+        let list_id = list_id_input.as_deref().unwrap_or("default");
         let expected_version = params.get("expected_version").and_then(|v| v.as_u64());
 
         match action {
@@ -331,10 +346,20 @@ impl AgentTool for TaskListTool {
                     .map(parse_autonomy_tier)
                     .transpose()?
                     .unwrap_or_default();
+                let parent_task = str_param_any(&params, &["parent_task", "parentTask"])
+                    .map(TaskId::from);
+                let principal = params
+                    .get("principal")
+                    .cloned()
+                    .map(serde_json::from_value::<TaskPrincipal>)
+                    .transpose()
+                    .map_err(|e| Error::message(format!("invalid principal: {e}")))?;
 
                 let mut spec = TaskSpec::new(subject, description);
                 spec.is_intent = is_intent;
                 spec.autonomy_tier = autonomy_tier;
+                spec.parent_task = parent_task;
+                spec.principal = principal.clone();
                 if let Some(af) = active_form {
                     // active_form is a UI hint; not stored in the spec currently.
                     let _ = af;
@@ -343,9 +368,20 @@ impl AgentTool for TaskListTool {
                     spec.max_attempts = override_max;
                 }
 
+                let resolved_list_id = if list_id_input.as_deref().is_none()
+                    || list_id_input.as_deref() == Some("default")
+                {
+                    principal
+                        .as_ref()
+                        .map(TaskPrincipal::canonical_list_id)
+                        .unwrap_or_else(|| list_id.to_string())
+                } else {
+                    list_id.to_string()
+                };
+
                 let task = self
                     .store
-                    .create(list_id, spec, blocked_by)
+                    .create(&resolved_list_id, spec, blocked_by)
                     .await
                     .map_err(anyhow::Error::from)?;
                 Ok(json!({ "ok": true, "task": task_view(&task) }))
@@ -866,6 +902,75 @@ mod tests {
         let task = store.get("default", &id).await.unwrap().unwrap();
         assert!(!task.spec.is_intent);
         assert_eq!(task.spec.autonomy_tier, AutonomyTier::Auto);
+    }
+
+    #[tokio::test]
+    async fn create_with_principal_derives_canonical_list_id() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({
+                "action": "create",
+                "subject": "principal task",
+                "principal": {
+                    "channel": "whatsapp",
+                    "sender": "+15551234567",
+                    "account_id": "biz-1"
+                }
+            }))
+            .await
+            .unwrap();
+
+        let list_id = result["task"]["list_id"].as_str().unwrap();
+        assert!(list_id.starts_with("v1:whatsapp:"));
+
+        let id = result["task"]["id"].as_str().unwrap().to_string();
+        let store = t.store();
+        let task = store.get(list_id, &id).await.unwrap().unwrap();
+        let principal = task.spec.principal.expect("principal must be set");
+        assert_eq!(principal.channel, "whatsapp");
+        assert_eq!(principal.sender, "+15551234567");
+        assert_eq!(principal.account_id, "biz-1");
+    }
+
+    #[tokio::test]
+    async fn create_with_parent_and_principal_persists_relationship() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+
+        let parent = t
+            .execute(json!({
+                "action": "create",
+                "subject": "intent root",
+                "list_id": "custom-list",
+                "is_intent": true
+            }))
+            .await
+            .unwrap();
+        let parent_id = parent["task"]["id"].as_str().unwrap().to_string();
+
+        let child = t
+            .execute(json!({
+                "action": "create",
+                "subject": "shift child",
+                "list_id": "custom-list",
+                "parent_task": parent_id,
+                "principal": {
+                    "channel": "web",
+                    "sender": "alice"
+                }
+            }))
+            .await
+            .unwrap();
+        let child_id = child["task"]["id"].as_str().unwrap().to_string();
+
+        let store = t.store();
+        let task = store.get("custom-list", &child_id).await.unwrap().unwrap();
+        assert_eq!(task.spec.parent_task.as_ref().map(|id| id.0.as_str()), Some(parent_id.as_str()));
+        assert_eq!(
+            task.spec.principal.as_ref().map(|p| p.channel.as_str()),
+            Some("web")
+        );
     }
 
     #[tokio::test]
