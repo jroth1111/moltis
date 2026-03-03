@@ -177,6 +177,11 @@ impl ToolRegistry {
             .unwrap_or(&[])
     }
 
+    /// Return the source for a tool by name.
+    pub fn source_for(&self, name: &str) -> Option<&ToolSource> {
+        self.tools.get(name).map(|e| &e.source)
+    }
+
     /// Dispatch a tool call by name: check rate limit, then execute.
     pub async fn call(&self, name: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let entry = self

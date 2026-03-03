@@ -2,12 +2,13 @@
 //!
 //! Matches task descriptions against a static keyword→category table and
 //! returns a filtered tool registry containing only tools whose categories
-//! overlap with the matched keywords. Tools with no categories are always
-//! included (safe fallback). If no keywords match, all tools are returned.
+//! overlap with the matched keywords. Uncategorized extension tools (MCP/WASM)
+//! are retained, while uncategorized built-ins are excluded when scoping is
+//! active. If no keywords match, all tools are returned.
 
 use std::collections::HashSet;
 
-use moltis_agents::tool_registry::ToolRegistry;
+use moltis_agents::tool_registry::{ToolRegistry, ToolSource};
 
 /// Static keyword→category mapping. Each entry maps a lowercase keyword
 /// (or phrase) to the tool categories it implies.
@@ -71,17 +72,49 @@ const KEYWORD_CATEGORIES: &[(&str, &[&str])] = &[
     ("memory", &["memory"]),
 ];
 
+fn contains_keyword(haystack: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        return false;
+    }
+
+    // Phrases/special tokens are matched as-is.
+    if keyword
+        .bytes()
+        .any(|b| !b.is_ascii_lowercase() && !b.is_ascii_digit())
+    {
+        return haystack.contains(keyword);
+    }
+
+    for (idx, _) in haystack.match_indices(keyword) {
+        let before_ok = idx == 0
+            || !haystack
+                .as_bytes()
+                .get(idx.wrapping_sub(1))
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        let end = idx + keyword.len();
+        let after_ok = end == haystack.len()
+            || !haystack
+                .as_bytes()
+                .get(end)
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
 /// Select tools relevant to a task description by matching keywords to categories.
 ///
 /// Returns a filtered registry containing only tools whose categories intersect
-/// with the matched keyword categories. Tools with no categories (e.g. MCP tools)
-/// are always included. If no keywords match, returns all tools (safe fallback).
+/// with the matched keyword categories. Uncategorized extension tools (e.g. MCP)
+/// are retained during scoping. If no keywords match, returns all tools.
 pub fn select_tools_for_task(task: &str, registry: &ToolRegistry) -> ToolRegistry {
     let lower = task.to_ascii_lowercase();
 
     let mut matched_categories: HashSet<&str> = HashSet::new();
     for (keyword, categories) in KEYWORD_CATEGORIES {
-        if lower.contains(keyword) {
+        if contains_keyword(&lower, keyword) {
             matched_categories.extend(categories.iter());
         }
     }
@@ -91,12 +124,16 @@ pub fn select_tools_for_task(task: &str, registry: &ToolRegistry) -> ToolRegistr
         return registry.clone_without(&[]);
     }
 
-    // Keep tools whose categories intersect with matched set OR that have no categories
+    // Keep tools whose categories intersect with matched set.
+    // Uncategorized built-ins are excluded when scoping is active.
     registry.clone_allowed_by(|name| {
         let cats = registry.categories_for(name);
-        // Tools with no categories are always included
+        // Keep uncategorized extension tools (MCP/WASM), but not uncategorized built-ins.
         if cats.is_empty() {
-            return true;
+            return matches!(
+                registry.source_for(name),
+                Some(ToolSource::Mcp { .. }) | Some(ToolSource::Wasm { .. })
+            );
         }
         // Include if any category matches
         cats.iter().any(|c| matched_categories.contains(c))
@@ -156,8 +193,15 @@ mod tests {
         }));
         reg.register(Box::new(FakeTool {
             name: "mcp_custom",
-            cats: &[], // no categories → always included
+            cats: &[],
         }));
+        reg.register_mcp(
+            Box::new(FakeTool {
+                name: "mcp_server_tool",
+                cats: &[],
+            }),
+            "test-server".to_string(),
+        );
         reg
     }
 
@@ -168,9 +212,10 @@ mod tests {
         assert!(filtered.get("web_fetch").is_some());
         assert!(filtered.get("web_search").is_some());
         assert!(
-            filtered.get("mcp_custom").is_some(),
-            "no-category tools always included"
+            filtered.get("mcp_server_tool").is_some(),
+            "uncategorized mcp tool should remain available"
         );
+        assert!(filtered.get("mcp_custom").is_none());
         assert!(filtered.get("sessions_list").is_none());
         assert!(filtered.get("cron").is_none());
     }
@@ -181,6 +226,8 @@ mod tests {
         let filtered = select_tools_for_task("write a function that sorts", &reg);
         assert!(filtered.get("exec").is_some());
         assert!(filtered.get("web_fetch").is_none());
+        assert!(filtered.get("mcp_custom").is_none());
+        assert!(filtered.get("mcp_server_tool").is_some());
     }
 
     #[test]
@@ -192,6 +239,7 @@ mod tests {
         assert!(filtered.get("sessions_list").is_some());
         assert!(filtered.get("cron").is_some());
         assert!(filtered.get("mcp_custom").is_some());
+        assert!(filtered.get("mcp_server_tool").is_some());
     }
 
     #[test]
@@ -201,6 +249,19 @@ mod tests {
         assert!(filtered.get("web_fetch").is_some());
         assert!(filtered.get("web_search").is_some());
         assert!(filtered.get("exec").is_some());
-        assert!(filtered.get("mcp_custom").is_some());
+        assert!(filtered.get("mcp_custom").is_none());
+        assert!(filtered.get("mcp_server_tool").is_some());
+    }
+
+    #[test]
+    fn test_word_boundary_matching_avoids_false_positives() {
+        let reg = test_registry();
+        let filtered = select_tools_for_task("show my session profile fields", &reg);
+        // "profile" should not match keyword "file" and enable code/file tools.
+        assert!(filtered.get("exec").is_none());
+        assert!(filtered.get("web_fetch").is_none());
+        assert!(filtered.get("sessions_list").is_some());
+        assert!(filtered.get("cron").is_none());
+        assert!(filtered.get("mcp_server_tool").is_some());
     }
 }
