@@ -144,6 +144,20 @@ pub mod memory {
     pub const SEARCHES_TOTAL: &str = "moltis_memory_searches_total";
     /// Memory search duration in seconds
     pub const SEARCH_DURATION_SECONDS: &str = "moltis_memory_search_duration_seconds";
+    /// Total auto-extraction attempts from completed assistant turns.
+    pub const AUTO_EXTRACT_ATTEMPTS_TOTAL: &str = "moltis_memory_auto_extract_attempts_total";
+    /// Total successful auto-extraction writes.
+    pub const AUTO_EXTRACT_SUCCESSES_TOTAL: &str = "moltis_memory_auto_extract_successes_total";
+    /// Total failed auto-extraction attempts.
+    pub const AUTO_EXTRACT_FAILURES_TOTAL: &str = "moltis_memory_auto_extract_failures_total";
+    /// Auto-extraction latency in seconds.
+    pub const AUTO_EXTRACT_LATENCY_SECONDS: &str = "moltis_memory_auto_extract_latency_seconds";
+    /// Total reconcile attempts for auto-extracted facts.
+    pub const AUTO_RECONCILE_ATTEMPTS_TOTAL: &str = "moltis_memory_auto_reconcile_attempts_total";
+    /// Total reconcile failures for auto-extracted facts.
+    pub const AUTO_RECONCILE_FAILURES_TOTAL: &str = "moltis_memory_auto_reconcile_failures_total";
+    /// Reconcile latency in seconds.
+    pub const AUTO_RECONCILE_LATENCY_SECONDS: &str = "moltis_memory_auto_reconcile_latency_seconds";
     /// Total reranking attempts for memory search results.
     pub const RERANK_ATTEMPTS_TOTAL: &str = "moltis_memory_rerank_attempts_total";
     /// Total reranking failures for memory search results.
