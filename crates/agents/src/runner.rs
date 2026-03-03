@@ -4501,7 +4501,10 @@ mod tests {
 
             // Some(2_000) → base 4_000; jitter range [3_000, 5_000].
             let v = next_rate_limit_retry_ms(Some(2_000));
-            assert!((3_000..=5_000).contains(&v), "Some(2_000) case out of range: {v}");
+            assert!(
+                (3_000..=5_000).contains(&v),
+                "Some(2_000) case out of range: {v}"
+            );
 
             // Some(30_000) → base clamped to 60_000; jitter range [45_000, 60_000].
             let v = next_rate_limit_retry_ms(Some(30_000));
