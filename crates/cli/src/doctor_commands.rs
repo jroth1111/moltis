@@ -154,13 +154,15 @@ pub async fn handle_doctor() -> Result<()> {
     sections.push(check_directories(config_dir.as_deref(), &data_dir));
 
     // 4. Database health
+    // When gateway is disabled, gateway tables (auth_*, passkeys, channels, etc.)
+    // may still exist in the database from previous runs — this is harmless.
     sections.push(check_database(&data_dir).await);
 
     // 5. Provider readiness
     sections.push(check_providers(&config));
 
     // 6. TLS health
-    #[cfg(feature = "tls")]
+    #[cfg(all(feature = "gateway", feature = "tls"))]
     sections.push(check_tls(&config));
 
     // 7. MCP server health
@@ -533,7 +535,7 @@ fn check_providers(config: &MoltisConfig) -> Section {
 
 // ── 6. TLS health ───────────────────────────────────────────────────────────
 
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "gateway", feature = "tls"))]
 fn check_tls(config: &MoltisConfig) -> Section {
     let mut section = Section::new("TLS");
 
@@ -594,7 +596,7 @@ fn check_tls(config: &MoltisConfig) -> Section {
     section
 }
 
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "gateway", feature = "tls"))]
 fn check_file_readable(section: &mut Section, path: &str, label: &str) {
     let p = Path::new(path);
     if p.exists() {
@@ -609,7 +611,7 @@ fn check_file_readable(section: &mut Section, path: &str, label: &str) {
 }
 
 /// Returns the age of a file in days (from mtime), or `None` on error.
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "gateway", feature = "tls"))]
 fn cert_age_days(path: &Path) -> Option<i64> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;

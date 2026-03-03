@@ -1212,6 +1212,7 @@ var connectOpts = {
 				"node.pair.resolved",
 				"node.invoke.request",
 				"session",
+				"session.recovered",
 				"update.available",
 				"hooks.status",
 				"push.subscriptions",

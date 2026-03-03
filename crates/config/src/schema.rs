@@ -1239,6 +1239,11 @@ pub struct ChatConfig {
     /// When the queue is full, new messages are rejected with an error.
     #[serde(default = "default_message_queue_max_size")]
     pub message_queue_max_size: usize,
+    /// Starvation bound for queue priority replay.
+    /// When higher-priority traffic is continuous, replay at least one lower-priority
+    /// message after this many consecutive higher-priority replays.
+    #[serde(default = "default_priority_starvation_bound")]
+    pub priority_starvation_bound: usize,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1257,6 +1262,10 @@ fn default_message_queue_max_size() -> usize {
     100
 }
 
+fn default_priority_starvation_bound() -> usize {
+    5
+}
+
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
@@ -1268,6 +1277,7 @@ impl Default for ChatConfig {
             context_compaction_keep_recent: default_compaction_keep_recent(),
             research: ResearchConfig::default(),
             message_queue_max_size: default_message_queue_max_size(),
+            priority_starvation_bound: default_priority_starvation_bound(),
         }
     }
 }
@@ -1331,6 +1341,12 @@ pub struct ToolsConfig {
     /// Maximum wall-clock seconds for an agent run (0 = no timeout). Default 600.
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
+    /// Maximum wall-clock seconds for a single provider completion call (0 = no timeout).
+    /// Default 120.
+    #[serde(default = "default_provider_call_timeout_secs")]
+    pub provider_call_timeout_secs: u64,
+    /// Outbound LLM provider request throttling.
+    pub provider_rate_limit: ProviderRateLimitConfig,
     /// Maximum number of agent loop iterations before aborting. Default 25.
     #[serde(default = "default_agent_max_iterations")]
     pub agent_max_iterations: usize,
@@ -1352,6 +1368,8 @@ impl Default for ToolsConfig {
             maps: MapsConfig::default(),
             browser: BrowserConfig::default(),
             agent_timeout_secs: default_agent_timeout_secs(),
+            provider_call_timeout_secs: default_provider_call_timeout_secs(),
+            provider_rate_limit: ProviderRateLimitConfig::default(),
             agent_max_iterations: default_agent_max_iterations(),
             max_tool_result_bytes: default_max_tool_result_bytes(),
             leak_detection_sensitivity: default_leak_detection_sensitivity(),
@@ -1361,6 +1379,67 @@ impl Default for ToolsConfig {
 
 fn default_agent_timeout_secs() -> u64 {
     600
+}
+
+fn default_provider_call_timeout_secs() -> u64 {
+    120
+}
+
+/// Per-provider window settings for outbound rate limiting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderRateLimitWindowConfig {
+    /// Sliding-window length in seconds.
+    #[serde(default = "default_provider_rate_limit_window_secs")]
+    pub window_secs: u64,
+    /// Max requests permitted in each window.
+    #[serde(default = "default_provider_rate_limit_max_requests_per_window")]
+    pub max_requests_per_window: u32,
+}
+
+impl Default for ProviderRateLimitWindowConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: default_provider_rate_limit_window_secs(),
+            max_requests_per_window: default_provider_rate_limit_max_requests_per_window(),
+        }
+    }
+}
+
+/// Outbound provider rate limiter configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderRateLimitConfig {
+    /// Enable outbound throttling.
+    pub enabled: bool,
+    /// When true, wait for window drain; when false, reject and let failover handle it.
+    pub wait_on_limit: bool,
+    /// Maximum number of provider/model keys tracked in memory.
+    pub max_tracked_keys: usize,
+    /// Default limits when no provider-specific override is defined.
+    pub defaults: ProviderRateLimitWindowConfig,
+    /// Provider-specific overrides by provider name/id.
+    pub providers: HashMap<String, ProviderRateLimitWindowConfig>,
+}
+
+impl Default for ProviderRateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            wait_on_limit: false,
+            max_tracked_keys: 1024,
+            defaults: ProviderRateLimitWindowConfig::default(),
+            providers: HashMap::new(),
+        }
+    }
+}
+
+fn default_provider_rate_limit_window_secs() -> u64 {
+    60
+}
+
+fn default_provider_rate_limit_max_requests_per_window() -> u32 {
+    30
 }
 
 fn default_agent_max_iterations() -> usize {
@@ -2356,6 +2435,18 @@ system_prompt_suffix = "Focus on evidence."
     fn chat_config_toml_parses_queue_max_size() {
         let cfg: ChatConfig = toml::from_str("message_queue_max_size = 42").unwrap();
         assert_eq!(cfg.message_queue_max_size, 42);
+    }
+
+    #[test]
+    fn chat_config_default_priority_starvation_bound_is_5() {
+        let cfg = ChatConfig::default();
+        assert_eq!(cfg.priority_starvation_bound, 5);
+    }
+
+    #[test]
+    fn chat_config_toml_parses_priority_starvation_bound() {
+        let cfg: ChatConfig = toml::from_str("priority_starvation_bound = 9").unwrap();
+        assert_eq!(cfg.priority_starvation_bound, 9);
     }
 
     #[test]

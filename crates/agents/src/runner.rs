@@ -11,9 +11,11 @@ use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 use moltis_common::hooks::{HookAction, HookPayload, HookRegistry};
 
 use crate::{
+    classify::{ProviderErrorKind, classify_error_message, extract_retry_after_ms},
+    intent_tracker::IntentTracker,
     model::{
-        ChatMessage, CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage, UserContent,
-        values_to_chat_messages,
+        ChatMessage, CompletionResponse, ContentPart, LlmProvider, StreamEvent, ToolCall, Usage,
+        UserContent, values_to_chat_messages,
     },
     response_sanitizer::{
         clean_response, recover_tool_calls_from_content, sanitize_with_leak_detection,
@@ -38,78 +40,6 @@ fn resolve_agent_max_iterations(configured: usize) -> usize {
         return DEFAULT_AGENT_MAX_ITERATIONS;
     }
     configured
-}
-
-/// Error patterns that indicate the context window has been exceeded.
-const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
-    "context_length_exceeded",
-    "max_tokens",
-    "too many tokens",
-    "request too large",
-    "maximum context length",
-    "context window",
-    "token limit",
-    "content_too_large",
-    "request_too_large",
-];
-
-/// Check if an error message indicates a context window overflow.
-fn is_context_window_error(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    CONTEXT_WINDOW_PATTERNS.iter().any(|p| lower.contains(p))
-}
-
-/// Error patterns that indicate a transient server error worth retrying.
-const RETRYABLE_SERVER_PATTERNS: &[&str] = &[
-    "http 500",
-    "http 502",
-    "http 503",
-    "http 529",
-    "server_error",
-    "internal server error",
-    "overloaded",
-    "bad gateway",
-    "service unavailable",
-    "the server had an error processing your request",
-];
-
-/// Check if an error looks like a transient provider failure that may
-/// succeed on retry (5xx, overloaded, etc.).
-fn is_retryable_server_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    RETRYABLE_SERVER_PATTERNS.iter().any(|p| lower.contains(p))
-}
-
-/// Error patterns that indicate provider-side rate limiting.
-const RATE_LIMIT_PATTERNS: &[&str] = &[
-    "http 429",
-    "status=429",
-    "status 429",
-    "status: 429",
-    "too many requests",
-    "rate limit",
-    "rate_limit",
-];
-
-fn is_rate_limit_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    RATE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p))
-}
-
-/// Error patterns that indicate the account is out of credits/quota.
-/// These are not retryable in the short term and should surface directly.
-const BILLING_QUOTA_PATTERNS: &[&str] = &[
-    "insufficient_quota",
-    "quota exceeded",
-    "current quota",
-    "billing details",
-    "billing limit",
-    "credit balance",
-];
-
-fn is_billing_quota_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    BILLING_QUOTA_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 /// Base delay for non-rate-limit transient retries.
@@ -153,103 +83,77 @@ fn apply_jitter(base_ms: u64, max_ms: u64) -> u64 {
     jittered.clamp(1, max_ms)
 }
 
-fn parse_retry_delay_ms_from_fragment(
-    fragment: &str,
-    unit_default_ms: bool,
-    max_ms: u64,
-) -> Option<u64> {
-    let start = fragment.find(|c: char| c.is_ascii_digit())?;
-    let tail = &fragment[start..];
-    let digits_len = tail.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits_len == 0 {
-        return None;
-    }
-    let amount = tail[..digits_len].parse::<u64>().ok()?;
-    let unit = tail[digits_len..].trim_start();
-
-    let ms = if unit.starts_with("ms") || unit.starts_with("millisecond") {
-        amount
-    } else if unit.starts_with("sec") || unit.starts_with("second") || unit.starts_with('s') {
-        amount.saturating_mul(1_000)
-    } else if unit.starts_with("min") || unit.starts_with("minute") || unit.starts_with('m') {
-        amount.saturating_mul(60_000)
-    } else if unit_default_ms {
-        amount
-    } else {
-        amount.saturating_mul(1_000)
-    };
-
-    Some(ms.clamp(1, max_ms))
-}
-
-/// Extract retry delay hints embedded in provider error messages.
-///
-/// Supports patterns like:
-/// - `retry_after_ms=1234`
-/// - `Retry-After: 30`
-/// - `retry after 30s`
-/// - `retry in 45 seconds`
-fn extract_retry_after_ms(msg: &str, max_ms: u64) -> Option<u64> {
-    let lower = msg.to_ascii_lowercase();
-    for (needle, default_ms) in [
-        ("retry_after_ms=", true),
-        ("retry-after-ms=", true),
-        ("retry_after=", false),
-        ("retry-after:", false),
-        ("retry after ", false),
-        ("retry in ", false),
-    ] {
-        if let Some(idx) = lower.find(needle) {
-            let fragment = &lower[idx + needle.len()..];
-            if let Some(ms) = parse_retry_delay_ms_from_fragment(fragment, default_ms, max_ms) {
-                return Some(ms);
-            }
-        }
-    }
-    None
-}
-
 fn next_retry_delay_ms(
     msg: &str,
     server_retries_remaining: &mut u8,
     rate_limit_retries_remaining: &mut u8,
     rate_limit_backoff_ms: &mut Option<u64>,
 ) -> Option<u64> {
-    // Account/billing quota exhaustion is not transient; don't auto-retry.
-    if is_billing_quota_error(msg) {
+    match classify_error_message(msg) {
+        ProviderErrorKind::RateLimit => {
+            if *rate_limit_retries_remaining == 0 {
+                return None;
+            }
+            *rate_limit_retries_remaining -= 1;
+
+            // Keep exponential state advancing even when the provider gives a
+            // Retry-After hint, so future retries remain bounded and predictable.
+            let current_backoff = *rate_limit_backoff_ms;
+            *rate_limit_backoff_ms = Some(next_rate_limit_retry_ms(current_backoff));
+
+            let hinted_ms = extract_retry_after_ms(msg, RATE_LIMIT_MAX_RETRY_MS);
+            let delay_ms = hinted_ms
+                .or(*rate_limit_backoff_ms)
+                .unwrap_or(RATE_LIMIT_INITIAL_RETRY_MS);
+            Some(delay_ms.clamp(1, RATE_LIMIT_MAX_RETRY_MS))
+        },
+        ProviderErrorKind::ServerError | ProviderErrorKind::Timeout => {
+            if *server_retries_remaining == 0 {
+                return None;
+            }
+            *server_retries_remaining -= 1;
+            Some(apply_jitter(
+                SERVER_RETRY_DELAY.as_millis() as u64,
+                RATE_LIMIT_MAX_RETRY_MS,
+            ))
+        },
+        _ => None,
+    }
+}
+
+fn remaining_agent_budget(
+    run_started: std::time::Instant,
+    agent_timeout_secs: u64,
+) -> Option<std::time::Duration> {
+    if agent_timeout_secs == 0 {
         return None;
     }
+    std::time::Duration::from_secs(agent_timeout_secs).checked_sub(run_started.elapsed())
+}
 
-    if is_rate_limit_error(msg) {
-        if *rate_limit_retries_remaining == 0 {
-            return None;
-        }
-        *rate_limit_retries_remaining -= 1;
-
-        // Keep exponential state advancing even when the provider gives a
-        // Retry-After hint, so future retries remain bounded and predictable.
-        let current_backoff = *rate_limit_backoff_ms;
-        *rate_limit_backoff_ms = Some(next_rate_limit_retry_ms(current_backoff));
-
-        let hinted_ms = extract_retry_after_ms(msg, RATE_LIMIT_MAX_RETRY_MS);
-        let delay_ms = hinted_ms
-            .or(*rate_limit_backoff_ms)
-            .unwrap_or(RATE_LIMIT_INITIAL_RETRY_MS);
-        return Some(delay_ms.clamp(1, RATE_LIMIT_MAX_RETRY_MS));
+fn effective_provider_timeout(
+    provider_call_timeout_secs: u64,
+    remaining_budget: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let provider_timeout = (provider_call_timeout_secs > 0)
+        .then(|| std::time::Duration::from_secs(provider_call_timeout_secs));
+    match (provider_timeout, remaining_budget) {
+        (Some(provider), Some(remaining)) => Some(provider.min(remaining)),
+        (Some(provider), None) => Some(provider),
+        (None, Some(remaining)) => Some(remaining),
+        (None, None) => None,
     }
+}
 
-    if is_retryable_server_error(msg) {
-        if *server_retries_remaining == 0 {
-            return None;
-        }
-        *server_retries_remaining -= 1;
-        return Some(apply_jitter(
-            SERVER_RETRY_DELAY.as_millis() as u64,
-            RATE_LIMIT_MAX_RETRY_MS,
-        ));
+fn timeout_hit_agent_budget(
+    provider_call_timeout_secs: u64,
+    remaining_budget: Option<std::time::Duration>,
+) -> bool {
+    match remaining_budget {
+        Some(remaining) if provider_call_timeout_secs == 0 => true,
+        Some(remaining) => remaining <= std::time::Duration::from_secs(provider_call_timeout_secs),
+        None => false,
     }
-
-    None
 }
 
 /// Typed errors from the agent loop.
@@ -642,7 +546,10 @@ pub async fn run_agent_loop_with_context(
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
     let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
+    let agent_timeout_secs = config.tools.agent_timeout_secs;
+    let provider_call_timeout_secs = config.tools.provider_call_timeout_secs;
     let tool_schemas = tools.list_schemas();
+    let run_started = std::time::Instant::now();
 
     let is_multimodal = matches!(user_content, UserContent::Multimodal(_));
     info!(
@@ -651,6 +558,8 @@ pub async fn run_agent_loop_with_context(
         native_tools,
         tools_count = tool_schemas.len(),
         is_multimodal,
+        agent_timeout_secs,
+        provider_call_timeout_secs,
         "starting agent loop"
     );
 
@@ -697,6 +606,13 @@ pub async fn run_agent_loop_with_context(
             warn!("agent loop exceeded max iterations ({})", max_iterations);
             return Err(AgentRunError::Other(anyhow::anyhow!(
                 "agent loop exceeded max iterations"
+            )));
+        }
+        if agent_timeout_secs > 0
+            && remaining_agent_budget(run_started, agent_timeout_secs).is_none()
+        {
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "agent run timed out after {agent_timeout_secs}s"
             )));
         }
 
@@ -754,18 +670,46 @@ pub async fn run_agent_loop_with_context(
             cb(RunnerEvent::Thinking);
         }
 
-        let mut response: CompletionResponse = match provider
-            .complete(&messages, schemas_for_api)
-            .await
+        let remaining_budget = remaining_agent_budget(run_started, agent_timeout_secs);
+        let completion_result = if let Some(timeout) =
+            effective_provider_timeout(provider_call_timeout_secs, remaining_budget)
         {
+            match tokio::time::timeout(timeout, provider.complete(&messages, schemas_for_api)).await
+            {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    if timeout_hit_agent_budget(provider_call_timeout_secs, remaining_budget) {
+                        Err(anyhow::anyhow!(
+                            "agent run timed out after {agent_timeout_secs}s"
+                        ))
+                    } else {
+                        warn!(
+                            timeout_secs = provider_call_timeout_secs,
+                            "provider call timed out"
+                        );
+                        Err(anyhow::anyhow!(
+                            "provider call timed out after {provider_call_timeout_secs}s"
+                        ))
+                    }
+                },
+            }
+        } else {
+            provider.complete(&messages, schemas_for_api).await
+        };
+
+        let mut response: CompletionResponse = match completion_result {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
+                if msg.starts_with("agent run timed out after ") {
+                    return Err(AgentRunError::Other(anyhow::anyhow!(msg)));
+                }
                 if let Some(ref hooks) = hook_registry {
                     let payload = HookPayload::AfterLLMCall {
                         session_key: session_key_for_hooks.clone(),
                         provider: provider.name().to_string(),
                         model: provider.id().to_string(),
+                        error: Some(msg.clone()),
                         text: None,
                         tool_calls: vec![],
                         input_tokens: 0,
@@ -777,7 +721,7 @@ pub async fn run_agent_loop_with_context(
                         warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
                     }
                 }
-                if is_context_window_error(&msg) {
+                if classify_error_message(&msg) == ProviderErrorKind::ContextWindow {
                     return Err(AgentRunError::ContextWindowExceeded(msg));
                 }
                 if let Some(delay_ms) = next_retry_delay_ms(
@@ -928,6 +872,7 @@ pub async fn run_agent_loop_with_context(
                 session_key: session_key_for_hooks.clone(),
                 provider: provider.name().to_string(),
                 model: provider.id().to_string(),
+                error: None,
                 text: response.text.clone(),
                 tool_calls: tc_json,
                 input_tokens: response.usage.input_tokens,
@@ -1196,7 +1141,10 @@ pub async fn run_agent_loop_streaming(
     let max_tool_result_bytes = config.tools.max_tool_result_bytes;
     let leak_detection_sensitivity = config.tools.leak_detection_sensitivity;
     let max_iterations = resolve_agent_max_iterations(config.tools.agent_max_iterations);
+    let agent_timeout_secs = config.tools.agent_timeout_secs;
+    let provider_call_timeout_secs = config.tools.provider_call_timeout_secs;
     let tool_schemas = tools.list_schemas();
+    let run_started = std::time::Instant::now();
 
     let is_multimodal = matches!(user_content, UserContent::Multimodal(_));
     info!(
@@ -1205,6 +1153,8 @@ pub async fn run_agent_loop_streaming(
         native_tools,
         tools_count = tool_schemas.len(),
         is_multimodal,
+        agent_timeout_secs,
+        provider_call_timeout_secs,
         "starting streaming agent loop"
     );
 
@@ -1219,6 +1169,20 @@ pub async fn run_agent_loop_streaming(
         content: user_content.clone(),
     });
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
+
+    // Extract original intent for drift detection.
+    let original_intent = match user_content {
+        UserContent::Text(t) => t.clone(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let mut intent_tracker = IntentTracker::new(&original_intent);
 
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
@@ -1265,6 +1229,13 @@ pub async fn run_agent_loop_streaming(
             );
             return Err(AgentRunError::Other(anyhow::anyhow!(
                 "agent loop exceeded max iterations"
+            )));
+        }
+        if agent_timeout_secs > 0
+            && remaining_agent_budget(run_started, agent_timeout_secs).is_none()
+        {
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "agent run timed out after {agent_timeout_secs}s"
             )));
         }
 
@@ -1324,7 +1295,11 @@ pub async fn run_agent_loop_streaming(
 
         // Use streaming API.
         #[cfg(feature = "metrics")]
+        let should_record_stream_metrics = !provider.emits_metrics();
+        #[cfg(feature = "metrics")]
         let iter_start = std::time::Instant::now();
+        #[cfg(feature = "metrics")]
+        let mut first_token_at: Option<std::time::Instant> = None;
         let mut stream = provider.stream_with_tools(messages.clone(), schemas_for_api.clone());
 
         // Accumulate answer text, reasoning text, and tool calls from the stream.
@@ -1344,9 +1319,40 @@ pub async fn run_agent_loop_streaming(
         let mut output_tokens: u32 = 0;
         let mut stream_error: Option<String> = None;
 
-        while let Some(event) = stream.next().await {
+        loop {
+            let remaining_budget = remaining_agent_budget(run_started, agent_timeout_secs);
+            let Some(event) = (if let Some(timeout) =
+                effective_provider_timeout(provider_call_timeout_secs, remaining_budget)
+            {
+                match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(event) => event,
+                    Err(_elapsed) => {
+                        stream_error = Some(
+                            if timeout_hit_agent_budget(
+                                provider_call_timeout_secs,
+                                remaining_budget,
+                            ) {
+                                format!("agent run timed out after {agent_timeout_secs}s")
+                            } else {
+                                format!(
+                                    "provider call timed out after {provider_call_timeout_secs}s"
+                                )
+                            },
+                        );
+                        break;
+                    },
+                }
+            } else {
+                stream.next().await
+            }) else {
+                break;
+            };
             match event {
                 StreamEvent::Delta(text) => {
+                    #[cfg(feature = "metrics")]
+                    if should_record_stream_metrics && first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     accumulated_text.push_str(&text);
                     if let Some(cb) = on_event {
                         cb(RunnerEvent::TextDelta(text));
@@ -1358,12 +1364,20 @@ pub async fn run_agent_loop_streaming(
                     }
                 },
                 StreamEvent::ReasoningDelta(text) => {
+                    #[cfg(feature = "metrics")]
+                    if should_record_stream_metrics && first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     accumulated_reasoning.push_str(&text);
                     if let Some(cb) = on_event {
                         cb(RunnerEvent::ThinkingText(accumulated_reasoning.clone()));
                     }
                 },
                 StreamEvent::ToolCallStart { id, name, index } => {
+                    #[cfg(feature = "metrics")]
+                    if should_record_stream_metrics && first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     let vec_pos = tool_calls.len();
                     debug!(tool = %name, id = %id, stream_index = index, vec_pos, "tool call started in stream");
                     tool_calls.push(ToolCall {
@@ -1375,6 +1389,10 @@ pub async fn run_agent_loop_streaming(
                     tool_call_args.insert(index, String::new());
                 },
                 StreamEvent::ToolCallArgumentsDelta { index, delta } => {
+                    #[cfg(feature = "metrics")]
+                    if should_record_stream_metrics && first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     if let Some(args) = tool_call_args.get_mut(&index) {
                         args.push_str(&delta);
                     }
@@ -1390,7 +1408,7 @@ pub async fn run_agent_loop_streaming(
                     debug!(input_tokens, output_tokens, "stream done");
 
                     #[cfg(feature = "metrics")]
-                    {
+                    if should_record_stream_metrics {
                         let provider_name = provider.name().to_string();
                         let model_id = provider.id().to_string();
                         let duration = iter_start.elapsed().as_secs_f64();
@@ -1430,9 +1448,38 @@ pub async fn run_agent_loop_streaming(
                             labels::MODEL => model_id
                         )
                         .record(duration);
+
+                        if let Some(first_token_time) = first_token_at {
+                            histogram!(
+                                llm_metrics::TIME_TO_FIRST_TOKEN_SECONDS,
+                                labels::PROVIDER => provider.name().to_string(),
+                                labels::MODEL => provider.id().to_string()
+                            )
+                            .record(first_token_time.duration_since(iter_start).as_secs_f64());
+                        }
+
+                        if duration > 0.0 && usage.output_tokens > 0 {
+                            histogram!(
+                                llm_metrics::TOKENS_PER_SECOND,
+                                labels::PROVIDER => provider.name().to_string(),
+                                labels::MODEL => provider.id().to_string()
+                            )
+                            .record(f64::from(usage.output_tokens) / duration);
+                        }
                     }
                 },
                 StreamEvent::Error(msg) => {
+                    #[cfg(feature = "metrics")]
+                    if should_record_stream_metrics {
+                        let kind = classify_error_message(&msg);
+                        counter!(
+                            llm_metrics::COMPLETION_ERRORS_TOTAL,
+                            labels::PROVIDER => provider.name().to_string(),
+                            labels::MODEL => provider.id().to_string(),
+                            labels::ERROR_TYPE => format!("{kind:?}")
+                        )
+                        .increment(1);
+                    }
                     stream_error = Some(msg);
                     break;
                 },
@@ -1445,11 +1492,15 @@ pub async fn run_agent_loop_streaming(
 
         // Handle stream errors — retry on transient failures/rate limits.
         if let Some(err) = stream_error {
+            if err.starts_with("agent run timed out after ") {
+                return Err(AgentRunError::Other(anyhow::anyhow!(err)));
+            }
             if let Some(ref hooks) = hook_registry {
                 let payload = HookPayload::AfterLLMCall {
                     session_key: session_key_for_hooks.clone(),
                     provider: provider.name().to_string(),
                     model: provider.id().to_string(),
+                    error: Some(err.clone()),
                     text: None,
                     tool_calls: vec![],
                     input_tokens: 0,
@@ -1461,7 +1512,7 @@ pub async fn run_agent_loop_streaming(
                     warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for streaming provider error");
                 }
             }
-            if is_context_window_error(&err) {
+            if classify_error_message(&err) == ProviderErrorKind::ContextWindow {
                 return Err(AgentRunError::ContextWindowExceeded(err));
             }
             if let Some(delay_ms) = next_retry_delay_ms(
@@ -1596,6 +1647,7 @@ pub async fn run_agent_loop_streaming(
                 session_key: session_key_for_hooks.clone(),
                 provider: provider.name().to_string(),
                 model: provider.id().to_string(),
+                error: None,
                 text: if accumulated_text.is_empty() {
                     None
                 } else {
@@ -1655,6 +1707,20 @@ pub async fn run_agent_loop_streaming(
                 raw_llm_responses,
             });
         }
+
+        // Check intent drift when tool calls are present.
+        let current_intent = format!(
+            "{} {}",
+            accumulated_text.as_str(),
+            tool_calls
+                .iter()
+                .map(|tc| tc.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // check_drift logs warnings internally when drift is detected.
+        let (_drift_score, _is_drifted) =
+            intent_tracker.check_drift(&current_intent, trace_id.as_deref());
 
         // Append assistant message with tool calls.
         //
@@ -4397,39 +4463,61 @@ mod tests {
     // ── Retry tests ─────────────────────────────────────────────────
 
     #[test]
-    fn test_is_retryable_server_error() {
-        assert!(is_retryable_server_error(
-            "openai-codex API error HTTP 500 Internal Server Error: {}"
-        ));
-        assert!(is_retryable_server_error(
-            "The server had an error processing your request."
-        ));
-        assert!(is_retryable_server_error("HTTP 502 Bad Gateway"));
-        assert!(is_retryable_server_error("HTTP 503 Service Unavailable"));
-        assert!(is_retryable_server_error(
-            "overloaded_error: server is overloaded"
-        ));
-        assert!(!is_retryable_server_error("context_length_exceeded"));
-        assert!(!is_retryable_server_error("invalid API key"));
+    fn test_classify_server_errors() {
+        assert_eq!(
+            classify_error_message("openai-codex API error HTTP 500 Internal Server Error: {}"),
+            ProviderErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_error_message("The server had an error processing your request."),
+            ProviderErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_error_message("HTTP 502 Bad Gateway"),
+            ProviderErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_error_message("HTTP 503 Service Unavailable"),
+            ProviderErrorKind::ServerError
+        );
+        assert_eq!(
+            classify_error_message("overloaded_error: server is overloaded"),
+            ProviderErrorKind::ServerError
+        );
     }
 
     #[test]
-    fn test_is_rate_limit_error() {
-        assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
-        assert!(is_rate_limit_error("status=429 upstream limit"));
-        assert!(is_rate_limit_error("rate_limit_exceeded"));
-        assert!(!is_rate_limit_error("HTTP 500 Internal Server Error"));
-        assert!(!is_rate_limit_error("insufficient_quota"));
+    fn test_classify_rate_limit_errors() {
+        assert_eq!(
+            classify_error_message("HTTP 429 Too Many Requests"),
+            ProviderErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_error_message("status=429 upstream limit"),
+            ProviderErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_error_message("rate_limit_exceeded"),
+            ProviderErrorKind::RateLimit
+        );
     }
 
     #[test]
-    fn test_is_billing_quota_error() {
-        assert!(is_billing_quota_error(
-            "You exceeded your current quota, please check your plan and billing details."
-        ));
-        assert!(is_billing_quota_error("insufficient_quota"));
-        assert!(is_billing_quota_error("quota exceeded"));
-        assert!(!is_billing_quota_error("HTTP 429 Too Many Requests"));
+    fn test_classify_billing_quota_errors() {
+        assert_eq!(
+            classify_error_message(
+                "You exceeded your current quota, please check your plan and billing details."
+            ),
+            ProviderErrorKind::BillingExhausted
+        );
+        assert_eq!(
+            classify_error_message("insufficient_quota"),
+            ProviderErrorKind::BillingExhausted
+        );
+        assert_eq!(
+            classify_error_message("quota exceeded"),
+            ProviderErrorKind::BillingExhausted
+        );
     }
 
     #[test]

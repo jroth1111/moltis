@@ -2,13 +2,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
-
-#[cfg(feature = "graphql")]
-use std::sync::atomic::AtomicBool;
 
 #[cfg(feature = "metrics")]
 use moltis_metrics::MetricsHandle;
@@ -103,8 +100,8 @@ pub struct TtsRuntimeOverride {
 pub struct ConnectedClient {
     pub conn_id: String,
     pub connect_params: ConnectParams,
-    /// Bounded channel for sending serialized frames to this client's write loop.
-    pub sender: mpsc::Sender<String>,
+    /// Bounded channel for sending outbound frames to this client's write loop.
+    pub sender: mpsc::Sender<OutboundWsFrame>,
     pub connected_at: Instant,
     pub last_activity: Instant,
     /// The `Accept-Language` header from the WebSocket upgrade request, forwarded
@@ -124,6 +121,13 @@ pub struct ConnectedClient {
     pub joined_channels: HashSet<String>,
     /// Negotiated protocol version for this connection.
     pub negotiated_protocol: u32,
+}
+
+/// Outbound frame type sent to a WebSocket write loop.
+#[derive(Debug, Clone)]
+pub enum OutboundWsFrame {
+    Text(String),
+    Close { code: u16, reason: String },
 }
 
 impl ConnectedClient {
@@ -166,7 +170,19 @@ impl ConnectedClient {
     /// Uses `try_send` to avoid blocking; drops the frame if the client's
     /// outbound buffer is full (slow consumer protection).
     pub fn send(&self, frame: &str) -> bool {
-        self.sender.try_send(frame.to_string()).is_ok()
+        self.sender
+            .try_send(OutboundWsFrame::Text(frame.to_string()))
+            .is_ok()
+    }
+
+    /// Send a close control frame request to this client.
+    pub fn send_close(&self, code: u16, reason: impl Into<String>) -> bool {
+        self.sender
+            .try_send(OutboundWsFrame::Close {
+                code,
+                reason: reason.into(),
+            })
+            .is_ok()
     }
 
     /// Touch the activity timestamp.
@@ -436,6 +452,8 @@ pub struct GatewayState {
     pub tls_active: bool,
     /// Whether WebSocket request/response logging is enabled.
     pub ws_request_logs: bool,
+    /// Whether the gateway is in shutdown drain mode.
+    pub shutting_down: AtomicBool,
     /// Runtime GraphQL availability toggle.
     #[cfg(feature = "graphql")]
     pub graphql_enabled: AtomicBool,
@@ -533,6 +551,7 @@ impl GatewayState {
             behind_proxy,
             tls_active,
             ws_request_logs,
+            shutting_down: AtomicBool::new(false),
             session_event_bus: session_event_bus.unwrap_or_default(),
             deploy_platform,
             port,
@@ -596,6 +615,16 @@ impl GatewayState {
 
     pub fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Mark shutdown mode. Returns `true` when this call transitioned the
+    /// state from running -> shutting_down.
+    pub fn mark_shutting_down(&self) -> bool {
+        !self.shutting_down.swap(true, Ordering::SeqCst)
     }
 
     #[cfg(feature = "graphql")]
@@ -860,6 +889,109 @@ impl GatewayState {
         removed
     }
 
+    /// Close all connected WebSocket clients with RFC6455 code 1001 ("Going Away").
+    pub async fn notify_clients_shutting_down(&self, reason: &str) {
+        let inner = self.inner.read().await;
+
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let frame = EventFrame::new(
+            "gateway.shutting_down",
+            serde_json::json!({ "reason": reason }),
+            seq,
+        );
+        if let Ok(json) = serde_json::to_string(&frame) {
+            for client in inner.clients.values() {
+                let _ = client.send(&json);
+            }
+        }
+    }
+
+    /// Close all connected WebSocket clients with RFC6455 code 1001 ("Going Away").
+    pub async fn close_all_clients_going_away(&self, reason: &str) {
+        self.close_all_clients_going_away_impl(reason, true).await;
+    }
+
+    /// Close all connected WebSocket clients with RFC6455 code 1001 ("Going Away"),
+    /// without emitting an additional `gateway.shutting_down` event frame.
+    pub async fn close_all_clients_going_away_without_notice(&self, reason: &str) {
+        self.close_all_clients_going_away_impl(reason, false).await;
+    }
+
+    async fn close_all_clients_going_away_impl(&self, reason: &str, send_notice: bool) {
+        let mut inner = self.inner.write().await;
+
+        if send_notice {
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let frame = EventFrame::new(
+                "gateway.shutting_down",
+                serde_json::json!({ "reason": reason }),
+                seq,
+            );
+            if let Ok(json) = serde_json::to_string(&frame) {
+                for client in inner.clients.values() {
+                    let _ = client.send(&json);
+                    let _ = client.send_close(1001, reason);
+                }
+            } else {
+                for client in inner.clients.values() {
+                    let _ = client.send_close(1001, reason);
+                }
+            }
+        } else {
+            for client in inner.clients.values() {
+                let _ = client.send_close(1001, reason);
+            }
+        }
+
+        inner.nodes.clear();
+        inner.clients.clear();
+        inner.active_sessions.clear();
+        inner.active_projects.clear();
+        inner.pending_invokes.clear();
+        inner.pending_client_requests.clear();
+
+        drop(inner);
+
+        #[cfg(feature = "metrics")]
+        moltis_metrics::gauge!(moltis_metrics::system::CONNECTED_CLIENTS).set(0.0);
+
+        tracing::info!(reason, "closed all WebSocket clients (going away)");
+    }
+
+    /// Wait until no in-flight agent runs remain, or timeout.
+    ///
+    /// Returns the number of sessions still running when the timeout elapses.
+    pub async fn wait_for_inflight_agent_runs(&self, timeout: std::time::Duration) -> usize {
+        let Some(store) = self.services.session_state_store.as_ref() else {
+            return 0;
+        };
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let running = match store.list_running_sessions().await {
+                Ok(running) => running,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to list running sessions during shutdown drain"
+                    );
+                    if Instant::now() >= deadline {
+                        return 1;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                },
+            };
+            if running.is_empty() {
+                return 0;
+            }
+            if Instant::now() >= deadline {
+                return running.len();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// Disconnect all WebSocket clients: send an `auth.credentials_changed`
     /// event so browsers can redirect to login, then drain every connection.
     pub async fn disconnect_all_clients(&self, reason: &str) {
@@ -919,7 +1051,7 @@ mod tests {
         )
     }
 
-    fn mock_client(conn_id: &str) -> (ConnectedClient, mpsc::Receiver<String>) {
+    fn mock_client(conn_id: &str) -> (ConnectedClient, mpsc::Receiver<OutboundWsFrame>) {
         let (tx, rx) = mpsc::channel(512);
         let client = ConnectedClient {
             conn_id: conn_id.to_string(),
@@ -961,6 +1093,13 @@ mod tests {
         (client, rx)
     }
 
+    fn expect_text_frame(frame: OutboundWsFrame) -> String {
+        match frame {
+            OutboundWsFrame::Text(text) => text,
+            OutboundWsFrame::Close { .. } => panic!("expected text frame, got close frame"),
+        }
+    }
+
     #[tokio::test]
     async fn disconnect_all_clients_drains_state_and_notifies() {
         let state = test_state();
@@ -996,8 +1135,8 @@ mod tests {
         }
 
         // Both receivers got the event frame before the channel closed.
-        let msg1 = rx1.recv().await.expect("should receive event");
-        let msg2 = rx2.recv().await.expect("should receive event");
+        let msg1 = expect_text_frame(rx1.recv().await.expect("should receive event"));
+        let msg2 = expect_text_frame(rx2.recv().await.expect("should receive event"));
 
         let frame1: serde_json::Value = serde_json::from_str(&msg1).unwrap();
         assert_eq!(frame1["event"], "auth.credentials_changed");
@@ -1018,6 +1157,82 @@ mod tests {
         // Should not panic.
         state.disconnect_all_clients("noop").await;
         assert_eq!(state.client_count().await, 0);
+    }
+
+    #[test]
+    fn shutdown_flag_transitions_once() {
+        let state = test_state();
+        assert!(!state.is_shutting_down());
+        assert!(state.mark_shutting_down());
+        assert!(state.is_shutting_down());
+        assert!(!state.mark_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn close_all_clients_going_away_sends_close() {
+        let state = test_state();
+        let (c1, mut rx1) = mock_client("conn-1");
+        state.register_client(c1).await;
+
+        state.close_all_clients_going_away("server restart").await;
+
+        let first = rx1
+            .recv()
+            .await
+            .expect("should receive shutting_down event");
+        let first_text = expect_text_frame(first);
+        let frame: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        assert_eq!(frame["event"], "gateway.shutting_down");
+
+        let second = rx1.recv().await.expect("should receive close frame");
+        match second {
+            OutboundWsFrame::Close { code, reason } => {
+                assert_eq!(code, 1001);
+                assert_eq!(reason, "server restart");
+            },
+            OutboundWsFrame::Text(_) => panic!("expected close frame"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_clients_shutting_down_sends_event_without_closing() {
+        let state = test_state();
+        let (c1, mut rx1) = mock_client("conn-1");
+        state.register_client(c1).await;
+
+        state
+            .notify_clients_shutting_down("server is shutting down")
+            .await;
+
+        let first = rx1
+            .recv()
+            .await
+            .expect("should receive shutting_down event");
+        let first_text = expect_text_frame(first);
+        let frame: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+        assert_eq!(frame["event"], "gateway.shutting_down");
+        assert_eq!(frame["payload"]["reason"], "server is shutting down");
+        assert_eq!(state.client_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn close_all_clients_going_away_without_notice_sends_only_close() {
+        let state = test_state();
+        let (c1, mut rx1) = mock_client("conn-1");
+        state.register_client(c1).await;
+
+        state
+            .close_all_clients_going_away_without_notice("shutdown")
+            .await;
+
+        let first = rx1.recv().await.expect("should receive close frame");
+        match first {
+            OutboundWsFrame::Close { code, reason } => {
+                assert_eq!(code, 1001);
+                assert_eq!(reason, "shutdown");
+            },
+            OutboundWsFrame::Text(_) => panic!("expected close frame"),
+        }
     }
 
     // ── Subscription tests ──────────────────────────────────────────────
@@ -1105,7 +1320,7 @@ mod tests {
         assert!(rx1.try_recv().is_err());
 
         // Client 2 should receive it (wildcard)
-        let msg = rx2.try_recv().expect("wildcard should receive");
+        let msg = expect_text_frame(rx2.try_recv().expect("wildcard should receive"));
         let frame: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(frame["event"], "presence");
     }
@@ -1136,7 +1351,7 @@ mod tests {
         .await;
 
         // Client 1 should receive it
-        let msg = rx1.try_recv().expect("channel member should receive");
+        let msg = expect_text_frame(rx1.try_recv().expect("channel member should receive"));
         let frame: serde_json::Value = serde_json::from_str(&msg).unwrap();
         assert_eq!(frame["event"], "chat");
         assert_eq!(frame["channel"], "session:abc");

@@ -1,6 +1,8 @@
 //! LLM agent runtime: model selection, prompt building, tool execution, streaming.
 
 pub mod auth_profiles;
+pub mod classify;
+pub mod intent_tracker;
 pub mod json_repair;
 pub mod memory_writer;
 pub mod model;
@@ -14,6 +16,8 @@ pub use {
 };
 pub mod leak_detector;
 pub mod provider_chain;
+pub mod provider_health;
+pub mod rate_limiter;
 pub mod research;
 pub mod response_sanitizer;
 pub mod self_repair;

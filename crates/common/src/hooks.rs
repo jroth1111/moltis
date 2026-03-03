@@ -126,6 +126,8 @@ pub enum HookPayload {
         session_key: String,
         provider: String,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
         text: Option<String>,
         tool_calls: Vec<Value>,
         input_tokens: u32,
@@ -146,14 +148,20 @@ pub enum HookPayload {
         session_key: String,
         content: String,
         channel: Option<String>,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     MessageSending {
         session_key: String,
         content: String,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     MessageSent {
         session_key: String,
         content: String,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     BeforeToolCall {
         session_key: String,
@@ -886,6 +894,7 @@ mod tests {
             session_key: "sess-1".into(),
             provider: "anthropic".into(),
             model: "claude-sonnet-4-20250514".into(),
+            error: None,
             text: Some("Hello!".into()),
             tool_calls: vec![serde_json::json!({"name": "exec"})],
             input_tokens: 100,
@@ -922,6 +931,7 @@ mod tests {
             session_key: "s".into(),
             provider: "p".into(),
             model: "m".into(),
+            error: None,
             text: None,
             tool_calls: vec![],
             input_tokens: 0,

@@ -4,6 +4,7 @@ import { html } from "htm/preact";
 import { render } from "preact";
 import prettyBytes from "pretty-bytes";
 import { applyIdentityFavicon, formatPageTitle } from "./branding.js";
+import { chatAddMsg } from "./chat-ui.js";
 import { initHighlighter } from "./code-highlight.js";
 import { SessionList } from "./components/session-list.js";
 import { onEvent } from "./events.js";
@@ -112,6 +113,28 @@ onEvent("session", (payload) => {
 	if (payload && payload.kind === "patched" && payload.sessionKey === S.activeSessionKey) {
 		refreshActiveSession();
 	}
+});
+onEvent("session.recovered", (payload) => {
+	fetchSessions();
+	if (!payload || payload.sessionKey !== S.activeSessionKey) return;
+	refreshActiveSession();
+	var details = [];
+	if (payload.removedMalformedLines > 0) {
+		details.push(`${payload.removedMalformedLines} malformed line(s) removed`);
+	}
+	if (payload.injectedToolResults > 0) {
+		details.push(`${payload.injectedToolResults} tool result(s) recovered`);
+	}
+	if (payload.appendedAssistantMessages > 0) {
+		details.push("assistant recovery message appended");
+	}
+	if (payload.replayAttempted) {
+		details.push("replay queued");
+	} else if (payload.replayBlockedReason) {
+		details.push(`replay skipped (${payload.replayBlockedReason})`);
+	}
+	var msg = details.length > 0 ? `Session recovered: ${details.join(", ")}.` : "Session recovered after interruption.";
+	chatAddMsg("system", msg);
 });
 
 function applyMemory(mem) {

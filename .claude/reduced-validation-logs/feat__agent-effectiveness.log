@@ -1,0 +1,570 @@
+Detected macOS without nvcc; forcing non-CUDA local validation commands (no --all-features).
+Override with LOCAL_VALIDATE_LINT_CMD / LOCAL_VALIDATE_TEST_CMD / LOCAL_VALIDATE_COVERAGE_CMD if needed.
+Local-only validation (f65ea76) — no statuses will be published
+Removing cached llama build dir: target/debug/build/llama-cpp-sys-2-3c3b88d324c899b4
+Removing cached llama build dir: target/debug/build/llama-cpp-sys-2-f46a64f6c4eb860e
+🌈 zizmor v1.22.0
+ INFO audit: zizmor: 🌈 completed ./.github/actions/sign-artifacts/action.yml
+ INFO audit: zizmor: 🌈 completed ./.github/workflows/ci.yml
+ INFO audit: zizmor: 🌈 completed ./.github/workflows/codspeed.yml
+ INFO audit: zizmor: 🌈 completed ./.github/workflows/docs.yml
+ INFO audit: zizmor: 🌈 completed ./.github/workflows/e2e.yml
+ INFO audit: zizmor: 🌈 completed ./.github/workflows/homebrew.yml
+ INFO audit: zizmor: 🌈 completed ./.github/workflows/release.yml
+No findings to report. Good job! (28 suppressed)
+[local/zizmor] passed in 1s
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+i18n parity OK: 3 locales, 18 namespaces.
+[local/i18n] passed in 1s
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+[0m[34mChecked [0m[0m[34m130[0m[0m[34m [0m[0m[34mfiles[0m[0m[34m in [0m[0m[34m268[0m[0m[2m[34mms[0m[0m[34m.[0m[0m[34m No fixes applied.[0m
+[local/biome] passed in 5s
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_comments = true`, unstable features are only available in nightly channel.
+Warning: can't set `normalize_doc_attributes = true`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_matchers = false`, unstable features are only available in nightly channel.
+Warning: can't set `format_macro_bodies = false`, unstable features are only available in nightly channel.
+Warning: can't set `imports_granularity = One`, unstable features are only available in nightly channel.
+Warning: can't set `group_imports = Preserve`, unstable features are only available in nightly channel.
+Warning: can't set `reorder_impl_items = true`, unstable features are only available in nightly channel.
+Warning: can't set `overflow_delimited_expr = true`, unstable features are only available in nightly channel.
+Warning: can't set `condense_wildcard_suffixes = true`, unstable features are only available in nightly channel.
+[local/fmt] passed in 6s
+[local/fmt] total 6s
+[local/biome] total 5s
+[local/i18n] total 1s
+[local/lockfile] passed in 1s
+    Checking rustls-webpki v0.103.9
+   Compiling llama-cpp-sys-2 v0.1.133
+    Checking moltis-channels v0.10.6 (/Users/gwizz/CascadeProjects/moltis/.claude/worktrees/feat/agent-effectiveness/crates/channels)
+    Checking wasmtime v30.0.2
+    Checking openssl v0.10.75
+    Checking wacore-binary v0.2.0
+   Compiling convert_case v0.4.0
+    Checking sync_wrapper v0.1.2
+    Checking num-order v1.2.0
+    Checking protobuf v3.7.2
+   Compiling curl-sys v0.4.85+curl-8.18.0
+   Compiling oid-registry v0.7.1
+   Compiling rustversion v1.0.22
+    Checking base64urlsafedata v0.5.4
+    Checking reqwest v0.11.27
+error[E0554]: `#![feature]` may not be used on the stable release channel
+ --> /Users/gwizz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wacore-binary-0.2.0/src/lib.rs:1:1
+  |
+1 | #![feature(portable_simd)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    Checking text-splitter v0.29.3
+    Checking gix-worktree v0.47.0
+   Compiling derive_more v0.99.20
+    Checking der v0.6.1
+    Checking rustls v0.23.36
+    Checking serde_with v1.14.0
+    Checking rc-box v1.3.0
+For more information about this error, try `rustc --explain E0554`.
+error: could not compile `wacore-binary` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+      Timing report saved to /Users/gwizz/CascadeProjects/moltis/.claude/worktrees/feat/agent-effectiveness/target/cargo-timings/cargo-timing-20260303T034122.789722Z.html
+[local/lint] failed in 9s
