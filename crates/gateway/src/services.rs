@@ -17,10 +17,7 @@ use {
 fn security_audit(event: &str, details: Value) {
     let dir = moltis_config::data_dir().join("logs");
     let path = dir.join("security-audit.jsonl");
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let now_ms = now_unix_ms();
     let line = serde_json::json!({
         "ts": now_ms,
         "event": event,
@@ -38,6 +35,13 @@ fn security_audit(event: &str, details: Value) {
         writeln!(file, "{line}")?;
         Ok(())
     })();
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn command_available(command: &str) -> bool {
@@ -159,6 +163,43 @@ fn risky_install_pattern(command: &str) -> Option<&'static str> {
     patterns
         .into_iter()
         .find_map(|(needle, reason)| c.contains(needle).then_some(reason))
+}
+
+fn ensure_install_dep_approval(
+    action: moltis_tools::approval::ApprovalAction,
+    command_preview: &str,
+) -> Result<(), ServiceError> {
+    match action {
+        moltis_tools::approval::ApprovalAction::Proceed => Ok(()),
+        moltis_tools::approval::ApprovalAction::NeedsApproval => Err(format!(
+            "dependency install blocked by exec approval policy for command: {command_preview}. \
+approve this command with tools.exec.allowlist (or adjust tools.exec.approval_mode / \
+tools.exec.security_level), then retry skills.install_dep"
+        )
+        .into()),
+    }
+}
+
+fn ensure_skill_enable_allowed(
+    skill_name: &str,
+    trusted: bool,
+    drifted: bool,
+) -> Result<(), ServiceError> {
+    if drifted {
+        return Err(format!(
+            "skill '{skill_name}' source changed since it was last trusted. Review and run skills.skill.trust before enabling"
+        )
+        .into());
+    }
+
+    if !trusted {
+        return Err(format!(
+            "skill '{skill_name}' is not trusted. Review it and run skills.skill.trust before enabling"
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 /// Convert markdown to sanitized HTML using pulldown-cmark.
@@ -387,6 +428,8 @@ impl SkillsService for NoopSkillsService {
                                 "display_name": entry.and_then(|e| e.display_name.as_deref()),
                                 "relative_path": s.relative_path,
                                 "trusted": s.trusted,
+                                "trusted_at_ms": s.trusted_at_ms,
+                                "trusted_commit_sha": s.trusted_commit_sha,
                                 "enabled": s.enabled,
                                 "drifted": drifted_sources.contains(&repo.source),
                                 "eligible": true,
@@ -432,6 +475,8 @@ impl SkillsService for NoopSkillsService {
                                 "display_name": display_name,
                                 "relative_path": s.relative_path,
                                 "trusted": s.trusted,
+                                "trusted_at_ms": s.trusted_at_ms,
+                                "trusted_commit_sha": s.trusted_commit_sha,
                                 "enabled": s.enabled,
                                 "drifted": drifted_sources.contains(&repo.source),
                                 "eligible": elig.as_ref().map(|e| e.eligible).unwrap_or(true),
@@ -657,6 +702,8 @@ impl SkillsService for NoopSkillsService {
                     "missing_bins": elig.missing_bins,
                     "install_options": elig.install_options,
                     "trusted": skill_state.trusted,
+                    "trusted_at_ms": skill_state.trusted_at_ms,
+                    "trusted_commit_sha": skill_state.trusted_commit_sha,
                     "enabled": skill_state.enabled,
                     "drifted": drifted_sources.contains(source),
                     "commit_sha": commit_sha,
@@ -702,6 +749,8 @@ impl SkillsService for NoopSkillsService {
                     "missing_bins": empty,
                     "install_options": empty,
                     "trusted": skill_state.trusted,
+                    "trusted_at_ms": skill_state.trusted_at_ms,
+                    "trusted_commit_sha": skill_state.trusted_commit_sha,
                     "enabled": skill_state.enabled,
                     "drifted": drifted_sources.contains(source),
                     "commit_sha": commit_sha,
@@ -722,9 +771,7 @@ impl SkillsService for NoopSkillsService {
                 discover::{FsSkillDiscoverer, SkillDiscoverer},
                 requirements::{check_requirements, install_command_preview, run_install},
             },
-            moltis_tools::approval::{
-                ApprovalAction, ApprovalManager, ApprovalMode, SecurityLevel,
-            },
+            moltis_tools::approval::{ApprovalManager, ApprovalMode, SecurityLevel},
         };
 
         let skill_name = params
@@ -798,15 +845,20 @@ impl SkillsService for NoopSkillsService {
             .unwrap_or(SecurityLevel::Allowlist);
         approval.allowlist = config.tools.exec.allowlist;
 
-        match approval
+        let approval_action = approval
             .check_command(&command_preview)
             .await
-            .map_err(ServiceError::message)?
-        {
-            ApprovalAction::Proceed => {},
-            // skills.install_dep is an interactive RPC invoked by the user in the UI;
-            // `confirm=true` is treated as the explicit approval for this action.
-            ApprovalAction::NeedsApproval => {},
+            .map_err(ServiceError::message)?;
+        if let Err(error) = ensure_install_dep_approval(approval_action, &command_preview) {
+            security_audit(
+                "skills.install_dep_blocked",
+                serde_json::json!({
+                    "skill": skill_name,
+                    "command": command_preview,
+                    "reason": "needs_approval",
+                }),
+            );
+            return Err(error);
         }
 
         let result = run_install(spec).await.map_err(ServiceError::message)?;
@@ -889,7 +941,13 @@ impl SkillsService for NoopSkillsService {
 }
 
 fn local_repo_head_sha(repo_dir: &Path) -> Option<String> {
-    let repo = gix::open(repo_dir).ok()?;
+    let repo = match gix::open(repo_dir) {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::debug!(path = %repo_dir.display(), "skill repo is not a git repository, provenance SHA unavailable");
+            return None;
+        }
+    };
     let obj = repo.rev_parse_single("HEAD").ok()?;
     Some(obj.detach().to_hex().to_string())
 }
@@ -915,7 +973,7 @@ fn detect_and_mark_repo_drift(
             drifted.insert(repo.source.clone());
             repo.commit_sha = Some(current_sha);
             for skill in &mut repo.skills {
-                skill.trusted = false;
+                skill.set_trust_with_provenance(false, None, None);
                 skill.enabled = false;
             }
             security_audit(
@@ -1007,6 +1065,8 @@ fn skill_detail_discovered(source_type: &str, skill_name: &str) -> ServiceResult
         "missing_bins": elig.missing_bins,
         "install_options": elig.install_options,
         "trusted": true,
+        "trusted_at_ms": null,
+        "trusted_commit_sha": null,
         "enabled": true,
         "protected": is_protected_discovered_skill(skill_name),
         "body": content.body,
@@ -1039,24 +1099,13 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
     }
 
     if enabled {
-        if drifted_sources.contains(source) {
-            return Err(format!(
-                "skill '{skill_name}' source changed since it was last trusted. Review and run skills.skill.trust before enabling"
-            )
-            .into());
-        }
-
+        let drifted = drifted_sources.contains(source);
         let trusted = manifest
             .find_repo(source)
             .and_then(|r| r.skills.iter().find(|s| s.name == skill_name))
             .map(|s| s.trusted)
             .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
-        if !trusted {
-            return Err(format!(
-                "skill '{skill_name}' is not trusted. Review it and run skills.skill.trust before enabling"
-            )
-            .into());
-        }
+        ensure_skill_enable_allowed(skill_name, trusted, drifted)?;
     }
 
     if !manifest.set_skill_enabled(source, skill_name, enabled) {
@@ -1091,13 +1140,37 @@ fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
     let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
     let mut manifest = store.load().map_err(ServiceError::message)?;
 
-    if !manifest.set_skill_trusted(source, skill_name, trusted) {
+    let mut trusted_at_ms = None;
+    let mut trusted_commit_sha = None;
+    if trusted {
+        let repo = manifest
+            .find_repo(source)
+            .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
+        let install_dir =
+            moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
+        trusted_at_ms = Some(now_unix_ms());
+        trusted_commit_sha =
+            local_repo_head_sha(&install_dir.join(&repo.repo_name)).or(repo.commit_sha.clone());
+    }
+
+    if !manifest.set_skill_trusted_with_provenance(
+        source,
+        skill_name,
+        trusted,
+        trusted_at_ms,
+        trusted_commit_sha,
+    ) {
         return Err(format!("skill '{skill_name}' not found in repo '{source}'").into());
     }
 
     if !trusted {
         let _ = manifest.set_skill_enabled(source, skill_name, false);
     }
+
+    let skill_state = manifest
+        .find_repo(source)
+        .and_then(|repo| repo.skills.iter().find(|s| s.name == skill_name))
+        .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
 
     store.save(&manifest).map_err(ServiceError::message)?;
     security_audit(
@@ -1106,9 +1179,17 @@ fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
             "source": source,
             "skill": skill_name,
             "trusted": trusted,
+            "trusted_at_ms": skill_state.trusted_at_ms,
+            "trusted_commit_sha": skill_state.trusted_commit_sha,
         }),
     );
-    Ok(serde_json::json!({ "source": source, "skill": skill_name, "trusted": trusted }))
+    Ok(serde_json::json!({
+        "source": source,
+        "skill": skill_name,
+        "trusted": trusted,
+        "trusted_at_ms": skill_state.trusted_at_ms,
+        "trusted_commit_sha": skill_state.trusted_commit_sha,
+    }))
 }
 
 // ── Browser (Real implementation — depends on moltis-browser) ───────────────
@@ -1395,6 +1476,7 @@ impl GatewayServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moltis_tools::approval::ApprovalAction;
 
     #[test]
     fn risky_install_pattern_detects_piped_shell() {
@@ -1407,6 +1489,38 @@ mod tests {
     #[test]
     fn risky_install_pattern_allows_plain_package_install() {
         assert_eq!(risky_install_pattern("cargo install ripgrep"), None);
+    }
+
+    #[test]
+    fn install_dep_needs_approval_fails_closed() {
+        let error = match ensure_install_dep_approval(
+            ApprovalAction::NeedsApproval,
+            "brew install example-tool",
+        ) {
+            Ok(()) => panic!("needs-approval must fail closed"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("blocked by exec approval policy"));
+        assert!(message.contains("brew install example-tool"));
+    }
+
+    #[test]
+    fn install_dep_proceed_is_allowed() {
+        assert!(ensure_install_dep_approval(
+            ApprovalAction::Proceed,
+            "cargo install ripgrep"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn skill_enable_fails_closed_when_untrusted() {
+        let error = match ensure_skill_enable_allowed("demo-skill", false, false) {
+            Ok(()) => panic!("must reject untrusted skill enable"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not trusted"));
     }
 
     #[tokio::test]
