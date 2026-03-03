@@ -12,7 +12,6 @@ fi
 node --input-type=module - "$locales_dir" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 
 const localesDir = process.argv[2];
 
@@ -33,8 +32,9 @@ function flattenKeys(value, prefix = "", out = new Set()) {
 }
 
 async function loadLocaleModule(filePath) {
-	const fileUrl = `${pathToFileURL(filePath).href}?v=${Date.now()}`;
-	const mod = await import(fileUrl);
+	const source = fs.readFileSync(filePath, "utf8");
+	const dataUrl = `data:text/javascript;base64,${Buffer.from(source, "utf8").toString("base64")}`;
+	const mod = await import(dataUrl);
 	return mod.default ?? {};
 }
 
