@@ -240,7 +240,7 @@ pub enum VoiceTarget {
 /// Parse a `serde_json::Value` into a typed param struct, mapping
 /// deserialization errors to the service error format.
 pub fn parse_params<T: serde::de::DeserializeOwned>(
-    params: serde_json::Value,
+    params: Value,
 ) -> Result<T, ServiceError> {
     serde_json::from_value(params).map_err(ServiceError::message)
 }
