@@ -3165,6 +3165,10 @@ impl ChatService for LiveChatService {
             .get("_conn_id")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let source = params
+            .get("_source")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let trace_id = params
             .get("_trace_id")
             .and_then(|v| v.as_str())
@@ -4337,6 +4341,7 @@ impl ChatService for LiveChatService {
                         hook_registry,
                         accept_language.clone(),
                         conn_id.clone(),
+                        source.clone(),
                         trace_id.clone(),
                         Some(&session_store),
                         state_store.as_ref(),
@@ -4533,6 +4538,10 @@ impl ChatService for LiveChatService {
             .get("_trace_id")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let source = params
+            .get("_source")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let desired_reply_medium = infer_reply_medium(&params, &text);
 
         let explicit_model = params.get("model").and_then(|v| v.as_str());
@@ -4684,6 +4693,7 @@ impl ChatService for LiveChatService {
                 hook_registry,
                 None,
                 None, // send_sync: no conn_id
+                source,
                 trace_id,
                 Some(&self.session_store),
                 self.state_store.as_ref(),
@@ -6726,6 +6736,31 @@ async fn maybe_append_research_context(
     false
 }
 
+fn build_tool_context(
+    session_key: &str,
+    accept_language: Option<&str>,
+    conn_id: Option<&str>,
+    source: Option<&str>,
+    trace_id: Option<&str>,
+) -> Value {
+    let mut tool_context = serde_json::json!({
+        "_session_key": session_key,
+    });
+    if let Some(lang) = accept_language {
+        tool_context["_accept_language"] = serde_json::json!(lang);
+    }
+    if let Some(cid) = conn_id {
+        tool_context["_conn_id"] = serde_json::json!(cid);
+    }
+    if let Some(src) = source {
+        tool_context["_source"] = serde_json::json!(src);
+    }
+    if let Some(tid) = trace_id {
+        tool_context["_trace_id"] = serde_json::json!(tid);
+    }
+    tool_context
+}
+
 async fn run_with_tools(
     state: &Arc<dyn ChatRuntime>,
     model_store: &Arc<RwLock<DisabledModelsStore>>,
@@ -6747,6 +6782,7 @@ async fn run_with_tools(
     hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
     accept_language: Option<String>,
     conn_id: Option<String>,
+    source: Option<String>,
     trace_id: Option<String>,
     session_store: Option<&Arc<SessionStore>>,
     state_store: Option<&Arc<SessionStateStore>>,
@@ -7229,18 +7265,13 @@ async fn run_with_tools(
 
     // Inject session key and accept-language into tool call params so tools can
     // resolve per-session state and forward the user's locale to web requests.
-    let mut tool_context = serde_json::json!({
-        "_session_key": session_key,
-    });
-    if let Some(lang) = accept_language.as_deref() {
-        tool_context["_accept_language"] = serde_json::json!(lang);
-    }
-    if let Some(cid) = conn_id.as_deref() {
-        tool_context["_conn_id"] = serde_json::json!(cid);
-    }
-    if let Some(tid) = trace_id.as_deref() {
-        tool_context["_trace_id"] = serde_json::json!(tid);
-    }
+    let tool_context = build_tool_context(
+        session_key,
+        accept_language.as_deref(),
+        conn_id.as_deref(),
+        source.as_deref(),
+        trace_id.as_deref(),
+    );
 
     // Research phase: gather context before the main agent turn when enabled.
     let _ = maybe_append_research_context(
@@ -9731,6 +9762,30 @@ mod tests {
         assert_eq!(host.timezone.as_deref(), Some("America/New_York"));
         assert!(host.time.as_deref().is_some_and(|value| !value.is_empty()));
         assert!(host.today.as_deref().is_some_and(|value| value.len() >= 10));
+    }
+
+    #[test]
+    fn build_tool_context_includes_optional_source_when_present() {
+        let ctx = build_tool_context(
+            "session:abc",
+            Some("en-US"),
+            Some("conn-1"),
+            Some("cron"),
+            Some("trace-1"),
+        );
+
+        assert_eq!(ctx["_session_key"], "session:abc");
+        assert_eq!(ctx["_accept_language"], "en-US");
+        assert_eq!(ctx["_conn_id"], "conn-1");
+        assert_eq!(ctx["_source"], "cron");
+        assert_eq!(ctx["_trace_id"], "trace-1");
+    }
+
+    #[test]
+    fn build_tool_context_omits_source_when_absent() {
+        let ctx = build_tool_context("main", None, None, None, None);
+        assert_eq!(ctx["_session_key"], "main");
+        assert!(ctx.get("_source").is_none());
     }
 
     #[test]

@@ -425,6 +425,8 @@ sandbox = false                   # Run browser in Docker/Apple Container for is
 # When set, browser will refuse to navigate to domains not in this list.
 # This helps prevent prompt injection from untrusted websites.
 allowed_domains = []              # Empty = all domains allowed
+# For autonomous browser runs (cron/dispatch). Empty + empty allowed_domains = block autonomous navigation.
+autonomous_allowed_domains = []
 # allowed_domains = [
 #     "docs.example.com",         # Exact match
 #     "*.github.com",             # Wildcard: matches any subdomain of github.com

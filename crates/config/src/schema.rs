@@ -1680,6 +1680,11 @@ pub struct BrowserConfig {
     /// Supports wildcards: "*.example.com" matches subdomains.
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Allowed domains for autonomous browser runs (e.g. cron/dispatch).
+    /// Empty list means autonomous runs are blocked unless `allowed_domains` is set.
+    /// Supports the same wildcard behavior as `allowed_domains`.
+    #[serde(default)]
+    pub autonomous_allowed_domains: Vec<String>,
     /// Total system RAM threshold (MB) below which memory-saving Chrome flags
     /// are injected automatically. Set to 0 to disable. Default: 2048.
     #[serde(default = "default_low_memory_threshold_mb")]
@@ -1769,6 +1774,7 @@ impl Default for BrowserConfig {
             chrome_args: Vec::new(),
             sandbox_image: default_sandbox_image(),
             allowed_domains: Vec::new(),
+            autonomous_allowed_domains: Vec::new(),
             low_memory_threshold_mb: default_low_memory_threshold_mb(),
             persist_profile: default_persist_profile(),
             profile_dir: None,
