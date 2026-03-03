@@ -3224,6 +3224,7 @@ impl ChatService for LiveChatService {
                 session_key: session_key.clone(),
                 content: text.clone(),
                 channel,
+                trace_id: trace_id.clone(),
             };
             if let Err(e) = hooks.dispatch(&payload).await {
                 warn!(session = %session_key, error = %e, "MessageReceived hook failed");

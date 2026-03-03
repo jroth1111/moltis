@@ -148,14 +148,20 @@ pub enum HookPayload {
         session_key: String,
         content: String,
         channel: Option<String>,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     MessageSending {
         session_key: String,
         content: String,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     MessageSent {
         session_key: String,
         content: String,
+        #[serde(default)]
+        trace_id: Option<String>,
     },
     BeforeToolCall {
         session_key: String,
