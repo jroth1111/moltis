@@ -2736,6 +2736,58 @@ async fn mark_self_repair_finished(state_store: Option<&SessionStateStore>, sess
     }
 }
 
+/// RAII guard that ensures self-repair cleanup happens when dropped.
+/// Uses a tokio spawn to handle async cleanup since Drop is sync.
+struct SelfRepairGuard {
+    state_store: Option<Arc<SessionStateStore>>,
+    session_key: String,
+}
+
+impl SelfRepairGuard {
+    fn new(state_store: Option<&Arc<SessionStateStore>>, session_key: &str) -> Self {
+        Self {
+            state_store: state_store.cloned(),
+            session_key: session_key.to_string(),
+        }
+    }
+
+    /// Mark the session as started. Must be awaited after creating the guard.
+    async fn mark_started(&self) {
+        if let Some(ref store) = self.state_store {
+            if let Err(error) =
+                moltis_agents::self_repair::mark_session_started(store, &self.session_key).await
+            {
+                warn!(
+                    session = %self.session_key,
+                    error = %error,
+                    "failed to mark session as running for self-repair"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SelfRepairGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.state_store.take() {
+            let session_key = std::mem::take(&mut self.session_key);
+            // Spawn a background task for async cleanup.
+            // Best-effort: if this fails, the background scanner will eventually clean up.
+            tokio::spawn(async move {
+                if let Err(error) =
+                    moltis_agents::self_repair::mark_session_finished(&store, &session_key).await
+                {
+                    warn!(
+                        session = %session_key,
+                        error = %error,
+                        "failed to mark session as finished for self-repair (cleanup task)"
+                    );
+                }
+            });
+        }
+    }
+}
+
 fn suggested_next_step_for_error(error: &str) -> Option<String> {
     use moltis_agents::classify::{ProviderErrorKind, classify_error_message};
 
@@ -6904,8 +6956,9 @@ async fn run_with_tools(
         append_handoff_constraints(&mut system_prompt, &handoff_context);
     }
 
-    // Mark session as running for self-repair tracking.
-    mark_self_repair_started(state_store.map(|v| v.as_ref()), session_key).await;
+    // RAII guard ensures self-repair cleanup on all exit paths (including early returns).
+    let _self_repair_guard = SelfRepairGuard::new(state_store, session_key);
+    _self_repair_guard.mark_started().await;
 
     let provider_ref = provider.clone();
     let first_result = run_agent_loop_streaming(
@@ -7008,8 +7061,7 @@ async fn run_with_tools(
         other => other,
     };
 
-    // Mark session as finished for self-repair tracking.
-    mark_self_repair_finished(state_store.map(|v| v.as_ref()), session_key).await;
+    // Self-repair cleanup happens automatically via _self_repair_guard Drop.
 
     // Ensure all runner events (including deltas) are broadcast in order before
     // emitting terminal final/error frames.
