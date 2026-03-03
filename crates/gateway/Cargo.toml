@@ -63,7 +63,7 @@ moltis-tools           = { workspace = true }
 moltis-vault           = { optional = true, workspace = true }
 moltis-voice           = { optional = true, workspace = true }
 moltis-whatsapp        = { optional = true, workspace = true }
-p256                   = { features = ["ecdsa"], optional = true, workspace = true }
+p256                   = { features = ["ecdsa"], workspace = true }
 once_cell              = { workspace = true }
 portable-pty           = { optional = true, workspace = true }
 pulldown-cmark         = { features = ["html"], workspace = true }
@@ -141,7 +141,7 @@ mdns = ["dep:mdns-sd"]
 metrics = ["dep:moltis-metrics", "moltis-chat/metrics", "moltis-metrics/sqlite"]
 openclaw-import = ["dep:moltis-openclaw-import"]
 prometheus = ["metrics", "moltis-metrics/prometheus"]
-push-notifications = ["dep:chrono", "dep:p256", "dep:web-push", "moltis-chat/push-notifications"]
+push-notifications = ["dep:chrono", "dep:web-push", "moltis-chat/push-notifications"]
 qmd = ["dep:moltis-qmd"]
 tailscale = ["dep:moltis-tailscale"]
 tls = [

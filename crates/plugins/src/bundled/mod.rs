@@ -10,4 +10,3 @@ pub mod pattern_scanner;
 pub mod prompt_guard;
 pub mod screenshot_resolver;
 pub mod session_memory;
-pub mod task_board;

@@ -30,7 +30,7 @@ impl ChatRuntime for GatewayChatRuntime {
     // ── Broadcasting ────────────────────────────────────────────────────────
 
     async fn broadcast(&self, topic: &str, payload: Value) {
-        crate::broadcast::broadcast(
+        crate::broadcast::broadcast_raw(
             &self.state,
             topic,
             payload,

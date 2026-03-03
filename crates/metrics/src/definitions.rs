@@ -52,6 +52,10 @@ pub mod llm {
     pub const TIME_TO_FIRST_TOKEN_SECONDS: &str = "moltis_llm_time_to_first_token_seconds";
     /// Tokens per second generation rate
     pub const TOKENS_PER_SECOND: &str = "moltis_llm_tokens_per_second";
+    /// Outbound provider calls queued by the client-side rate limiter
+    pub const PROVIDER_RATE_LIMIT_QUEUED: &str = "moltis_provider_rate_limit_queued";
+    /// Outbound provider calls rejected by the client-side rate limiter
+    pub const PROVIDER_RATE_LIMIT_REJECTED: &str = "moltis_provider_rate_limit_rejected";
 }
 
 /// Session metrics
@@ -64,6 +68,10 @@ pub mod session {
     pub const MESSAGES_TOTAL: &str = "moltis_session_messages_total";
     /// Session duration in seconds
     pub const DURATION_SECONDS: &str = "moltis_session_duration_seconds";
+    /// Session recoveries performed after self-repair detected interrupted runs
+    pub const RECOVERY_TOTAL: &str = "moltis_session_recovery_total";
+    /// Malformed JSONL lines skipped while loading session history.
+    pub const JSONL_LINES_SKIPPED: &str = "moltis_session_jsonl_lines_skipped_total";
 }
 
 /// Chat metrics

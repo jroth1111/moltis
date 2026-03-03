@@ -12,7 +12,8 @@ use crate::manifest::ManifestStore;
 ///
 /// - Merges repos from `plugins-manifest.json` into `skills-manifest.json`
 /// - Moves directories from `installed-plugins/` to `installed-skills/`
-/// - Preserves all fields: `trusted`, `enabled`, `commit_sha`, `format`, `relative_path`
+/// - Preserves all fields: `trusted`, `trusted_at_ms`, `trusted_commit_sha`, `enabled`,
+///   `commit_sha`, `format`, `relative_path`
 /// - Skips entries already in skills manifest (idempotent)
 /// - Deletes old manifest + empty old dir after successful migration
 ///
@@ -138,6 +139,8 @@ mod tests {
                     name: "pr-review-toolkit:code-reviewer".into(),
                     relative_path: "anthropics-claude-plugins-official".into(),
                     trusted: false,
+                    trusted_at_ms: None,
+                    trusted_commit_sha: None,
                     enabled: true,
                 }],
             }],
@@ -204,6 +207,8 @@ mod tests {
                 name: "plugin:skill".into(),
                 relative_path: "owner-repo".into(),
                 trusted: true,
+                trusted_at_ms: None,
+                trusted_commit_sha: None,
                 enabled: true,
             }],
         };

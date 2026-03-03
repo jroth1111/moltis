@@ -201,6 +201,163 @@ impl AgentTool for MemorySaveTool {
     }
 }
 
+/// Tool: persist a failure signature and resolution into long-term memory.
+pub struct MemoryLearnTool {
+    manager: Arc<MemoryManager>,
+}
+
+impl MemoryLearnTool {
+    pub fn new(manager: Arc<MemoryManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MemoryLearnTool {
+    fn name(&self) -> &str {
+        "memory_learn"
+    }
+
+    fn description(&self) -> &str {
+        "Store a validated failure signature and its resolution in memory/failures.md so future runs can reuse successful fixes."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "failure_signature": {
+                    "type": "string",
+                    "description": "Canonicalized failure signature (error class, subsystem, and key symptom)"
+                },
+                "resolution": {
+                    "type": "string",
+                    "description": "Validated resolution steps or fix artifact summary"
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Optional extra context (trace ID, environment, reproducer)"
+                }
+            },
+            "required": ["failure_signature", "resolution"]
+        })
+    }
+
+    async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let failure_signature = params["failure_signature"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'failure_signature' parameter"))?
+            .trim();
+        if failure_signature.is_empty() {
+            anyhow::bail!("'failure_signature' must not be empty");
+        }
+
+        let resolution = params["resolution"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'resolution' parameter"))?
+            .trim();
+        if resolution.is_empty() {
+            anyhow::bail!("'resolution' must not be empty");
+        }
+
+        let context = params["context"].as_str().unwrap_or("").trim();
+        let recorded_at = chrono::Utc::now().to_rfc3339();
+
+        let mut entry = format!(
+            "## Failure Signature: {failure_signature}\n\
+             - recorded_at: {recorded_at}\n\
+             - resolution: {resolution}\n"
+        );
+        if !context.is_empty() {
+            entry.push_str(&format!("- context: {context}\n"));
+        }
+        entry.push('\n');
+
+        use moltis_agents::memory_writer::MemoryWriter;
+        let result = self
+            .manager
+            .write_memory("memory/failures.md", &entry, true)
+            .await?;
+
+        Ok(json!({
+            "saved": true,
+            "path": "memory/failures.md",
+            "failure_signature": failure_signature,
+            "bytes_written": result.bytes_written,
+        }))
+    }
+}
+
+/// Tool: search previously learned failure resolutions.
+pub struct MemoryRecallFailuresTool {
+    manager: Arc<MemoryManager>,
+}
+
+impl MemoryRecallFailuresTool {
+    pub fn new(manager: Arc<MemoryManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[async_trait]
+impl AgentTool for MemoryRecallFailuresTool {
+    fn name(&self) -> &str {
+        "memory_recall_failures"
+    }
+
+    fn description(&self) -> &str {
+        "Search memory/failures.md for prior validated fixes matching a failure signature or symptom."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Failure signature or symptom to look up"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of matching failure records to return",
+                    "default": 5
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let query = params["query"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing 'query' parameter"))?;
+        let limit = params["limit"].as_u64().unwrap_or(5) as usize;
+
+        // Query slightly above limit before filtering to failures.md hits.
+        let search_limit = limit.saturating_mul(3).max(limit);
+        let results = self.manager.search(query, search_limit).await?;
+        let items: Vec<serde_json::Value> = results
+            .into_iter()
+            .filter(|r| r.path.ends_with("memory/failures.md"))
+            .take(limit)
+            .map(|r| {
+                json!({
+                    "chunk_id": r.chunk_id,
+                    "path": r.path,
+                    "source": r.source,
+                    "start_line": r.start_line,
+                    "end_line": r.end_line,
+                    "score": r.score,
+                    "text": r.text,
+                    "citation": format!("{}#{}", r.path, r.start_line),
+                })
+            })
+            .collect();
+
+        Ok(json!({ "results": items }))
+    }
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
@@ -476,6 +633,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_memory_learn_tool_schema() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (manager, _tmp) = rt.block_on(setup_manager());
+        let tool = MemoryLearnTool::new(manager);
+        assert_eq!(tool.name(), "memory_learn");
+        let schema = tool.parameters_schema();
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("failure_signature"))
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("resolution"))
+        );
+    }
+
+    #[test]
+    fn test_memory_recall_failures_tool_schema() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (manager, _tmp) = rt.block_on(setup_manager());
+        let tool = MemoryRecallFailuresTool::new(manager);
+        assert_eq!(tool.name(), "memory_recall_failures");
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["query"].is_object());
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("query"))
+        );
+    }
+
     /// Default append mode: two writes produce both contents in the file.
     #[tokio::test]
     async fn test_memory_save_append_default() {
@@ -713,5 +907,64 @@ mod tests {
             retrieved.contains("jazz era"),
             "round-trip text should contain saved content, got: {retrieved}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_memory_learn_writes_structured_entry() {
+        let (manager, tmp) = setup_manager().await;
+        let tool = MemoryLearnTool::new(Arc::clone(&manager));
+
+        let result = tool
+            .execute(json!({
+                "failure_signature": "timeout:provider=openai",
+                "resolution": "retry with fallback model and 10s timeout",
+                "context": "trace_id=abc-123"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["saved"], json!(true));
+        assert_eq!(result["path"], json!("memory/failures.md"));
+        let content =
+            std::fs::read_to_string(tmp.path().join("memory").join("failures.md")).unwrap();
+        assert!(content.contains("Failure Signature: timeout:provider=openai"));
+        assert!(content.contains("resolution: retry with fallback model and 10s timeout"));
+        assert!(content.contains("context: trace_id=abc-123"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_recall_failures_finds_matching_entry() {
+        let (manager, _tmp) = setup_manager().await;
+        let learn = MemoryLearnTool::new(Arc::clone(&manager));
+        let recall = MemoryRecallFailuresTool::new(Arc::clone(&manager));
+
+        learn
+            .execute(json!({
+                "failure_signature": "db-lock-timeout",
+                "resolution": "serialize migrations before writes"
+            }))
+            .await
+            .unwrap();
+
+        let result = recall
+            .execute(json!({ "query": "lock timeout", "limit": 5 }))
+            .await
+            .unwrap();
+        let items = result["results"].as_array().unwrap();
+        assert!(!items.is_empty(), "expected at least one failure match");
+        assert_eq!(items[0]["path"], json!("memory/failures.md"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_recall_failures_empty_when_no_match() {
+        let (manager, _tmp) = setup_manager().await;
+        let recall = MemoryRecallFailuresTool::new(Arc::clone(&manager));
+
+        let result = recall
+            .execute(json!({ "query": "totally-unrelated-signature", "limit": 3 }))
+            .await
+            .unwrap();
+        let items = result["results"].as_array().unwrap();
+        assert!(items.is_empty());
     }
 }

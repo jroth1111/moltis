@@ -7,11 +7,16 @@
 
 use std::sync::Arc;
 
-use {async_trait::async_trait, futures::future::BoxFuture, serde_json::Value};
+use {async_trait::async_trait, futures::future::BoxFuture, serde_json::Value, tracing::warn};
 
 use {
     moltis_agents::tool_registry::AgentTool,
-    moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore},
+    moltis_common::handoff::{
+        HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
+    },
+    moltis_sessions::{
+        metadata::SqliteSessionMetadata, state_store::SessionStateStore, store::SessionStore,
+    },
 };
 
 use crate::{
@@ -61,11 +66,22 @@ impl SessionsHistoryTool {
 pub struct SessionsSendTool {
     metadata: Arc<SqliteSessionMetadata>,
     send_fn: SendToSessionFn,
+    state_store: Option<Arc<SessionStateStore>>,
 }
 
 impl SessionsSendTool {
     pub fn new(metadata: Arc<SqliteSessionMetadata>, send_fn: SendToSessionFn) -> Self {
-        Self { metadata, send_fn }
+        Self {
+            metadata,
+            send_fn,
+            state_store: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_state_store(mut self, state_store: Arc<SessionStateStore>) -> Self {
+        self.state_store = Some(state_store);
+        self
     }
 }
 
@@ -238,6 +254,10 @@ impl AgentTool for SessionsSendTool {
                 "model": {
                     "type": "string",
                     "description": "Optional model override for the target session turn."
+                },
+                "handoff_context": {
+                    "type": "object",
+                    "description": "Optional structured handoff context. If omitted, sessions_send attempts to load the latest handoff context from the sender session."
                 }
             },
             "required": ["key", "message"]
@@ -252,6 +272,7 @@ impl AgentTool for SessionsSendTool {
         let context = owned_str_param(&params, &["context"]);
         let model = owned_str_param(&params, &["model"]);
         let trace_id = owned_str_param(&params, &["_trace_id"]);
+        let source_session_key = owned_str_param(&params, &["_session_key"]);
 
         let entry = self
             .metadata
@@ -264,6 +285,62 @@ impl AgentTool for SessionsSendTool {
         } else {
             message
         };
+
+        let explicit_handoff = if let Some(value) = params
+            .get("handoff_context")
+            .or_else(|| params.get("handoffContext"))
+        {
+            Some(
+                serde_json::from_value::<HandoffContext>(value.clone()).map_err(|error| {
+                    Error::message(format!("invalid handoff_context payload: {error}"))
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let handoff = if explicit_handoff.is_some() {
+            explicit_handoff
+        } else if let (Some(store), Some(source_key)) = (&self.state_store, source_session_key) {
+            store
+                .get(&source_key, HANDOFF_NAMESPACE, HANDOFF_LATEST_KEY)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_str::<HandoffContext>(&value).ok())
+        } else {
+            None
+        };
+
+        let handoff_attached = handoff.is_some();
+        let mut handoff_persisted = false;
+        if let Some(handoff_context) = handoff
+            && let Some(store) = &self.state_store
+        {
+            match serde_json::to_string(&handoff_context) {
+                Ok(serialized) => {
+                    if let Err(error) = store
+                        .set(&key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY, &serialized)
+                        .await
+                    {
+                        warn!(
+                            session = %key,
+                            error = %error,
+                            "sessions_send: failed to persist inbound handoff context"
+                        );
+                    } else {
+                        handoff_persisted = true;
+                    }
+                },
+                Err(error) => {
+                    warn!(
+                        session = %key,
+                        error = %error,
+                        "sessions_send: failed to serialize handoff context"
+                    );
+                },
+            }
+        }
 
         let result = (self.send_fn)(SendToSessionRequest {
             key: key.clone(),
@@ -279,6 +356,8 @@ impl AgentTool for SessionsSendTool {
             "label": entry.label,
             "sent": true,
             "waitForReply": wait_for_reply,
+            "handoffAttached": handoff_attached,
+            "handoffPersisted": handoff_persisted,
             "result": result,
         }))
     }
@@ -302,6 +381,23 @@ mod tests {
             .await?;
         SqliteSessionMetadata::init(&pool).await?;
         Ok(pool)
+    }
+
+    async fn test_state_store() -> TestResult<Arc<SessionStateStore>> {
+        let pool = sqlx::SqlitePool::connect(":memory:").await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS session_state (
+                session_key TEXT NOT NULL,
+                namespace   TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_key, namespace, key)
+            )"#,
+        )
+        .execute(&pool)
+        .await?;
+        Ok(Arc::new(SessionStateStore::new(pool)))
     }
 
     #[tokio::test]
@@ -478,6 +574,57 @@ mod tests {
 
         assert_eq!(result["sent"], true);
         assert_eq!(result["result"]["text"], "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sessions_send_attaches_handoff_context_from_state_store() -> TestResult<()> {
+        let metadata = Arc::new(SqliteSessionMetadata::new(test_pool().await?));
+        metadata
+            .upsert("session:target", Some("Target".to_string()))
+            .await?;
+
+        let state_store = test_state_store().await?;
+        let mut handoff = HandoffContext {
+            last_action: Some("attempted migration".into()),
+            observed_error: Some("command timed out".into()),
+            dead_ends: Vec::new(),
+            suggested_next_step: Some("try a narrower query".into()),
+            estimated_tokens: Some(900),
+        };
+        handoff.add_dead_end("exec", "timeout", "build command timed out");
+        let handoff_json = serde_json::to_string(&handoff)?;
+        state_store
+            .set("session:source", "handoff", "latest", &handoff_json)
+            .await?;
+
+        let send_fn: SendToSessionFn = Arc::new(move |req| {
+            Box::pin(async move {
+                assert!(!req.message.contains("[HandoffContext]"));
+                Ok(serde_json::json!({ "text": "ok" }))
+            })
+        });
+        let tool =
+            SessionsSendTool::new(metadata, send_fn).with_state_store(Arc::clone(&state_store));
+
+        let result = tool
+            .execute(serde_json::json!({
+                "key": "session:target",
+                "message": "Do work",
+                "_session_key": "session:source"
+            }))
+            .await?;
+
+        assert_eq!(result["sent"], true);
+        assert_eq!(result["handoffAttached"], true);
+        assert_eq!(result["handoffPersisted"], true);
+
+        let persisted = state_store
+            .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+            .await?
+            .ok_or_else(|| std::io::Error::other("expected inbound handoff"))?;
+        let parsed: HandoffContext = serde_json::from_str(&persisted)?;
+        assert!(!parsed.dead_ends.is_empty());
         Ok(())
     }
 

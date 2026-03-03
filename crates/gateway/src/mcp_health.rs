@@ -9,7 +9,7 @@ use std::{
 use tracing::{info, warn};
 
 use crate::{
-    broadcast::{BroadcastOpts, broadcast},
+    broadcast::{BroadcastOpts, broadcast_raw},
     mcp_service::LiveMcpService,
     state::GatewayState,
 };
@@ -103,7 +103,7 @@ pub async fn run_health_monitor(state: Arc<GatewayState>, mcp: Arc<LiveMcpServic
 
         if changed {
             let payload = serde_json::to_value(&statuses).unwrap_or_default();
-            broadcast(&state, "mcp.status", payload, BroadcastOpts::default()).await;
+            broadcast_raw(&state, "mcp.status", payload, BroadcastOpts::default()).await;
         }
     }
 }

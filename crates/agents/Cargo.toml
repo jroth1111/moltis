@@ -11,6 +11,7 @@ metrics = ["dep:moltis-metrics"]
 anyhow          = { workspace = true }
 async-stream    = { workspace = true }
 async-trait     = { workspace = true }
+dashmap         = { workspace = true }
 futures         = { workspace = true }
 moltis-common   = { workspace = true }
 rand            = { workspace = true }

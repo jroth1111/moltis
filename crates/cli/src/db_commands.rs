@@ -68,13 +68,16 @@ async fn clear_databases() -> anyhow::Result<()> {
 
         // Order matters due to foreign key constraints.
         // Delete from child tables first.
-        let tables = [
+        let mut tables = vec![
             // Sessions/channels (depends on projects)
             "channel_sessions",
             "sessions",
             // Cron (cron_runs depends on cron_jobs)
             "cron_runs",
             "cron_jobs",
+        ];
+        #[cfg(feature = "gateway")]
+        tables.extend([
             // Gateway tables (no dependencies between them)
             "auth_sessions",
             "api_keys",
@@ -83,9 +86,9 @@ async fn clear_databases() -> anyhow::Result<()> {
             "env_variables",
             "message_log",
             "channels",
-            // Projects (other tables depend on this)
-            "projects",
-        ];
+        ]);
+        // Projects (other tables depend on this)
+        tables.push("projects");
 
         for table in tables {
             // Use raw query to avoid compile-time checks
@@ -160,10 +163,13 @@ async fn run_migrations() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("cron migrations failed: {e}"))?;
     println!("  - cron migrations complete");
 
-    moltis_gateway::run_migrations(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("gateway migrations failed: {e}"))?;
-    println!("  - gateway migrations complete");
+    #[cfg(feature = "gateway")]
+    {
+        moltis_gateway::run_migrations(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("gateway migrations failed: {e}"))?;
+        println!("  - gateway migrations complete");
+    }
 
     pool.close().await;
 
@@ -260,6 +266,7 @@ mod tests {
         moltis_projects::run_migrations(&pool).await.unwrap();
         moltis_sessions::run_migrations(&pool).await.unwrap();
         moltis_cron::run_migrations(&pool).await.unwrap();
+        #[cfg(feature = "gateway")]
         moltis_gateway::run_migrations(&pool).await.unwrap();
 
         // Verify tables were created by querying them
@@ -275,6 +282,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+        #[cfg(feature = "gateway")]
         let _: (i64,) = sqlx::query_as("SELECT count(*) FROM channels")
             .fetch_one(&pool)
             .await
@@ -321,12 +329,14 @@ mod tests {
         moltis_projects::run_migrations(&pool).await.unwrap();
         moltis_sessions::run_migrations(&pool).await.unwrap();
         moltis_cron::run_migrations(&pool).await.unwrap();
+        #[cfg(feature = "gateway")]
         moltis_gateway::run_migrations(&pool).await.unwrap();
 
         // Run again - should still work due to set_ignore_missing
         moltis_projects::run_migrations(&pool).await.unwrap();
         moltis_sessions::run_migrations(&pool).await.unwrap();
         moltis_cron::run_migrations(&pool).await.unwrap();
+        #[cfg(feature = "gateway")]
         moltis_gateway::run_migrations(&pool).await.unwrap();
 
         pool.close().await;

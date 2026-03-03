@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use {
-    axum::extract::ws::{Message, WebSocket},
+    axum::extract::ws::{CloseFrame, Message, WebSocket},
     futures::{SinkExt, stream::StreamExt},
     tokio::sync::mpsc,
     tracing::{debug, info, warn},
@@ -15,10 +15,10 @@ use moltis_protocol::{
 
 use crate::{
     auth,
-    broadcast::{BroadcastOpts, broadcast},
+    broadcast::{BroadcastEvent, BroadcastOpts, broadcast},
     methods::{MethodContext, MethodRegistry},
     nodes::NodeSession,
-    state::{ConnectedClient, GatewayState},
+    state::{ConnectedClient, GatewayState, OutboundWsFrame},
 };
 
 fn top_level_param_keys(params: &Option<serde_json::Value>) -> Vec<String> {
@@ -39,6 +39,7 @@ pub async fn handle_connection(
     accept_language: Option<String>,
     remote_ip: Option<String>,
     header_authenticated: bool,
+    header_api_key_scopes: Option<Vec<String>>,
     is_local: bool,
 ) {
     let conn_id = uuid::Uuid::new_v4().to_string();
@@ -47,14 +48,29 @@ pub async fn handle_connection(
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     // Bounded channel prevents unbounded memory growth from slow clients.
-    let (client_tx, mut client_rx) = mpsc::channel::<String>(512);
+    let (client_tx, mut client_rx) = mpsc::channel::<OutboundWsFrame>(512);
 
     // Spawn write loop: forwards frames from the client_tx channel to the WebSocket.
     let write_conn_id = conn_id.clone();
     let write_handle = tokio::spawn(async move {
-        while let Some(msg) = client_rx.recv().await {
-            if ws_tx.send(Message::Text(msg.into())).await.is_err() {
+        while let Some(frame) = client_rx.recv().await {
+            let (send_result, should_break) = match frame {
+                OutboundWsFrame::Text(msg) => (ws_tx.send(Message::Text(msg.into())).await, false),
+                OutboundWsFrame::Close { code, reason } => (
+                    ws_tx
+                        .send(Message::Close(Some(CloseFrame {
+                            code,
+                            reason: reason.into(),
+                        })))
+                        .await,
+                    true,
+                ),
+            };
+            if send_result.is_err() {
                 debug!(conn_id = %write_conn_id, "ws: write loop closed");
+                break;
+            }
+            if should_break {
                 break;
             }
         }
@@ -117,7 +133,7 @@ pub async fn handle_connection(
             ),
         );
         #[allow(clippy::unwrap_used)] // serializing known-valid struct
-        let _ = client_tx.try_send(serde_json::to_string(&err).unwrap());
+        let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
         drop(client_tx);
         write_handle.abort();
         return;
@@ -139,16 +155,15 @@ pub async fn handle_connection(
     // See CVE-2026-25253 for the analogous OpenClaw vulnerability.
     let mut authenticated = header_authenticated;
     // Scopes from API key verification (if any).
-    let mut api_key_scopes: Option<Vec<String>> = None;
+    let mut api_key_scopes: Option<Vec<String>> = header_api_key_scopes;
 
-    if !authenticated && let Some(ref cred_store) = state.credential_store {
+    if let Some(ref cred_store) = state.credential_store {
         if cred_store.is_setup_complete() {
-            // Check API key.
-            if let Some(ref api_key) = params.auth.as_ref().and_then(|a| a.api_key.clone())
+            if api_key_scopes.is_none()
+                && let Some(ref api_key) = params.auth.as_ref().and_then(|a| a.api_key.clone())
                 && let Ok(Some(verification)) = cred_store.verify_api_key(api_key).await
             {
                 authenticated = true;
-                // Store the scopes from the API key (empty = no access)
                 api_key_scopes = Some(verification.scopes);
             }
             // Check password against DB hash.
@@ -158,7 +173,7 @@ pub async fn handle_connection(
             {
                 authenticated = true;
             }
-        } else {
+        } else if !authenticated {
             // Setup not complete yet — only allow local connections.
             // Remote connections must go through the onboarding/setup flow.
             if is_local {
@@ -195,7 +210,7 @@ pub async fn handle_connection(
             ErrorShape::new(error_codes::UNAUTHORIZED, "authentication failed"),
         );
         #[allow(clippy::unwrap_used)] // serializing known-valid struct
-        let _ = client_tx.try_send(serde_json::to_string(&err).unwrap());
+        let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
         drop(client_tx);
         write_handle.abort();
         return;
@@ -222,7 +237,7 @@ pub async fn handle_connection(
                 ),
             );
             #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let _ = client_tx.try_send(serde_json::to_string(&err).unwrap());
+            let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
             drop(client_tx);
             write_handle.abort();
             return;
@@ -275,7 +290,7 @@ pub async fn handle_connection(
     let hello_val = serde_json::to_value(&hello).unwrap();
     let resp = ResponseFrame::ok(&request_id, hello_val);
     #[allow(clippy::unwrap_used)] // serializing known-valid struct
-    let _ = client_tx.try_send(serde_json::to_string(&resp).unwrap());
+    let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&resp).unwrap()));
 
     info!(
         conn_id = %conn_id,
@@ -374,12 +389,7 @@ pub async fn handle_connection(
         // Broadcast presence change.
         broadcast(
             &state,
-            "presence",
-            serde_json::json!({
-                "type": "node.connected",
-                "nodeId": params.client.id,
-                "platform": params.client.platform,
-            }),
+            BroadcastEvent::node_connected(&params.client.id, &params.client.platform),
             BroadcastOpts::default(),
         )
         .await;
@@ -407,7 +417,7 @@ pub async fn handle_connection(
                 state.next_seq(),
             );
             #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let _ = client_tx.try_send(serde_json::to_string(&err).unwrap());
+            let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
             continue;
         }
 
@@ -421,7 +431,8 @@ pub async fn handle_connection(
                     state.next_seq(),
                 );
                 #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let _ = client_tx.try_send(serde_json::to_string(&err).unwrap());
+                let _ =
+                    client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
                 continue;
             },
         };
@@ -433,6 +444,27 @@ pub async fn handle_connection(
 
         match frame {
             GatewayFrame::Request(req) => {
+                if state.is_shutting_down() {
+                    warn!(
+                        conn_id = %conn_id,
+                        request_id = %req.id,
+                        method = %req.method,
+                        "ws: rejecting request during shutdown drain"
+                    );
+                    let response = ResponseFrame::err(
+                        &req.id,
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            "gateway is shutting down; request rejected",
+                        ),
+                    );
+                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
+                    let _ = client_tx.try_send(OutboundWsFrame::Text(
+                        serde_json::to_string(&response).unwrap(),
+                    ));
+                    continue;
+                }
+
                 if state.ws_request_logs {
                     info!(
                         conn_id = %conn_id,
@@ -464,7 +496,9 @@ pub async fn handle_connection(
                     );
                 }
                 #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let _ = client_tx.try_send(serde_json::to_string(&response).unwrap());
+                let _ = client_tx.try_send(OutboundWsFrame::Text(
+                    serde_json::to_string(&response).unwrap(),
+                ));
             },
             GatewayFrame::Response(res) => {
                 // v4 bidirectional RPC: client responding to a server-initiated request.
@@ -504,11 +538,7 @@ pub async fn handle_connection(
         info!(conn_id = %conn_id, node_id = %node.node_id, "node unregistered");
         broadcast(
             &state,
-            "presence",
-            serde_json::json!({
-                "type": "node.disconnected",
-                "nodeId": node.node_id,
-            }),
+            BroadcastEvent::node_disconnected(&node.node_id),
             BroadcastOpts::default(),
         )
         .await;

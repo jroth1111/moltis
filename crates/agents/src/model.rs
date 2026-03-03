@@ -357,6 +357,14 @@ pub trait LlmProvider: Send + Sync {
         None
     }
 
+    /// Whether this provider already emits core LLM metrics internally.
+    ///
+    /// When true, higher layers should avoid recording duplicate completion
+    /// counters/histograms for the same provider call.
+    fn emits_metrics(&self) -> bool {
+        false
+    }
+
     /// Stream a completion, yielding delta/done/error events.
     fn stream(
         &self,

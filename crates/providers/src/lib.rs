@@ -481,6 +481,10 @@ impl LlmProvider for RegistryModelProvider {
         self.inner.tool_mode()
     }
 
+    fn emits_metrics(&self) -> bool {
+        self.inner.emits_metrics()
+    }
+
     fn context_window(&self) -> u32 {
         self.inner.context_window()
     }

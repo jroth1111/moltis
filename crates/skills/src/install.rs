@@ -65,6 +65,8 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
                         name: e.metadata.name.clone(),
                         relative_path: relative.clone(),
                         trusted: false,
+                        trusted_at_ms: None,
+                        trusted_commit_sha: None,
                         enabled: false,
                     })
                     .collect();
@@ -274,6 +276,8 @@ async fn scan_repo_skills(
             name: meta.name.clone(),
             relative_path: relative,
             trusted: false,
+            trusted_at_ms: None,
+            trusted_commit_sha: None,
             enabled: false,
         };
         return Ok((vec![meta], vec![state]));
@@ -315,6 +319,8 @@ async fn scan_repo_skills(
                             name: meta.name.clone(),
                             relative_path: relative,
                             trusted: false,
+                            trusted_at_ms: None,
+                            trusted_commit_sha: None,
                             enabled: false,
                         });
                         skills_meta.push(meta);
@@ -466,6 +472,8 @@ mod tests {
                 name: e.metadata.name.clone(),
                 relative_path: "test-owner-test-repo".into(),
                 trusted: false,
+                trusted_at_ms: None,
+                trusted_commit_sha: None,
                 enabled: false,
             })
             .collect();

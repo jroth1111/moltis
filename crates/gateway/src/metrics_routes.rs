@@ -65,7 +65,21 @@ pub async fn api_metrics_handler(State(state): State<AppState>) -> impl IntoResp
         Some(handle) => {
             let prometheus_text = handle.render();
             let snapshot = MetricsSnapshot::from_prometheus_text(&prometheus_text);
-            Json(snapshot).into_response()
+            let mut payload = match serde_json::to_value(snapshot) {
+                Ok(value) => value,
+                Err(_) => serde_json::json!({}),
+            };
+
+            if let Some(object) = payload.as_object_mut() {
+                let provider_health = moltis_agents::provider_health::global_snapshot();
+                let provider_health_value = match serde_json::to_value(provider_health) {
+                    Ok(value) => value,
+                    Err(_) => serde_json::json!({}),
+                };
+                object.insert("providerHealth".to_string(), provider_health_value);
+            }
+
+            Json(payload).into_response()
         },
         None => (
             StatusCode::SERVICE_UNAVAILABLE,

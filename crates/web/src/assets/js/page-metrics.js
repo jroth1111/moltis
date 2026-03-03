@@ -71,7 +71,11 @@ function subscribeToMetrics() {
 	unsubscribe = onEvent("metrics.update", (payload) => {
 		isLive.value = true;
 		if (payload.snapshot) {
-			metricsData.value = payload.snapshot;
+			var snapshot = payload.snapshot;
+			if (payload.providerHealth) {
+				snapshot = { ...snapshot, providerHealth: payload.providerHealth };
+			}
+			metricsData.value = snapshot;
 		}
 		if (payload.point) {
 			// Add new point to history, keeping max points based on longest time range
@@ -92,6 +96,11 @@ function formatNumber(n) {
 	if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
 	if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
 	return n.toString();
+}
+
+function formatRate(rate) {
+	if (rate === undefined || rate === null) return "\u2014";
+	return `${(rate * 100).toFixed(1)}%`;
 }
 
 function formatUptime(seconds) {
@@ -576,6 +585,65 @@ function ProviderTable({ byProvider }) {
 	`;
 }
 
+function ProviderHealthTable({ providerHealth }) {
+	var rows = providerHealth?.providers;
+	if (!rows || rows.length === 0) return null;
+
+	var sortedRows = [...rows].sort((a, b) => b.totalRequests - a.totalRequests);
+
+	return html`
+		<section>
+			<div class="flex items-center justify-between mb-5">
+				<h3 class="text-sm font-medium text-[var(--muted)] uppercase tracking-wide">Provider Health</h3>
+				<div class="text-xs text-[var(--muted)]">
+					window: ${providerHealth.windowSecs || 0}s, samples: ${providerHealth.sampleCount || 0}
+				</div>
+			</div>
+			<div class="bg-[var(--surface)] border border-[var(--border)] rounded-lg overflow-hidden">
+				<table class="w-full text-sm">
+					<thead>
+						<tr class="border-b border-[var(--border)] bg-[var(--surface2)]">
+							<th class="text-left px-6 py-4 font-medium">Provider</th>
+							<th class="text-left px-6 py-4 font-medium">Model</th>
+							<th class="text-right px-6 py-4 font-medium">Requests</th>
+							<th class="text-right px-6 py-4 font-medium">Success</th>
+							<th class="text-right px-6 py-4 font-medium">Errors</th>
+							<th class="text-right px-6 py-4 font-medium">P95 Latency</th>
+							<th class="text-left px-6 py-4 font-medium">Top Error Class</th>
+						</tr>
+					</thead>
+					<tbody>
+						${sortedRows.map((stats) => {
+							var topErrorClass = "\u2014";
+							var topErrorRate = -1;
+							var byClass = stats.errorRateByClass || {};
+							for (var [name, rate] of Object.entries(byClass)) {
+								if (rate > topErrorRate) {
+									topErrorRate = rate;
+									topErrorClass = `${name} (${formatRate(rate)})`;
+								}
+							}
+							return html`
+								<tr class="border-b border-[var(--border)] last:border-0">
+									<td class="px-6 py-4">${stats.provider}</td>
+									<td class="px-6 py-4 text-[var(--muted)]">${stats.model}</td>
+									<td class="text-right px-6 py-4">${formatNumber(stats.totalRequests)}</td>
+									<td class="text-right px-6 py-4">${formatRate(stats.successRate)}</td>
+									<td class="text-right px-6 py-4 ${stats.errorCount > 0 ? "text-[var(--error)]" : ""}">
+										${formatRate(stats.errorRate)}
+									</td>
+									<td class="text-right px-6 py-4">${stats.p95LatencyMs ? `${stats.p95LatencyMs.toFixed(0)}ms` : "\u2014"}</td>
+									<td class="px-6 py-4 text-[var(--muted)]">${topErrorClass}</td>
+								</tr>
+							`;
+						})}
+					</tbody>
+				</table>
+			</div>
+		</section>
+	`;
+}
+
 function PrometheusEndpoint() {
 	var [copied, setCopied] = useState(false);
 	var endpoint = `${window.location.origin}/metrics`;
@@ -695,6 +763,7 @@ function MonitoringPage({ initialTab }) {
 					<div class="space-y-10">
 						<${MetricsGrid} categories=${metricsData.value?.categories} />
 						<${ProviderTable} byProvider=${metricsData.value?.categories?.llm?.by_provider} />
+						<${ProviderHealthTable} providerHealth=${metricsData.value?.providerHealth} />
 						<${PrometheusEndpoint} />
 					</div>
 				`

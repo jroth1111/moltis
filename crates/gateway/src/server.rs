@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
@@ -59,7 +59,7 @@ use crate::{
     approval::{GatewayApprovalBroadcaster, LiveExecApprovalService},
     auth,
     auth_routes::{AuthState, SharedWebAuthnRegistry, auth_router},
-    broadcast::{BroadcastOpts, broadcast, broadcast_tick},
+    broadcast::{BroadcastOpts, broadcast_raw, broadcast_tick},
     chat::{LiveChatService, LiveModelService},
     methods::MethodRegistry,
     provider_setup::LiveProviderSetupService,
@@ -1829,7 +1829,11 @@ pub async fn prepare_gateway(
         tokio::spawn(async move {
             if let Some(state) = st.get() {
                 let chat = state.chat().await;
-                let params = serde_json::json!({ "text": text });
+                let params = serde_json::json!({
+                    "text": text,
+                    "_source": "cron",
+                    "_queue_priority": "maintenance",
+                });
                 if let Err(e) = chat.send(params).await {
                     tracing::error!("cron system event failed: {e}");
                 }
@@ -1941,6 +1945,8 @@ pub async fn prepare_gateway(
             let mut params = serde_json::json!({
                 "text": prompt_text,
                 "_session_key": session_key,
+                "_source": "cron",
+                "_queue_priority": "maintenance",
             });
             if let Some(ref model) = req.model {
                 params["model"] = serde_json::Value::String(model.clone());
@@ -2030,7 +2036,7 @@ pub async fn prepare_gateway(
             // Spawn async broadcast in a background task since we're in a sync callback.
             let state = Arc::clone(state);
             tokio::spawn(async move {
-                broadcast(
+                broadcast_raw(
                     &state,
                     event,
                     payload,
@@ -2160,7 +2166,7 @@ pub async fn prepare_gateway(
             tokio::spawn(async move {
                 // Broadcast build start event.
                 if let Some(state) = deferred_for_build.get() {
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "sandbox.image.build",
                         serde_json::json!({ "phase": "start", "packages": packages }),
@@ -2185,7 +2191,7 @@ pub async fn prepare_gateway(
                             .store(false, std::sync::atomic::Ordering::Relaxed);
 
                         if let Some(state) = deferred_for_build.get() {
-                            broadcast(
+                            broadcast_raw(
                                 state,
                                 "sandbox.image.build",
                                 serde_json::json!({
@@ -2215,7 +2221,7 @@ pub async fn prepare_gateway(
                             .building_flag
                             .store(false, std::sync::atomic::Ordering::Relaxed);
                         if let Some(state) = deferred_for_build.get() {
-                            broadcast(
+                            broadcast_raw(
                                 state,
                                 "sandbox.image.build",
                                 serde_json::json!({
@@ -2247,7 +2253,7 @@ pub async fn prepare_gateway(
             let pkg_count = packages.len();
             tokio::spawn(async move {
                 if let Some(state) = deferred_for_host.get() {
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "sandbox.host.provision",
                         serde_json::json!({
@@ -2271,7 +2277,7 @@ pub async fn prepare_gateway(
                             "host package provisioning complete"
                         );
                         if let Some(state) = deferred_for_host.get() {
-                            broadcast(
+                            broadcast_raw(
                                 state,
                                 "sandbox.host.provision",
                                 serde_json::json!({
@@ -2293,7 +2299,7 @@ pub async fn prepare_gateway(
                     Err(e) => {
                         warn!("host package provisioning failed: {e}");
                         if let Some(state) = deferred_for_host.get() {
-                            broadcast(
+                            broadcast_raw(
                                 state,
                                 "sandbox.host.provision",
                                 serde_json::json!({
@@ -2346,7 +2352,7 @@ pub async fn prepare_gateway(
         tokio::spawn(async move {
             // Broadcast pull start event.
             if let Some(state) = deferred_for_browser.get() {
-                broadcast(
+                broadcast_raw(
                     state,
                     "browser.image.pull",
                     serde_json::json!({
@@ -2365,7 +2371,7 @@ pub async fn prepare_gateway(
                 Ok(()) => {
                     info!(image = %sandbox_image, "browser container image ready");
                     if let Some(state) = deferred_for_browser.get() {
-                        broadcast(
+                        broadcast_raw(
                             state,
                             "browser.image.pull",
                             serde_json::json!({
@@ -2383,7 +2389,7 @@ pub async fn prepare_gateway(
                 Err(e) => {
                     tracing::warn!(image = %sandbox_image, error = %e, "browser container image pull failed");
                     if let Some(state) = deferred_for_browser.get() {
-                        broadcast(
+                        broadcast_raw(
                             state,
                             "browser.image.pull",
                             serde_json::json!({
@@ -3288,6 +3294,12 @@ pub async fn prepare_gateway(
             tool_registry.register(Box::new(moltis_memory::tools::MemorySaveTool::new(
                 Arc::clone(mm),
             )));
+            tool_registry.register(Box::new(moltis_memory::tools::MemoryLearnTool::new(
+                Arc::clone(mm),
+            )));
+            tool_registry.register(Box::new(
+                moltis_memory::tools::MemoryRecallFailuresTool::new(Arc::clone(mm)),
+            ));
         }
 
         // Register session state tool for per-session persistent KV store.
@@ -3397,6 +3409,7 @@ pub async fn prepare_gateway(
                 let mut params = serde_json::json!({
                     "text": req.message,
                     "_session_key": req.key,
+                    "_queue_priority": "background",
                 });
                 if let Some(model) = req.model {
                     params["model"] = serde_json::json!(model);
@@ -3416,21 +3429,15 @@ pub async fn prepare_gateway(
                 }
             })
         });
-        tool_registry.register(Box::new(SessionsSendTool::new(
-            Arc::clone(&session_metadata),
-            send_to_session,
-        )));
+        tool_registry.register(Box::new(
+            SessionsSendTool::new(Arc::clone(&session_metadata), send_to_session)
+                .with_state_store(Arc::clone(&session_state_store)),
+        ));
 
         // Register shared task coordination tool for multi-agent workflows.
         tool_registry.register(Box::new(moltis_tools::task_list::TaskListTool::new(
             &data_dir,
         )));
-        // Register the session-backed task board used by autonomous workflows.
-        tool_registry.register(Box::new(
-            moltis_plugins::bundled::task_board::TaskBoardTool::new(Arc::clone(
-                &session_state_store,
-            )),
-        ));
 
         // Register built-in voice tools for explicit TTS/STT calls in agents.
         tool_registry.register(Box::new(crate::voice_agent_tools::SpeakTool::new(
@@ -3521,7 +3528,7 @@ pub async fn prepare_gateway(
                     _ => return, // Only broadcast sub-agent lifecycle events.
                 };
                 tokio::spawn(async move {
-                    broadcast(&state, "chat", payload, BroadcastOpts::default()).await;
+                    broadcast_raw(&state, "chat", payload, BroadcastOpts::default()).await;
                 });
             });
             let agents_config = Arc::new(tokio::sync::RwLock::new(config.agents.clone()));
@@ -3585,7 +3592,7 @@ pub async fn prepare_gateway(
             tokio::spawn(async move {
                 let _watcher = _watcher; // keep alive
                 while let Some(_event) = rx.recv().await {
-                    broadcast(
+                    broadcast_raw(
                         &watcher_state,
                         "skills.changed",
                         serde_json::json!({}),
@@ -3936,12 +3943,133 @@ pub async fn prepare_gateway(
     }
 
     // Spawn self-repair background scanner (scans every 60s for stuck agent sessions).
+    let state_for_self_repair = Arc::clone(&state);
+    let session_store_for_self_repair = Arc::clone(&session_store);
+    let on_self_repair_scan: Arc<
+        dyn Fn(moltis_agents::self_repair::RepairScanResult) + Send + Sync,
+    > = Arc::new(move |result| {
+        const SELF_REPAIR_NAMESPACE: &str = "self_repair";
+        const SELF_REPAIR_REPLAY_HASH_KEY: &str = "last_replay_hash";
+
+        let state = Arc::clone(&state_for_self_repair);
+        let session_store = Arc::clone(&session_store_for_self_repair);
+        tokio::spawn(async move {
+            for session_key in result.recovered {
+                #[cfg(feature = "metrics")]
+                moltis_metrics::counter!(moltis_metrics::session::RECOVERY_TOTAL).increment(1);
+
+                match session_store.validate_session_integrity(&session_key).await {
+                    Ok(report) => {
+                        let replay_candidate = report.replay_candidate.clone();
+                        let mut replay_attempted = false;
+                        let mut replay_blocked_reason: Option<String> = None;
+
+                        if let Some(replay_text) = replay_candidate.as_deref() {
+                            if report.replay_blocked_by_tool_side_effects {
+                                replay_blocked_reason =
+                                    Some("unresolved_tool_side_effects".to_string());
+                            } else if let Some(state_store) =
+                                state.services.session_state_store.as_ref()
+                            {
+                                let replay_hash =
+                                    moltis_common::handoff::HandoffDeadEnd::fingerprint(
+                                        "self_repair_replay",
+                                        replay_text,
+                                    );
+                                let already_replayed = state_store
+                                    .get(
+                                        &session_key,
+                                        SELF_REPAIR_NAMESPACE,
+                                        SELF_REPAIR_REPLAY_HASH_KEY,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|value| value == replay_hash);
+
+                                if already_replayed {
+                                    replay_blocked_reason = Some("already_replayed".to_string());
+                                } else {
+                                    let chat = state.chat().await;
+                                    let replay_payload = serde_json::json!({
+                                        "text": replay_text,
+                                        "_session_key": session_key,
+                                        "_recovery_replay": true,
+                                    });
+                                    match chat.send(replay_payload).await {
+                                        Ok(_) => {
+                                            replay_attempted = true;
+                                            if let Err(error) = state_store
+                                                .set(
+                                                    &session_key,
+                                                    SELF_REPAIR_NAMESPACE,
+                                                    SELF_REPAIR_REPLAY_HASH_KEY,
+                                                    &replay_hash,
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    session = %session_key,
+                                                    error = %error,
+                                                    "failed to persist self-repair replay marker"
+                                                );
+                                                replay_blocked_reason =
+                                                    Some("replay_marker_write_failed".to_string());
+                                            }
+                                        },
+                                        Err(error) => {
+                                            warn!(
+                                                session = %session_key,
+                                                error = %error,
+                                                "failed to dispatch self-repair replay"
+                                            );
+                                            replay_blocked_reason =
+                                                Some("replay_dispatch_failed".to_string());
+                                        },
+                                    }
+                                }
+                            } else {
+                                replay_blocked_reason = Some("state_store_unavailable".to_string());
+                            }
+                        }
+
+                        broadcast_raw(
+                            &state,
+                            "session.recovered",
+                            serde_json::json!({
+                                "sessionKey": session_key,
+                                "recovered": report.recovered,
+                                "removedMalformedLines": report.removed_malformed_lines,
+                                "appendedAssistantMessages": report.appended_assistant_messages,
+                                "injectedToolResults": report.injected_tool_results,
+                                "replayCandidate": replay_candidate.is_some(),
+                                "replayAttempted": replay_attempted,
+                                "replayBlockedReason": replay_blocked_reason,
+                            }),
+                            BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    },
+                    Err(error) => {
+                        warn!(
+                            session = %session_key,
+                            error = %error,
+                            "session integrity validation failed after self-repair"
+                        );
+                    },
+                }
+            }
+        });
+    });
     moltis_agents::self_repair::start_background_task(
         Arc::clone(&session_state_store),
         std::time::Duration::from_secs(60),
         moltis_agents::self_repair::DEFAULT_STUCK_THRESHOLD,
         moltis_agents::self_repair::DEFAULT_MAX_REPAIR_ATTEMPTS,
-        None,
+        Some(on_self_repair_scan),
     );
 
     // Spawn tick timer.
@@ -3995,7 +4123,7 @@ pub async fn prepare_gateway(
                                 ("patched", session_key.as_str())
                             },
                         };
-                        broadcast(
+                        broadcast_raw(
                             &ws_state,
                             "session",
                             serde_json::json!({
@@ -4067,7 +4195,7 @@ pub async fn prepare_gateway(
                         }
                     };
                     if changed && let Ok(payload) = serde_json::to_value(&next) {
-                        broadcast(
+                        broadcast_raw(
                             &update_state,
                             "update.available",
                             payload,
@@ -4223,8 +4351,15 @@ pub async fn prepare_gateway(
 
                     // Broadcast metrics update to all connected clients.
                     let payload = crate::state::MetricsUpdatePayload { snapshot, point };
-                    if let Ok(payload_json) = serde_json::to_value(&payload) {
-                        broadcast(
+                    if let Ok(mut payload_json) = serde_json::to_value(&payload) {
+                        if let Some(obj) = payload_json.as_object_mut()
+                            && let Ok(health_json) = serde_json::to_value(
+                                moltis_agents::provider_health::global_snapshot(),
+                            )
+                        {
+                            obj.insert("providerHealth".to_string(), health_json);
+                        }
+                        broadcast_raw(
                             &metrics_state,
                             "metrics.update",
                             payload_json,
@@ -4337,7 +4472,7 @@ pub async fn prepare_gateway(
                                 }),
                             ),
                         };
-                        broadcast(
+                        broadcast_raw(
                             &event_state,
                             event_name,
                             payload,
@@ -4365,7 +4500,7 @@ pub async fn prepare_gateway(
                 match audit_rx.recv().await {
                     Ok(entry) => {
                         if let Ok(payload) = serde_json::to_value(&entry) {
-                            broadcast(
+                            broadcast_raw(
                                 &audit_state,
                                 "network.audit.entry",
                                 payload,
@@ -4393,7 +4528,7 @@ pub async fn prepare_gateway(
                 match rx.recv().await {
                     Ok(entry) => {
                         if let Ok(payload) = serde_json::to_value(&entry) {
-                            broadcast(
+                            broadcast_raw(
                                 &log_state,
                                 "logs.entry",
                                 payload,
@@ -4861,6 +4996,7 @@ pub async fn start_gateway(
     // - force process exit to avoid hanging after ctrl-c
     {
         let browser_for_shutdown = Arc::clone(&banner.browser_for_lifecycle);
+        let state_for_shutdown = Arc::clone(state);
         #[cfg(feature = "tailscale")]
         let reset_tailscale_on_exit =
             banner.tailscale_mode != TailscaleMode::Off && banner.tailscale_reset_on_exit;
@@ -4870,6 +5006,51 @@ pub async fn start_gateway(
             if tokio::signal::ctrl_c().await.is_err() {
                 return;
             }
+
+            if !state_for_shutdown.mark_shutting_down() {
+                return;
+            }
+
+            info!("shutdown signal received; entering drain mode");
+
+            if let Some(hooks) = state_for_shutdown.inner.read().await.hook_registry.clone() {
+                if let Err(e) = hooks
+                    .dispatch(&moltis_common::hooks::HookPayload::GatewayStop)
+                    .await
+                {
+                    tracing::warn!("GatewayStop hook dispatch failed: {e}");
+                }
+            }
+
+            state_for_shutdown
+                .notify_clients_shutting_down("server is shutting down")
+                .await;
+
+            let drain_timeout = std::time::Duration::from_secs(30);
+            let remaining_runs = state_for_shutdown
+                .wait_for_inflight_agent_runs(drain_timeout)
+                .await;
+            if remaining_runs == 0 {
+                info!(
+                    drain_secs = drain_timeout.as_secs(),
+                    "all in-flight agent runs drained before shutdown"
+                );
+            } else {
+                warn!(
+                    drain_secs = drain_timeout.as_secs(),
+                    remaining_runs, "forcing shutdown with in-flight agent runs still active"
+                );
+            }
+
+            if let Some(store) = state_for_shutdown.services.session_store.as_ref() {
+                if let Err(e) = flush_session_store_data(store).await {
+                    warn!(error = %e, "failed to flush session store during shutdown");
+                }
+            }
+
+            state_for_shutdown
+                .close_all_clients_going_away_without_notice("server is shutting down")
+                .await;
 
             #[cfg(feature = "mdns")]
             if let Some(ref daemon) = _mdns_daemon {
@@ -4963,6 +5144,10 @@ async fn ws_upgrade_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    if state.gateway.is_shutting_down() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "gateway is shutting down").into_response();
+    }
+
     // ── CSWSH protection ────────────────────────────────────────────────
     // Reject cross-origin WebSocket upgrades.  Browsers always send an
     // Origin header on cross-origin requests; non-browser clients (CLI,
@@ -4998,8 +5183,8 @@ async fn ws_upgrade_handler(
     let remote_ip = extract_ws_client_ip(&headers, addr).filter(|ip| is_public_ip(ip));
 
     let is_local = is_local_connection(&headers, addr, state.gateway.behind_proxy);
-    let header_authenticated =
-        websocket_header_authenticated(&headers, state.gateway.credential_store.as_ref(), is_local)
+    let header_auth =
+        websocket_header_auth_context(&headers, state.gateway.credential_store.as_ref(), is_local)
             .await;
     ws.on_upgrade(move |socket| {
         handle_connection(
@@ -5009,7 +5194,8 @@ async fn ws_upgrade_handler(
             addr,
             accept_language,
             remote_ip,
-            header_authenticated,
+            header_auth.authenticated,
+            header_auth.api_key_scopes,
             is_local,
         )
     })
@@ -5107,14 +5293,56 @@ async fn websocket_header_authenticated(
     credential_store: Option<&Arc<auth::CredentialStore>>,
     is_local: bool,
 ) -> bool {
+    websocket_header_auth_context(headers, credential_store, is_local)
+        .await
+        .authenticated
+}
+
+#[derive(Debug, Default)]
+struct WsHeaderAuthContext {
+    authenticated: bool,
+    api_key_scopes: Option<Vec<String>>,
+}
+
+async fn websocket_header_auth_context(
+    headers: &axum::http::HeaderMap,
+    credential_store: Option<&Arc<auth::CredentialStore>>,
+    is_local: bool,
+) -> WsHeaderAuthContext {
     let Some(store) = credential_store else {
-        return false;
+        return WsHeaderAuthContext::default();
     };
 
-    matches!(
-        crate::auth_middleware::check_auth(store, headers, is_local).await,
-        crate::auth_middleware::AuthResult::Allowed(_)
-    )
+    match crate::auth_middleware::check_auth(store, headers, is_local).await {
+        crate::auth_middleware::AuthResult::Allowed(identity)
+            if identity.method == auth::AuthMethod::ApiKey =>
+        {
+            let Some(api_key) = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+            else {
+                return WsHeaderAuthContext::default();
+            };
+
+            let Some(verification) = store.verify_api_key(api_key).await.ok().flatten() else {
+                return WsHeaderAuthContext::default();
+            };
+            if verification.scopes.is_empty() {
+                return WsHeaderAuthContext::default();
+            }
+            WsHeaderAuthContext {
+                authenticated: true,
+                api_key_scopes: Some(verification.scopes),
+            }
+        },
+        crate::auth_middleware::AuthResult::Allowed(_) => WsHeaderAuthContext {
+            authenticated: true,
+            api_key_scopes: None,
+        },
+        crate::auth_middleware::AuthResult::SetupRequired
+        | crate::auth_middleware::AuthResult::Unauthorized => WsHeaderAuthContext::default(),
+    }
 }
 
 /// Resolve the machine's primary outbound IP address.
@@ -5152,6 +5380,31 @@ fn startup_setup_code_lines(code: &str) -> Vec<String> {
         "enter this code to set your password or register a passkey".to_string(),
         String::new(),
     ]
+}
+
+async fn flush_session_store_data(store: &SessionStore) -> std::io::Result<()> {
+    let base_dir = store.base_dir.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if !base_dir.exists() {
+            return Ok(());
+        }
+
+        for entry in std::fs::read_dir(&base_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let file = OpenOptions::new().read(true).open(&path)?;
+            file.sync_all()?;
+        }
+
+        let dir = File::open(&base_dir)?;
+        dir.sync_all()?;
+        Ok(())
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Check whether a WebSocket `Origin` header matches the request `Host`.
@@ -6079,7 +6332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_header_auth_accepts_valid_bearer_api_key() {
+    async fn websocket_header_auth_accepts_valid_scoped_bearer_api_key() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = Arc::new(
             auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
@@ -6087,7 +6340,8 @@ mod tests {
                 .unwrap(),
         );
         store.set_initial_password("supersecret").await.unwrap();
-        let (_id, raw_key) = store.create_api_key("ws", None).await.unwrap();
+        let scopes = vec!["operator.read".to_string(), "operator.write".to_string()];
+        let (_id, raw_key) = store.create_api_key("ws", Some(&scopes)).await.unwrap();
 
         let mut headers = axum::http::HeaderMap::new();
         let auth_value = format!("Bearer {raw_key}");
@@ -6096,7 +6350,39 @@ mod tests {
             auth_value.parse().unwrap(),
         );
 
-        assert!(websocket_header_authenticated(&headers, Some(&store), false).await);
+        let auth_context = websocket_header_auth_context(&headers, Some(&store), false).await;
+        assert!(auth_context.authenticated);
+        assert_eq!(auth_context.api_key_scopes, Some(scopes));
+    }
+
+    #[tokio::test]
+    async fn websocket_header_auth_rejects_unscoped_bearer_api_key() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = Arc::new(
+            auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
+                .await
+                .unwrap(),
+        );
+        store.set_initial_password("supersecret").await.unwrap();
+        let scopes = vec!["operator.read".to_string()];
+        let (key_id, raw_key) = store.create_api_key("ws", Some(&scopes)).await.unwrap();
+        // Simulate a legacy key created before scope enforcement.
+        sqlx::query("UPDATE api_keys SET scopes = NULL WHERE id = ?")
+            .bind(key_id)
+            .execute(store.db_pool())
+            .await
+            .unwrap();
+
+        let mut headers = axum::http::HeaderMap::new();
+        let auth_value = format!("Bearer {raw_key}");
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            auth_value.parse().unwrap(),
+        );
+
+        let auth_context = websocket_header_auth_context(&headers, Some(&store), false).await;
+        assert!(!auth_context.authenticated);
+        assert!(auth_context.api_key_scopes.is_none());
     }
 
     #[tokio::test]

@@ -5,11 +5,19 @@ use {
     tracing::{debug, warn},
 };
 
-use crate::state::GatewayState;
+pub use crate::broadcast_types::BroadcastEvent;
+use crate::{
+    broadcast_types::{TickMemoryPayload, TickPayload},
+    state::GatewayState,
+};
 
 // ── Scope guards ─────────────────────────────────────────────────────────────
 
 /// Events that require specific scopes to receive.
+///
+/// **Maintenance note:** when adding a new `BroadcastEvent` variant that maps
+/// to a scope-restricted event name, you must add a corresponding entry here.
+/// The `scope_guard_table_covers_sensitive_variants` test verifies coverage.
 fn event_scope_guards() -> HashMap<&'static str, &'static [&'static str]> {
     let mut m = HashMap::new();
     m.insert("exec.approval.requested", [scopes::APPROVALS].as_slice());
@@ -39,20 +47,24 @@ pub struct BroadcastOpts {
 
 /// Broadcast events to all connected WebSocket clients, respecting scope
 /// guards and dropping/closing slow consumers.
-pub async fn broadcast(
-    state: &Arc<GatewayState>,
-    event: &str,
-    payload: serde_json::Value,
-    opts: BroadcastOpts,
-) {
+pub async fn broadcast(state: &Arc<GatewayState>, event: BroadcastEvent, opts: BroadcastOpts) {
+    let message = match event.into_message() {
+        Ok(message) => message,
+        Err(e) => {
+            warn!("failed to serialize broadcast payload: {e}");
+            return;
+        },
+    };
+    let event_name = message.event;
+
     let seq = state.next_seq();
     let stream = opts.stream.clone();
     let done = opts.done.then_some(true);
     let channel = opts.channel.clone();
     let frame = EventFrame {
         r#type: "event".into(),
-        event: event.into(),
-        payload: Some(payload),
+        event: event_name.to_string(),
+        payload: Some(message.payload),
         seq: Some(seq),
         state_version: opts.state_version,
         stream,
@@ -72,15 +84,15 @@ pub async fn broadcast(
     if let Some(ref payload) = frame.payload {
         let _ = state
             .graphql_broadcast
-            .send((event.to_string(), payload.clone()));
+            .send((event_name.to_string(), payload.clone()));
     }
 
     let guards = event_scope_guards();
-    let required_scopes = guards.get(event);
+    let required_scopes = guards.get(event_name.as_ref());
 
     let inner = state.inner.read().await;
     debug!(
-        event,
+        event = event_name.as_ref(),
         seq,
         clients = inner.clients.len(),
         "broadcasting event"
@@ -97,7 +109,7 @@ pub async fn broadcast(
         }
 
         // Subscription filter (v4): skip clients not subscribed to this event.
-        if !client.is_subscribed_to(event) {
+        if !client.is_subscribed_to(event_name.as_ref()) {
             continue;
         }
 
@@ -116,6 +128,17 @@ pub async fn broadcast(
     }
 }
 
+/// Legacy/raw bridge for dynamic event names and ad-hoc payloads.
+// TODO: migrate remaining broadcast_raw call sites to typed BroadcastEvent
+pub async fn broadcast_raw(
+    state: &Arc<GatewayState>,
+    event: impl Into<String>,
+    payload: serde_json::Value,
+    opts: BroadcastOpts,
+) {
+    broadcast(state, BroadcastEvent::raw(event, payload), opts).await;
+}
+
 /// Broadcast a tick event with the current timestamp and memory stats.
 pub async fn broadcast_tick(
     state: &Arc<GatewayState>,
@@ -129,14 +152,13 @@ pub async fn broadcast_tick(
         .as_millis() as u64;
     broadcast(
         state,
-        "tick",
-        serde_json::json!({
-            "ts": ts,
-            "mem": {
-                "process": process_memory_bytes,
-                "available": system_available_bytes,
-                "total": system_total_bytes
-            }
+        BroadcastEvent::Tick(TickPayload {
+            ts,
+            mem: TickMemoryPayload {
+                process: process_memory_bytes,
+                available: system_available_bytes,
+                total: system_total_bytes,
+            },
         }),
         BroadcastOpts {
             drop_if_slow: true,
@@ -144,4 +166,102 @@ pub async fn broadcast_tick(
         },
     )
     .await;
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broadcast_types::{
+        ExecApprovalRequestedPayload, PairRequestedPayload, PairResolvedPayload,
+        PairResolvedStatus, PresenceKind, PresencePayload, PushSubscriptionAction,
+        PushSubscriptionsPayload, SessionEventKind, SessionEventPayload, TickMemoryPayload,
+    };
+
+    /// Verify that every `BroadcastEvent` variant whose event name appears in
+    /// `event_scope_guards()` is accounted for. Adding a new variant forces
+    /// the developer to consider whether it needs a scope guard entry.
+    #[test]
+    fn scope_guard_table_covers_sensitive_variants() {
+        let guards = event_scope_guards();
+
+        // Build a representative instance of every variant and check its event name
+        // against the scope guard table. Variants that produce scope-guarded event
+        // names must have an entry; others must not.
+        let variants: Vec<BroadcastEvent> = vec![
+            BroadcastEvent::Tick(TickPayload {
+                ts: 0,
+                mem: TickMemoryPayload {
+                    process: 0,
+                    available: 0,
+                    total: 0,
+                },
+            }),
+            BroadcastEvent::Session(SessionEventPayload {
+                kind: SessionEventKind::Created,
+                session_key: String::new(),
+                version: None,
+            }),
+            BroadcastEvent::Presence(PresencePayload {
+                kind: PresenceKind::NodeConnected,
+                node_id: String::new(),
+                platform: None,
+            }),
+            BroadcastEvent::ExecApprovalRequested(ExecApprovalRequestedPayload {
+                request_id: String::new(),
+                command: String::new(),
+            }),
+            BroadcastEvent::NodePairRequested(PairRequestedPayload {
+                id: String::new(),
+                device_id: String::new(),
+                display_name: None,
+                platform: String::new(),
+            }),
+            BroadcastEvent::NodePairResolved(PairResolvedPayload {
+                id: String::new(),
+                status: PairResolvedStatus::Approved,
+            }),
+            BroadcastEvent::DevicePairResolved(PairResolvedPayload {
+                id: String::new(),
+                status: PairResolvedStatus::Approved,
+            }),
+            BroadcastEvent::PushSubscriptions(PushSubscriptionsPayload {
+                action: PushSubscriptionAction::Added,
+            }),
+            BroadcastEvent::raw("test.raw", serde_json::json!({})),
+        ];
+
+        // Events that are scope-guarded. Some are still emitted via broadcast_raw
+        // (exec.approval.resolved, device.pair.requested) and don't have typed
+        // variants yet.
+        let expected_guarded = [
+            "exec.approval.requested",
+            "exec.approval.resolved",
+            "device.pair.requested",
+            "device.pair.resolved",
+            "node.pair.requested",
+            "node.pair.resolved",
+        ];
+
+        for variant in variants {
+            let message = variant
+                .into_message()
+                .expect("serialization should not fail");
+            let event_name = message.event;
+            if expected_guarded.contains(&event_name.as_ref()) {
+                assert!(
+                    guards.contains_key(event_name.as_ref()),
+                    "scope-sensitive event {event_name:?} is missing from event_scope_guards()"
+                );
+            }
+        }
+
+        // Also verify the guard table only references known event names.
+        for key in guards.keys() {
+            assert!(
+                expected_guarded.contains(key),
+                "event_scope_guards() contains unknown event {key:?}"
+            );
+        }
+    }
 }

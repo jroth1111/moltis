@@ -52,6 +52,9 @@ pub mod runtime;
 pub use runtime::{ChatRuntime, TtsOverride};
 use {
     chat_error::parse_chat_error,
+    moltis_common::handoff::{
+        HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
+    },
     moltis_service_traits::{ChatService, ModelService, ServiceError, ServiceResult},
 };
 
@@ -2329,18 +2332,119 @@ impl ModelService for LiveModelService {
 #[derive(Debug, Clone)]
 struct QueuedMessage {
     params: Value,
+    priority: QueuePriority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QueuePriority {
+    Interactive,
+    Background,
+    Maintenance,
+}
+
+impl QueuePriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Background => "background",
+            Self::Maintenance => "maintenance",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "interactive" => Some(Self::Interactive),
+            "background" => Some(Self::Background),
+            "maintenance" => Some(Self::Maintenance),
+            _ => None,
+        }
+    }
+}
+
+fn resolve_queue_priority(params: &Value) -> QueuePriority {
+    if let Some(explicit) = params
+        .get("_queue_priority")
+        .and_then(Value::as_str)
+        .and_then(QueuePriority::parse)
+    {
+        return explicit;
+    }
+    if params
+        .get("_source")
+        .and_then(Value::as_str)
+        .is_some_and(|src| src == "cron")
+    {
+        return QueuePriority::Maintenance;
+    }
+    if params
+        .get("_cron")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return QueuePriority::Maintenance;
+    }
+    if params
+        .get("_session_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| key.starts_with("cron:"))
+    {
+        return QueuePriority::Maintenance;
+    }
+    if params.get("_session_key").is_some() {
+        return QueuePriority::Background;
+    }
+    QueuePriority::Interactive
 }
 
 fn enqueue_with_limit(
     entry: &mut Vec<QueuedMessage>,
     params: Value,
+    priority: QueuePriority,
     max_queue_size: usize,
 ) -> Option<usize> {
     if entry.len() >= max_queue_size {
         return None;
     }
-    entry.push(QueuedMessage { params });
+    entry.push(QueuedMessage { params, priority });
     Some(entry.len())
+}
+
+fn dequeue_followup_with_priority(
+    mut queued: Vec<QueuedMessage>,
+    starvation_bound: usize,
+    streak: &mut usize,
+) -> Option<(QueuedMessage, Vec<QueuedMessage>)> {
+    if queued.is_empty() {
+        return None;
+    }
+
+    let highest = queued.iter().map(|m| m.priority).min()?;
+    let has_lower = queued.iter().any(|m| m.priority > highest);
+    let bound = starvation_bound.max(1);
+
+    let pick_lower = has_lower && *streak >= bound;
+    let picked_index = if pick_lower {
+        queued
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.priority > highest)
+            .min_by_key(|(_, m)| m.priority)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    } else {
+        queued
+            .iter()
+            .position(|m| m.priority == highest)
+            .unwrap_or(0)
+    };
+
+    let picked = queued.remove(picked_index);
+    if has_lower && picked.priority == highest {
+        *streak = streak.saturating_add(1);
+    } else {
+        *streak = 0;
+    }
+    Some((picked, queued))
 }
 
 /// A tool call currently executing within an active agent run.
@@ -2367,6 +2471,9 @@ pub struct LiveChatService {
     session_locks: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
     /// Per-session message queue for messages arriving during an active run.
     message_queue: Arc<RwLock<HashMap<String, Vec<QueuedMessage>>>>,
+    /// Per-session streak of highest-priority followup replays used to enforce
+    /// starvation bounds across lower-priority queued messages.
+    message_queue_priority_streak: Arc<RwLock<HashMap<String, usize>>>,
     /// Per-session last-seen client sequence number for ordering diagnostics.
     last_client_seq: Arc<RwLock<HashMap<String, u64>>>,
     /// Per-session accumulated thinking text for active runs, so it can be
@@ -2403,6 +2510,7 @@ impl LiveChatService {
             hook_registry: None,
             session_locks: Arc::new(RwLock::new(HashMap::new())),
             message_queue: Arc::new(RwLock::new(HashMap::new())),
+            message_queue_priority_streak: Arc::new(RwLock::new(HashMap::new())),
             last_client_seq: Arc::new(RwLock::new(HashMap::new())),
             active_thinking_text: Arc::new(RwLock::new(HashMap::new())),
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
@@ -2626,6 +2734,187 @@ async fn mark_self_repair_finished(state_store: Option<&SessionStateStore>, sess
             "failed to clear session running state for self-repair"
         );
     }
+}
+
+/// RAII guard that ensures self-repair cleanup happens when dropped.
+/// Uses a tokio spawn to handle async cleanup since Drop is sync.
+struct SelfRepairGuard {
+    state_store: Option<Arc<SessionStateStore>>,
+    session_key: String,
+}
+
+impl SelfRepairGuard {
+    fn new(state_store: Option<&Arc<SessionStateStore>>, session_key: &str) -> Self {
+        Self {
+            state_store: state_store.cloned(),
+            session_key: session_key.to_string(),
+        }
+    }
+
+    /// Mark the session as started. Must be awaited after creating the guard.
+    async fn mark_started(&self) {
+        if let Some(ref store) = self.state_store {
+            if let Err(error) =
+                moltis_agents::self_repair::mark_session_started(store, &self.session_key).await
+            {
+                warn!(
+                    session = %self.session_key,
+                    error = %error,
+                    "failed to mark session as running for self-repair"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SelfRepairGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.state_store.take() {
+            let session_key = std::mem::take(&mut self.session_key);
+            // Spawn a background task for async cleanup.
+            // Best-effort: if this fails, the background scanner will eventually clean up.
+            tokio::spawn(async move {
+                if let Err(error) =
+                    moltis_agents::self_repair::mark_session_finished(&store, &session_key).await
+                {
+                    warn!(
+                        session = %session_key,
+                        error = %error,
+                        "failed to mark session as finished for self-repair (cleanup task)"
+                    );
+                }
+            });
+        }
+    }
+}
+
+fn suggested_next_step_for_error(error: &str) -> Option<String> {
+    use moltis_agents::classify::{ProviderErrorKind, classify_error_message};
+
+    let step = match classify_error_message(error) {
+        ProviderErrorKind::ContextWindow => "compact context or reduce prompt size",
+        ProviderErrorKind::RateLimit | ProviderErrorKind::NonRetryableRateLimit => {
+            "switch provider or wait for rate-limit reset"
+        },
+        ProviderErrorKind::AuthError => "verify provider credentials and permissions",
+        ProviderErrorKind::BillingExhausted => "restore provider billing quota",
+        ProviderErrorKind::Timeout | ProviderErrorKind::ServerError => {
+            "retry with an alternate provider"
+        },
+        ProviderErrorKind::InvalidRequest => "fix request parameters before retrying",
+        ProviderErrorKind::Unknown => "retry with additional diagnostics enabled",
+    };
+    Some(step.to_string())
+}
+
+async fn persist_handoff_context(
+    state_store: Option<&Arc<SessionStateStore>>,
+    session_key: &str,
+    handoff: &HandoffContext,
+) {
+    let Some(store) = state_store else {
+        return;
+    };
+
+    let serialized = match serde_json::to_string(handoff) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to serialize handoff context"
+            );
+            return;
+        },
+    };
+
+    if let Err(error) = store
+        .set(
+            session_key,
+            HANDOFF_NAMESPACE,
+            HANDOFF_LATEST_KEY,
+            &serialized,
+        )
+        .await
+    {
+        warn!(
+            session = %session_key,
+            error = %error,
+            "failed to persist handoff context"
+        );
+    }
+}
+
+async fn consume_inbound_handoff_context(
+    state_store: Option<&Arc<SessionStateStore>>,
+    session_key: &str,
+) -> Option<HandoffContext> {
+    let Some(store) = state_store else {
+        return None;
+    };
+
+    let raw = match store
+        .get(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to load inbound handoff context"
+            );
+            return None;
+        },
+    };
+
+    let Some(raw) = raw else {
+        return None;
+    };
+
+    if let Err(error) = store
+        .delete(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+        .await
+    {
+        warn!(
+            session = %session_key,
+            error = %error,
+            "failed to clear consumed inbound handoff context"
+        );
+    }
+
+    match serde_json::from_str::<HandoffContext>(&raw) {
+        Ok(handoff) => Some(handoff),
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "invalid inbound handoff context payload"
+            );
+            None
+        },
+    }
+}
+
+fn append_handoff_constraints(system_prompt: &mut String, handoff: &HandoffContext) {
+    if handoff.last_action.is_none()
+        && handoff.observed_error.is_none()
+        && handoff.dead_ends.is_empty()
+        && handoff.suggested_next_step.is_none()
+        && handoff.estimated_tokens.is_none()
+    {
+        return;
+    }
+
+    system_prompt.push_str("\n\n[InterSessionHandoff]\n");
+    system_prompt.push_str("Apply this context from a prior coordinating session.\n");
+    system_prompt.push_str(&handoff.to_message_block());
+    if !handoff.dead_ends.is_empty() {
+        system_prompt.push_str(
+            "\nTreat each do_not_retry item as a hard constraint unless the user explicitly overrides it.",
+        );
+    }
+    system_prompt.push_str("\n[/InterSessionHandoff]");
 }
 
 #[async_trait]
@@ -2873,9 +3162,11 @@ impl ChatService for LiveChatService {
                     let chat_cfg = moltis_config::discover_and_load().chat;
                     let queue_mode = chat_cfg.message_queue_mode;
                     let max_queue_size = chat_cfg.message_queue_max_size;
+                    let priority = resolve_queue_priority(&params);
                     info!(
                         session = %session_key,
                         mode = ?queue_mode,
+                        priority = priority.as_str(),
                         client_seq = ?client_seq,
                         "queueing message (run active)"
                     );
@@ -2883,7 +3174,7 @@ impl ChatService for LiveChatService {
                         let mut q = self.message_queue.write().await;
                         let entry = q.entry(session_key.clone()).or_default();
                         let Some(position) =
-                            enqueue_with_limit(entry, params.clone(), max_queue_size)
+                            enqueue_with_limit(entry, params.clone(), priority, max_queue_size)
                         else {
                             return Ok(serde_json::json!({
                                 "ok": false,
@@ -2901,6 +3192,7 @@ impl ChatService for LiveChatService {
                             "sessionKey": session_key,
                             "state": "queued",
                             "mode": format!("{queue_mode:?}").to_lowercase(),
+                            "priority": priority.as_str(),
                             "position": position,
                         }),
                         BroadcastOpts::default(),
@@ -2910,6 +3202,7 @@ impl ChatService for LiveChatService {
                         "ok": true,
                         "queued": true,
                         "mode": format!("{queue_mode:?}").to_lowercase(),
+                        "priority": priority.as_str(),
                     }));
                 },
             };
@@ -2947,6 +3240,7 @@ impl ChatService for LiveChatService {
             let tool_registry = Arc::clone(&self.tool_registry);
             let session_key_clone = session_key.clone();
             let message_queue = Arc::clone(&self.message_queue);
+            let message_queue_priority_streak = Arc::clone(&self.message_queue_priority_streak);
             let state_for_drain = Arc::clone(&self.state);
             let accept_language = params
                 .get("_accept_language")
@@ -3002,10 +3296,10 @@ impl ChatService for LiveChatService {
                 {
                     warn!("failed to persist /sh assistant message: {e}");
                 }
+                mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
                 if let Ok(count) = session_store.count(&session_key_clone).await {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
-                mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
 
                 active_runs.write().await.remove(&run_id_clone);
                 let mut runs_by_session = active_runs_by_session.write().await;
@@ -3029,15 +3323,27 @@ impl ChatService for LiveChatService {
                     .remove(&session_key_clone)
                     .unwrap_or_default();
                 if !queued.is_empty() {
-                    let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                    let chat_cfg = moltis_config::discover_and_load().chat;
+                    let queue_mode = chat_cfg.message_queue_mode;
+                    let starvation_bound = chat_cfg.priority_starvation_bound;
                     let chat = state_for_drain.chat_service().await;
                     match queue_mode {
                         MessageQueueMode::Followup => {
-                            let mut iter = queued.into_iter();
-                            let Some(first) = iter.next() else {
-                                return;
+                            let (first, rest) = {
+                                let mut streaks = message_queue_priority_streak.write().await;
+                                let streak = streaks.entry(session_key_clone.clone()).or_insert(0);
+                                let Some((first, rest)) = dequeue_followup_with_priority(
+                                    queued,
+                                    starvation_bound,
+                                    streak,
+                                ) else {
+                                    return;
+                                };
+                                if rest.is_empty() {
+                                    streaks.remove(&session_key_clone);
+                                }
+                                (first, rest)
                             };
-                            let rest: Vec<QueuedMessage> = iter.collect();
                             if !rest.is_empty() {
                                 message_queue
                                     .write()
@@ -3046,7 +3352,12 @@ impl ChatService for LiveChatService {
                                     .or_default()
                                     .extend(rest);
                             }
-                            info!(session = %session_key_clone, "replaying queued message (followup)");
+                            info!(
+                                session = %session_key_clone,
+                                priority = first.priority.as_str(),
+                                starvation_bound,
+                                "replaying queued message (followup)"
+                            );
                             let mut replay_params = first.params;
                             replay_params["_queued_replay"] = serde_json::json!(true);
                             if let Err(e) = chat.send(replay_params).await {
@@ -3171,6 +3482,7 @@ impl ChatService for LiveChatService {
                 session_key: session_key.clone(),
                 content: text.clone(),
                 channel,
+                trace_id: trace_id.clone(),
             };
             if let Err(e) = hooks.dispatch(&payload).await {
                 warn!(session = %session_key, error = %e, "MessageReceived hook failed");
@@ -3617,16 +3929,19 @@ impl ChatService for LiveChatService {
                 let chat_cfg = moltis_config::discover_and_load().chat;
                 let queue_mode = chat_cfg.message_queue_mode;
                 let max_queue_size = chat_cfg.message_queue_max_size;
+                let priority = resolve_queue_priority(&params);
                 info!(
                     session = %session_key,
                     mode = ?queue_mode,
+                    priority = priority.as_str(),
                     client_seq = ?client_seq,
                     "queueing message (run active)"
                 );
                 let position = {
                     let mut q = self.message_queue.write().await;
                     let entry = q.entry(session_key.clone()).or_default();
-                    let Some(position) = enqueue_with_limit(entry, params.clone(), max_queue_size)
+                    let Some(position) =
+                        enqueue_with_limit(entry, params.clone(), priority, max_queue_size)
                     else {
                         return Ok(serde_json::json!({
                             "ok": false,
@@ -3644,6 +3959,7 @@ impl ChatService for LiveChatService {
                         "sessionKey": session_key,
                         "state": "queued",
                         "mode": format!("{queue_mode:?}").to_lowercase(),
+                        "priority": priority.as_str(),
                         "position": position,
                     }),
                     BroadcastOpts::default(),
@@ -3653,6 +3969,7 @@ impl ChatService for LiveChatService {
                     "ok": true,
                     "queued": true,
                     "mode": format!("{queue_mode:?}").to_lowercase(),
+                    "priority": priority.as_str(),
                 }));
             },
         };
@@ -3682,6 +3999,7 @@ impl ChatService for LiveChatService {
         let agent_timeout_secs = moltis_config::discover_and_load().tools.agent_timeout_secs;
 
         let message_queue = Arc::clone(&self.message_queue);
+        let message_queue_priority_streak = Arc::clone(&self.message_queue_priority_streak);
         let state_for_drain = Arc::clone(&self.state);
         let deferred_channel_target = deferred_channel_target.clone();
 
@@ -3730,6 +4048,7 @@ impl ChatService for LiveChatService {
                         &discovered_skills,
                         Some(&runtime_context),
                         Some(&session_store),
+                        state_store.as_ref(),
                         client_seq,
                     )
                     .await
@@ -3756,6 +4075,7 @@ impl ChatService for LiveChatService {
                         conn_id.clone(),
                         trace_id.clone(),
                         Some(&session_store),
+                        state_store.as_ref(),
                         mcp_disabled,
                         client_seq,
                         Some(Arc::clone(&active_thinking_text)),
@@ -3859,17 +4179,27 @@ impl ChatService for LiveChatService {
                 .remove(&session_key_clone)
                 .unwrap_or_default();
             if !queued.is_empty() {
-                let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                let chat_cfg = moltis_config::discover_and_load().chat;
+                let queue_mode = chat_cfg.message_queue_mode;
+                let starvation_bound = chat_cfg.priority_starvation_bound;
                 let chat = state_for_drain.chat_service().await;
                 match queue_mode {
                     MessageQueueMode::Followup => {
-                        let mut iter = queued.into_iter();
-                        let Some(first) = iter.next() else {
-                            return;
+                        let (first, rest) = {
+                            let mut streaks = message_queue_priority_streak.write().await;
+                            let streak = streaks.entry(session_key_clone.clone()).or_insert(0);
+                            let Some((first, rest)) =
+                                dequeue_followup_with_priority(queued, starvation_bound, streak)
+                            else {
+                                return;
+                            };
+                            if rest.is_empty() {
+                                streaks.remove(&session_key_clone);
+                            }
+                            (first, rest)
                         };
                         // Put remaining messages back so the replayed run's
                         // own drain loop picks them up after it completes.
-                        let rest: Vec<QueuedMessage> = iter.collect();
                         if !rest.is_empty() {
                             message_queue
                                 .write()
@@ -3878,7 +4208,12 @@ impl ChatService for LiveChatService {
                                 .or_default()
                                 .extend(rest);
                         }
-                        info!(session = %session_key_clone, "replaying queued message (followup)");
+                        info!(
+                            session = %session_key_clone,
+                            priority = first.priority.as_str(),
+                            starvation_bound,
+                            "replaying queued message (followup)"
+                        );
                         let mut replay_params = first.params;
                         replay_params["_queued_replay"] = serde_json::json!(true);
                         if let Err(e) = chat.send(replay_params).await {
@@ -4057,6 +4392,7 @@ impl ChatService for LiveChatService {
                 &[],
                 Some(&runtime_context),
                 Some(&self.session_store),
+                self.state_store.as_ref(),
                 None, // send_sync: no client seq
             )
             .await
@@ -4083,6 +4419,7 @@ impl ChatService for LiveChatService {
                 None, // send_sync: no conn_id
                 trace_id,
                 Some(&self.session_store),
+                self.state_store.as_ref(),
                 false, // send_sync: MCP tools always enabled for API calls
                 None,  // send_sync: no client seq
                 None,  // send_sync: no thinking text tracking
@@ -4229,6 +4566,10 @@ impl ChatService for LiveChatService {
             .await
             .remove(session_key)
             .unwrap_or_default();
+        self.message_queue_priority_streak
+            .write()
+            .await
+            .remove(session_key);
         let count = removed.len();
         info!(session = %session_key, count, "cancel_queued: cleared message queue");
 
@@ -6123,6 +6464,7 @@ async fn run_with_tools(
     conn_id: Option<String>,
     trace_id: Option<String>,
     session_store: Option<&Arc<SessionStore>>,
+    state_store: Option<&Arc<SessionStateStore>>,
     mcp_disabled: bool,
     client_seq: Option<u64>,
     active_thinking_text: Option<Arc<RwLock<HashMap<String, String>>>>,
@@ -6613,6 +6955,14 @@ async fn run_with_tools(
     )
     .await;
 
+    if let Some(handoff_context) = consume_inbound_handoff_context(state_store, session_key).await {
+        append_handoff_constraints(&mut system_prompt, &handoff_context);
+    }
+
+    // RAII guard ensures self-repair cleanup on all exit paths (including early returns).
+    let _self_repair_guard = SelfRepairGuard::new(state_store, session_key);
+    _self_repair_guard.mark_started().await;
+
     let provider_ref = provider.clone();
     let first_result = run_agent_loop_streaming(
         provider,
@@ -6686,8 +7036,8 @@ async fn run_with_tools(
                         Some(&on_event),
                         retry_hist,
                         Some(tool_context),
-                        hook_registry,
-                        trace_id,
+                        hook_registry.clone(),
+                        trace_id.clone(),
                     )
                     .await
                 },
@@ -6713,6 +7063,8 @@ async fn run_with_tools(
         },
         other => other,
     };
+
+    // Self-repair cleanup happens automatically via _self_repair_guard Drop.
 
     // Ensure all runner events (including deltas) are broadcast in order before
     // emitting terminal final/error frames.
@@ -6757,6 +7109,40 @@ async fn run_with_tools(
                 silent = is_silent,
                 "agent run complete"
             );
+
+            let handoff_context = HandoffContext {
+                last_action: Some(if tool_calls_made > 0 {
+                    format!("completed run with {tool_calls_made} tool calls")
+                } else {
+                    "completed run without tool calls".to_string()
+                }),
+                observed_error: None,
+                dead_ends: Vec::new(),
+                suggested_next_step: None,
+                estimated_tokens: Some(
+                    request_usage
+                        .input_tokens
+                        .saturating_add(request_usage.output_tokens),
+                ),
+            };
+            persist_handoff_context(state_store, session_key, &handoff_context).await;
+
+            if let Some(ref hooks) = hook_registry {
+                let payload = moltis_common::hooks::HookPayload::AgentEnd {
+                    session_key: session_key.to_string(),
+                    text: display_text.clone(),
+                    iterations,
+                    tool_calls: tool_calls_made,
+                    trace_id: trace_id.clone(),
+                };
+                if let Err(error) = hooks.dispatch(&payload).await {
+                    warn!(
+                        run_id,
+                        error = %error,
+                        "AgentEnd hook dispatch failed"
+                    );
+                }
+            }
 
             // Detect provider failures: silent response with zero tokens
             // produced means the LLM never processed the request (e.g.
@@ -6881,6 +7267,32 @@ async fn run_with_tools(
         Err(e) => {
             let error_str = e.to_string();
             warn!(run_id, error = %error_str, "agent run error");
+            let mut handoff_context = HandoffContext {
+                last_action: Some("agent run failed".to_string()),
+                observed_error: Some(error_str.clone()),
+                dead_ends: Vec::new(),
+                suggested_next_step: suggested_next_step_for_error(&error_str),
+                estimated_tokens: None,
+            };
+            handoff_context.add_dead_end("llm", &error_str, "provider call failed");
+            persist_handoff_context(state_store, session_key, &handoff_context).await;
+
+            if let Some(ref hooks) = hook_registry {
+                let payload = moltis_common::hooks::HookPayload::AgentEnd {
+                    session_key: session_key.to_string(),
+                    text: error_str.clone(),
+                    iterations: 0,
+                    tool_calls: 0,
+                    trace_id: trace_id.clone(),
+                };
+                if let Err(error) = hooks.dispatch(&payload).await {
+                    warn!(
+                        run_id,
+                        error = %error,
+                        "AgentEnd hook dispatch failed for error case"
+                    );
+                }
+            }
             state.set_run_error(run_id, error_str.clone()).await;
             let error_obj = parse_chat_error(&error_str, Some(provider_name));
             mark_unsupported_model(state, model_store, model_id, provider_name, &error_obj).await;
@@ -7071,6 +7483,7 @@ async fn run_streaming(
     _skills: &[moltis_skills::types::SkillMetadata],
     runtime_context: Option<&PromptRuntimeContext>,
     session_store: Option<&Arc<SessionStore>>,
+    state_store: Option<&Arc<SessionStateStore>>,
     client_seq: Option<u64>,
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
@@ -7106,6 +7519,10 @@ async fn run_streaming(
     )
     .await;
 
+    if let Some(handoff_context) = consume_inbound_handoff_context(state_store, session_key).await {
+        append_handoff_constraints(&mut system_prompt, &handoff_context);
+    }
+
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage::system(system_prompt));
     messages.extend(chat_history);
@@ -7118,6 +7535,8 @@ async fn run_streaming(
     let mut rate_limit_backoff_ms: Option<u64> = None;
     let mut channel_stream_dispatcher =
         ChannelStreamDispatcher::for_session(state, session_key).await;
+    #[cfg(feature = "metrics")]
+    let should_record_stream_metrics = !provider.emits_metrics();
 
     'attempts: loop {
         #[cfg(feature = "metrics")]
@@ -7173,7 +7592,7 @@ async fn run_streaming(
 
                     // Record streaming completion metrics (mirroring provider_chain.rs)
                     #[cfg(feature = "metrics")]
-                    {
+                    if should_record_stream_metrics {
                         let duration = stream_start.elapsed().as_secs_f64();
                         counter!(
                             llm_metrics::COMPLETIONS_TOTAL,
@@ -9296,6 +9715,66 @@ mod tests {
         Arc::new(SessionStateStore::new(pool.clone()))
     }
 
+    #[test]
+    fn append_handoff_constraints_includes_do_not_retry_guidance() {
+        let mut prompt = String::from("base prompt");
+        let mut handoff = HandoffContext {
+            last_action: Some("attempted migration".to_string()),
+            observed_error: Some("tool timeout".to_string()),
+            dead_ends: Vec::new(),
+            suggested_next_step: Some("retry with narrower scope".to_string()),
+            estimated_tokens: Some(512),
+        };
+        handoff.add_dead_end("exec", "timed out", "command exceeded timeout");
+
+        append_handoff_constraints(&mut prompt, &handoff);
+
+        assert!(prompt.contains("[InterSessionHandoff]"));
+        assert!(prompt.contains("do_not_retry"));
+        assert!(prompt.contains("hard constraint"));
+    }
+
+    #[tokio::test]
+    async fn consume_inbound_handoff_context_reads_and_clears_state() {
+        let pool = sqlite_pool().await;
+        let state_store = make_state_store(&pool).await;
+
+        let handoff = HandoffContext {
+            last_action: Some("completed dependency scan".to_string()),
+            observed_error: None,
+            dead_ends: Vec::new(),
+            suggested_next_step: Some("apply patch".to_string()),
+            estimated_tokens: Some(123),
+        };
+        let serialized = serde_json::to_string(&handoff).expect("serialize handoff");
+        state_store
+            .set(
+                "session:target",
+                HANDOFF_NAMESPACE,
+                HANDOFF_INBOUND_KEY,
+                &serialized,
+            )
+            .await
+            .expect("persist inbound handoff");
+
+        let loaded = consume_inbound_handoff_context(Some(&state_store), "session:target")
+            .await
+            .expect("handoff should be loaded");
+        assert_eq!(
+            loaded.last_action.as_deref(),
+            Some("completed dependency scan")
+        );
+
+        let after = state_store
+            .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+            .await
+            .expect("read inbound handoff after consume");
+        assert!(
+            after.is_none(),
+            "inbound handoff must be consumed exactly once"
+        );
+    }
+
     #[tokio::test]
     async fn deliver_channel_replies_waits_for_outbound_sends() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -9673,10 +10152,16 @@ mod tests {
                 .any(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant")),
             "explicit /sh should persist an assistant turn for history coherence"
         );
-        assert!(
-            !moltis_agents::self_repair::is_session_running(&state_store, "main").await,
-            "self-repair running marker should be cleared when /sh run completes"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !moltis_agents::self_repair::is_session_running(&state_store, "main").await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("self-repair running marker should be cleared when /sh run completes");
     }
 
     #[tokio::test]
@@ -10054,6 +10539,20 @@ mod tests {
         Arc::new(RwLock::new(HashMap::new()))
     }
 
+    fn queued_text(text: &str) -> QueuedMessage {
+        QueuedMessage {
+            params: serde_json::json!({ "text": text }),
+            priority: QueuePriority::Interactive,
+        }
+    }
+
+    fn queued_with_priority(text: &str, priority: QueuePriority) -> QueuedMessage {
+        QueuedMessage {
+            params: serde_json::json!({ "text": text }),
+            priority,
+        }
+    }
+
     fn make_target(message_id: &str) -> Value {
         serde_json::json!({
             "channel_type": "telegram",
@@ -10071,12 +10570,12 @@ mod tests {
         // Enqueue two messages.
         {
             let mut q = queue.write().await;
-            q.entry(key.to_string()).or_default().push(QueuedMessage {
-                params: serde_json::json!({"text": "hello"}),
-            });
-            q.entry(key.to_string()).or_default().push(QueuedMessage {
-                params: serde_json::json!({"text": "world"}),
-            });
+            q.entry(key.to_string())
+                .or_default()
+                .push(queued_text("hello"));
+            q.entry(key.to_string())
+                .or_default()
+                .push(queued_text("world"));
         }
 
         // Drain.
@@ -10094,12 +10593,15 @@ mod tests {
         let msgs = [
             QueuedMessage {
                 params: serde_json::json!({"text": "first", "model": "gpt-4"}),
+                priority: QueuePriority::Interactive,
             },
             QueuedMessage {
                 params: serde_json::json!({"text": "second"}),
+                priority: QueuePriority::Interactive,
             },
             QueuedMessage {
                 params: serde_json::json!({"text": "third", "_conn_id": "c1"}),
+                priority: QueuePriority::Interactive,
             },
         ];
 
@@ -10166,23 +10668,16 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "a"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "b"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "c"}),
-            });
+            entry.push(queued_text("a"));
+            entry.push(queued_text("b"));
+            entry.push(queued_text("c"));
         }
 
         // Drain and apply the send-first/requeue-rest logic.
         let queued = queue.write().await.remove(key).unwrap_or_default();
-
-        let mut iter = queued.into_iter();
-        let first = iter.next().expect("queued is non-empty");
-        let rest: Vec<QueuedMessage> = iter.collect();
+        let mut streak = 0usize;
+        let (first, rest) =
+            dequeue_followup_with_priority(queued, 5, &mut streak).expect("queued is non-empty");
 
         // The first message is the one to send.
         assert_eq!(first.params["text"], "a");
@@ -10218,25 +10713,28 @@ mod tests {
                     "text": "a",
                     "_channel_reply_target": make_target("m1"),
                 }),
+                priority: QueuePriority::Interactive,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({
                     "text": "b",
                     "_channel_reply_target": make_target("m2"),
                 }),
+                priority: QueuePriority::Interactive,
             });
             entry.push(QueuedMessage {
                 params: serde_json::json!({
                     "text": "c",
                     "_channel_reply_target": make_target("m3"),
                 }),
+                priority: QueuePriority::Interactive,
             });
         }
 
         let queued = queue.write().await.remove(key).unwrap_or_default();
-        let mut iter = queued.into_iter();
-        let first = iter.next().expect("queued is non-empty");
-        let rest: Vec<QueuedMessage> = iter.collect();
+        let mut streak = 0usize;
+        let (first, rest) =
+            dequeue_followup_with_priority(queued, 5, &mut streak).expect("queued is non-empty");
 
         assert_eq!(first.params["_channel_reply_target"]["message_id"], "m1");
 
@@ -10270,18 +10768,21 @@ mod tests {
                     "text": "first",
                     "_channel_reply_target": make_target("m1"),
                 }),
+                priority: QueuePriority::Interactive,
             },
             QueuedMessage {
                 params: serde_json::json!({
                     "text": "second",
                     "_channel_reply_target": make_target("m2"),
                 }),
+                priority: QueuePriority::Interactive,
             },
             QueuedMessage {
                 params: serde_json::json!({
                     "text": "third",
                     "_channel_reply_target": make_target("m3"),
                 }),
+                priority: QueuePriority::Interactive,
             },
         ];
 
@@ -10327,12 +10828,8 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "a"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "b"}),
-            });
+            entry.push(queued_text("a"));
+            entry.push(queued_text("b"));
         }
 
         // Cancel (same logic as cancel_queued: remove + unwrap_or_default).
@@ -10347,21 +10844,34 @@ mod tests {
     fn enqueue_with_limit_accepts_until_capacity() {
         let mut entry = Vec::new();
 
-        let first = enqueue_with_limit(&mut entry, serde_json::json!({"text": "a"}), 2);
+        let first = enqueue_with_limit(
+            &mut entry,
+            serde_json::json!({"text": "a"}),
+            QueuePriority::Interactive,
+            2,
+        );
         assert_eq!(first, Some(1));
 
-        let second = enqueue_with_limit(&mut entry, serde_json::json!({"text": "b"}), 2);
+        let second = enqueue_with_limit(
+            &mut entry,
+            serde_json::json!({"text": "b"}),
+            QueuePriority::Interactive,
+            2,
+        );
         assert_eq!(second, Some(2));
         assert_eq!(entry.len(), 2);
     }
 
     #[test]
     fn enqueue_with_limit_rejects_when_full_without_mutating() {
-        let mut entry = vec![QueuedMessage {
-            params: serde_json::json!({"text": "already"}),
-        }];
+        let mut entry = vec![queued_text("already")];
 
-        let result = enqueue_with_limit(&mut entry, serde_json::json!({"text": "new"}), 1);
+        let result = enqueue_with_limit(
+            &mut entry,
+            serde_json::json!({"text": "new"}),
+            QueuePriority::Interactive,
+            1,
+        );
         assert_eq!(result, None);
         assert_eq!(entry.len(), 1);
         assert_eq!(entry[0].params["text"], "already");
@@ -10375,15 +10885,9 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "x"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "y"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "z"}),
-            });
+            entry.push(queued_text("x"));
+            entry.push(queued_text("y"));
+            entry.push(queued_text("z"));
         }
 
         let removed = queue.write().await.remove(key).unwrap_or_default();
@@ -10404,6 +10908,93 @@ mod tests {
 
         let result = serde_json::json!({ "cleared": removed.len() });
         assert_eq!(result["cleared"], 0);
+    }
+
+    #[test]
+    fn resolve_queue_priority_defaults_to_interactive() {
+        let params = serde_json::json!({ "text": "hi" });
+        assert_eq!(resolve_queue_priority(&params), QueuePriority::Interactive);
+    }
+
+    #[test]
+    fn resolve_queue_priority_classifies_background_and_maintenance() {
+        let background = serde_json::json!({ "_session_key": "session:abc" });
+        assert_eq!(
+            resolve_queue_priority(&background),
+            QueuePriority::Background
+        );
+
+        let maintenance = serde_json::json!({
+            "_session_key": "cron:nightly",
+            "_source": "cron",
+        });
+        assert_eq!(
+            resolve_queue_priority(&maintenance),
+            QueuePriority::Maintenance
+        );
+    }
+
+    #[test]
+    fn dequeue_followup_prefers_highest_priority_first() {
+        let queued = vec![
+            queued_with_priority("b1", QueuePriority::Background),
+            queued_with_priority("i1", QueuePriority::Interactive),
+            queued_with_priority("m1", QueuePriority::Maintenance),
+        ];
+        let mut streak = 0usize;
+        let (picked, rest) =
+            dequeue_followup_with_priority(queued, 5, &mut streak).expect("message available");
+        assert_eq!(picked.params["text"], "i1");
+        assert_eq!(picked.priority, QueuePriority::Interactive);
+        assert_eq!(streak, 1);
+        assert_eq!(rest.len(), 2);
+    }
+
+    #[test]
+    fn dequeue_followup_honors_starvation_bound() {
+        let mut streak = 0usize;
+        let queue = vec![
+            queued_with_priority("i1", QueuePriority::Interactive),
+            queued_with_priority("b1", QueuePriority::Background),
+        ];
+        let (first, mut rest) =
+            dequeue_followup_with_priority(queue, 2, &mut streak).expect("first pick");
+        assert_eq!(first.params["text"], "i1");
+        assert_eq!(streak, 1);
+
+        rest.push(queued_with_priority("i2", QueuePriority::Interactive));
+        let (second, mut rest) =
+            dequeue_followup_with_priority(rest, 2, &mut streak).expect("second pick");
+        assert_eq!(second.params["text"], "i2");
+        assert_eq!(streak, 2);
+
+        rest.push(queued_with_priority("i3", QueuePriority::Interactive));
+        let (third, _rest) =
+            dequeue_followup_with_priority(rest, 2, &mut streak).expect("third pick");
+        assert_eq!(third.params["text"], "b1");
+        assert_eq!(third.priority, QueuePriority::Background);
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn dequeue_followup_preserves_fifo_within_same_priority() {
+        let mut streak = 0usize;
+        let queued = vec![
+            queued_with_priority("b1", QueuePriority::Background),
+            queued_with_priority("b2", QueuePriority::Background),
+            queued_with_priority("m1", QueuePriority::Maintenance),
+        ];
+        let (first, rest) =
+            dequeue_followup_with_priority(queued, 3, &mut streak).expect("first pick");
+        assert_eq!(first.params["text"], "b1");
+        assert_eq!(first.priority, QueuePriority::Background);
+        assert_eq!(streak, 1);
+
+        let mut second_streak = 0usize;
+        let (second, _) =
+            dequeue_followup_with_priority(rest, 3, &mut second_streak).expect("second pick");
+        assert_eq!(second.params["text"], "b2");
+        assert_eq!(second.priority, QueuePriority::Background);
     }
 
     #[test]

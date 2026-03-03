@@ -1,233 +1,53 @@
-//! Provider failover chain with per-provider circuit breakers.
+//! Provider failover chain with outbound throttling and health tracking.
 //!
 //! `ProviderChain` wraps a primary `LlmProvider` with a list of fallbacks.
 //! When the primary fails with a retryable error (rate limit, auth, server error),
-//! it automatically tries the next provider in the chain, skipping any that have
-//! their circuit breaker tripped.
+//! it automatically tries the next provider in the chain.
 
-use std::{
-    pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::{pin::Pin, sync::Arc, time::Instant};
 
 use {async_trait::async_trait, tokio_stream::Stream, tracing::warn};
 
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 
-use crate::model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent};
+use crate::{
+    model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent},
+    provider_health::{ProviderHealthTracker, global_tracker},
+    rate_limiter::{ProviderRateLimiter, RateLimitDecision},
+};
 
-/// How a provider error should be handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderErrorKind {
-    /// 429 — rotate to next provider.
-    RateLimit,
-    /// 401/403 — rotate (bad key or permissions).
-    AuthError,
-    /// 5xx — rotate to next provider.
-    ServerError,
-    /// Billing/usage limit exhausted — rotate.
-    BillingExhausted,
-    /// Plan/model does not support this request — different from billing exhaustion.
-    /// Example: "Your plan doesn't include access to this model."
-    /// Should skip the entire provider, not just the key.
-    NonRetryableRateLimit,
-    /// Context window exceeded — don't rotate, caller should compact.
-    ContextWindow,
-    /// 400, bad format — don't rotate, it'll fail everywhere.
-    InvalidRequest,
-    /// Unrecognised error — attempt failover.
-    Unknown,
-}
-
-impl ProviderErrorKind {
-    /// Whether this error kind should trigger failover to the next provider.
-    #[must_use]
-    pub fn should_failover(self) -> bool {
-        matches!(
-            self,
-            Self::RateLimit
-                | Self::AuthError
-                | Self::ServerError
-                | Self::BillingExhausted
-                | Self::NonRetryableRateLimit
-                | Self::Unknown
-        )
-    }
-}
-
-/// Error patterns for context window overflow (reused from runner.rs).
-const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
-    "context_length_exceeded",
-    "max_tokens",
-    "too many tokens",
-    "request too large",
-    "maximum context length",
-    "context window",
-    "token limit",
-    "content_too_large",
-    "request_too_large",
-];
-
-/// Classify an error into a `ProviderErrorKind` based on the error message.
-#[must_use]
-pub fn classify_error(err: &anyhow::Error) -> ProviderErrorKind {
-    let msg = err.to_string().to_lowercase();
-
-    // Context window — must check first since "request too large" overlaps.
-    if CONTEXT_WINDOW_PATTERNS.iter().any(|p| msg.contains(p)) {
-        return ProviderErrorKind::ContextWindow;
-    }
-
-    // Plan/model access errors — non-retryable with key rotation.
-    // Must check before the general rate limit check.
-    if msg.contains("your plan does not include")
-        || msg.contains("model not available")
-        || msg.contains("not available on your plan")
-        || msg.contains("upgrade your plan")
-        || msg.contains("organization does not have access")
-    {
-        return ProviderErrorKind::NonRetryableRateLimit;
-    }
-
-    // Rate limiting.
-    if msg.contains("429")
-        || msg.contains("rate limit")
-        || msg.contains("rate_limit")
-        || msg.contains("too many requests")
-    {
-        return ProviderErrorKind::RateLimit;
-    }
-
-    // Auth errors.
-    if msg.contains("401")
-        || msg.contains("403")
-        || msg.contains("unauthorized")
-        || msg.contains("forbidden")
-        || msg.contains("invalid api key")
-        || msg.contains("invalid_api_key")
-        || msg.contains("authentication")
-    {
-        return ProviderErrorKind::AuthError;
-    }
-
-    // Billing / quota exhaustion.
-    if msg.contains("billing")
-        || msg.contains("quota")
-        || msg.contains("insufficient_quota")
-        || msg.contains("usage limit")
-        || msg.contains("credit")
-    {
-        return ProviderErrorKind::BillingExhausted;
-    }
-
-    // Server errors.
-    if msg.contains("500")
-        || msg.contains("502")
-        || msg.contains("503")
-        || msg.contains("504")
-        || msg.contains("internal server error")
-        || msg.contains("bad gateway")
-        || msg.contains("service unavailable")
-        || msg.contains("overloaded")
-    {
-        return ProviderErrorKind::ServerError;
-    }
-
-    // Invalid request (400-level, non-auth, non-rate-limit).
-    if msg.contains("400") || msg.contains("bad request") || msg.contains("invalid_request") {
-        return ProviderErrorKind::InvalidRequest;
-    }
-
-    ProviderErrorKind::Unknown
-}
-
-/// Parse a retry-after duration (in milliseconds) from an error message.
-/// Looks for patterns like "retry after 30", "retry-after: 5.5", "Retry-After: 60".
-#[must_use]
-pub fn parse_retry_after_ms(msg: &str) -> Option<u64> {
-    let re = regex::Regex::new(r"(?i)retry.?after[:\s]+(\d+\.?\d*)").ok()?;
-    let cap = re.captures(msg)?;
-    let secs: f64 = cap.get(1)?.as_str().parse().ok()?;
-    Some((secs * 1000.0) as u64)
-}
-
-// ── Circuit breaker (same pattern as embeddings_fallback.rs) ─────────────
-
-/// Circuit breaker state for a single provider.
-struct ProviderState {
-    consecutive_failures: AtomicUsize,
-    last_failure: Mutex<Option<Instant>>,
-}
-
-impl ProviderState {
-    fn new() -> Self {
-        Self {
-            consecutive_failures: AtomicUsize::new(0),
-            last_failure: Mutex::new(None),
-        }
-    }
-
-    fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::SeqCst);
-    }
-
-    fn record_failure(&self) {
-        self.consecutive_failures.fetch_add(1, Ordering::SeqCst);
-        *self.last_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-    }
-
-    /// Returns `true` when the circuit is open (provider should be skipped).
-    fn is_tripped(&self, threshold: usize, cooldown: Duration) -> bool {
-        let failures = self.consecutive_failures.load(Ordering::SeqCst);
-        if failures < threshold {
-            return false;
-        }
-        let last = self.last_failure.lock().unwrap_or_else(|e| e.into_inner());
-        match *last {
-            Some(t) if t.elapsed() < cooldown => true,
-            _ => {
-                drop(last);
-                self.consecutive_failures.store(0, Ordering::SeqCst);
-                false
-            },
-        }
-    }
-}
+pub use crate::classify::{
+    ErrorRoutingAction, ProviderErrorKind, classify_error, classify_error_message,
+    extract_retry_after_ms, parse_retry_after_ms, parse_retry_delay_ms_from_fragment,
+};
 
 /// A provider entry in the failover chain.
 struct ChainEntry {
     provider: Arc<dyn LlmProvider>,
-    state: ProviderState,
 }
 
-/// Failover chain that tries providers in order, with circuit breakers.
+/// Failover chain that tries providers in order.
 ///
 /// Implements `LlmProvider` itself so callers don't need to know about failover.
 pub struct ProviderChain {
     chain: Vec<ChainEntry>,
-    cb_threshold: usize,
-    cb_cooldown: Duration,
+    rate_limiter: Option<Arc<ProviderRateLimiter>>,
+    health_tracker: Arc<ProviderHealthTracker>,
 }
 
 impl ProviderChain {
     /// Build a chain from a list of providers (primary first, then fallbacks).
     pub fn new(providers: Vec<Arc<dyn LlmProvider>>) -> Self {
+        let config = moltis_config::discover_and_load();
         let chain = providers
             .into_iter()
-            .map(|provider| ChainEntry {
-                provider,
-                state: ProviderState::new(),
-            })
+            .map(|provider| ChainEntry { provider })
             .collect();
         Self {
             chain,
-            cb_threshold: 3,
-            cb_cooldown: Duration::from_secs(60),
+            rate_limiter: ProviderRateLimiter::from_config(&config.tools.provider_rate_limit),
+            health_tracker: global_tracker(),
         }
     }
 
@@ -236,10 +56,15 @@ impl ProviderChain {
         Self::new(vec![provider])
     }
 
-    /// Override the circuit breaker threshold and cooldown.
-    pub fn with_circuit_breaker(mut self, threshold: usize, cooldown: Duration) -> Self {
-        self.cb_threshold = threshold;
-        self.cb_cooldown = cooldown;
+    /// Override the outbound provider rate limiter.
+    pub fn with_rate_limiter(mut self, limiter: Option<Arc<ProviderRateLimiter>>) -> Self {
+        self.rate_limiter = limiter;
+        self
+    }
+
+    /// Override provider-health tracking sink.
+    pub fn with_health_tracker(mut self, tracker: Arc<ProviderHealthTracker>) -> Self {
+        self.health_tracker = tracker;
         self
     }
 
@@ -266,6 +91,10 @@ impl LlmProvider for ProviderChain {
         self.primary().provider.context_window()
     }
 
+    fn emits_metrics(&self) -> bool {
+        true
+    }
+
     async fn complete(
         &self,
         messages: &[ChatMessage],
@@ -275,17 +104,49 @@ impl LlmProvider for ProviderChain {
         #[cfg(feature = "metrics")]
         let start = Instant::now();
 
-        for entry in &self.chain {
-            if entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
-                continue;
-            }
-
+        'providers: for entry in &self.chain {
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
+            let attempt_start = Instant::now();
+
+            if let Some(ref limiter) = self.rate_limiter {
+                loop {
+                    match limiter.acquire(&provider_name, &model_id) {
+                        RateLimitDecision::Allowed => break,
+                        RateLimitDecision::Wait(delay) => {
+                            warn!(
+                                provider = %provider_name,
+                                model = %model_id,
+                                delay_ms = delay.as_millis() as u64,
+                                "outbound provider limiter queued request"
+                            );
+                            tokio::time::sleep(delay).await;
+                        },
+                        RateLimitDecision::Rejected(retry_after) => {
+                            warn!(
+                                provider = %provider_name,
+                                model = %model_id,
+                                retry_after_ms = retry_after.as_millis() as u64,
+                                "outbound provider limiter rejected request; trying next provider"
+                            );
+                            errors.push(format!(
+                                "{}: local provider rate limiter active (retry_after={}ms)",
+                                entry.provider.id(),
+                                retry_after.as_millis()
+                            ));
+                            continue 'providers;
+                        },
+                    }
+                }
+            }
 
             match entry.provider.complete(messages, tools).await {
                 Ok(resp) => {
-                    entry.state.record_success();
+                    self.health_tracker.record_success(
+                        &provider_name,
+                        &model_id,
+                        attempt_start.elapsed().as_millis() as u64,
+                    );
 
                     // Record metrics on successful completion
                     #[cfg(feature = "metrics")]
@@ -339,7 +200,21 @@ impl LlmProvider for ProviderChain {
                 },
                 Err(e) => {
                     let kind = classify_error(&e);
-                    entry.state.record_failure();
+                    self.health_tracker.record_failure(
+                        &provider_name,
+                        &model_id,
+                        attempt_start.elapsed().as_millis() as u64,
+                        provider_error_kind_label(kind),
+                    );
+
+                    if matches!(
+                        kind,
+                        ProviderErrorKind::RateLimit | ProviderErrorKind::NonRetryableRateLimit
+                    ) && let Some(retry_after_ms) = parse_retry_after_ms(&e.to_string())
+                        && let Some(ref limiter) = self.rate_limiter
+                    {
+                        limiter.note_retry_after_ms(&provider_name, &model_id, retry_after_ms);
+                    }
 
                     // Record error metrics
                     #[cfg(feature = "metrics")]
@@ -387,16 +262,214 @@ impl LlmProvider for ProviderChain {
         messages: Vec<ChatMessage>,
         tools: Vec<serde_json::Value>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
-        // For streaming, we try the first non-tripped provider.
-        // If the stream yields an Error event, we can't transparently retry mid-stream,
-        // so we pick the best available provider upfront.
+        // For streaming, we choose a provider up-front.
+        // If the stream yields an Error event, we can't transparently retry
+        // mid-stream, so we pick the best available provider upfront.
+        let mut selected = None;
+        let mut limiter_rejections: Vec<String> = Vec::new();
         for entry in &self.chain {
-            if !entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
-                return entry.provider.stream_with_tools(messages, tools);
+            let provider_name = entry.provider.name().to_string();
+            let model_id = entry.provider.id().to_string();
+
+            if let Some(ref limiter) = self.rate_limiter {
+                match limiter.acquire(&provider_name, &model_id) {
+                    RateLimitDecision::Allowed => {
+                        selected = Some((entry, None));
+                        break;
+                    },
+                    RateLimitDecision::Wait(delay) => {
+                        selected = Some((entry, Some(delay)));
+                        break;
+                    },
+                    RateLimitDecision::Rejected(retry_after) => {
+                        limiter_rejections.push(format!(
+                            "{}: local provider rate limiter active (retry_after={}ms)",
+                            entry.provider.id(),
+                            retry_after.as_millis()
+                        ));
+                        continue;
+                    },
+                }
+            } else {
+                selected = Some((entry, None));
+                break;
             }
         }
-        // All tripped — try primary anyway (it may have cooled down by now).
-        self.primary().provider.stream_with_tools(messages, tools)
+
+        let Some((selected, initial_delay)) = selected else {
+            let message = if limiter_rejections.is_empty() {
+                "all providers in failover chain unavailable for streaming".to_string()
+            } else {
+                format!(
+                    "all providers in failover chain unavailable for streaming: {}",
+                    limiter_rejections.join("; ")
+                )
+            };
+            return Box::pin(tokio_stream::once(StreamEvent::Error(message)));
+        };
+
+        let provider_name = selected.provider.name().to_string();
+        let model_id = selected.provider.id().to_string();
+        let health_tracker = Arc::clone(&self.health_tracker);
+        let limiter = self.rate_limiter.clone();
+        let start = Instant::now();
+        let mut first_delta_recorded = false;
+        let provider = Arc::clone(&selected.provider);
+
+        let wrapped = async_stream::stream! {
+            if let Some(delay) = initial_delay {
+                tokio::time::sleep(delay).await;
+                if let Some(ref limiter) = limiter {
+                    loop {
+                        match limiter.acquire(&provider_name, &model_id) {
+                            RateLimitDecision::Allowed => break,
+                            RateLimitDecision::Wait(next_delay) => {
+                                warn!(
+                                    provider = %provider_name,
+                                    model = %model_id,
+                                    delay_ms = next_delay.as_millis() as u64,
+                                    "outbound provider limiter queued streaming request"
+                                );
+                                tokio::time::sleep(next_delay).await;
+                            },
+                            RateLimitDecision::Rejected(retry_after) => {
+                                yield StreamEvent::Error(format!(
+                                    "{}: local provider rate limiter active (retry_after={}ms)",
+                                    provider.id(),
+                                    retry_after.as_millis()
+                                ));
+                                return;
+                            },
+                        }
+                    }
+                }
+            }
+
+            use tokio_stream::StreamExt;
+            let mut inner = provider.stream_with_tools(messages, tools);
+            while let Some(event) = inner.next().await {
+                match &event {
+                    StreamEvent::Delta(_) if !first_delta_recorded => {
+                        first_delta_recorded = true;
+                        #[cfg(feature = "metrics")]
+                        histogram!(
+                            llm_metrics::TIME_TO_FIRST_TOKEN_SECONDS,
+                            labels::PROVIDER => provider_name.clone(),
+                            labels::MODEL => model_id.clone()
+                        )
+                        .record(start.elapsed().as_secs_f64());
+                    },
+                    StreamEvent::Done(usage) => {
+                        health_tracker.record_success(
+                            &provider_name,
+                            &model_id,
+                            start.elapsed().as_millis() as u64,
+                        );
+                        #[cfg(feature = "metrics")]
+                        {
+                            let duration_secs = start.elapsed().as_secs_f64();
+                            counter!(
+                                llm_metrics::COMPLETIONS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(1);
+                            counter!(
+                                llm_metrics::INPUT_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(usage.input_tokens));
+                            counter!(
+                                llm_metrics::OUTPUT_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(usage.output_tokens));
+                            counter!(
+                                llm_metrics::CACHE_READ_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(usage.cache_read_tokens));
+                            counter!(
+                                llm_metrics::CACHE_WRITE_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(usage.cache_write_tokens));
+                            histogram!(
+                                llm_metrics::COMPLETION_DURATION_SECONDS,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .record(duration_secs);
+
+                            if duration_secs > 0.0 {
+                                let tps = usage.output_tokens as f64 / duration_secs;
+                                histogram!(
+                                    llm_metrics::TOKENS_PER_SECOND,
+                                    labels::PROVIDER => provider_name.clone(),
+                                    labels::MODEL => model_id.clone()
+                                )
+                                .record(tps);
+                            }
+                        }
+                    },
+                    StreamEvent::Error(msg) => {
+                        let kind = classify_error_message(msg);
+                        health_tracker.record_failure(
+                            &provider_name,
+                            &model_id,
+                            start.elapsed().as_millis() as u64,
+                            provider_error_kind_label(kind),
+                        );
+
+                        if matches!(kind, ProviderErrorKind::RateLimit | ProviderErrorKind::NonRetryableRateLimit)
+                            && let Some(retry_after_ms) = parse_retry_after_ms(msg)
+                            && let Some(ref limiter) = limiter
+                        {
+                            limiter.note_retry_after_ms(&provider_name, &model_id, retry_after_ms);
+                        }
+
+                        #[cfg(feature = "metrics")]
+                        {
+                            histogram!(
+                                llm_metrics::COMPLETION_DURATION_SECONDS,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .record(start.elapsed().as_secs_f64());
+                            counter!(
+                                llm_metrics::COMPLETION_ERRORS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone(),
+                                labels::ERROR_TYPE => format!("{kind:?}")
+                            )
+                            .increment(1);
+                        }
+                    },
+                    _ => {},
+                }
+
+                yield event;
+            }
+        };
+        Box::pin(wrapped)
+    }
+}
+
+fn provider_error_kind_label(kind: ProviderErrorKind) -> &'static str {
+    match kind {
+        ProviderErrorKind::RateLimit => "rate_limit",
+        ProviderErrorKind::AuthError => "auth_error",
+        ProviderErrorKind::ServerError => "server_error",
+        ProviderErrorKind::Timeout => "timeout",
+        ProviderErrorKind::BillingExhausted => "billing_exhausted",
+        ProviderErrorKind::NonRetryableRateLimit => "non_retryable_rate_limit",
+        ProviderErrorKind::ContextWindow => "context_window",
+        ProviderErrorKind::InvalidRequest => "invalid_request",
+        ProviderErrorKind::Unknown => "unknown",
     }
 }
 
@@ -407,6 +480,7 @@ mod tests {
         super::*,
         crate::model::{ChatMessage, StreamEvent, Usage},
         async_trait::async_trait,
+        std::{sync::Mutex, time::Duration},
         tokio_stream::StreamExt,
     };
 
@@ -499,6 +573,12 @@ mod tests {
         assert_eq!(chain.id(), "primary");
     }
 
+    #[test]
+    fn chain_reports_internal_metrics_emission() {
+        let chain = ProviderChain::single(Arc::new(SuccessProvider { id: "primary" }));
+        assert!(chain.emits_metrics());
+    }
+
     #[tokio::test]
     async fn failover_on_rate_limit() {
         let chain = ProviderChain::new(vec![
@@ -514,7 +594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failover_on_server_error() {
+    async fn no_failover_on_server_error() {
         let chain = ProviderChain::new(vec![
             Arc::new(FailingProvider {
                 id: "primary",
@@ -523,8 +603,8 @@ mod tests {
             Arc::new(SuccessProvider { id: "fallback" }),
         ]);
 
-        let resp = chain.complete(&[], &[]).await.unwrap();
-        assert_eq!(resp.text.as_deref(), Some("ok"));
+        let err = chain.complete(&[], &[]).await.unwrap_err();
+        assert!(err.to_string().contains("500 internal server error"));
     }
 
     #[tokio::test]
@@ -539,6 +619,156 @@ mod tests {
 
         let resp = chain.complete(&[], &[]).await.unwrap();
         assert_eq!(resp.text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_rejects_primary_then_fallback_succeeds() {
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
+        cfg.enabled = true;
+        cfg.wait_on_limit = false;
+        cfg.defaults.max_requests_per_window = 0;
+        cfg.providers.insert(
+            "success".to_string(),
+            moltis_config::schema::ProviderRateLimitWindowConfig {
+                window_secs: 60,
+                max_requests_per_window: 10,
+            },
+        );
+        let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
+
+        let chain = ProviderChain::new(vec![
+            Arc::new(FailingProvider {
+                id: "primary",
+                error_msg: "500 internal server error",
+            }),
+            Arc::new(SuccessProvider { id: "fallback" }),
+        ])
+        .with_rate_limiter(Some(limiter));
+
+        let resp = chain.complete(&[], &[]).await.unwrap();
+        assert_eq!(resp.text.as_deref(), Some("ok"));
+    }
+
+    struct StreamingTextProvider {
+        id: &'static str,
+        text: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingTextProvider {
+        fn name(&self) -> &str {
+            "streaming-text"
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> anyhow::Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: Some(self.text.to_string()),
+                tool_calls: vec![],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            self.stream_with_tools(vec![], vec![])
+        }
+
+        fn stream_with_tools(
+            &self,
+            _messages: Vec<ChatMessage>,
+            _tools: Vec<serde_json::Value>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::iter(vec![
+                StreamEvent::Delta(self.text.to_string()),
+                StreamEvent::Done(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                }),
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_rate_limiter_rejects_primary_then_uses_fallback() {
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
+        cfg.enabled = true;
+        cfg.wait_on_limit = false;
+        cfg.defaults.max_requests_per_window = 10;
+        let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
+        limiter.note_retry_after_ms("streaming-text", "primary", 10_000);
+
+        let chain = ProviderChain::new(vec![
+            Arc::new(StreamingTextProvider {
+                id: "primary",
+                text: "from-primary",
+            }),
+            Arc::new(StreamingTextProvider {
+                id: "fallback",
+                text: "from-fallback",
+            }),
+        ])
+        .with_rate_limiter(Some(limiter));
+
+        let mut stream = chain.stream(vec![]);
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::Delta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "from-fallback");
+    }
+
+    #[tokio::test]
+    async fn streaming_rate_limiter_waits_then_uses_primary() {
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
+        cfg.enabled = true;
+        cfg.wait_on_limit = true;
+        cfg.defaults.max_requests_per_window = 10;
+        let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
+        limiter.note_retry_after_ms("streaming-text", "primary", 40);
+
+        let chain = ProviderChain::new(vec![
+            Arc::new(StreamingTextProvider {
+                id: "primary",
+                text: "from-primary",
+            }),
+            Arc::new(StreamingTextProvider {
+                id: "fallback",
+                text: "from-fallback",
+            }),
+        ])
+        .with_rate_limiter(Some(limiter));
+
+        let start = Instant::now();
+        let mut stream = chain.stream(vec![]);
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::Delta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "from-primary");
+        assert!(start.elapsed() >= Duration::from_millis(30));
     }
 
     #[tokio::test]
@@ -583,50 +813,7 @@ mod tests {
         ]);
 
         let err = chain.complete(&[], &[]).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("all providers in failover chain failed")
-        );
-    }
-
-    #[tokio::test]
-    async fn circuit_breaker_trips_after_three_failures() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "flaky",
-                error_msg: "500 internal server error",
-            }),
-            Arc::new(SuccessProvider { id: "backup" }),
-        ]);
-
-        // Fail 3 times to trip the circuit breaker on the first provider.
-        for _ in 0..3 {
-            let _ = chain.complete(&[], &[]).await;
-        }
-
-        // After tripping, the flaky provider should be skipped.
-        assert!(chain.chain[0].state.is_tripped(3, Duration::from_secs(60)));
-    }
-
-    #[tokio::test]
-    async fn stream_uses_first_non_tripped() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "tripped",
-                error_msg: "500 error",
-            }),
-            Arc::new(SuccessProvider { id: "backup" }),
-        ]);
-
-        // Trip the first provider.
-        for _ in 0..3 {
-            let _ = chain.complete(&[], &[]).await;
-        }
-
-        // Stream should use backup.
-        let mut stream = chain.stream(vec![]);
-        let event = stream.next().await.unwrap();
-        assert!(matches!(event, StreamEvent::Done(_)));
+        assert!(err.to_string().contains("503 service unavailable"));
     }
 
     #[test]
@@ -675,7 +862,8 @@ mod tests {
     fn should_failover_mapping() {
         assert!(ProviderErrorKind::RateLimit.should_failover());
         assert!(ProviderErrorKind::AuthError.should_failover());
-        assert!(ProviderErrorKind::ServerError.should_failover());
+        assert!(!ProviderErrorKind::ServerError.should_failover());
+        assert!(!ProviderErrorKind::Timeout.should_failover());
         assert!(ProviderErrorKind::BillingExhausted.should_failover());
         assert!(ProviderErrorKind::Unknown.should_failover());
         assert!(!ProviderErrorKind::ContextWindow.should_failover());
@@ -687,6 +875,48 @@ mod tests {
         let chain = ProviderChain::single(Arc::new(SuccessProvider { id: "only" }));
         assert_eq!(chain.id(), "only");
         assert_eq!(chain.chain.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn records_provider_health_on_successful_completion() {
+        let tracker = Arc::new(ProviderHealthTracker::new(Duration::from_secs(60), 100));
+        let chain = ProviderChain::single(Arc::new(SuccessProvider { id: "health-model" }))
+            .with_health_tracker(Arc::clone(&tracker));
+
+        let _ = chain.complete(&[], &[]).await.unwrap();
+
+        let snapshot = tracker.snapshot();
+        let stats = snapshot
+            .providers
+            .iter()
+            .find(|item| item.provider == "success" && item.model == "health-model")
+            .unwrap();
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.success_count, 1);
+        assert_eq!(stats.error_count, 0);
+    }
+
+    #[tokio::test]
+    async fn records_provider_health_on_failed_completion() {
+        let tracker = Arc::new(ProviderHealthTracker::new(Duration::from_secs(60), 100));
+        let chain = ProviderChain::single(Arc::new(FailingProvider {
+            id: "health-model",
+            error_msg: "500 internal server error",
+        }))
+        .with_health_tracker(Arc::clone(&tracker));
+
+        let _ = chain.complete(&[], &[]).await;
+
+        let snapshot = tracker.snapshot();
+        let stats = snapshot
+            .providers
+            .iter()
+            .find(|item| item.provider == "failing" && item.model == "health-model")
+            .unwrap();
+        assert_eq!(stats.total_requests, 1);
+        assert_eq!(stats.success_count, 0);
+        assert_eq!(stats.error_count, 1);
+        assert!(stats.error_rate_by_class.contains_key("server_error"));
     }
 
     // ── Regression: stream_with_tools must forward tools to the provider ──
