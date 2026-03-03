@@ -38,16 +38,26 @@ use {
 /// Tool wrapper around [`moltis_tasks::TaskStore`].
 pub struct TaskListTool {
     store: Arc<TaskStore>,
+    /// Global max-attempts override from `TasksConfig`. When set, overrides the
+    /// per-task default on every newly created task.
+    max_attempts_override: Option<u8>,
 }
 
 impl TaskListTool {
     pub fn new(store: Arc<TaskStore>) -> Self {
-        Self { store }
+        Self { store, max_attempts_override: None }
     }
 
     /// Return the underlying `Arc<TaskStore>` for sharing with other tools.
     pub fn store(&self) -> Arc<TaskStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Apply a global max-attempts override from `TasksConfig`.
+    #[must_use]
+    pub fn with_max_attempts_override(mut self, override_val: Option<u8>) -> Self {
+        self.max_attempts_override = override_val;
+        self
     }
 }
 
@@ -286,10 +296,13 @@ impl AgentTool for TaskListTool {
                     })
                     .unwrap_or_default();
 
-                let spec = TaskSpec::new(subject, description);
+                let mut spec = TaskSpec::new(subject, description);
                 if let Some(af) = active_form {
                     // Store active_form in description suffix for compat (tooling layer ignores it).
                     let _ = af; // Stored in spec description extension if needed later.
+                }
+                if let Some(override_max) = self.max_attempts_override.filter(|&v| v > 0) {
+                    spec.max_attempts = override_max;
                 }
 
                 let task = self
