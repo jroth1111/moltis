@@ -177,6 +177,82 @@ impl HandoffContext {
     }
 }
 
+// ── Autonomy tier ────────────────────────────────────────────────────────────
+
+/// Autonomy tier for outloop (dispatch-managed) execution.
+///
+/// Tools are annotated with a tier; during dispatch, tools above the intent's
+/// tier are structurally removed from the agent's tool registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyTier {
+    /// Read-only tools (web_fetch, search, file read, memory read).
+    #[default]
+    Auto = 0,
+    /// Local-write tools (file write, sandbox exec, memory write).
+    Confirm = 1,
+    /// External-write tools (git push, message send, API calls).
+    Approve = 2,
+}
+
+impl std::fmt::Display for AutonomyTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Auto => "auto",
+            Self::Confirm => "confirm",
+            Self::Approve => "approve",
+        };
+        f.write_str(s)
+    }
+}
+
+// ── Task principal ───────────────────────────────────────────────────────────
+
+/// Identity context for a task — who initiated it, where to notify.
+///
+/// Used for notification routing, autonomy policy resolution, and `list_id`
+/// derivation. Never used as a session key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskPrincipal {
+    /// Channel that originated the intent ("whatsapp", "web", "cron").
+    pub channel: String,
+    /// Sender identity within the channel (phone number, user ID, "system").
+    /// Stored in `principal_json`; the derived `list_id` uses a hashed form.
+    pub sender: String,
+    /// Account/bot identifier for multi-account channels.
+    /// E.g. WhatsApp business account ID, Telegram bot token prefix.
+    /// Empty string for single-account channels.
+    #[serde(default)]
+    pub account_id: String,
+}
+
+impl TaskPrincipal {
+    /// Derive a canonical, stable, PII-safe list_id.
+    ///
+    /// Uses BLAKE3 (stable across Rust versions, unlike `DefaultHasher`) truncated
+    /// to 128 bits. Channel is included raw (low cardinality, useful for queries).
+    /// Sender is hashed for PII safety.
+    #[must_use]
+    pub fn canonical_list_id(&self) -> String {
+        let channel = self
+            .channel
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(32)
+            .collect::<String>();
+        let account = self
+            .account_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(32)
+            .collect::<String>();
+        let input = format!("{channel}:{account}:{}", self.sender);
+        let hash = blake3::hash(input.as_bytes());
+        let truncated = &hash.to_hex()[..32]; // 128 bits
+        format!("v1:{channel}:{truncated}")
+    }
+}
+
 // ── Task Spec (immutable) ─────────────────────────────────────────────────────
 
 /// Immutable task intent — set at creation time, never changed.
@@ -196,6 +272,16 @@ pub struct TaskSpec {
     /// When this task was created.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Whether this task is a dispatch-managed intent (long-running, multi-shift).
+    /// Only tasks with `is_intent = true` are picked up by the dispatch loop.
+    #[serde(default)]
+    pub is_intent: bool,
+    /// Identity context: who initiated this task, where to send notifications.
+    #[serde(default)]
+    pub principal: Option<TaskPrincipal>,
+    /// Parent intent task ID (for shift→intent relationship).
+    #[serde(default)]
+    pub parent_task: Option<TaskId>,
 }
 
 fn default_priority() -> u8 {
@@ -214,6 +300,9 @@ impl TaskSpec {
             priority: default_priority(),
             max_attempts: default_max_attempts(),
             created_at: OffsetDateTime::now_utc(),
+            is_intent: false,
+            principal: None,
+            parent_task: None,
         }
     }
 }

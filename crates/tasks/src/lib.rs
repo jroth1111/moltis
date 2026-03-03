@@ -31,5 +31,8 @@ pub use {
     state::{RuntimeState, TerminalState},
     store::TaskStore,
     transitions::{TransitionEvent, apply},
-    types::{FailureClass, HandoffContext, Task, TaskId, TaskRuntime, TaskSpec},
+    types::{
+        AutonomyTier, FailureClass, HandoffContext, Task, TaskId, TaskPrincipal, TaskRuntime,
+        TaskSpec,
+    },
 };

@@ -10,6 +10,7 @@ tracing  = ["dep:tracing"]
 
 [dependencies]
 anyhow       = { workspace = true }
+blake3       = { workspace = true }
 moltis-metrics = { optional = true, workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
