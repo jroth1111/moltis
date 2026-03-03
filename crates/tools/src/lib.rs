@@ -58,6 +58,7 @@ pub mod policy;
 pub mod process;
 pub mod sandbox;
 pub mod sandbox_packages;
+pub mod sandbox_pool;
 pub mod send_image;
 pub mod session_state;
 pub mod sessions_communicate;
