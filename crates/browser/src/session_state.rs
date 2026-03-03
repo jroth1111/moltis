@@ -325,10 +325,10 @@ pub fn list_saved() -> Result<Vec<String>, Error> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "json") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                names.push(stem.to_string());
-            }
+        if path.extension().is_some_and(|ext| ext == "json")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            names.push(stem.to_string());
         }
     }
 
@@ -372,7 +372,7 @@ fn encrypt_state(json: &str, name: &str) -> Result<String, Error> {
         let ciphertext = cipher
             .encrypt(&key, json.as_bytes(), name.as_bytes())
             .map_err(|e| Error::InvalidAction(format!("encrypt session: {e}")))?;
-        return Ok(format!("ENC:{}", BASE64.encode(&ciphertext)));
+        Ok(format!("ENC:{}", BASE64.encode(&ciphertext)))
     }
 
     #[cfg(not(feature = "session-encrypt"))]
@@ -405,8 +405,8 @@ fn decrypt_state(content: &str, name: &str) -> Result<String, Error> {
         let plaintext = cipher
             .decrypt(&key, &ciphertext, name.as_bytes())
             .map_err(|e| Error::InvalidAction(format!("decrypt session: {e}")))?;
-        return String::from_utf8(plaintext)
-            .map_err(|e| Error::InvalidAction(format!("session not valid UTF-8: {e}")));
+        String::from_utf8(plaintext)
+            .map_err(|e| Error::InvalidAction(format!("session not valid UTF-8: {e}")))
     }
 
     #[cfg(not(feature = "session-encrypt"))]
@@ -465,35 +465,35 @@ mod tests {
     }
 
     #[test]
-    fn test_session_state_round_trip() {
+    fn test_session_state_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let state = make_state("https://example.com");
-        let json = serde_json::to_string(&state).unwrap();
-        let decoded: SessionState = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&state)?;
+        let decoded: SessionState = serde_json::from_str(&json)?;
 
         assert_eq!(decoded.url, "https://example.com");
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.cookies.len(), 1);
         assert_eq!(decoded.cookies[0].name, "session");
         assert_eq!(decoded.storage[0].local["theme"], "dark");
+        Ok(())
     }
 
     #[test]
-    fn test_save_load_disk_unencrypted() {
-        let dir = tempfile::tempdir().unwrap();
-        // Override via std::env to affect sessions_dir (test only approach:
-        // use a sub-function that accepts a path).
-        // Since sessions_dir() is hardcoded, we test via the public API but
-        // with a patched path — we do this by writing/reading directly.
+    fn test_save_load_disk_unencrypted() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        // Since sessions_dir() is hardcoded, we test the serde round-trip
+        // by writing/reading directly to a temp path.
         let state = make_state("https://save-load.test");
-        let json = serde_json::to_string_pretty(&state).unwrap();
+        let json = serde_json::to_string_pretty(&state)?;
         let name = "test-session";
         let path = dir.path().join(format!("{name}.json"));
-        std::fs::write(&path, &json).unwrap();
+        std::fs::write(&path, &json)?;
 
         let loaded: SessionState =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&path)?)?;
         assert_eq!(loaded.url, "https://save-load.test");
         assert_eq!(loaded.cookies[0].value, "abc123");
+        Ok(())
     }
 
     #[test]

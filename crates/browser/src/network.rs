@@ -334,10 +334,11 @@ mod tests {
         let har = recorder.to_har_json();
 
         let log = &har["log"];
-        assert_eq!(log["version"].as_str().unwrap(), "1.2");
-        assert_eq!(log["creator"]["name"].as_str().unwrap(), "moltis-browser");
-        assert!(
-            log["entries"].as_array().unwrap().is_empty(),
+        assert_eq!(log["version"].as_str(), Some("1.2"));
+        assert_eq!(log["creator"]["name"].as_str(), Some("moltis-browser"));
+        assert_eq!(
+            log["entries"].as_array().map(|a| a.is_empty()),
+            Some(true),
             "empty recorder should produce zero entries"
         );
     }
@@ -358,16 +359,18 @@ mod tests {
         });
 
         let har = recorder.to_har_json();
-        let entries = har["log"]["entries"].as_array().unwrap();
+        let Some(entries) = har["log"]["entries"].as_array() else {
+            panic!("entries must be a JSON array");
+        };
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["request"]["method"].as_str().unwrap(), "GET");
+        assert_eq!(entries[0]["request"]["method"].as_str(), Some("GET"));
         assert_eq!(
-            entries[0]["request"]["url"].as_str().unwrap(),
-            "https://example.com/"
+            entries[0]["request"]["url"].as_str(),
+            Some("https://example.com/")
         );
-        assert_eq!(entries[0]["response"]["status"].as_u64().unwrap(), 200);
-        assert_eq!(entries[0]["time"].as_u64().unwrap(), 42);
+        assert_eq!(entries[0]["response"]["status"].as_u64(), Some(200));
+        assert_eq!(entries[0]["time"].as_u64(), Some(42));
     }
 
     #[test]

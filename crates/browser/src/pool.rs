@@ -382,11 +382,8 @@ impl BrowserPool {
             if let Some(ref mut handle) = inst.screencast_handle {
                 // Drain the channel to get the latest frame.
                 let mut latest = None;
-                loop {
-                    match handle.frames_rx.try_recv() {
-                        Ok(frame) => latest = Some(frame),
-                        Err(_) => break,
-                    }
+                while let Ok(frame) = handle.frames_rx.try_recv() {
+                    latest = Some(frame);
                 }
                 return latest.map(|f| BASE64.encode(&f.data));
             }
@@ -475,10 +472,10 @@ impl BrowserPool {
         let instance = instances.get(session_id).ok_or(Error::ElementNotFound(0))?;
 
         let mut inst = instance.lock().await;
-        if let Some(page) = inst.pages.remove(name) {
-            if let Err(e) = page.close().await {
-                warn!(tab = name, error = %e, "error closing tab");
-            }
+        if let Some(page) = inst.pages.remove(name)
+            && let Err(e) = page.close().await
+        {
+            warn!(tab = name, error = %e, "error closing tab");
         }
         if inst.active_tab == name {
             inst.active_tab = "main".to_string();
@@ -780,12 +777,14 @@ impl BrowserPool {
             .request_timeout(Duration::from_millis(self.config.navigation_timeout_ms));
 
         // User agent: explicit config > stealth default > none
-        let ua = self.config.user_agent.as_deref().or_else(|| {
-            #[cfg(feature = "stealth")]
+        let ua = self.config.user_agent.as_deref();
+        #[cfg(feature = "stealth")]
+        let ua = ua.or_else(|| {
             if self.config.stealth.enabled {
-                return Some(crate::stealth::default_user_agent());
+                Some(crate::stealth::default_user_agent())
+            } else {
+                None
             }
-            None
         });
         if let Some(ua) = ua {
             builder = builder.arg(format!("--user-agent={ua}"));
