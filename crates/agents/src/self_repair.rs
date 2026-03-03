@@ -270,8 +270,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
-    use std::time::Duration;
+    use {super::*, std::time::Duration};
 
     async fn make_store() -> (SessionStateStore, sqlx::SqlitePool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

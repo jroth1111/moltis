@@ -125,8 +125,7 @@ pub async fn inject_stealth(page: &Page, config: &StealthConfig) -> Result<(), E
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::types::StealthConfig;
+    use {super::*, crate::types::StealthConfig};
 
     fn default_config() -> StealthConfig {
         StealthConfig::default()

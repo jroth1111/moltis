@@ -3,12 +3,13 @@
 //! Tracks consecutive failures per provider and opens a circuit to block calls
 //! when a provider is unreliable, allowing it to recover.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use serde::Serialize;
-use {async_trait::async_trait, tokio::sync::RwLock, tracing::info};
+use {async_trait::async_trait, serde::Serialize, tokio::sync::RwLock, tracing::info};
 
 use moltis_common::{
     Result,
@@ -157,12 +158,9 @@ impl HookHandler for CircuitBreakerHook {
                         // Probe failed — reopen immediately.
                         CircuitState::HalfOpen => {
                             counts.insert(provider.clone(), self.failure_threshold);
-                            states.insert(
-                                provider.clone(),
-                                CircuitState::Open {
-                                    opened_at: Instant::now(),
-                                },
-                            );
+                            states.insert(provider.clone(), CircuitState::Open {
+                                opened_at: Instant::now(),
+                            });
                             info!(
                                 provider = %provider,
                                 "circuit-breaker: half-open probe failed, circuit reopened"
@@ -172,12 +170,9 @@ impl HookHandler for CircuitBreakerHook {
                             let count = counts.entry(provider.clone()).or_insert(0);
                             *count += 1;
                             if *count >= self.failure_threshold {
-                                states.insert(
-                                    provider.clone(),
-                                    CircuitState::Open {
-                                        opened_at: Instant::now(),
-                                    },
-                                );
+                                states.insert(provider.clone(), CircuitState::Open {
+                                    opened_at: Instant::now(),
+                                });
                                 info!(
                                     provider = %provider,
                                     failures = *count,

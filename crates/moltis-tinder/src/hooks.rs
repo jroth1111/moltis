@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use moltis_common::hooks::{HookAction, HookEvent, HookHandler, HookPayload};
-use once_cell::sync::Lazy;
-use regex::Regex;
-use tracing::{info, warn};
+use {
+    async_trait::async_trait,
+    moltis_common::hooks::{HookAction, HookEvent, HookHandler, HookPayload},
+    once_cell::sync::Lazy,
+    regex::Regex,
+    tracing::{info, warn},
+};
 
 use crate::funnel::{self, FunnelState};
 

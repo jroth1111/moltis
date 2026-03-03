@@ -123,8 +123,7 @@ impl Default for UndoManager {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
-    use serde_json::json;
+    use {super::*, serde_json::json};
 
     fn msgs(n: u32) -> Vec<serde_json::Value> {
         (0..n).map(|i| json!({"role": "user", "idx": i})).collect()

@@ -9,9 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use async_trait::async_trait;
-use base64::Engine;
-use tracing::{debug, warn};
+use {
+    async_trait::async_trait,
+    base64::Engine,
+    tracing::{debug, warn},
+};
 
 use moltis_common::{
     Result,
@@ -191,11 +193,13 @@ fn guess_mime(path: &str) -> &'static str {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::{
-        io::Write,
-        path::Path,
-        sync::{Mutex, OnceLock},
+    use {
+        super::*,
+        std::{
+            io::Write,
+            path::Path,
+            sync::{Mutex, OnceLock},
+        },
     };
 
     fn env_lock() -> &'static Mutex<()> {
