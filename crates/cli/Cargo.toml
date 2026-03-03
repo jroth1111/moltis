@@ -83,7 +83,6 @@ default = [
   "prometheus",
   "push-notifications",
   "qmd",
-  "session-encrypt",
   "stealth",
   "tailscale",
   "tls",

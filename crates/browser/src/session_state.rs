@@ -423,6 +423,9 @@ fn decrypt_state(content: &str, name: &str) -> Result<String, Error> {
 /// This is intentionally simple: the same name always produces the same key on
 /// any machine. It provides basic obfuscation rather than strong per-user
 /// security (which would require the vault's unseal mechanism).
+// TODO(security): Replace SHA-256(salt||name) with a proper KDF.
+// Options: HKDF-SHA256 with vault unseal key, or argon2id with per-install secret.
+// Currently `session-encrypt` is intentionally excluded from default features until hardened.
 #[cfg(feature = "session-encrypt")]
 fn derive_key(name: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
