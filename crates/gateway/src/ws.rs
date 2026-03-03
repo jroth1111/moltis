@@ -55,9 +55,7 @@ pub async fn handle_connection(
     let write_handle = tokio::spawn(async move {
         while let Some(frame) = client_rx.recv().await {
             let (send_result, should_break) = match frame {
-                OutboundWsFrame::Text(msg) => {
-                    (ws_tx.send(Message::Text(msg.into())).await, false)
-                },
+                OutboundWsFrame::Text(msg) => (ws_tx.send(Message::Text(msg.into())).await, false),
                 OutboundWsFrame::Close { code, reason } => (
                     ws_tx
                         .send(Message::Close(Some(CloseFrame {
@@ -135,9 +133,7 @@ pub async fn handle_connection(
             ),
         );
         #[allow(clippy::unwrap_used)] // serializing known-valid struct
-        let _ = client_tx.try_send(OutboundWsFrame::Text(
-            serde_json::to_string(&err).unwrap(),
-        ));
+        let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
         drop(client_tx);
         write_handle.abort();
         return;
@@ -214,9 +210,7 @@ pub async fn handle_connection(
             ErrorShape::new(error_codes::UNAUTHORIZED, "authentication failed"),
         );
         #[allow(clippy::unwrap_used)] // serializing known-valid struct
-        let _ = client_tx.try_send(OutboundWsFrame::Text(
-            serde_json::to_string(&err).unwrap(),
-        ));
+        let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
         drop(client_tx);
         write_handle.abort();
         return;
@@ -243,9 +237,7 @@ pub async fn handle_connection(
                 ),
             );
             #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let _ = client_tx.try_send(OutboundWsFrame::Text(
-                serde_json::to_string(&err).unwrap(),
-            ));
+            let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
             drop(client_tx);
             write_handle.abort();
             return;
@@ -298,9 +290,7 @@ pub async fn handle_connection(
     let hello_val = serde_json::to_value(&hello).unwrap();
     let resp = ResponseFrame::ok(&request_id, hello_val);
     #[allow(clippy::unwrap_used)] // serializing known-valid struct
-    let _ = client_tx.try_send(OutboundWsFrame::Text(
-        serde_json::to_string(&resp).unwrap(),
-    ));
+    let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&resp).unwrap()));
 
     info!(
         conn_id = %conn_id,
@@ -432,9 +422,7 @@ pub async fn handle_connection(
                 state.next_seq(),
             );
             #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let _ = client_tx.try_send(OutboundWsFrame::Text(
-                serde_json::to_string(&err).unwrap(),
-            ));
+            let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
             continue;
         }
 
@@ -448,9 +436,8 @@ pub async fn handle_connection(
                     state.next_seq(),
                 );
                 #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let _ = client_tx.try_send(OutboundWsFrame::Text(
-                    serde_json::to_string(&err).unwrap(),
-                ));
+                let _ =
+                    client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
                 continue;
             },
         };
@@ -462,6 +449,27 @@ pub async fn handle_connection(
 
         match frame {
             GatewayFrame::Request(req) => {
+                if state.is_shutting_down() {
+                    warn!(
+                        conn_id = %conn_id,
+                        request_id = %req.id,
+                        method = %req.method,
+                        "ws: rejecting request during shutdown drain"
+                    );
+                    let response = ResponseFrame::err(
+                        &req.id,
+                        ErrorShape::new(
+                            error_codes::UNAVAILABLE,
+                            "gateway is shutting down; request rejected",
+                        ),
+                    );
+                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
+                    let _ = client_tx.try_send(OutboundWsFrame::Text(
+                        serde_json::to_string(&response).unwrap(),
+                    ));
+                    continue;
+                }
+
                 if state.ws_request_logs {
                     info!(
                         conn_id = %conn_id,
