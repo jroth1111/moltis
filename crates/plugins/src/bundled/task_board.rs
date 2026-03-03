@@ -187,7 +187,10 @@ mod tests {
             .unwrap();
         assert_eq!(created["status"], "pending");
 
-        let listed = tool.execute(serde_json::json!({ "action": "list" })).await.unwrap();
+        let listed = tool
+            .execute(serde_json::json!({ "action": "list" }))
+            .await
+            .unwrap();
         let tasks = listed["tasks"].as_array().expect("tasks array");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["subject"], "Ship fix");
