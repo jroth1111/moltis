@@ -4956,7 +4956,7 @@ pub async fn start_gateway(
             }
 
             state_for_shutdown
-                .close_all_clients_going_away("server is shutting down")
+                .close_all_clients_going_away_without_notice("server is shutting down")
                 .await;
 
             #[cfg(feature = "mdns")]
