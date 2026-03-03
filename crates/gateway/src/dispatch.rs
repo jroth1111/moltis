@@ -32,11 +32,13 @@
 use std::sync::Arc;
 
 use {
+    futures::future::join_all,
+    moltis_agents::runner::classify_error as classify_shift_error,
     moltis_config::schema::TasksConfig,
-    moltis_service_traits::ServiceError,
     moltis_tasks::{
-        AutonomyTier, HandoffContext, IntentStore, ObjectiveSnapshot, OutputStore, RuntimeState,
-        ShiftOutput, Task, TaskSpec, TaskStore, TerminalState, TransitionError, TransitionEvent,
+        AutonomyTier, FailureClass, HandoffContext, IntentStore, ObjectiveSnapshot, OutputStore,
+        RuntimeState, ShiftOutput, Task, TaskId, TaskSpec, TaskStore, TerminalState,
+        TransitionError, TransitionEvent,
     },
     serde_json::Value,
     tracing::{debug, info, warn},
@@ -89,6 +91,7 @@ pub async fn run_dispatch_loop(
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct DispatchContext {
     task_store: Arc<TaskStore>,
     intent_store: IntentStore,
@@ -112,24 +115,33 @@ async fn run_cycle(ctx: &DispatchContext) -> Result<usize, anyhow::Error> {
         return Ok(0);
     }
 
-    let intents = ctx.task_store.list_actionable_intents().await?;
-    let mut dispatched = 0usize;
+    let capacity = ctx.config.max_concurrent_shifts.saturating_sub(active);
+    if capacity == 0 {
+        return Ok(0);
+    }
 
-    for intent in intents {
-        // Re-check concurrency limit per intent in case we dispatched inside
-        // this loop and reached the cap before exhausting the intent list.
-        let active_now = ctx.task_store.count_active_shifts().await?;
-        if active_now >= ctx.config.max_concurrent_shifts {
-            break;
-        }
+    let intents = ctx
+        .task_store
+        .list_actionable_intents()
+        .await?
+        .into_iter()
+        .take(capacity);
 
+    let jobs = intents.map(|intent| {
+        let local_ctx = ctx.clone();
         let intent_id = intent.id.0.clone();
-        match process_intent(ctx, intent).await {
-            Ok(true) => dispatched += 1,
-            Ok(false) => {},
-            Err(e) => {
+        tokio::spawn(async move { (intent_id, process_intent(&local_ctx, intent).await) })
+    });
+
+    let mut dispatched = 0usize;
+    for joined in join_all(jobs).await {
+        match joined {
+            Ok((_, Ok(true))) => dispatched += 1,
+            Ok((_, Ok(false))) => {},
+            Ok((intent_id, Err(e))) => {
                 warn!(intent_id = %intent_id, error = %e, "intent processing error — skipping");
             },
+            Err(e) => warn!(error = %e, "intent processing task join error"),
         }
     }
 
@@ -160,99 +172,7 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
         intent
     };
 
-    // ── 2. Classify child shifts to decide how to proceed. ────────────────────
-    let shift = match classify_shifts(&ctx.task_store, &intent_id).await? {
-        ShiftClassification::InProgress => {
-            debug!(intent_id = %intent_id, "intent has an active/escalated shift — skipping");
-            return Ok(false);
-        },
-        ShiftClassification::RetryPending => {
-            debug!(
-                intent_id = %intent_id,
-                "intent has a retrying shift — waiting for retry timer"
-            );
-            return Ok(false);
-        },
-        ShiftClassification::RecoverPending(pending_shift) => {
-            // Recovery path: a shift from a previous attempt was promoted back
-            // to Pending by the retry-promotion sweep. Reclaim and re-run it
-            // instead of creating a duplicate.
-            info!(
-                intent_id = %intent_id,
-                shift_id = %pending_shift.id.0,
-                "recovering pending shift from previous attempt"
-            );
-            *pending_shift
-        },
-        ShiftClassification::NeedsNew => {
-            // ── 3. Get or create IntentState. ─────────────────────────────────
-            let intent_state = match ctx.intent_store.get(&intent_id).await? {
-                Some(s) => s,
-                None => {
-                    ctx.intent_store
-                        .create(
-                            &intent_id,
-                            &list_id,
-                            ctx.config.intent_token_budget,
-                            Some(ctx.config.intent_spin_threshold),
-                        )
-                        .await?
-                },
-            };
-
-            // ── 4. Budget check before spawning shift. ────────────────────────
-            if intent_state.is_over_budget() {
-                escalate(ctx, &list_id, &intent_id, "Token budget exhausted").await?;
-                return Ok(false);
-            }
-
-            // ── 4b. Cooldown: don't start a new shift too soon after the last. ─
-            if ctx.config.shift_cooldown_secs > 0 && intent_state.shift_count > 0 {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let last_updated = intent_state.updated_at.unix_timestamp();
-                let elapsed = (now - last_updated).max(0) as u64;
-                if elapsed < ctx.config.shift_cooldown_secs {
-                    debug!(
-                        intent_id = %intent_id,
-                        elapsed_secs = elapsed,
-                        cooldown_secs = ctx.config.shift_cooldown_secs,
-                        "shift cooldown active — skipping"
-                    );
-                    return Ok(false);
-                }
-            }
-
-            // ── 5. Create new shift task. ──────────────────────────────────────
-            // shift_count+1 gives the next shift number; used for subject only.
-            let next_num = intent_state.shift_count + 1;
-            let mut shift_spec = TaskSpec::new(
-                format!("{}: shift {}", intent.spec.subject, next_num),
-                "Dispatch-managed execution shift.",
-            );
-            shift_spec.parent_task = Some(intent.id.clone());
-            ctx.task_store.create(&list_id, shift_spec, vec![]).await?
-        },
-    };
-
-    // ── 3/5 (continued). Claim the shift (Pending → Active). ─────────────────
-    // Applies whether the shift is freshly-created or recovered from a retry.
-    ctx.task_store
-        .apply_transition(
-            &list_id,
-            &shift.id.0,
-            None,
-            &TransitionEvent::Claim {
-                owner: "dispatch".into(),
-                lease_duration_secs: Some(ctx.config.lease_duration_secs),
-            },
-        )
-        .await?;
-
-    // ── 6. Get current IntentState (create if first shift) and register shift. ─
-    // Read unconditionally: both `NeedsNew` and `RecoverPending` paths need it.
+    // ── 2. Load (or initialize) mutable intent state. ─────────────────────────
     let intent_state = match ctx.intent_store.get(&intent_id).await? {
         Some(s) => s,
         None => {
@@ -267,13 +187,120 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
         },
     };
 
-    // shift_count is the number of shifts dispatched so far; +1 is this shift.
-    let shift_num = intent_state.shift_count + 1;
+    // ── 3. Classify child shifts and decide whether to recover or create. ────
+    let (shift, slot_state, shift_num, shift_was_new) =
+        match classify_shifts(&ctx.task_store, &intent_id).await? {
+            ShiftClassification::InProgress => {
+                debug!(intent_id = %intent_id, "intent has an active/escalated shift — skipping");
+                return Ok(false);
+            },
+            ShiftClassification::RetryPending => {
+                debug!(
+                    intent_id = %intent_id,
+                    "intent has a retrying shift — waiting for retry timer"
+                );
+                return Ok(false);
+            },
+            ShiftClassification::RecoverPending(pending_shift) => {
+                let shift = *pending_shift;
+                let shift_num = intent_state.shift_count.saturating_add(1);
+                let slot = match ctx
+                    .intent_store
+                    .set_active_shift(&intent_id, &shift.id.0, intent_state.version)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(TransitionError::VersionConflict { .. }) => return Ok(false),
+                    Err(e) => return Err(e.into()),
+                };
+                (shift, slot, shift_num, false)
+            },
+            ShiftClassification::NeedsNew => {
+                if intent_state.is_over_budget() {
+                    escalate(ctx, &list_id, &intent_id, "Token budget exhausted").await?;
+                    return Ok(false);
+                }
 
-    let intent_state = ctx
-        .intent_store
-        .set_active_shift(&intent_id, &shift.id.0, intent_state.version)
-        .await?;
+                // Cooldown: don't start a new shift too soon after the last one.
+                if ctx.config.shift_cooldown_secs > 0 && intent_state.shift_count > 0 {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let elapsed = (now - intent_state.updated_at.unix_timestamp()).max(0) as u64;
+                    if elapsed < ctx.config.shift_cooldown_secs {
+                        debug!(
+                            intent_id = %intent_id,
+                            elapsed_secs = elapsed,
+                            cooldown_secs = ctx.config.shift_cooldown_secs,
+                            "shift cooldown active — skipping"
+                        );
+                        return Ok(false);
+                    }
+                }
+
+                let shift_num = intent_state.shift_count.saturating_add(1);
+                let shift_id = TaskId::new();
+                let slot = match ctx
+                    .intent_store
+                    .set_active_shift(&intent_id, &shift_id.0, intent_state.version)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(TransitionError::VersionConflict { .. }) => return Ok(false),
+                    Err(e) => return Err(e.into()),
+                };
+
+                let mut shift_spec = TaskSpec::new(
+                    format!("{}: shift {}", intent.spec.subject, shift_num),
+                    "Dispatch-managed execution shift.",
+                );
+                shift_spec.parent_task = Some(intent.id.clone());
+                shift_spec.principal = intent.spec.principal.clone();
+                let created = match ctx
+                    .task_store
+                    .create_with_id(&list_id, shift_id.clone(), shift_spec, vec![])
+                    .await
+                {
+                    Ok(task) => task,
+                    Err(e) => {
+                        let _ = ctx
+                            .intent_store
+                            .clear_active_shift(&intent_id, &shift_id.0, slot.version)
+                            .await;
+                        return Err(e.into());
+                    },
+                };
+                (created, slot, shift_num, true)
+            },
+        };
+
+    // ── 4. Claim the shift task (Pending → Active). ───────────────────────────
+    if let Err(err) = ctx
+        .task_store
+        .apply_transition(
+            &list_id,
+            &shift.id.0,
+            None,
+            &TransitionEvent::Claim {
+                owner: "dispatch".into(),
+                lease_duration_secs: Some(ctx.config.lease_duration_secs),
+            },
+        )
+        .await
+    {
+        let _ = ctx
+            .intent_store
+            .clear_active_shift(&intent_id, &shift.id.0, slot_state.version)
+            .await;
+        if shift_was_new {
+            cancel_shift_best_effort(&ctx.task_store, &list_id, &shift.id.0).await;
+        }
+        if matches!(err, TransitionError::VersionConflict { .. }) {
+            return Ok(false);
+        }
+        return Err(err.into());
+    }
 
     info!(
         intent_id = %intent_id,
@@ -291,6 +318,7 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
 
     let session_key = format!("dispatch:intent:{intent_id}:shift:{shift_num}");
     let prompt = build_shift_prompt(
+        &intent_id,
         &intent.spec.subject,
         &intent.spec.description,
         &intent.runtime.handoff,
@@ -306,7 +334,16 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
         "_dispatch_tool_deny": deny_list,
     });
 
+    let heartbeat = spawn_shift_heartbeat(
+        Arc::clone(&ctx.task_store),
+        list_id.clone(),
+        shift.id.0.clone(),
+        ctx.config.lease_duration_secs,
+        ctx.config.lease_heartbeat_interval_secs,
+    );
+
     let shift_result = ctx.chat.send_sync(params).await;
+    heartbeat.abort();
 
     // ── 9. Extract token usage (best-effort; 0 on parse failure). ─────────────
     let tokens_used = match &shift_result {
@@ -325,18 +362,41 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
         .await?
         .ok_or_else(|| TransitionError::NotFound(shift.id.0.clone()))?;
 
+    let mut failure_class: Option<FailureClass> = None;
     if matches!(shift_now.runtime.state, RuntimeState::Active { .. }) {
-        // Normal path: shift ran to completion.
-        TaskStore::apply_transition_tx(
-            &mut tx,
-            &list_id,
-            &shift.id.0,
-            None,
-            &TransitionEvent::Complete,
-        )
-        .await?;
+        match &shift_result {
+            Ok(_) => {
+                TaskStore::apply_transition_tx(
+                    &mut tx,
+                    &list_id,
+                    &shift.id.0,
+                    None,
+                    &TransitionEvent::Complete,
+                )
+                .await?;
+            },
+            Err(err) => {
+                let class = classify_shift_error(&err.to_string());
+                failure_class = Some(class.clone());
+                TaskStore::apply_transition_tx(
+                    &mut tx,
+                    &list_id,
+                    &shift.id.0,
+                    None,
+                    &TransitionEvent::Fail {
+                        class,
+                        handoff: HandoffContext {
+                            observed_error: err.to_string(),
+                            ..HandoffContext::default()
+                        },
+                        retry_after: None,
+                    },
+                )
+                .await?;
+            },
+        }
     }
-    // If shift is already terminal or AwaitingHuman (mid-turn escalation), skip.
+    // If shift is already terminal or AwaitingHuman (mid-turn escalation), skip transition.
 
     // Persist shift output for future context injection.
     let output_text = match &shift_result {
@@ -366,9 +426,10 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
     let (final_state, is_spinning) = IntentStore::finalize_shift_tx(
         &mut tx,
         &intent_id,
+        &shift.id.0,
         new_snapshot,
         tokens_used,
-        intent_state.version,
+        slot_state.version,
     )
     .await?;
 
@@ -394,7 +455,17 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
     }
 
     // ── 13. Post-finalization escalation checks. ──────────────────────────────
-    if is_spinning {
+    if let Some(class) = &failure_class
+        && class.requires_human()
+    {
+        escalate(
+            ctx,
+            &list_id,
+            &intent_id,
+            "Shift execution requires human intervention",
+        )
+        .await?;
+    } else if is_spinning {
         escalate(
             ctx,
             &list_id,
@@ -410,11 +481,6 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
             "Token budget exhausted after shift",
         )
         .await?;
-    } else if let Err(ServiceError::Message { message }) = &shift_result {
-        // Permanent provider failure → escalate immediately.
-        if message.contains("billing") || message.contains("invalid_api_key") {
-            escalate(ctx, &list_id, &intent_id, message).await?;
-        }
     }
 
     Ok(true)
@@ -438,7 +504,7 @@ enum ShiftClassification {
 /// should do.
 ///
 /// Priority:
-/// 1. Any Active / AwaitingHuman → `InProgress` (wait, don't double-dispatch)
+/// 1. Any Active / AwaitingHuman / Blocked → `InProgress` (wait, don't double-dispatch)
 /// 2. Any Retrying → `RetryPending` (retry timer hasn't fired yet)
 /// 3. Any Pending → `RecoverPending` (reclaim and re-run the existing shift)
 /// 4. Otherwise → `NeedsNew` (all children are terminal)
@@ -450,7 +516,9 @@ async fn classify_shifts(
 
     for child in &children {
         match &child.runtime.state {
-            RuntimeState::Active { .. } | RuntimeState::AwaitingHuman { .. } => {
+            RuntimeState::Active { .. }
+            | RuntimeState::AwaitingHuman { .. }
+            | RuntimeState::Blocked { .. } => {
                 return Ok(ShiftClassification::InProgress);
             },
             RuntimeState::Retrying { .. } => {
@@ -541,8 +609,55 @@ async fn escalate(
         .map(|_| ())
 }
 
+fn spawn_shift_heartbeat(
+    task_store: Arc<TaskStore>,
+    list_id: String,
+    shift_id: String,
+    lease_duration_secs: u64,
+    heartbeat_secs: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let heartbeat = heartbeat_secs.max(1);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(heartbeat));
+        interval.tick().await; // skip immediate tick
+        loop {
+            interval.tick().await;
+            let renewed = task_store
+                .apply_transition(
+                    &list_id,
+                    &shift_id,
+                    None,
+                    &TransitionEvent::renew_lease(lease_duration_secs),
+                )
+                .await;
+            if renewed.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+async fn cancel_shift_best_effort(task_store: &TaskStore, list_id: &str, shift_id: &str) {
+    match task_store.get(list_id, shift_id).await {
+        Ok(Some(task)) if !task.runtime.state.is_terminal() => {
+            let _ = task_store
+                .apply_transition(
+                    list_id,
+                    shift_id,
+                    None,
+                    &TransitionEvent::Cancel {
+                        reason: "dispatch slot claim failed".to_string(),
+                    },
+                )
+                .await;
+        },
+        _ => {},
+    }
+}
+
 /// Build the system prompt injected into the shift session.
 fn build_shift_prompt(
+    intent_id: &str,
     subject: &str,
     description: &str,
     handoff: &Option<HandoffContext>,
@@ -579,11 +694,10 @@ fn build_shift_prompt(
         parts.push(format!("## Prior Shift History\n{history}"));
     }
 
-    parts.push(
+    parts.push(format!(
         "When the objective is fully complete, call `task_list` with \
-         `action: complete` on this intent task ID to close the dispatch loop."
-            .into(),
-    );
+             `action: complete` and `id: \"{intent_id}\"` to close the dispatch loop."
+    ));
 
     parts.join("\n\n")
 }
@@ -705,6 +819,62 @@ mod tests {
             )
             .await
             .expect("claim shift");
+
+        let result = classify_shifts(&store, &intent.id.0)
+            .await
+            .expect("classify");
+        assert!(matches!(result, ShiftClassification::InProgress));
+    }
+
+    #[tokio::test]
+    async fn classify_shifts_in_progress_when_blocked_child() {
+        let store = make_store().await;
+
+        let intent_spec = {
+            let mut s = TaskSpec::new("intent", "desc");
+            s.is_intent = true;
+            s
+        };
+        let intent = store
+            .create("default", intent_spec, vec![])
+            .await
+            .expect("create intent");
+        store
+            .apply_transition(
+                "default",
+                &intent.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim intent");
+
+        // Create dependency so we can move shift -> Blocked.
+        let dep = store
+            .create("default", TaskSpec::new("dep", ""), vec![])
+            .await
+            .expect("create dep");
+
+        let mut shift_spec = TaskSpec::new("shift 1", "");
+        shift_spec.parent_task = Some(intent.id.clone());
+        let shift = store
+            .create("default", shift_spec, vec![dep.id.clone()])
+            .await
+            .expect("create shift");
+        store
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Block {
+                    waiting_on: vec![dep.id.clone()],
+                },
+            )
+            .await
+            .expect("block shift");
 
         let result = classify_shifts(&store, &intent.id.0)
             .await
@@ -925,10 +1095,11 @@ mod tests {
 
     #[test]
     fn build_shift_prompt_no_handoff() {
-        let p = build_shift_prompt("Find restaurants", "Near London", &None, &[]);
+        let p = build_shift_prompt("intent-123", "Find restaurants", "Near London", &None, &[]);
         assert!(p.contains("Find restaurants"));
         assert!(p.contains("Near London"));
         assert!(p.contains("task_list"));
+        assert!(p.contains("intent-123"));
         assert!(!p.contains("Previous Attempt"));
     }
 
@@ -940,7 +1111,7 @@ mod tests {
             dead_ends: vec![],
             suggested_next_step: "try Bing".into(),
         };
-        let p = build_shift_prompt("Find restaurants", "", &Some(h), &[]);
+        let p = build_shift_prompt("intent-123", "Find restaurants", "", &Some(h), &[]);
         assert!(p.contains("searched Google"));
         assert!(p.contains("403 forbidden"));
         assert!(p.contains("try Bing"));
@@ -948,7 +1119,7 @@ mod tests {
 
     #[test]
     fn build_shift_prompt_empty_description_omitted() {
-        let p = build_shift_prompt("subject only", "", &None, &[]);
+        let p = build_shift_prompt("intent-123", "subject only", "", &None, &[]);
         assert!(!p.contains("## Details"));
     }
 
