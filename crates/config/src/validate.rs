@@ -206,6 +206,21 @@ fn build_schema_map() -> KnownKeys {
         ]))
     };
 
+    let stealth = || {
+        Struct(HashMap::from([
+            ("enabled", Leaf),
+            ("js_evasion", Leaf),
+            ("stealth_args", Leaf),
+            ("behavioral", Leaf),
+            ("user_agent", Leaf),
+            ("webgl_vendor", Leaf),
+            ("webgl_renderer", Leaf),
+            ("languages", Leaf),
+            ("hardware_concurrency", Leaf),
+            ("device_memory", Leaf),
+        ]))
+    };
+
     let browser = || {
         Struct(HashMap::from([
             ("enabled", Leaf),
@@ -226,6 +241,7 @@ fn build_schema_map() -> KnownKeys {
             ("low_memory_threshold_mb", Leaf),
             ("persist_profile", Leaf),
             ("profile_dir", Leaf),
+            ("stealth", stealth()),
         ]))
     };
 
@@ -1232,6 +1248,49 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             category: "invalid-value",
             path: "tools.browser.profile_dir".into(),
             message: "profile_dir should be an absolute path".into(),
+        });
+    }
+
+    // Stealth: hardware_concurrency should be a power of two
+    if let Some(n) = config.tools.browser.stealth.hardware_concurrency
+        && n > 0
+        && !n.is_power_of_two()
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "tools.browser.stealth.hardware_concurrency".into(),
+            message: format!(
+                "hardware_concurrency {n} is not a power of two; \
+                 real CPUs use powers of two (2, 4, 8, 16, …)"
+            ),
+        });
+    }
+
+    // Stealth: device_memory should be one of the standard values
+    if let Some(mem) = config.tools.browser.stealth.device_memory
+        && !matches!(mem, 2 | 4 | 8 | 16)
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "tools.browser.stealth.device_memory".into(),
+            message: format!(
+                "device_memory {mem} is unusual; standard values are 2, 4, 8, or 16 GiB"
+            ),
+        });
+    }
+
+    // Stealth: languages list should not be empty when explicitly set
+    if let Some(ref langs) = config.tools.browser.stealth.languages
+        && langs.is_empty()
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "tools.browser.stealth.languages".into(),
+            message: "stealth languages list is empty; navigator.languages will be an empty array"
+                .into(),
         });
     }
 

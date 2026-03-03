@@ -69,9 +69,28 @@ const EXTRACT_ELEMENTS_JS: &str = r#"
                    : el.type === 'submit' || el.type === 'button' ? 'button'
                    : 'textbox',
             'select': 'combobox',
-            'textarea': 'textbox'
+            'textarea': 'textbox',
+            'h1': 'heading',
+            'h2': 'heading',
+            'h3': 'heading',
+            'h4': 'heading',
+            'h5': 'heading',
+            'h6': 'heading',
+            'nav': 'navigation',
+            'main': 'main',
+            'img': 'img',
+            'table': 'table',
+            'tr': 'row',
+            'td': 'cell',
+            'th': 'columnheader'
         };
         return roleMap[tag] || null;
+    }
+
+    function isCursorInteractive(el) {
+        if (el.closest('a, button, input, select, textarea')) return false;
+        const style = window.getComputedStyle(el);
+        return style.cursor === 'pointer';
     }
 
     function isInteractive(el) {
@@ -83,6 +102,7 @@ const EXTRACT_ELEMENTS_JS: &str = r#"
         if (el.getAttribute('role')) return true;
         const tabindex = el.getAttribute('tabindex');
         if (tabindex && parseInt(tabindex, 10) >= 0) return true;
+        if (isCursorInteractive(el)) return true;
         return false;
     }
 
@@ -95,6 +115,7 @@ const EXTRACT_ELEMENTS_JS: &str = r#"
         const visible = isInViewport(rect);
         const tag = el.tagName.toLowerCase();
 
+        const isInput = tag === 'input';
         results.push({
             ref_: refNum++,
             tag: tag,
@@ -106,6 +127,10 @@ const EXTRACT_ELEMENTS_JS: &str = r#"
             aria_label: el.getAttribute('aria-label'),
             visible: visible,
             interactive: isInteractive(el),
+            checked: (isInput && (el.type === 'checkbox' || el.type === 'radio'))
+                ? el.checked : null,
+            disabled: el.disabled || el.getAttribute('aria-disabled') === 'true' || false,
+            input_type: isInput ? (el.type || 'text') : null,
             bounds: {
                 x: rect.x,
                 y: rect.y,
@@ -298,6 +323,9 @@ fn parse_elements(result: &Value) -> Result<Vec<ElementRef>, Error> {
                 aria_label: e["aria_label"].as_str().map(String::from),
                 visible: e["visible"].as_bool().unwrap_or(false),
                 interactive: e["interactive"].as_bool().unwrap_or(false),
+                checked: e["checked"].as_bool(),
+                disabled: e["disabled"].as_bool().unwrap_or(false),
+                input_type: e["input_type"].as_str().map(String::from),
                 bounds: parse_bounds(&e["bounds"]),
             })
         })
@@ -361,6 +389,9 @@ mod tests {
                 "aria_label": null,
                 "visible": true,
                 "interactive": true,
+                "checked": null,
+                "disabled": false,
+                "input_type": null,
                 "bounds": { "x": 10, "y": 20, "width": 100, "height": 40 }
             }],
             "viewport": { "width": 1280, "height": 720 },
@@ -373,5 +404,73 @@ mod tests {
         assert_eq!(elements[0].tag, "button");
         assert_eq!(elements[0].text.as_deref(), Some("Click me"));
         assert!(elements[0].visible);
+    }
+
+    fn element_json(tag: &str, extras: Value) -> Value {
+        let mut base = serde_json::json!({
+            "ref_": 1,
+            "tag": tag,
+            "role": null,
+            "text": null,
+            "href": null,
+            "placeholder": null,
+            "value": null,
+            "aria_label": null,
+            "visible": true,
+            "interactive": true,
+            "checked": null,
+            "disabled": false,
+            "input_type": null,
+            "bounds": { "x": 0, "y": 0, "width": 50, "height": 20 }
+        });
+        if let (Some(obj), Some(ext)) = (base.as_object_mut(), extras.as_object()) {
+            for (k, v) in ext {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::json!({
+            "elements": [base],
+            "viewport": { "width": 800, "height": 600 },
+            "scroll": { "x": 0, "y": 0, "width": 800, "height": 600 }
+        })
+    }
+
+    #[test]
+    fn test_parse_elements_checked_field() {
+        let result = element_json(
+            "input",
+            serde_json::json!({"checked": true, "input_type": "checkbox"}),
+        );
+        let elements = parse_elements(&result).unwrap();
+        assert_eq!(elements[0].checked, Some(true));
+        assert_eq!(elements[0].input_type.as_deref(), Some("checkbox"));
+    }
+
+    #[test]
+    fn test_parse_elements_disabled_field() {
+        let result = element_json(
+            "input",
+            serde_json::json!({"disabled": true, "input_type": "text"}),
+        );
+        let elements = parse_elements(&result).unwrap();
+        assert!(elements[0].disabled);
+    }
+
+    #[test]
+    fn test_parse_elements_input_type_field() {
+        let result = element_json("input", serde_json::json!({"input_type": "email"}));
+        let elements = parse_elements(&result).unwrap();
+        assert_eq!(elements[0].input_type.as_deref(), Some("email"));
+    }
+
+    #[test]
+    fn test_parse_elements_no_checked_for_non_checkbox() {
+        // Non-checkbox inputs should have checked = null (None)
+        let result = element_json(
+            "input",
+            serde_json::json!({"input_type": "text", "checked": null}),
+        );
+        let elements = parse_elements(&result).unwrap();
+        assert_eq!(elements[0].checked, None);
     }
 }

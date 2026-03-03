@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use moltis_common::hooks::{HookAction, HookEvent, HookHandler, HookPayload};
-use once_cell::sync::Lazy;
-use regex::Regex;
-use tracing::{info, warn};
+use {
+    async_trait::async_trait,
+    moltis_common::hooks::{HookAction, HookEvent, HookHandler, HookPayload},
+    once_cell::sync::Lazy,
+    regex::Regex,
+    tracing::{info, warn},
+};
 
 use crate::funnel::{self, FunnelState};
 
@@ -56,17 +58,17 @@ impl HookHandler for FunnelGuardHook {
         };
 
         // Guard tinder_funnel advance calls.
-        if tool_name == "tinder_funnel" {
-            if let Some("advance") = arguments.get("action").and_then(|v| v.as_str()) {
-                return self.guard_advance(arguments).await;
-            }
+        if tool_name == "tinder_funnel"
+            && let Some("advance") = arguments.get("action").and_then(|v| v.as_str())
+        {
+            return self.guard_advance(arguments).await;
         }
 
         // Guard tinder_browser type calls for contact pattern leakage.
-        if tool_name == "tinder_browser" {
-            if let Some("type") = arguments.get("command").and_then(|v| v.as_str()) {
-                return self.guard_browser_type(arguments).await;
-            }
+        if tool_name == "tinder_browser"
+            && let Some("type") = arguments.get("command").and_then(|v| v.as_str())
+        {
+            return self.guard_browser_type(arguments).await;
         }
 
         Ok(HookAction::Continue)
@@ -96,16 +98,14 @@ impl FunnelGuardHook {
         let current = match funnel::get_match(&self.pool, match_id).await {
             Ok(Some(m)) => m,
             Ok(None) => {
-                return Ok(HookAction::Block(format!(
-                    "match not found: {match_id}"
-                )));
-            }
+                return Ok(HookAction::Block(format!("match not found: {match_id}")));
+            },
             Err(e) => {
                 warn!(error = %e, "funnel guard DB error — blocking action");
                 return Ok(HookAction::Block(
                     "guard unavailable, action blocked".to_string(),
                 ));
-            }
+            },
         };
 
         // Block transition to number_secured with < 3 exchanges.
@@ -159,22 +159,20 @@ impl FunnelGuardHook {
                     return Ok(HookAction::Block(
                         "contact pattern detected but match not found".to_string(),
                     ));
-                }
+                },
                 Err(e) => {
                     warn!(error = %e, "funnel guard DB error — blocking action");
                     return Ok(HookAction::Block(
                         "guard unavailable, action blocked".to_string(),
                     ));
-                }
+                },
             };
 
             // Allow contact sharing only if engaged or beyond.
             match current.funnel_state {
-                FunnelState::Engaged
-                | FunnelState::DateProposed
-                | FunnelState::NumberSecured => {
+                FunnelState::Engaged | FunnelState::DateProposed | FunnelState::NumberSecured => {
                     return Ok(HookAction::Continue);
-                }
+                },
                 _ => {
                     info!(
                         match_id = %match_id,
@@ -185,7 +183,7 @@ impl FunnelGuardHook {
                         "contact sharing blocked: match {} is in {} state (need engaged+)",
                         match_id, current.funnel_state
                     )));
-                }
+                },
             }
         }
 

@@ -153,8 +153,7 @@ impl moltis_agents::tool_registry::AgentTool for TaskBoardTool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use moltis_agents::tool_registry::AgentTool;
+    use {super::*, moltis_agents::tool_registry::AgentTool};
 
     async fn test_store() -> Arc<SessionStateStore> {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -187,7 +186,10 @@ mod tests {
             .unwrap();
         assert_eq!(created["status"], "pending");
 
-        let listed = tool.execute(serde_json::json!({ "action": "list" })).await.unwrap();
+        let listed = tool
+            .execute(serde_json::json!({ "action": "list" }))
+            .await
+            .unwrap();
         let tasks = listed["tasks"].as_array().expect("tasks array");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["subject"], "Ship fix");

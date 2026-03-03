@@ -14,7 +14,7 @@ use {
     },
     futures::StreamExt,
     sysinfo::System,
-    tokio::sync::{Mutex, RwLock},
+    tokio::sync::{Mutex, RwLock, broadcast},
     tracing::{debug, info, warn},
 };
 
@@ -66,6 +66,14 @@ struct BrowserInstance {
     /// Container for sandboxed instances (None for host browser).
     #[allow(dead_code)]
     container: Option<BrowserContainer>,
+    /// Active tab name (key into `pages`). Defaults to `"main"`.
+    active_tab: String,
+    /// Last known mouse cursor position (x, y) for bezier movement continuity.
+    current_mouse_pos: (f64, f64),
+    /// Network interception and HAR recording state.
+    interception: crate::network::InterceptionState,
+    /// Active screencast handle (if screencast is running).
+    screencast_handle: Option<crate::screencast::ScreencastHandle>,
 }
 
 /// Pool of browser instances for reuse.
@@ -220,8 +228,306 @@ impl BrowserPool {
             "created new page with viewport"
         );
 
+        // Inject JS stealth evasions before first navigation
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.js_evasion {
+            if let Err(e) = crate::stealth::inject_stealth(&page, &self.config.stealth).await {
+                warn!(session_id, error = %e, "stealth injection failed, continuing without stealth");
+            } else {
+                debug!(session_id, "stealth evasions injected");
+            }
+        }
+
         inst.pages.insert("main".to_string(), page.clone());
         Ok(page)
+    }
+
+    // ── Mouse position tracking ──────────────────────────────────────────────
+
+    /// Get the last known mouse cursor position for a session.
+    pub async fn get_mouse_pos(&self, session_id: &str) -> (f64, f64) {
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let inst = instance.lock().await;
+            return inst.current_mouse_pos;
+        }
+        (0.0, 0.0)
+    }
+
+    /// Update the last known mouse cursor position for a session.
+    pub async fn set_mouse_pos(&self, session_id: &str, pos: (f64, f64)) {
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            inst.current_mouse_pos = pos;
+        }
+    }
+
+    // ── Network interception ─────────────────────────────────────────────────
+
+    /// Enable network interception and optionally HAR recording for a session.
+    ///
+    /// Calls `Fetch.enable` on the active page, subscribes to `EventRequestPaused`
+    /// events, and spawns a background task that auto-continues each paused request
+    /// (so they are never left hanging) and feeds data into the HAR recorder if one
+    /// is active.
+    pub async fn enable_interception(
+        &self,
+        session_id: &str,
+        patterns: Vec<String>,
+        extra_headers: HashMap<String, String>,
+    ) -> Result<(), Error> {
+        use chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused;
+
+        let page = self.get_page(session_id).await?;
+        crate::network::enable_interception(&page, patterns).await?;
+
+        // Subscribe to CDP EventRequestPaused events before storing state.
+        let event_stream = page
+            .event_listener::<EventRequestPaused>()
+            .await
+            .map_err(|e| Error::Cdp(format!("intercept event listener: {e}")))?;
+
+        let (paused_tx, _rx) = broadcast::channel::<Arc<EventRequestPaused>>(32);
+        let paused_tx_clone = paused_tx.clone();
+        let page_clone = page.clone();
+
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let instance_arc = Arc::clone(instance);
+            let mut inst = instance.lock().await;
+            inst.interception.enabled = true;
+            inst.interception.extra_headers = extra_headers;
+
+            let task = tokio::spawn(async move {
+                let mut stream = event_stream;
+                while let Some(event) = stream.next().await {
+                    // Record into HAR if active — lock briefly, release before CDP call.
+                    {
+                        let mut inst = instance_arc.lock().await;
+                        if let Some(ref mut rec) = inst.interception.recorder {
+                            rec.record(crate::network::HarEntry::from_event(&event));
+                        }
+                    }
+                    // Forward to external subscribers (ignore if none).
+                    let _ = paused_tx_clone.send(event.clone());
+                    // Auto-continue so the request is never left hanging.
+                    let _ = crate::network::continue_request(
+                        &page_clone,
+                        event.request_id.clone(),
+                        None,
+                    )
+                    .await;
+                }
+                debug!("intercept event stream closed");
+            });
+
+            inst.interception.paused_tx = Some(paused_tx);
+            inst.interception._task = Some(task);
+        }
+
+        Ok(())
+    }
+
+    /// Disable network interception for a session.
+    pub async fn disable_interception(&self, session_id: &str) -> Result<(), Error> {
+        let page = self.get_page(session_id).await?;
+        crate::network::disable_interception(&page).await?;
+
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            if let Some(task) = inst.interception._task.take() {
+                task.abort();
+            }
+            inst.interception.paused_tx = None;
+            inst.interception.enabled = false;
+        }
+
+        Ok(())
+    }
+
+    /// Start HAR recording for a session.
+    pub async fn start_har(&self, session_id: &str) -> Result<(), Error> {
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            inst.interception.recorder = Some(crate::network::HarRecorder::new());
+        }
+        Ok(())
+    }
+
+    /// Stop HAR recording and return the HAR JSON document.
+    ///
+    /// Returns `None` if HAR recording was not active.
+    pub async fn stop_har(&self, session_id: &str) -> Option<serde_json::Value> {
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            if let Some(recorder) = inst.interception.recorder.take() {
+                #[cfg(feature = "metrics")]
+                moltis_metrics::counter!(moltis_metrics::browser::HAR_RECORDINGS_TOTAL)
+                    .increment(1);
+                return Some(recorder.to_har_json());
+            }
+        }
+        None
+    }
+
+    /// Update extra headers for a session's interception state.
+    pub async fn set_extra_headers(&self, session_id: &str, headers: HashMap<String, String>) {
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            inst.interception.extra_headers = headers;
+        }
+    }
+
+    // ── Screencast ────────────────────────────────────────────────────────────
+
+    /// Start a screencast session and store the handle on the instance.
+    pub async fn start_screencast(
+        &self,
+        session_id: &str,
+        format: &str,
+        quality: u8,
+        every_nth: u32,
+    ) -> Result<(), Error> {
+        let page = self.get_page(session_id).await?;
+        let handle = crate::screencast::start_screencast(&page, format, quality, every_nth).await?;
+
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            inst.screencast_handle = Some(handle);
+        }
+
+        Ok(())
+    }
+
+    /// Stop the active screencast for a session.
+    pub async fn stop_screencast(&self, session_id: &str) -> Result<(), Error> {
+        let page = self.get_page(session_id).await?;
+        crate::screencast::stop_screencast(&page).await?;
+
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            inst.screencast_handle = None;
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve the most recent screencast frame (if any) as base64.
+    pub async fn get_screencast_frame(&self, session_id: &str) -> Option<String> {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            if let Some(ref mut handle) = inst.screencast_handle {
+                // Drain the channel to get the latest frame.
+                let mut latest = None;
+                while let Ok(frame) = handle.frames_rx.try_recv() {
+                    latest = Some(frame);
+                }
+                return latest.map(|f| BASE64.encode(&f.data));
+            }
+        }
+        None
+    }
+
+    // ── Tab management ────────────────────────────────────────────────────────
+
+    /// Get the page for the currently active tab.
+    pub async fn get_active_page(&self, session_id: &str) -> Result<Page, Error> {
+        let instances = self.instances.read().await;
+        let instance = instances.get(session_id).ok_or(Error::ElementNotFound(0))?;
+
+        let mut inst = instance.lock().await;
+        inst.last_used = Instant::now();
+
+        let tab = inst.active_tab.clone();
+
+        if let Some(page) = inst.pages.get(&tab) {
+            return Ok(page.clone());
+        }
+
+        // Tab name exists but page not created yet — fall back to main tab logic.
+        drop(inst);
+        drop(instances);
+        self.get_page(session_id).await
+    }
+
+    /// Open a new browser tab named `name` and switch to it.
+    pub async fn new_tab(&self, session_id: &str, name: &str) -> Result<(), Error> {
+        let instances = self.instances.read().await;
+        let instance = instances.get(session_id).ok_or(Error::ElementNotFound(0))?;
+
+        let mut inst = instance.lock().await;
+        inst.last_used = Instant::now();
+
+        let page = inst
+            .browser
+            .new_page("about:blank")
+            .await
+            .map_err(|e| Error::LaunchFailed(format!("new_tab failed: {e}")))?;
+
+        inst.pages.insert(name.to_string(), page);
+        inst.active_tab = name.to_string();
+
+        Ok(())
+    }
+
+    /// List all open tab names for a session.
+    pub async fn list_tabs(&self, session_id: &str) -> Vec<String> {
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let inst = instance.lock().await;
+            let mut tabs: Vec<String> = inst.pages.keys().cloned().collect();
+            tabs.sort();
+            return tabs;
+        }
+        vec![]
+    }
+
+    /// Switch the active tab to `name`.
+    pub async fn switch_tab(&self, session_id: &str, name: &str) -> Result<(), Error> {
+        let instances = self.instances.read().await;
+        let instance = instances.get(session_id).ok_or(Error::ElementNotFound(0))?;
+
+        let mut inst = instance.lock().await;
+        if !inst.pages.contains_key(name) {
+            return Err(Error::InvalidAction(format!("tab '{name}' not found")));
+        }
+        inst.active_tab = name.to_string();
+        Ok(())
+    }
+
+    /// Close the tab named `name`.
+    ///
+    /// If the closed tab was the active tab, switches to `"main"`.
+    pub async fn close_tab(&self, session_id: &str, name: &str) -> Result<(), Error> {
+        if name == "main" {
+            return Err(Error::InvalidAction(
+                "cannot close the main tab".to_string(),
+            ));
+        }
+
+        let instances = self.instances.read().await;
+        let instance = instances.get(session_id).ok_or(Error::ElementNotFound(0))?;
+
+        let mut inst = instance.lock().await;
+        if let Some(page) = inst.pages.remove(name)
+            && let Err(e) = page.close().await
+        {
+            warn!(tab = name, error = %e, "error closing tab");
+        }
+        if inst.active_tab == name {
+            inst.active_tab = "main".to_string();
+        }
+
+        Ok(())
     }
 
     /// Close a specific browser session.
@@ -424,6 +730,10 @@ impl BrowserPool {
             last_used: Instant::now(),
             sandboxed: true,
             container: Some(container),
+            active_tab: "main".to_string(),
+            current_mouse_pos: (0.0, 0.0),
+            interception: crate::network::InterceptionState::default(),
+            screencast_handle: None,
         })
     }
 
@@ -512,14 +822,31 @@ impl BrowserPool {
             })
             .request_timeout(Duration::from_millis(self.config.navigation_timeout_ms));
 
-        // User agent can be set via Chrome arg instead of builder method
-        if let Some(ref ua) = self.config.user_agent {
+        // User agent: explicit config > stealth default > none
+        let ua = self.config.user_agent.as_deref();
+        #[cfg(feature = "stealth")]
+        let ua = ua.or_else(|| {
+            if self.config.stealth.enabled {
+                Some(crate::stealth::default_user_agent())
+            } else {
+                None
+            }
+        });
+        if let Some(ua) = ua {
             builder = builder.arg(format!("--user-agent={ua}"));
         }
         builder = builder.chrome_executable(selected.path.clone());
 
         for arg in &self.config.chrome_args {
             builder = builder.arg(arg);
+        }
+
+        // Inject stealth Chrome launch flags
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.stealth_args {
+            for arg in crate::stealth::chrome_stealth_args() {
+                builder = builder.arg(*arg);
+            }
         }
 
         // Set persistent profile directory if configured
@@ -596,6 +923,10 @@ impl BrowserPool {
             last_used: Instant::now(),
             sandboxed: false,
             container: None,
+            active_tab: "main".to_string(),
+            current_mouse_pos: (0.0, 0.0),
+            interception: crate::network::InterceptionState::default(),
+            screencast_handle: None,
         })
     }
 }

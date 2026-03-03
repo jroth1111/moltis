@@ -162,8 +162,17 @@ fn normalize_schedule_value(schedule: &mut Value) -> Result<()> {
                 "expression",
                 "cron",
             ]);
-            take_alias(obj, "pattern", &["regex", "match", "messagePattern", "message_pattern"]);
-            take_alias(obj, "channel_filter", &["channelFilter", "channelType", "channel_type"]);
+            take_alias(obj, "pattern", &[
+                "regex",
+                "match",
+                "messagePattern",
+                "message_pattern",
+            ]);
+            take_alias(obj, "channel_filter", &[
+                "channelFilter",
+                "channelType",
+                "channel_type",
+            ]);
 
             if let Some(kind_val) = obj.get_mut("kind") {
                 let kind_raw = kind_val

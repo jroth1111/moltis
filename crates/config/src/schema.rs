@@ -1303,8 +1303,12 @@ impl Default for ResearchConfig {
     }
 }
 
-fn default_research_trigger() -> String { "question".to_string() }
-fn default_research_max_iterations() -> usize { 3 }
+fn default_research_trigger() -> String {
+    "question".to_string()
+}
+fn default_research_max_iterations() -> usize {
+    3
+}
 
 /// Tools configuration (exec, sandbox, policy, web, browser).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1547,6 +1551,51 @@ pub struct BrowserConfig {
     /// When set, `persist_profile` is implicitly true.
     /// If not set and `persist_profile` is true, defaults to `data_dir()/browser/profile/`.
     pub profile_dir: Option<String>,
+    /// Stealth / anti-bot-detection configuration.
+    pub stealth: StealthConfig,
+}
+
+/// Stealth / anti-bot-detection configuration for the browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StealthConfig {
+    /// Master switch — disables all stealth when false.
+    pub enabled: bool,
+    /// Inject the 16-evasion JS script via `addScriptToEvaluateOnNewDocument`.
+    pub js_evasion: bool,
+    /// Add the stealth Chrome launch flags.
+    pub stealth_args: bool,
+    /// Use Bezier mouse movement and randomised keyboard timing.
+    pub behavioral: bool,
+    /// Override User-Agent (default: removes `HeadlessChrome`).
+    pub user_agent: Option<String>,
+    /// WebGL `UNMASKED_VENDOR_WEBGL` override.
+    pub webgl_vendor: Option<String>,
+    /// WebGL `UNMASKED_RENDERER_WEBGL` override.
+    pub webgl_renderer: Option<String>,
+    /// `navigator.languages` override (default: `["en-US", "en"]`).
+    pub languages: Option<Vec<String>>,
+    /// `navigator.hardwareConcurrency` override (default: `4`).
+    pub hardware_concurrency: Option<u32>,
+    /// `navigator.deviceMemory` override in GiB (default: `8`).
+    pub device_memory: Option<u8>,
+}
+
+impl Default for StealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            js_evasion: true,
+            stealth_args: true,
+            behavioral: true,
+            user_agent: None,
+            webgl_vendor: None,
+            webgl_renderer: None,
+            languages: None,
+            hardware_concurrency: None,
+            device_memory: None,
+        }
+    }
 }
 
 fn default_sandbox_image() -> String {
@@ -1581,6 +1630,7 @@ impl Default for BrowserConfig {
             low_memory_threshold_mb: default_low_memory_threshold_mb(),
             persist_profile: default_persist_profile(),
             profile_dir: None,
+            stealth: StealthConfig::default(),
         }
     }
 }
@@ -2067,7 +2117,10 @@ impl std::fmt::Debug for ProviderEntry {
         f.debug_struct("ProviderEntry")
             .field("enabled", &self.enabled)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("extra_api_keys", &format!("[{} keys]", self.extra_api_keys.len()))
+            .field(
+                "extra_api_keys",
+                &format!("[{} keys]", self.extra_api_keys.len()),
+            )
             .field("base_url", &self.base_url)
             .field("models", &self.models)
             .field("fetch_models", &self.fetch_models)
@@ -2533,7 +2586,10 @@ memory = 300
     #[test]
     fn provider_entry_extra_api_keys_round_trip() {
         let entry = ProviderEntry {
-            extra_api_keys: vec![Secret::new("sk-extra-1".into()), Secret::new("sk-extra-2".into())],
+            extra_api_keys: vec![
+                Secret::new("sk-extra-1".into()),
+                Secret::new("sk-extra-2".into()),
+            ],
             ..ProviderEntry::default()
         };
 

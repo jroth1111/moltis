@@ -1,10 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
-use async_trait::async_trait;
-use moltis_agents::tool_registry::AgentTool;
-use serde_json::{Value, json};
-use tracing::{debug, warn};
+use {
+    anyhow::Result,
+    async_trait::async_trait,
+    moltis_agents::tool_registry::AgentTool,
+    serde_json::{Value, json},
+    tracing::{debug, warn},
+};
 
 use crate::{SessionLock, funnel};
 
@@ -178,12 +180,12 @@ impl TinderBrowserTool {
 
         // Handle screenshots: detect base64 image data in output.
         let mut screenshot_path: Option<String> = None;
-        if command == "screenshot" {
-            if let Some(b64_data) = extract_base64_image(&stdout) {
-                match decode_and_save_screenshot(b64_data, &self.data_dir).await {
-                    Ok(path) => screenshot_path = Some(path),
-                    Err(e) => warn!(error = %e, "failed to process screenshot"),
-                }
+        if command == "screenshot"
+            && let Some(b64_data) = extract_base64_image(&stdout)
+        {
+            match decode_and_save_screenshot(b64_data, &self.data_dir).await {
+                Ok(path) => screenshot_path = Some(path),
+                Err(e) => warn!(error = %e, "failed to process screenshot"),
             }
         }
 
@@ -219,8 +221,7 @@ fn extract_base64_image(output: &str) -> Option<&str> {
 
 /// Decode base64 image, resize to max 768px, and save to the media directory.
 async fn decode_and_save_screenshot(b64: &str, data_dir: &std::path::Path) -> Result<String> {
-    use base64::Engine;
-    use image::GenericImageView;
+    use {base64::Engine, image::GenericImageView};
 
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
     let img =

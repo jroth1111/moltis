@@ -1,16 +1,16 @@
 //! Registration of the Moltis Tinder subsystem: tools and cron jobs.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
-use anyhow::Result;
-use sqlx::SqlitePool;
+use {anyhow::Result, sqlx::SqlitePool};
 
-use moltis_agents::tool_registry::{RateLimit, ToolRegistry};
-use moltis_cron::service::CronService;
-use moltis_tinder::{
-    TinderBrowserTool, TinderFunnelTool,
-    cron::{daily_session, ghost_recovery, hourly_replies, system_liveness},
+use {
+    moltis_agents::tool_registry::{RateLimit, ToolRegistry},
+    moltis_cron::service::CronService,
+    moltis_tinder::{
+        TinderBrowserTool, TinderFunnelTool,
+        cron::{daily_session, ghost_recovery, hourly_replies, system_liveness},
+    },
 };
 
 /// Register Tinder cron jobs and tools at startup.

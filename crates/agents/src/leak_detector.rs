@@ -250,7 +250,6 @@ impl LeakDetector {
     /// - `Warn` matches are left in place (caller should log).
     /// - `Block` matches cause the entire content to be rejected — an `Err`
     ///   is returned containing the blocking pattern name.
-    #[must_use]
     pub fn apply(&self, content: &str) -> Result<String, String> {
         let matches = self.scan(content);
         if matches.is_empty() {
@@ -320,7 +319,9 @@ mod tests {
         let input = format!("here: {key}");
         let matches = detector.scan(&input);
         assert!(
-            matches.iter().any(|m| m.pattern_name == "anthropic_api_key"),
+            matches
+                .iter()
+                .any(|m| m.pattern_name == "anthropic_api_key"),
             "should detect Anthropic key: {matches:?}"
         );
     }

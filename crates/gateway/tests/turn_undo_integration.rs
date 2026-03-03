@@ -2,16 +2,20 @@
 
 use std::{fs, path::Path, sync::Arc};
 
-use async_trait::async_trait;
-use serde_json::{Value, json};
-
-use moltis_gateway::{
-    auth,
-    methods::{MethodContext, MethodRegistry},
-    services::{ChatService, GatewayServices, ServiceResult},
-    state::GatewayState,
+use {
+    async_trait::async_trait,
+    serde_json::{Value, json},
 };
-use moltis_sessions::{store::SessionStore, undo::UndoManager};
+
+use {
+    moltis_gateway::{
+        auth,
+        methods::{MethodContext, MethodRegistry},
+        services::{ChatService, GatewayServices, ServiceResult},
+        state::GatewayState,
+    },
+    moltis_sessions::{store::SessionStore, undo::UndoManager},
+};
 
 struct QueuedOnlyChatService;
 
@@ -116,7 +120,8 @@ async fn queued_chat_send_does_not_push_undo_snapshot() {
     }
 
     let methods = MethodRegistry::new();
-    let response = dispatch_method(&methods, &state, "chat.send", json!({ "text": "queued" })).await;
+    let response =
+        dispatch_method(&methods, &state, "chat.send", json!({ "text": "queued" })).await;
 
     assert!(response.ok, "chat.send should succeed: {response:?}");
     let payload = response.payload.expect("payload should be present");
@@ -138,11 +143,15 @@ async fn destructive_session_methods_prune_undo_managers() {
 
         let mut reset_mgr = UndoManager::new();
         reset_mgr.push(sample_messages("reset"), 0);
-        inner.undo_managers.insert("reset-me".to_string(), reset_mgr);
+        inner
+            .undo_managers
+            .insert("reset-me".to_string(), reset_mgr);
 
         let mut delete_mgr = UndoManager::new();
         delete_mgr.push(sample_messages("delete"), 0);
-        inner.undo_managers.insert("delete-me".to_string(), delete_mgr);
+        inner
+            .undo_managers
+            .insert("delete-me".to_string(), delete_mgr);
 
         let mut keep_mgr = UndoManager::new();
         keep_mgr.push(sample_messages("keep"), 0);
@@ -158,7 +167,10 @@ async fn destructive_session_methods_prune_undo_managers() {
         json!({ "key": "reset-me" }),
     )
     .await;
-    assert!(reset_response.ok, "sessions.reset should succeed: {reset_response:?}");
+    assert!(
+        reset_response.ok,
+        "sessions.reset should succeed: {reset_response:?}"
+    );
     {
         let inner = state.inner.read().await;
         assert!(!inner.undo_managers.contains_key("reset-me"));
@@ -173,7 +185,10 @@ async fn destructive_session_methods_prune_undo_managers() {
         json!({ "key": "delete-me" }),
     )
     .await;
-    assert!(delete_response.ok, "sessions.delete should succeed: {delete_response:?}");
+    assert!(
+        delete_response.ok,
+        "sessions.delete should succeed: {delete_response:?}"
+    );
     {
         let inner = state.inner.read().await;
         assert!(!inner.undo_managers.contains_key("delete-me"));
@@ -181,7 +196,10 @@ async fn destructive_session_methods_prune_undo_managers() {
     }
 
     let clear_response = dispatch_method(&methods, &state, "sessions.clear_all", json!({})).await;
-    assert!(clear_response.ok, "sessions.clear_all should succeed: {clear_response:?}");
+    assert!(
+        clear_response.ok,
+        "sessions.clear_all should succeed: {clear_response:?}"
+    );
     let inner = state.inner.read().await;
     assert!(
         inner.undo_managers.is_empty(),
@@ -217,7 +235,10 @@ async fn undo_rolls_back_manager_state_when_replace_history_fails() {
     let methods = MethodRegistry::new();
     let response = dispatch_method(&methods, &state, "chat.undo", json!({})).await;
 
-    assert!(!response.ok, "chat.undo should fail on read-only history file");
+    assert!(
+        !response.ok,
+        "chat.undo should fail on read-only history file"
+    );
     assert_eq!(
         response.error.as_ref().map(|e| e.code.as_str()),
         Some("UNAVAILABLE")
@@ -239,7 +260,10 @@ async fn redo_rolls_back_manager_state_when_replace_history_fails() {
     let store = Arc::new(SessionStore::new(sessions_dir.clone()));
 
     store
-        .append("main", &json!({ "role": "assistant", "content": "current" }))
+        .append(
+            "main",
+            &json!({ "role": "assistant", "content": "current" }),
+        )
         .await
         .unwrap();
     mark_read_only(&sessions_dir.join("main.jsonl"));
@@ -261,7 +285,10 @@ async fn redo_rolls_back_manager_state_when_replace_history_fails() {
     let methods = MethodRegistry::new();
     let response = dispatch_method(&methods, &state, "chat.redo", json!({})).await;
 
-    assert!(!response.ok, "chat.redo should fail on read-only history file");
+    assert!(
+        !response.ok,
+        "chat.redo should fail on read-only history file"
+    );
     assert_eq!(
         response.error.as_ref().map(|e| e.code.as_str()),
         Some("UNAVAILABLE")

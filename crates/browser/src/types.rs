@@ -4,6 +4,57 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Stealth / anti-bot configuration.
+///
+/// These settings control the JS evasions injected before each navigation,
+/// the Chrome launch flags that reduce automation signals, and the
+/// behavioral (mouse/keyboard) emulation layer.
+///
+/// All fields default to enabled with sensible defaults. The struct is
+/// always compiled regardless of the `stealth` Cargo feature; the feature
+/// gate controls the injection code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StealthConfig {
+    /// Master switch — disables all stealth when false.
+    pub enabled: bool,
+    /// Inject the 16-evasion JS script via `addScriptToEvaluateOnNewDocument`.
+    pub js_evasion: bool,
+    /// Add the 19 stealth Chrome launch flags.
+    pub stealth_args: bool,
+    /// Use Bezier mouse movement and randomised keyboard timing.
+    pub behavioral: bool,
+    /// Override User-Agent (default: removes `HeadlessChrome`).
+    pub user_agent: Option<String>,
+    /// WebGL `UNMASKED_VENDOR_WEBGL` override (default: `"Intel Inc."`).
+    pub webgl_vendor: Option<String>,
+    /// WebGL `UNMASKED_RENDERER_WEBGL` override (default: `"Intel Iris OpenGL Engine"`).
+    pub webgl_renderer: Option<String>,
+    /// `navigator.languages` override (default: `["en-US", "en"]`).
+    pub languages: Option<Vec<String>>,
+    /// `navigator.hardwareConcurrency` override (default: `4`).
+    pub hardware_concurrency: Option<u32>,
+    /// `navigator.deviceMemory` override in GiB (default: `8`).
+    pub device_memory: Option<u8>,
+}
+
+impl Default for StealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            js_evasion: true,
+            stealth_args: true,
+            behavioral: true,
+            user_agent: None,
+            webgl_vendor: None,
+            webgl_renderer: None,
+            languages: None,
+            hardware_concurrency: None,
+            device_memory: None,
+        }
+    }
+}
+
 /// Browser action to perform.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -70,8 +121,165 @@ pub enum BrowserAction {
     /// Refresh the page.
     Refresh,
 
+    /// Hover the mouse over an element (triggers hover CSS and JS events).
+    Hover { ref_: u32 },
+
+    /// Double-click an element (fires two click events + a `dblclick` event).
+    DoubleClick { ref_: u32 },
+
+    /// Focus an element via keyboard focus without clicking it.
+    Focus { ref_: u32 },
+
+    /// Drag from one element to another (pointer events, not HTML5 drag-and-drop).
+    Drag { from_ref: u32, to_ref: u32 },
+
+    /// Check a checkbox or radio button. No-op if already checked.
+    Check { ref_: u32 },
+
+    /// Uncheck a checkbox. No-op if already unchecked.
+    Uncheck { ref_: u32 },
+
+    /// Select an option in a `<select>` element by its value attribute.
+    Select { ref_: u32, value: String },
+
+    /// Press a named key on the focused element.
+    ///
+    /// Use CDP key names: `"Enter"`, `"Escape"`, `"Tab"`, `"Backspace"`,
+    /// `"ArrowDown"`, `"ArrowUp"`, `"F5"`, single chars `"a"`, `"1"`, etc.
+    Press { key: String },
+
+    /// Upload a file to a `<input type="file">` element.
+    ///
+    /// `path` must be an absolute path on the machine running the browser.
+    Upload { ref_: u32, path: String },
+
+    /// Clear the value of an input or textarea element.
+    ///
+    /// Uses the native value setter so React's synthetic event system detects
+    /// the change, then fires `input` + `change` events.
+    Clear { ref_: u32 },
+
+    // ── Phase 5: Network interception & HAR ────────────────────────────────
+    /// Enable CDP `Fetch` domain to intercept matching requests.
+    ///
+    /// `url_patterns` is a list of URL wildcard patterns (e.g. `["*api*"]`).
+    /// An empty list intercepts all requests.
+    InterceptRequests {
+        #[serde(default)]
+        url_patterns: Vec<String>,
+    },
+
+    /// Disable request interception (stops a running intercept + HAR session).
+    StopIntercept,
+
+    /// Inject extra HTTP headers into every subsequent intercepted request.
+    SetExtraHeaders {
+        headers: std::collections::HashMap<String, String>,
+    },
+
+    /// Begin accumulating network requests into a HAR 1.2 log.
+    StartHar,
+
+    /// Stop HAR recording and return the captured HAR JSON in `response.result`.
+    StopHar,
+
+    // ── Phase 6: Session state ─────────────────────────────────────────────
+    /// Capture cookies + storage and save them to disk.
+    SaveState {
+        name: String,
+        #[serde(default)]
+        encrypt: bool,
+    },
+
+    /// Load a previously saved session state and restore cookies + storage.
+    LoadState { name: String },
+
+    /// List saved session state names (returned in `response.result`).
+    ListStates,
+
+    /// Delete a saved session state by name.
+    DeleteState { name: String },
+
+    // ── Phase 7a: Emulation overrides ──────────────────────────────────────
+    /// Override viewport size and device emulation.
+    SetDevice {
+        width: u32,
+        height: u32,
+        #[serde(default = "default_device_scale_factor")]
+        device_scale_factor: f64,
+        #[serde(default)]
+        mobile: bool,
+    },
+
+    /// Override the GPS location reported to the page.
+    SetGeolocation {
+        latitude: f64,
+        longitude: f64,
+        #[serde(default = "default_geo_accuracy")]
+        accuracy: f64,
+    },
+
+    /// Override the timezone reported to the page.
+    SetTimezone { timezone_id: String },
+
+    /// Override the locale reported to the page.
+    SetLocale { locale: String },
+
+    /// Clear any active device-metrics override and restore original viewport.
+    ClearDevice,
+
+    // ── Phase 7b: Screencast ───────────────────────────────────────────────
+    /// Start streaming page frames via the CDP screencast API.
+    StartScreencast {
+        #[serde(default = "default_screencast_format")]
+        format: String,
+        #[serde(default = "default_screencast_quality")]
+        quality: u8,
+        #[serde(default = "default_every_nth")]
+        every_nth: u32,
+    },
+
+    /// Stop the active screencast session.
+    StopScreencast,
+
+    /// Retrieve the most recent screencast frame as a base64 image in `response.result`.
+    GetScreencastFrame,
+
+    // ── Phase 7c: Tab management ───────────────────────────────────────────
+    /// Open a new browser tab with the given name and switch to it.
+    TabNew { name: String },
+
+    /// List all open tab names (returned in `response.result`).
+    TabList,
+
+    /// Switch the active tab to `name`.
+    TabSwitch { name: String },
+
+    /// Close the tab named `name` (cannot close `"main"`).
+    TabClose { name: String },
+
     /// Close the browser session.
     Close,
+}
+
+fn default_device_scale_factor() -> f64 {
+    1.0
+}
+
+fn default_geo_accuracy() -> f64 {
+    1.0
+}
+
+fn default_screencast_format() -> String {
+    "jpeg".to_string()
+}
+
+fn default_screencast_quality() -> u8 {
+    80
+}
+
+fn default_every_nth() -> u32 {
+    1
 }
 
 fn default_wait_timeout_ms() -> u64 {
@@ -181,6 +389,53 @@ impl fmt::Display for BrowserAction {
             Self::Back => write!(f, "back"),
             Self::Forward => write!(f, "forward"),
             Self::Refresh => write!(f, "refresh"),
+            Self::Hover { ref_ } => write!(f, "hover(ref={ref_})"),
+            Self::DoubleClick { ref_ } => write!(f, "double_click(ref={ref_})"),
+            Self::Focus { ref_ } => write!(f, "focus(ref={ref_})"),
+            Self::Drag { from_ref, to_ref } => {
+                write!(f, "drag(from={from_ref}, to={to_ref})")
+            },
+            Self::Check { ref_ } => write!(f, "check(ref={ref_})"),
+            Self::Uncheck { ref_ } => write!(f, "uncheck(ref={ref_})"),
+            Self::Select { ref_, .. } => write!(f, "select(ref={ref_})"),
+            Self::Press { key } => write!(f, "press(key={key})"),
+            Self::Upload { ref_, .. } => write!(f, "upload(ref={ref_})"),
+            Self::Clear { ref_ } => write!(f, "clear(ref={ref_})"),
+            Self::InterceptRequests { url_patterns } => {
+                write!(f, "intercept_requests(patterns={})", url_patterns.len())
+            },
+            Self::StopIntercept => write!(f, "stop_intercept"),
+            Self::SetExtraHeaders { headers } => {
+                write!(f, "set_extra_headers(count={})", headers.len())
+            },
+            Self::StartHar => write!(f, "start_har"),
+            Self::StopHar => write!(f, "stop_har"),
+            Self::SaveState { name, .. } => write!(f, "save_state(name={name})"),
+            Self::LoadState { name } => write!(f, "load_state(name={name})"),
+            Self::ListStates => write!(f, "list_states"),
+            Self::DeleteState { name } => write!(f, "delete_state(name={name})"),
+            Self::SetDevice { width, height, .. } => {
+                write!(f, "set_device({width}x{height})")
+            },
+            Self::SetGeolocation {
+                latitude,
+                longitude,
+                ..
+            } => {
+                write!(f, "set_geolocation({latitude},{longitude})")
+            },
+            Self::SetTimezone { timezone_id } => write!(f, "set_timezone({timezone_id})"),
+            Self::SetLocale { locale } => write!(f, "set_locale({locale})"),
+            Self::ClearDevice => write!(f, "clear_device"),
+            Self::StartScreencast { format, .. } => {
+                write!(f, "start_screencast(format={format})")
+            },
+            Self::StopScreencast => write!(f, "stop_screencast"),
+            Self::GetScreencastFrame => write!(f, "get_screencast_frame"),
+            Self::TabNew { name } => write!(f, "tab_new(name={name})"),
+            Self::TabList => write!(f, "tab_list"),
+            Self::TabSwitch { name } => write!(f, "tab_switch(name={name})"),
+            Self::TabClose { name } => write!(f, "tab_close(name={name})"),
             Self::Close => write!(f, "close"),
         }
     }
@@ -246,6 +501,15 @@ pub struct ElementRef {
     pub visible: bool,
     /// Whether the element is interactive (clickable/editable).
     pub interactive: bool,
+    /// Checked state for checkboxes and radio buttons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
+    /// Whether the element is disabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+    /// Input type attribute ("text", "email", "password", "submit", etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
     /// Bounding box in viewport coordinates.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<ElementBounds>,
@@ -445,6 +709,8 @@ pub struct BrowserConfig {
     pub persist_profile: bool,
     /// Custom path for the persistent Chrome profile directory.
     pub profile_dir: Option<String>,
+    /// Stealth / anti-bot-detection configuration.
+    pub stealth: StealthConfig,
 }
 
 fn default_sandbox_image() -> String {
@@ -476,6 +742,7 @@ impl Default for BrowserConfig {
             low_memory_threshold_mb: 2048,
             persist_profile: true,
             profile_dir: None,
+            stealth: StealthConfig::default(),
         }
     }
 }
@@ -518,6 +785,18 @@ impl From<&moltis_config::schema::BrowserConfig> for BrowserConfig {
             low_memory_threshold_mb: cfg.low_memory_threshold_mb,
             persist_profile: cfg.persist_profile,
             profile_dir: cfg.profile_dir.clone(),
+            stealth: StealthConfig {
+                enabled: cfg.stealth.enabled,
+                js_evasion: cfg.stealth.js_evasion,
+                stealth_args: cfg.stealth.stealth_args,
+                behavioral: cfg.stealth.behavioral,
+                user_agent: cfg.stealth.user_agent.clone(),
+                webgl_vendor: cfg.stealth.webgl_vendor.clone(),
+                webgl_renderer: cfg.stealth.webgl_renderer.clone(),
+                languages: cfg.stealth.languages.clone(),
+                hardware_concurrency: cfg.stealth.hardware_concurrency,
+                device_memory: cfg.stealth.device_memory,
+            },
         }
     }
 }

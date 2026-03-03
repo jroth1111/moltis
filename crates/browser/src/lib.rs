@@ -29,19 +29,27 @@
 //! let response = manager.handle_request(request).await;
 //! ```
 
+pub mod actions;
 pub mod container;
 pub mod detect;
+pub mod emulation;
 pub mod error;
 pub mod manager;
+pub mod network;
 pub mod pool;
+pub mod screencast;
+pub mod session_state;
 pub mod snapshot;
 pub mod types;
+
+#[cfg(feature = "stealth")]
+pub mod stealth;
 
 pub use {
     error::Error,
     manager::BrowserManager,
     types::{
         BrowserAction, BrowserConfig, BrowserKind, BrowserPreference, BrowserRequest,
-        BrowserResponse,
+        BrowserResponse, StealthConfig,
     },
 };

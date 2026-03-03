@@ -3,10 +3,12 @@
 //! `EventMatcher` loads all event-triggered cron jobs from the store,
 //! compiles their patterns into regexes, and provides fast message matching.
 
-use std::sync::Arc;
-use regex::Regex;
-use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use {
+    regex::Regex,
+    std::sync::Arc,
+    tokio::sync::RwLock,
+    tracing::{debug, warn},
+};
 
 use crate::types::{CronJobId, CronSchedule};
 
@@ -33,7 +35,11 @@ impl EventMatcher {
     pub async fn reload(&self, jobs: Vec<(CronJobId, CronSchedule)>) {
         let mut new_entries = Vec::new();
         for (job_id, schedule) in jobs {
-            if let CronSchedule::EventTrigger { pattern, channel_filter } = schedule {
+            if let CronSchedule::EventTrigger {
+                pattern,
+                channel_filter,
+            } = schedule
+            {
                 match Regex::new(&pattern) {
                     Ok(re) => new_entries.push(EventEntry {
                         job_id,
@@ -42,7 +48,7 @@ impl EventMatcher {
                     }),
                     Err(e) => {
                         warn!(%job_id, pattern, error = %e, "invalid event trigger regex, skipping");
-                    }
+                    },
                 }
             }
         }
@@ -57,10 +63,10 @@ impl EventMatcher {
             .iter()
             .filter(|e| {
                 // Check channel filter
-                if let Some(ref filter) = e.channel_filter {
-                    if channel.map_or(true, |ch| ch != filter) {
-                        return false;
-                    }
+                if let Some(ref filter) = e.channel_filter
+                    && channel.is_none_or(|ch| ch != filter)
+                {
+                    return false;
                 }
                 e.pattern.is_match(text)
             })
@@ -88,13 +94,12 @@ mod tests {
         patterns
             .iter()
             .enumerate()
-            .map(|(i, (pat, ch))| (
-                format!("job-{i}"),
-                CronSchedule::EventTrigger {
+            .map(|(i, (pat, ch))| {
+                (format!("job-{i}"), CronSchedule::EventTrigger {
                     pattern: pat.to_string(),
                     channel_filter: ch.map(str::to_string),
-                },
-            ))
+                })
+            })
             .collect()
     }
 
@@ -102,7 +107,9 @@ mod tests {
     async fn matches_simple_pattern() {
         let matcher = EventMatcher::new();
         matcher.reload(make_jobs(&[("billing", None)])).await;
-        let ids = matcher.match_message(None, "I have a billing question").await;
+        let ids = matcher
+            .match_message(None, "I have a billing question")
+            .await;
         assert_eq!(ids, vec!["job-0"]);
     }
 
@@ -117,7 +124,9 @@ mod tests {
     #[tokio::test]
     async fn channel_filter_respected() {
         let matcher = EventMatcher::new();
-        matcher.reload(make_jobs(&[("hello", Some("general"))])).await;
+        matcher
+            .reload(make_jobs(&[("hello", Some("general"))]))
+            .await;
         // Wrong channel — no match
         let ids = matcher.match_message(Some("random"), "hello world").await;
         assert!(ids.is_empty());

@@ -3,8 +3,10 @@
 //! Checks an atomic flag (and optionally a sentinel file at the moltis data
 //! directory) and blocks all agent starts and LLM calls when activated.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
 
