@@ -51,10 +51,21 @@ impl SkillsManifest {
     }
 
     pub fn set_skill_trusted(&mut self, source: &str, skill_name: &str, trusted: bool) -> bool {
+        self.set_skill_trusted_with_provenance(source, skill_name, trusted, None, None)
+    }
+
+    pub fn set_skill_trusted_with_provenance(
+        &mut self,
+        source: &str,
+        skill_name: &str,
+        trusted: bool,
+        trusted_at_ms: Option<u64>,
+        trusted_commit_sha: Option<String>,
+    ) -> bool {
         if let Some(repo) = self.find_repo_mut(source)
             && let Some(skill) = repo.skills.iter_mut().find(|s| s.name == skill_name)
         {
-            skill.trusted = trusted;
+            skill.set_trust_with_provenance(trusted, trusted_at_ms, trusted_commit_sha);
             return true;
         }
         false
@@ -81,13 +92,33 @@ pub struct SkillState {
     pub relative_path: String,
     #[serde(default = "default_trusted")]
     pub trusted: bool,
+    #[serde(default)]
+    pub trusted_at_ms: Option<u64>,
+    #[serde(default)]
+    pub trusted_commit_sha: Option<String>,
     pub enabled: bool,
 }
 
 fn default_trusted() -> bool {
-    // Backward compatibility: manifests created before trust-gating should
-    // continue to work without immediately disabling all installed skills.
-    true
+    false
+}
+
+impl SkillState {
+    pub fn set_trust_with_provenance(
+        &mut self,
+        trusted: bool,
+        trusted_at_ms: Option<u64>,
+        trusted_commit_sha: Option<String>,
+    ) {
+        self.trusted = trusted;
+        if trusted {
+            self.trusted_at_ms = trusted_at_ms;
+            self.trusted_commit_sha = trusted_commit_sha;
+        } else {
+            self.trusted_at_ms = None;
+            self.trusted_commit_sha = None;
+        }
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -96,12 +127,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skill_state_defaults_trusted_for_backward_compat() {
+    fn skill_state_defaults_untrusted_when_trusted_missing() {
         let parsed: SkillState = serde_json::from_str(
             r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":true}"#,
         )
         .unwrap();
-        assert!(parsed.trusted);
+        assert!(!parsed.trusted);
+        assert!(parsed.trusted_at_ms.is_none());
+        assert!(parsed.trusted_commit_sha.is_none());
+    }
+
+    #[test]
+    fn set_skill_trusted_with_provenance_round_trip() {
+        let mut manifest = SkillsManifest {
+            version: 1,
+            repos: vec![RepoEntry {
+                source: "owner/repo".into(),
+                repo_name: "owner-repo".into(),
+                installed_at_ms: 1,
+                commit_sha: Some("abcdef".into()),
+                format: PluginFormat::default(),
+                skills: vec![SkillState {
+                    name: "demo".into(),
+                    relative_path: "owner-repo".into(),
+                    trusted: false,
+                    trusted_at_ms: None,
+                    trusted_commit_sha: None,
+                    enabled: false,
+                }],
+            }],
+        };
+
+        assert!(manifest.set_skill_trusted_with_provenance(
+            "owner/repo",
+            "demo",
+            true,
+            Some(1234),
+            Some("abcdef".into())
+        ));
+        let skill = &manifest.repos[0].skills[0];
+        assert!(skill.trusted);
+        assert_eq!(skill.trusted_at_ms, Some(1234));
+        assert_eq!(skill.trusted_commit_sha.as_deref(), Some("abcdef"));
+
+        assert!(manifest.set_skill_trusted("owner/repo", "demo", false));
+        let skill = &manifest.repos[0].skills[0];
+        assert!(!skill.trusted);
+        assert!(skill.trusted_at_ms.is_none());
+        assert!(skill.trusted_commit_sha.is_none());
     }
 }
 
