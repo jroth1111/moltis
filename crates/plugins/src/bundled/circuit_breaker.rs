@@ -158,9 +158,12 @@ impl HookHandler for CircuitBreakerHook {
                         // Probe failed — reopen immediately.
                         CircuitState::HalfOpen => {
                             counts.insert(provider.clone(), self.failure_threshold);
-                            states.insert(provider.clone(), CircuitState::Open {
-                                opened_at: Instant::now(),
-                            });
+                            states.insert(
+                                provider.clone(),
+                                CircuitState::Open {
+                                    opened_at: Instant::now(),
+                                },
+                            );
                             info!(
                                 provider = %provider,
                                 "circuit-breaker: half-open probe failed, circuit reopened"
@@ -170,9 +173,12 @@ impl HookHandler for CircuitBreakerHook {
                             let count = counts.entry(provider.clone()).or_insert(0);
                             *count += 1;
                             if *count >= self.failure_threshold {
-                                states.insert(provider.clone(), CircuitState::Open {
-                                    opened_at: Instant::now(),
-                                });
+                                states.insert(
+                                    provider.clone(),
+                                    CircuitState::Open {
+                                        opened_at: Instant::now(),
+                                    },
+                                );
                                 info!(
                                     provider = %provider,
                                     failures = *count,

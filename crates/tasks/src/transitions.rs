@@ -270,10 +270,13 @@ mod tests {
 
     fn active_task(owner: &str) -> Task {
         let t = pending_task();
-        apply(t, &TransitionEvent::Claim {
-            owner: owner.to_string(),
-            lease_duration_secs: None,
-        })
+        apply(
+            t,
+            &TransitionEvent::Claim {
+                owner: owner.to_string(),
+                lease_duration_secs: None,
+            },
+        )
         .expect("claim")
     }
 
@@ -282,10 +285,13 @@ mod tests {
     #[test]
     fn pending_claim_goes_active() {
         let task = pending_task();
-        let result = apply(task, &TransitionEvent::Claim {
-            owner: "agent-1".into(),
-            lease_duration_secs: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Claim {
+                owner: "agent-1".into(),
+                lease_duration_secs: None,
+            },
+        )
         .expect("claim should succeed");
         assert!(result.runtime.state.is_active());
         assert_eq!(result.runtime.owner.as_deref(), Some("agent-1"));
@@ -297,9 +303,12 @@ mod tests {
     fn pending_block_goes_blocked() {
         let task = pending_task();
         let dep = TaskId::from("dep-1");
-        let result = apply(task, &TransitionEvent::Block {
-            waiting_on: vec![dep.clone()],
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Block {
+                waiting_on: vec![dep.clone()],
+            },
+        )
         .expect("block should succeed");
         assert!(matches!(
             result.runtime.state,
@@ -310,9 +319,12 @@ mod tests {
     #[test]
     fn pending_cancel() {
         let task = pending_task();
-        let result = apply(task, &TransitionEvent::Cancel {
-            reason: "not needed".into(),
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Cancel {
+                reason: "not needed".into(),
+            },
+        )
         .expect("cancel should succeed");
         assert!(matches!(
             result.runtime.state,
@@ -325,9 +337,12 @@ mod tests {
     #[test]
     fn blocked_deps_met_goes_pending() {
         let t = pending_task();
-        let blocked = apply(t, &TransitionEvent::Block {
-            waiting_on: vec![TaskId::from("x")],
-        })
+        let blocked = apply(
+            t,
+            &TransitionEvent::Block {
+                waiting_on: vec![TaskId::from("x")],
+            },
+        )
         .expect("block");
         let pending = apply(blocked, &TransitionEvent::DependenciesMet).expect("deps met");
         assert_eq!(pending.runtime.state, RuntimeState::Pending);
@@ -349,11 +364,14 @@ mod tests {
     #[test]
     fn active_fail_retryable_goes_retrying() {
         let task = active_task("agent");
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::ProviderTransient,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::ProviderTransient,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail retryable");
         assert!(matches!(
             result.runtime.state,
@@ -371,11 +389,14 @@ mod tests {
         task.runtime.attempt = 3; // already at max
         task.spec.max_attempts = 3;
 
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::AgentError,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail should succeed");
         assert!(matches!(
             result.runtime.state,
@@ -388,11 +409,14 @@ mod tests {
     #[test]
     fn active_fail_human_required_goes_awaiting_human() {
         let task = active_task("agent");
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::ProviderPermanent,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::ProviderPermanent,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail human-required");
         // ProviderPermanent.requires_human() → AwaitingHuman (not terminal)
         assert!(matches!(
@@ -404,10 +428,13 @@ mod tests {
     #[test]
     fn active_escalate_goes_awaiting_human() {
         let task = active_task("agent");
-        let result = apply(task, &TransitionEvent::Escalate {
-            question: "which env?".into(),
-            handoff: HandoffContext::default(),
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Escalate {
+                question: "which env?".into(),
+                handoff: HandoffContext::default(),
+            },
+        )
         .expect("escalate");
         assert!(matches!(
             result.runtime.state,
@@ -420,11 +447,14 @@ mod tests {
     #[test]
     fn retrying_promote_goes_pending() {
         let task = active_task("agent");
-        let retrying = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::AgentError,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let retrying = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail");
         let promoted = apply(retrying, &TransitionEvent::PromoteRetry).expect("promote");
         assert_eq!(promoted.runtime.state, RuntimeState::Pending);
@@ -435,14 +465,20 @@ mod tests {
     #[test]
     fn awaiting_human_resolve_goes_pending() {
         let task = active_task("agent");
-        let awaiting = apply(task, &TransitionEvent::Escalate {
-            question: "question".into(),
-            handoff: HandoffContext::default(),
-        })
+        let awaiting = apply(
+            task,
+            &TransitionEvent::Escalate {
+                question: "question".into(),
+                handoff: HandoffContext::default(),
+            },
+        )
         .expect("escalate");
-        let resolved = apply(awaiting, &TransitionEvent::HumanResolve {
-            resolution: "use prod".into(),
-        })
+        let resolved = apply(
+            awaiting,
+            &TransitionEvent::HumanResolve {
+                resolution: "use prod".into(),
+            },
+        )
         .expect("resolve");
         assert_eq!(resolved.runtime.state, RuntimeState::Pending);
     }
@@ -458,9 +494,12 @@ mod tests {
         let err = apply(done.clone(), &TransitionEvent::Complete).unwrap_err();
         assert!(matches!(err, TransitionError::InvalidTransition { .. }));
 
-        let err2 = apply(done, &TransitionEvent::Cancel {
-            reason: "late".into(),
-        })
+        let err2 = apply(
+            done,
+            &TransitionEvent::Cancel {
+                reason: "late".into(),
+            },
+        )
         .unwrap_err();
         assert!(matches!(err2, TransitionError::InvalidTransition { .. }));
     }
@@ -472,10 +511,13 @@ mod tests {
         let t0 = pending_task();
         assert_eq!(t0.runtime.version, 0);
 
-        let t1 = apply(t0, &TransitionEvent::Claim {
-            owner: "a".into(),
-            lease_duration_secs: None,
-        })
+        let t1 = apply(
+            t0,
+            &TransitionEvent::Claim {
+                owner: "a".into(),
+                lease_duration_secs: None,
+            },
+        )
         .expect("claim");
         assert_eq!(t1.runtime.version, 1);
 
@@ -498,10 +540,13 @@ mod tests {
     #[test]
     fn claim_with_lease_sets_expiry() {
         let task = pending_task();
-        let claimed = apply(task, &TransitionEvent::Claim {
-            owner: "agent".into(),
-            lease_duration_secs: Some(300),
-        })
+        let claimed = apply(
+            task,
+            &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: Some(300),
+            },
+        )
         .expect("claim");
         if let RuntimeState::Active {
             lease_expires_at: Some(exp),
@@ -521,9 +566,12 @@ mod tests {
     #[test]
     fn pending_cancel_goes_terminal_canceled() {
         let task = pending_task();
-        let result = apply(task, &TransitionEvent::Cancel {
-            reason: "stop".into(),
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Cancel {
+                reason: "stop".into(),
+            },
+        )
         .expect("cancel pending");
         assert!(matches!(
             result.runtime.state,
@@ -534,13 +582,19 @@ mod tests {
     #[test]
     fn blocked_cancel_goes_terminal_canceled() {
         let task = pending_task();
-        let blocked = apply(task, &TransitionEvent::Block {
-            waiting_on: vec![TaskId::from("dep-1")],
-        })
+        let blocked = apply(
+            task,
+            &TransitionEvent::Block {
+                waiting_on: vec![TaskId::from("dep-1")],
+            },
+        )
         .expect("block");
-        let result = apply(blocked, &TransitionEvent::Cancel {
-            reason: "stop".into(),
-        })
+        let result = apply(
+            blocked,
+            &TransitionEvent::Cancel {
+                reason: "stop".into(),
+            },
+        )
         .expect("cancel blocked");
         assert!(matches!(
             result.runtime.state,
@@ -551,15 +605,21 @@ mod tests {
     #[test]
     fn retrying_cancel_goes_terminal_canceled() {
         let task = active_task("agent");
-        let retrying = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::AgentError,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let retrying = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail");
-        let result = apply(retrying, &TransitionEvent::Cancel {
-            reason: "abort".into(),
-        })
+        let result = apply(
+            retrying,
+            &TransitionEvent::Cancel {
+                reason: "abort".into(),
+            },
+        )
         .expect("cancel retrying");
         assert!(matches!(
             result.runtime.state,
@@ -570,14 +630,20 @@ mod tests {
     #[test]
     fn awaiting_human_cancel_goes_terminal_canceled() {
         let task = active_task("agent");
-        let awaiting = apply(task, &TransitionEvent::Escalate {
-            question: "help?".into(),
-            handoff: HandoffContext::default(),
-        })
+        let awaiting = apply(
+            task,
+            &TransitionEvent::Escalate {
+                question: "help?".into(),
+                handoff: HandoffContext::default(),
+            },
+        )
         .expect("escalate");
-        let result = apply(awaiting, &TransitionEvent::Cancel {
-            reason: "abort".into(),
-        })
+        let result = apply(
+            awaiting,
+            &TransitionEvent::Cancel {
+                reason: "abort".into(),
+            },
+        )
         .expect("cancel awaiting");
         assert!(matches!(
             result.runtime.state,
@@ -596,11 +662,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::AgentError,
-            handoff: handoff.clone(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: handoff.clone(),
+                retry_after: None,
+            },
+        )
         .expect("fail");
 
         // runtime.handoff and Retrying.handoff should match what we passed.
@@ -623,11 +692,14 @@ mod tests {
             ..Default::default()
         };
 
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::ProviderPermanent, // requires_human()
-            handoff: handoff.clone(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::ProviderPermanent, // requires_human()
+                handoff: handoff.clone(),
+                retry_after: None,
+            },
+        )
         .expect("fail→awaiting_human");
 
         if let RuntimeState::AwaitingHuman { handoff: hc, .. } = &result.runtime.state {
@@ -643,11 +715,14 @@ mod tests {
     fn fail_with_custom_retry_after_sets_retrying_timestamp() {
         let task = active_task("agent");
         let future = OffsetDateTime::now_utc() + time::Duration::seconds(999);
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::AgentError,
-            handoff: HandoffContext::default(),
-            retry_after: Some(future),
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: Some(future),
+            },
+        )
         .expect("fail");
         if let RuntimeState::Retrying { retry_after, .. } = result.runtime.state {
             // Allow ±5s around the expected value.
@@ -668,11 +743,14 @@ mod tests {
         let mut task = active_task("agent");
         task.spec.max_attempts = 10; // budget not exhausted
         // MaxAttemptsExceeded is !is_retryable() → Terminal regardless of budget
-        let result = apply(task, &TransitionEvent::Fail {
-            class: FailureClass::MaxAttemptsExceeded,
-            handoff: HandoffContext::default(),
-            retry_after: None,
-        })
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::MaxAttemptsExceeded,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
         .expect("fail non-retryable");
         assert!(matches!(
             result.runtime.state,
@@ -685,17 +763,23 @@ mod tests {
     #[test]
     fn active_renew_lease_extends_expiry() {
         let task = pending_task();
-        let claimed = apply(task, &TransitionEvent::Claim {
-            owner: "agent".into(),
-            lease_duration_secs: Some(60),
-        })
+        let claimed = apply(
+            task,
+            &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: Some(60),
+            },
+        )
         .expect("claim");
         let v_before = claimed.runtime.version;
 
         let new_exp = OffsetDateTime::now_utc() + time::Duration::seconds(3600);
-        let renewed = apply(claimed, &TransitionEvent::RenewLease {
-            new_expires_at: new_exp,
-        })
+        let renewed = apply(
+            claimed,
+            &TransitionEvent::RenewLease {
+                new_expires_at: new_exp,
+            },
+        )
         .expect("renew lease");
 
         assert_eq!(renewed.runtime.version, v_before + 1);
@@ -714,9 +798,12 @@ mod tests {
     #[test]
     fn non_active_renew_lease_is_invalid() {
         let task = pending_task();
-        let err = apply(task, &TransitionEvent::RenewLease {
-            new_expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(60),
-        })
+        let err = apply(
+            task,
+            &TransitionEvent::RenewLease {
+                new_expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            },
+        )
         .unwrap_err();
         assert!(matches!(err, TransitionError::InvalidTransition { .. }));
     }

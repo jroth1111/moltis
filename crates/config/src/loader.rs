@@ -1417,17 +1417,17 @@ name = "Rex"
             .expect("write template");
 
         let mut config = load_config(&path).expect("load template config");
-        config
-            .providers
-            .providers
-            .insert("openai".into(), crate::schema::ProviderEntry {
+        config.providers.providers.insert(
+            "openai".into(),
+            crate::schema::ProviderEntry {
                 api_key: Some(secrecy::Secret::new("sk-openai-primary".into())),
                 extra_api_keys: vec![
                     secrecy::Secret::new("sk-openai-extra-1".into()),
                     secrecy::Secret::new("sk-openai-extra-2".into()),
                 ],
                 ..Default::default()
-            });
+            },
+        );
 
         save_config_to_path(&path, &config).expect("save config");
 

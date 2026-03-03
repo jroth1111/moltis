@@ -462,10 +462,15 @@ impl AgentTool for TaskListTool {
 
                 let task = self
                     .store
-                    .apply_transition(list_id, id, expected_version, &TransitionEvent::Claim {
-                        owner,
-                        lease_duration_secs: None,
-                    })
+                    .apply_transition(
+                        list_id,
+                        id,
+                        expected_version,
+                        &TransitionEvent::Claim {
+                            owner,
+                            lease_duration_secs: None,
+                        },
+                    )
                     .await
                     .map_err(anyhow::Error::from)?;
 
@@ -481,11 +486,16 @@ impl AgentTool for TaskListTool {
 
                 let task = self
                     .store
-                    .apply_transition(list_id, id, expected_version, &TransitionEvent::Fail {
-                        class,
-                        handoff,
-                        retry_after: None,
-                    })
+                    .apply_transition(
+                        list_id,
+                        id,
+                        expected_version,
+                        &TransitionEvent::Fail {
+                            class,
+                            handoff,
+                            retry_after: None,
+                        },
+                    )
                     .await
                     .map_err(anyhow::Error::from)?;
 
@@ -502,10 +512,12 @@ impl AgentTool for TaskListTool {
 
                 let task = self
                     .store
-                    .apply_transition(list_id, id, expected_version, &TransitionEvent::Escalate {
-                        question,
-                        handoff,
-                    })
+                    .apply_transition(
+                        list_id,
+                        id,
+                        expected_version,
+                        &TransitionEvent::Escalate { question, handoff },
+                    )
                     .await
                     .map_err(anyhow::Error::from)?;
 
