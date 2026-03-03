@@ -290,12 +290,7 @@ impl IntentStore {
                 actual: current.version,
             });
         }
-        if current
-            .active_shift_id
-            .as_ref()
-            .map(|id| id.0.as_str())
-            != Some(shift_id)
-        {
+        if current.active_shift_id.as_ref().map(|id| id.0.as_str()) != Some(shift_id) {
             return Err(TransitionError::Other(
                 "intent active shift does not match finalized shift".to_string(),
             ));
@@ -915,17 +910,16 @@ mod tests {
 
         // Finalize with same (default) snapshot — spin.
         let mut tx = task_store.begin_tx().await.expect("begin");
-        let (s1, spinning) =
-            IntentStore::finalize_shift_tx(
-                &mut tx,
-                &id.0,
-                "shift-1",
-                ObjectiveSnapshot::default(),
-                0,
-                1,
-            )
-                .await
-                .expect("finalize 1");
+        let (s1, spinning) = IntentStore::finalize_shift_tx(
+            &mut tx,
+            &id.0,
+            "shift-1",
+            ObjectiveSnapshot::default(),
+            0,
+            1,
+        )
+        .await
+        .expect("finalize 1");
         tx.commit().await.expect("commit 1");
 
         assert!(!spinning);
@@ -937,17 +931,16 @@ mod tests {
             .expect("set active 2");
 
         let mut tx = task_store.begin_tx().await.expect("begin 2");
-        let (s2, spinning) =
-            IntentStore::finalize_shift_tx(
-                &mut tx,
-                &id.0,
-                "shift-2",
-                ObjectiveSnapshot::default(),
-                0,
-                3,
-            )
-                .await
-                .expect("finalize 2");
+        let (s2, spinning) = IntentStore::finalize_shift_tx(
+            &mut tx,
+            &id.0,
+            "shift-2",
+            ObjectiveSnapshot::default(),
+            0,
+            3,
+        )
+        .await
+        .expect("finalize 2");
         tx.commit().await.expect("commit 2");
 
         assert!(!spinning);
@@ -959,17 +952,16 @@ mod tests {
             .expect("set active 3");
 
         let mut tx = task_store.begin_tx().await.expect("begin 3");
-        let (s3, spinning) =
-            IntentStore::finalize_shift_tx(
-                &mut tx,
-                &id.0,
-                "shift-3",
-                ObjectiveSnapshot::default(),
-                0,
-                5,
-            )
-                .await
-                .expect("finalize 3");
+        let (s3, spinning) = IntentStore::finalize_shift_tx(
+            &mut tx,
+            &id.0,
+            "shift-3",
+            ObjectiveSnapshot::default(),
+            0,
+            5,
+        )
+        .await
+        .expect("finalize 3");
         tx.commit().await.expect("commit 3");
 
         assert!(spinning, "spin_count == spin_threshold should be detected");
@@ -987,34 +979,32 @@ mod tests {
         // Shift 1: spin (no progress).
         is.set_active_shift(&id.0, "s1", 0).await.expect("set s1"); // version=1
         let mut tx = task_store.begin_tx().await.expect("tx1");
-        let (s1, _) =
-            IntentStore::finalize_shift_tx(
-                &mut tx,
-                &id.0,
-                "s1",
-                ObjectiveSnapshot::default(),
-                0,
-                1,
-            )
-                .await
-                .expect("finalize s1"); // version=2
+        let (s1, _) = IntentStore::finalize_shift_tx(
+            &mut tx,
+            &id.0,
+            "s1",
+            ObjectiveSnapshot::default(),
+            0,
+            1,
+        )
+        .await
+        .expect("finalize s1"); // version=2
         tx.commit().await.expect("commit1");
         assert_eq!(s1.spin_count, 1);
 
         // Shift 2: spin (no progress).
         is.set_active_shift(&id.0, "s2", 2).await.expect("set s2"); // version=3
         let mut tx = task_store.begin_tx().await.expect("tx2");
-        let (s2, _) =
-            IntentStore::finalize_shift_tx(
-                &mut tx,
-                &id.0,
-                "s2",
-                ObjectiveSnapshot::default(),
-                0,
-                3,
-            )
-                .await
-                .expect("finalize s2"); // version=4
+        let (s2, _) = IntentStore::finalize_shift_tx(
+            &mut tx,
+            &id.0,
+            "s2",
+            ObjectiveSnapshot::default(),
+            0,
+            3,
+        )
+        .await
+        .expect("finalize s2"); // version=4
         tx.commit().await.expect("commit2");
         assert_eq!(s2.spin_count, 2);
 
@@ -1025,10 +1015,9 @@ mod tests {
             ..Default::default()
         };
         let mut tx = task_store.begin_tx().await.expect("tx3");
-        let (s3, spinning) =
-            IntentStore::finalize_shift_tx(&mut tx, &id.0, "s3", progress, 100, 5)
-                .await
-                .expect("finalize s3"); // version=6
+        let (s3, spinning) = IntentStore::finalize_shift_tx(&mut tx, &id.0, "s3", progress, 100, 5)
+            .await
+            .expect("finalize s3"); // version=6
         tx.commit().await.expect("commit3");
 
         assert!(!spinning, "progress should not trigger spin escalation");
