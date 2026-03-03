@@ -116,6 +116,15 @@ fn would_create_cycle(tasks: &HashMap<String, Task>, task_id: &str, new_deps: &[
     false
 }
 
+fn is_privileged_caller(caller_identity: &str) -> bool {
+    matches!(caller_identity, "admin" | "system")
+}
+
+fn require_mutation_caller<'a>(params: &'a serde_json::Value) -> crate::Result<&'a str> {
+    str_param_any(params, &["_session_key"])
+        .ok_or_else(|| Error::message("unauthorized: _session_key is required for task mutations"))
+}
+
 impl TaskStore {
     pub fn new(base_dir: &Path) -> Self {
         Self {
@@ -248,7 +257,7 @@ impl TaskStore {
         owner: Option<String>,
         blocked_by: Option<Vec<String>>,
         proof: Option<String>,
-        caller_identity: Option<&str>,
+        caller_identity: &str,
         trace_id: Option<&str>,
         force: bool,
     ) -> crate::Result<Task> {
@@ -268,15 +277,22 @@ impl TaskStore {
                 .get(task_id)
                 .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
 
-            // Ownership enforcement: when the task has an owner and a caller is
-            // identified, only the owner (or force=true) may change status or owner.
+            if force && !is_privileged_caller(caller_identity) {
+                return Err(Error::message(format!(
+                    "task {task_id} force override requires privileged caller; \
+                     caller '{caller_identity}' is not allowed"
+                )));
+            }
+
+            // Ownership enforcement: when the task has an owner, only the owner
+            // (or an authorized force=true call) may change status or owner.
             if !force {
-                if let (Some(current_owner), Some(caller)) = (&task.owner, caller_identity) {
+                if let Some(current_owner) = &task.owner {
                     let is_owner_mutation = status.is_some() || owner.is_some();
-                    if is_owner_mutation && current_owner != caller {
+                    if is_owner_mutation && current_owner != caller_identity {
                         return Err(Error::message(format!(
                             "task {task_id} is owned by '{current_owner}'; \
-                             caller '{caller}' cannot modify status or owner"
+                             caller '{caller_identity}' cannot modify status or owner"
                         )));
                     }
                 }
@@ -523,6 +539,7 @@ impl AgentTool for TaskListTool {
 
         match action {
             "create" => {
+                let _caller_identity = require_mutation_caller(&params)?;
                 let subject = require_str(&params, "subject")?.to_string();
                 let description = str_param(&params, "description").unwrap_or("").to_string();
                 let task = self.store.create(list_id, subject, description).await?;
@@ -568,7 +585,7 @@ impl AgentTool for TaskListTool {
                             .collect::<Vec<_>>()
                     });
                 let proof = str_param(&params, "proof").map(String::from);
-                let caller_identity = str_param_any(&params, &["_session_key"]);
+                let caller_identity = require_mutation_caller(&params)?;
                 let trace_id = str_param_any(&params, &["_trace_id"]);
                 let force = params
                     .get("force")
@@ -596,12 +613,18 @@ impl AgentTool for TaskListTool {
                 }))
             },
             "claim" => {
+                let caller_identity = require_mutation_caller(&params)?;
                 let id = require_str(&params, "id")?;
-                let owner = str_param_any(&params, &["owner", "_session_key"])
-                    .unwrap_or("agent")
-                    .to_string();
+                let owner = str_param(&params, "owner").unwrap_or(caller_identity);
+                if owner != caller_identity && !is_privileged_caller(caller_identity) {
+                    return Err(Error::message(
+                        "unauthorized: only privileged callers may claim tasks for another owner"
+                            .to_string(),
+                    )
+                    .into());
+                }
                 let trace_id = str_param_any(&params, &["_trace_id"]);
-                let task = self.store.claim(list_id, id, &owner, trace_id).await?;
+                let task = self.store.claim(list_id, id, owner, trace_id).await?;
                 Ok(serde_json::json!({
                     "ok": true,
                     "task": task,
@@ -618,8 +641,33 @@ mod tests {
 
     type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-    fn tool(tmp: &tempfile::TempDir) -> TaskListTool {
-        TaskListTool::new(tmp.path())
+    const TEST_SESSION_KEY: &str = "session:tester";
+
+    struct TestTaskTool {
+        inner: TaskListTool,
+    }
+
+    impl TestTaskTool {
+        fn new(tmp: &tempfile::TempDir) -> Self {
+            Self {
+                inner: TaskListTool::new(tmp.path()),
+            }
+        }
+
+        async fn execute(
+            &self,
+            mut params: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            if let Some(map) = params.as_object_mut() {
+                map.entry("_session_key".to_string())
+                    .or_insert_with(|| serde_json::Value::String(TEST_SESSION_KEY.to_string()));
+            }
+            self.inner.execute(params).await
+        }
+    }
+
+    fn tool(tmp: &tempfile::TempDir) -> TestTaskTool {
+        TestTaskTool::new(tmp)
     }
 
     #[tokio::test]
@@ -662,11 +710,85 @@ mod tests {
         let claimed = task_tool
             .execute(serde_json::json!({
                 "action": "claim",
-                "id": id,
-                "owner": "worker-a"
+                "id": id
             }))
             .await?;
         assert_eq!(claimed["task"]["status"], "in_progress");
+        assert_eq!(claimed["task"]["owner"], TEST_SESSION_KEY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_rejects_missing_session_key() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let raw_tool = TaskListTool::new(tmp.path());
+
+        let result = raw_tool
+            .execute(serde_json::json!({
+                "action": "create",
+                "subject": "work"
+            }))
+            .await;
+        let err = result
+            .err()
+            .ok_or_else(|| std::io::Error::other("expected unauthorized create failure"))?;
+        assert!(err.to_string().contains("_session_key is required"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_non_privileged_owner_override() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let raw_tool = TaskListTool::new(tmp.path());
+        let created = raw_tool
+            .execute(serde_json::json!({
+                "action": "create",
+                "subject": "work",
+                "_session_key": "caller"
+            }))
+            .await?;
+        let id = created["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+
+        let result = raw_tool
+            .execute(serde_json::json!({
+                "action": "claim",
+                "id": id,
+                "owner": "worker-a",
+                "_session_key": "caller"
+            }))
+            .await;
+        let err = result
+            .err()
+            .ok_or_else(|| std::io::Error::other("expected unauthorized claim failure"))?;
+        assert!(err.to_string().contains("only privileged callers"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn claim_allows_privileged_owner_override() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let raw_tool = TaskListTool::new(tmp.path());
+        let created = raw_tool
+            .execute(serde_json::json!({
+                "action": "create",
+                "subject": "work",
+                "_session_key": "admin"
+            }))
+            .await?;
+        let id = created["task"]["id"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+
+        let claimed = raw_tool
+            .execute(serde_json::json!({
+                "action": "claim",
+                "id": id,
+                "owner": "worker-a",
+                "_session_key": "admin"
+            }))
+            .await?;
         assert_eq!(claimed["task"]["owner"], "worker-a");
         Ok(())
     }
@@ -707,8 +829,7 @@ mod tests {
         let result = task_tool
             .execute(serde_json::json!({
                 "action": "claim",
-                "id": id,
-                "owner": "worker-a"
+                "id": id
             }))
             .await;
         let err = result
@@ -945,7 +1066,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("owner-b"),
+                "owner-b",
                 None,
                 false,
             )
@@ -977,7 +1098,7 @@ mod tests {
                 None,
                 None,
                 Some("owner proof".into()),
-                Some("owner-a"),
+                "owner-a",
                 None,
                 false,
             )
@@ -1007,7 +1128,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("owner-b"),
+                "owner-b",
                 None,
                 false,
             )
@@ -1035,7 +1156,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("anyone"),
+                "anyone",
                 None,
                 false,
             )
@@ -1045,7 +1166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_force_overrides_ownership() -> TestResult<()> {
+    async fn update_force_overrides_ownership_for_privileged_callers() -> TestResult<()> {
         let tmp = tempfile::tempdir()?;
         let store = TaskStore::new(tmp.path());
         let task = store
@@ -1054,7 +1175,7 @@ mod tests {
 
         store.claim("default", &task.id, "owner-a", None).await?;
 
-        // owner-b with force=true → allowed.
+        // privileged caller with force=true → allowed.
         let updated = store
             .update(
                 "default",
@@ -1065,12 +1186,42 @@ mod tests {
                 None,
                 None,
                 Some("forced close proof".into()),
-                Some("owner-b"),
+                "admin",
                 None,
                 true,
             )
             .await?;
         assert_eq!(updated.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_force_rejects_non_privileged_caller() -> TestResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskStore::new(tmp.path());
+        let task = store
+            .create("default", "work".into(), String::new())
+            .await?;
+
+        store.claim("default", &task.id, "owner-a", None).await?;
+
+        let result = store
+            .update(
+                "default",
+                &task.id,
+                Some(TaskStatus::Completed),
+                None,
+                None,
+                None,
+                None,
+                Some("forced close proof".into()),
+                "owner-b",
+                None,
+                true,
+            )
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("requires privileged caller"));
         Ok(())
     }
 
@@ -1096,7 +1247,7 @@ mod tests {
                 None,
                 None,
                 Some("tests passed, coverage 95%".into()),
-                Some("worker"),
+                "worker",
                 None,
                 false,
             )
@@ -1126,7 +1277,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("worker"),
+                "worker",
                 None,
                 false,
             )
@@ -1187,7 +1338,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                "system",
                 Some("trace-abc-123"),
                 false,
             )
