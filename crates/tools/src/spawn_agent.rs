@@ -15,12 +15,14 @@ use {
 
 use {
     moltis_agents::{
-        model::LlmProvider,
+        ChatMessage, ContentPart, UserContent,
+        model::{LlmProvider, values_to_chat_messages},
         runner::{RunnerEvent, run_agent_loop_with_context},
         tool_registry::{AgentTool, ToolRegistry},
     },
     moltis_config::schema::{AgentPresetConfig, AgentsConfig},
     moltis_providers::ProviderRegistry,
+    moltis_sessions::store::SessionStore,
 };
 
 /// Maximum nesting depth for sub-agents (prevents infinite recursion).
@@ -51,6 +53,7 @@ pub struct SpawnAgentTool {
     provider_registry: Arc<tokio::sync::RwLock<ProviderRegistry>>,
     default_provider: Arc<dyn LlmProvider>,
     tool_registry: Arc<ToolRegistry>,
+    session_store: Option<Arc<SessionStore>>,
     agents_config: Option<Arc<tokio::sync::RwLock<AgentsConfig>>>,
     on_event: Option<OnSpawnEvent>,
     /// Optional task store for lifecycle management when `task_id` is provided.
@@ -72,6 +75,7 @@ impl SpawnAgentTool {
             provider_registry,
             default_provider,
             tool_registry,
+            session_store: None,
             agents_config: None,
             on_event: None,
             task_store: None,
@@ -94,6 +98,12 @@ impl SpawnAgentTool {
         agents_config: Arc<tokio::sync::RwLock<AgentsConfig>>,
     ) -> Self {
         self.agents_config = Some(agents_config);
+        self
+    }
+
+    /// Attach session storage so sub-agents can optionally inherit parent context.
+    pub fn with_session_store(mut self, session_store: Arc<SessionStore>) -> Self {
+        self.session_store = Some(session_store);
         self
     }
 
@@ -229,6 +239,102 @@ impl SpawnAgentTool {
         }
         tool_context
     }
+
+    fn estimate_text_tokens(text: &str) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+        ((text.len() as u32).saturating_add(3) / 4).max(1)
+    }
+
+    fn estimate_message_tokens(message: &ChatMessage) -> u32 {
+        match message {
+            ChatMessage::System { content } => Self::estimate_text_tokens(content),
+            ChatMessage::User { content } => match content {
+                UserContent::Text(text) => Self::estimate_text_tokens(text),
+                UserContent::Multimodal(parts) => parts
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text(text) => Self::estimate_text_tokens(text),
+                        ContentPart::Image { data, .. } => Self::estimate_text_tokens(data),
+                    })
+                    .sum(),
+            },
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let content_tokens = content
+                    .as_deref()
+                    .map(Self::estimate_text_tokens)
+                    .unwrap_or_default();
+                let tool_tokens = tool_calls
+                    .iter()
+                    .map(|call| {
+                        Self::estimate_text_tokens(&call.name)
+                            .saturating_add(Self::estimate_text_tokens(&call.arguments.to_string()))
+                    })
+                    .sum::<u32>();
+                content_tokens.saturating_add(tool_tokens)
+            },
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => Self::estimate_text_tokens(tool_call_id)
+                .saturating_add(Self::estimate_text_tokens(content)),
+        }
+    }
+
+    fn trim_history_to_token_budget(
+        history: Vec<ChatMessage>,
+        max_tokens: u32,
+    ) -> Vec<ChatMessage> {
+        if history.is_empty() {
+            return history;
+        }
+
+        let mut kept_reversed: Vec<ChatMessage> = Vec::new();
+        let mut used_tokens = 0_u32;
+
+        for message in history.into_iter().rev() {
+            let estimate = Self::estimate_message_tokens(&message).max(1);
+            if used_tokens.saturating_add(estimate) > max_tokens {
+                if kept_reversed.is_empty() {
+                    kept_reversed.push(message);
+                }
+                break;
+            }
+            used_tokens = used_tokens.saturating_add(estimate);
+            kept_reversed.push(message);
+        }
+
+        kept_reversed.reverse();
+        kept_reversed
+    }
+
+    async fn load_parent_history(
+        &self,
+        params: &serde_json::Value,
+        include_context: bool,
+        context_max_tokens: u32,
+    ) -> Option<Vec<ChatMessage>> {
+        if !include_context {
+            return None;
+        }
+        let session_key = params
+            .get("_session_key")
+            .and_then(|value| value.as_str())?;
+        let store = self.session_store.as_ref()?;
+        let raw_history = store.read(session_key).await.ok()?;
+        let history = values_to_chat_messages(&raw_history);
+        if history.is_empty() {
+            return None;
+        }
+        Some(Self::trim_history_to_token_budget(
+            history,
+            context_max_tokens,
+        ))
+    }
 }
 
 #[async_trait]
@@ -290,6 +396,15 @@ impl AgentTool for SpawnAgentTool {
                 "list_id": {
                     "type": "string",
                     "description": "Task list ID required when task_id is provided."
+                },
+                "include_context": {
+                    "type": "boolean",
+                    "description": "If true, include recent parent session turns as sub-agent history."
+                },
+                "context_max_tokens": {
+                    "type": "integer",
+                    "description": "Approximate max tokens of parent context to include when include_context=true.",
+                    "default": 4000
                 }
             },
             "required": ["task"]
@@ -348,6 +463,9 @@ impl AgentTool for SpawnAgentTool {
             "delegate_only",
             preset.as_ref().map(|p| p.delegate_only).unwrap_or(false),
         );
+        let include_context = bool_param(&params, "include_context", false);
+        let context_max_tokens =
+            u64_param(&params, "context_max_tokens", 4000).clamp(256, 32000) as u32;
 
         // Check nesting depth.
         let depth = u64_param(&params, SPAWN_DEPTH_KEY, 0);
@@ -429,6 +547,9 @@ impl AgentTool for SpawnAgentTool {
             .get("_trace_id")
             .and_then(|value| value.as_str())
             .map(str::to_string);
+        let history = self
+            .load_parent_history(&params, include_context, context_max_tokens)
+            .await;
 
         // Set initial lease on the linked task before starting the agent loop.
         if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
@@ -477,15 +598,15 @@ impl AgentTool for SpawnAgentTool {
                 None
             };
 
-        // Run the sub-agent loop (no event forwarding, no hooks, no history).
-        let user_content = moltis_agents::UserContent::text(task);
+        let user_content = UserContent::text(task);
+        // Run the sub-agent loop (no event forwarding, no hooks).
         let result = run_agent_loop_with_context(
             provider,
             &sub_tools,
             &system_prompt,
             &user_content,
             None,
-            None, // no history
+            history,
             Some(tool_context),
             None, // no hooks for sub-agents
             trace_id,
@@ -672,6 +793,25 @@ mod tests {
         assert_eq!(context[SPAWN_DEPTH_KEY], 2);
         assert_eq!(context["_session_key"], "main");
         assert_eq!(context["_trace_id"], "trace-abc-123");
+    }
+
+    #[test]
+    fn test_trim_history_to_token_budget_keeps_most_recent_turns() {
+        let history = vec![
+            ChatMessage::user("old context"),
+            ChatMessage::assistant("middle context"),
+            ChatMessage::user("most recent detail"),
+        ];
+        let trimmed = SpawnAgentTool::trim_history_to_token_budget(history, 4);
+        assert_eq!(trimmed.len(), 1);
+        match &trimmed[0] {
+            ChatMessage::User {
+                content: UserContent::Text(text),
+            } => {
+                assert_eq!(text, "most recent detail");
+            },
+            other => panic!("expected user text message, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -1955,12 +1955,13 @@ pub async fn prepare_gateway(
                     );
                     moltis_cron::heartbeat::build_event_enriched_prompt(&events, &req.message)
                 };
-                if let Ok(Some(stats)) = moltis_cron::store_sqlite::SqliteStore::engagement_stats_with_pool(
-                    &pool,
-                    "__heartbeat__",
-                    20,
-                )
-                .await
+                if let Ok(Some(stats)) =
+                    moltis_cron::store_sqlite::SqliteStore::engagement_stats_with_pool(
+                        &pool,
+                        "__heartbeat__",
+                        20,
+                    )
+                    .await
                     && stats.sample_size >= 5
                 {
                     let response_rate_pct = (stats.response_rate * 100.0).round();
@@ -2515,12 +2516,11 @@ pub async fn prepare_gateway(
             crate::channel_store::SqliteChannelStore::new(db_pool.clone()),
         );
 
-        let channel_sink: Arc<dyn moltis_channels::ChannelEventSink> = Arc::new(
-            crate::channel_events::GatewayChannelEventSink::new(
+        let channel_sink: Arc<dyn moltis_channels::ChannelEventSink> =
+            Arc::new(crate::channel_events::GatewayChannelEventSink::new(
                 Arc::clone(&deferred_state),
                 Some(Arc::new(db_pool.clone())),
-            ),
-        );
+            ));
         let tg_plugin = Arc::new(tokio::sync::RwLock::new(
             moltis_telegram::TelegramPlugin::new()
                 .with_message_log(Arc::clone(&message_log))
@@ -3672,6 +3672,11 @@ pub async fn prepare_gateway(
                 base_tools,
             )
             .with_on_event(on_spawn_event)
+            .with_agents_config(agents_config)
+            .with_task_store(Arc::clone(&task_store))
+            .with_tasks_config(config.tasks.clone())
+            .with_tool_policy_resolver(tool_policy_resolver);
+            .with_session_store(Arc::clone(&session_store))
             .with_agents_config(agents_config)
             .with_task_store(Arc::clone(&task_store))
             .with_tasks_config(config.tasks.clone())
