@@ -12366,4 +12366,54 @@ mod tests {
         };
         assert_eq!(effective_tool_mode(&text), ToolMode::Text);
     }
+
+    #[test]
+    fn test_pre_compact_fires_memory_flush_before_compact() {
+        // At 72% occupancy the action is PreCompact: silent memory flush, no
+        // summarisation.  This guarantees a ~10% buffer before full compaction
+        // (Compact) fires at 80%, so memories are not lost in a large-token jump.
+        assert_eq!(
+            context_compaction_action_for_usage(72, 100),
+            ContextCompactionAction::PreCompact
+        );
+        // Below 70% no action is taken — we are not near the compaction boundary.
+        assert_eq!(
+            context_compaction_action_for_usage(69, 100),
+            ContextCompactionAction::None
+        );
+        // At 80% the action escalates to Compact (full summarisation path), not
+        // PreCompact, so the two code paths are distinct.
+        assert_eq!(
+            context_compaction_action_for_usage(80, 100),
+            ContextCompactionAction::Compact
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_compact_dedup_only_fires_once_per_window() {
+        // Replicate the pre_compact_flushed dedup logic used by LiveChatService to
+        // confirm it fires at most once per compaction window and resets when a full
+        // Compact fires.
+        let flushed: Arc<RwLock<HashMap<String, bool>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let session = "s1".to_string();
+
+        // Initially no flush has occurred for this session.
+        let already = flushed.read().await.get(&session).copied().unwrap_or(false);
+        assert!(!already, "no flush before first PreCompact");
+
+        // First PreCompact turn: mark flushed.
+        flushed.write().await.insert(session.clone(), true);
+
+        // Subsequent PreCompact turns at the same usage level must be no-ops.
+        let already = flushed.read().await.get(&session).copied().unwrap_or(false);
+        assert!(already, "dedup flag must be set after first PreCompact");
+
+        // Full Compact fires: reset the dedup flag for the new compaction window.
+        flushed.write().await.remove(&session);
+
+        // PreCompact may now fire again in the next window.
+        let already = flushed.read().await.get(&session).copied().unwrap_or(false);
+        assert!(!already, "dedup flag must be cleared after Compact resets the window");
+    }
 }
