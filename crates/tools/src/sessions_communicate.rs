@@ -286,10 +286,18 @@ impl AgentTool for SessionsSendTool {
             message
         };
 
-        let explicit_handoff = params
+        let explicit_handoff = if let Some(value) = params
             .get("handoff_context")
             .or_else(|| params.get("handoffContext"))
-            .and_then(|value| serde_json::from_value::<HandoffContext>(value.clone()).ok());
+        {
+            Some(
+                serde_json::from_value::<HandoffContext>(value.clone()).map_err(|error| {
+                    Error::message(format!("invalid handoff_context payload: {error}"))
+                })?,
+            )
+        } else {
+            None
+        };
 
         let handoff = if explicit_handoff.is_some() {
             explicit_handoff

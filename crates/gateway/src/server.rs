@@ -3989,22 +3989,6 @@ pub async fn prepare_gateway(
 
                                 if already_replayed {
                                     replay_blocked_reason = Some("already_replayed".to_string());
-                                } else if let Err(error) = state_store
-                                    .set(
-                                        &session_key,
-                                        SELF_REPAIR_NAMESPACE,
-                                        SELF_REPAIR_REPLAY_HASH_KEY,
-                                        &replay_hash,
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        session = %session_key,
-                                        error = %error,
-                                        "failed to persist self-repair replay marker"
-                                    );
-                                    replay_blocked_reason =
-                                        Some("replay_marker_write_failed".to_string());
                                 } else {
                                     let chat = state.chat().await;
                                     let replay_payload = serde_json::json!({
@@ -4015,6 +3999,23 @@ pub async fn prepare_gateway(
                                     match chat.send(replay_payload).await {
                                         Ok(_) => {
                                             replay_attempted = true;
+                                            if let Err(error) = state_store
+                                                .set(
+                                                    &session_key,
+                                                    SELF_REPAIR_NAMESPACE,
+                                                    SELF_REPAIR_REPLAY_HASH_KEY,
+                                                    &replay_hash,
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    session = %session_key,
+                                                    error = %error,
+                                                    "failed to persist self-repair replay marker"
+                                                );
+                                                replay_blocked_reason =
+                                                    Some("replay_marker_write_failed".to_string());
+                                            }
                                         },
                                         Err(error) => {
                                             warn!(
@@ -5394,14 +5395,12 @@ async fn flush_session_store_data(store: &SessionStore) -> std::io::Result<()> {
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Ok(file) = OpenOptions::new().read(true).open(&path) {
-                let _ = file.sync_all();
-            }
+            let file = OpenOptions::new().read(true).open(&path)?;
+            file.sync_all()?;
         }
 
-        if let Ok(dir) = File::open(&base_dir) {
-            let _ = dir.sync_all();
-        }
+        let dir = File::open(&base_dir)?;
+        dir.sync_all()?;
         Ok(())
     })
     .await

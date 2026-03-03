@@ -968,7 +968,20 @@ impl GatewayState {
 
         let deadline = Instant::now() + timeout;
         loop {
-            let running = store.list_running_sessions().await.unwrap_or_default();
+            let running = match store.list_running_sessions().await {
+                Ok(running) => running,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to list running sessions during shutdown drain"
+                    );
+                    if Instant::now() >= deadline {
+                        return 1;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                },
+            };
             if running.is_empty() {
                 return 0;
             }
