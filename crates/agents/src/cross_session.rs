@@ -121,9 +121,9 @@ impl CrossSessionLearning {
     /// Get all learnings across all categories.
     pub fn get_all_learnings(&self) -> Vec<Learning> {
         let guard = self.learnings.read();
-        guard
-            .values()
-            .flat_map(|v| v.iter().cloned())
+        let map: &HashMap<String, Vec<Learning>> = guard.deref();
+        map.values()
+            .flat_map(|v: &Vec<Learning>| v.iter().cloned())
             .filter(|l| l.confidence >= CONFIDENCE_THRESHOLD)
             .collect()
     }
@@ -133,7 +133,8 @@ impl CrossSessionLearning {
         let mut guard = self.learnings.write();
         let map: &mut HashMap<String, Vec<Learning>> = guard.deref_mut();
         for (_, category_learnings) in map.iter_mut() {
-            for learning in category_learnings.iter_mut() {
+            let learnings: &mut Vec<Learning> = category_learnings;
+            for learning in learnings {
                 if learning.id == learning_id {
                     learning.application_count += 1;
                     learning.last_applied = Some(OffsetDateTime::now_utc());
@@ -149,7 +150,8 @@ impl CrossSessionLearning {
         let mut guard = self.learnings.write();
         let map: &mut HashMap<String, Vec<Learning>> = guard.deref_mut();
         for (_, category_learnings) in map.iter_mut() {
-            for learning in category_learnings.iter_mut() {
+            let learnings: &mut Vec<Learning> = category_learnings;
+            for learning in learnings {
                 if learning.id == learning_id {
                     learning.confidence = (learning.confidence + boost).min(1.0);
                     *self.dirty.write() = true;
@@ -164,7 +166,8 @@ impl CrossSessionLearning {
         let mut guard = self.learnings.write();
         let map: &mut HashMap<String, Vec<Learning>> = guard.deref_mut();
         for (_, category_learnings) in map.iter_mut() {
-            for learning in category_learnings.iter_mut() {
+            let learnings: &mut Vec<Learning> = category_learnings;
+            for learning in learnings {
                 if learning.id == learning_id {
                     learning.confidence = (learning.confidence - reduction).max(0.0);
                     *self.dirty.write() = true;
