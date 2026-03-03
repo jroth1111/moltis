@@ -6216,7 +6216,7 @@ impl AgentTool for AgentScopedMemorySearchTool {
             #[cfg(feature = "metrics")]
             counter!(mem_metrics::RERANK_ATTEMPTS_TOTAL).increment(1);
             #[cfg(feature = "metrics")]
-            let rerank_start = std::time::Instant::now();
+            let rerank_start = Instant::now();
 
             let client: Arc<dyn moltis_memory::reranking::LlmClient> = Arc::new(
                 ProviderBackedRerankClient::new(Arc::clone(&self.provider)),
