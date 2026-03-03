@@ -1708,23 +1708,24 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 // Skip if the message was queued rather than executed synchronously: the
                 // pre-turn snapshot would be stale (the session hasn't changed yet).
                 let was_queued = result.as_ref().ok().is_some_and(chat_send_result_is_queued);
-                if result.is_ok() && !was_queued {
-                    if let Some((session_key, snapshot)) = pre_turn_snapshot {
-                        let turn_index = {
-                            let inner = ctx.state.inner.read().await;
-                            // Use undo depth as a proxy for turn count.
-                            inner
-                                .undo_managers
-                                .get(&session_key)
-                                .map_or(0, |m| m.undo_depth())
-                        };
-                        let mut inner = ctx.state.inner.write().await;
-                        let mgr = inner
+                if result.is_ok()
+                    && !was_queued
+                    && let Some((session_key, snapshot)) = pre_turn_snapshot
+                {
+                    let turn_index = {
+                        let inner = ctx.state.inner.read().await;
+                        // Use undo depth as a proxy for turn count.
+                        inner
                             .undo_managers
-                            .entry(session_key)
-                            .or_insert_with(moltis_sessions::undo::UndoManager::new);
-                        mgr.push(snapshot, turn_index);
-                    }
+                            .get(&session_key)
+                            .map_or(0, |m| m.undo_depth())
+                    };
+                    let mut inner = ctx.state.inner.write().await;
+                    let mgr = inner
+                        .undo_managers
+                        .entry(session_key)
+                        .or_insert_with(moltis_sessions::undo::UndoManager::new);
+                    mgr.push(snapshot, turn_index);
                 }
 
                 result
