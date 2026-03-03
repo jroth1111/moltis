@@ -21,7 +21,11 @@ use {
 use crate::{
     agent_persona::AgentPersonaStore,
     services::{ServiceError, ServiceResult, SessionService, TtsService},
-    session_types::{PatchParams, VoiceGenerateParams, VoiceTarget, parse_params},
+    session_types::{
+        DeleteParams, ForkParams, PatchParams, PreviewParams, ResolveParams, RunDetailParams,
+        SearchParams, SessionKeyParams, ShareCreateParams, ShareRevokeParams, VoiceGenerateParams,
+        VoiceTarget, parse_params,
+    },
     share_store::{
         ShareSnapshot, ShareStore, ShareVisibility, SharedImageAsset, SharedImageSet,
         SharedMapLinks, SharedMessage, SharedMessageRole,
@@ -1012,11 +1016,9 @@ impl SessionService for LiveSessionService {
     }
 
     async fn preview(&self, params: Value) -> ServiceResult {
-        let key = params
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'key' parameter".to_string())?;
-        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+        let p: PreviewParams = parse_params(params)?;
+        let key = p.key.as_str();
+        let limit = p.limit_or_default();
 
         let messages = self
             .store
@@ -1027,14 +1029,9 @@ impl SessionService for LiveSessionService {
     }
 
     async fn resolve(&self, params: Value) -> ServiceResult {
-        let key = params
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'key' parameter".to_string())?;
-        let inherit_from_key = params
-            .get("inherit_agent_from")
-            .and_then(|v| v.as_str())
-            .filter(|value| !value.trim().is_empty());
+        let p: ResolveParams = parse_params(params)?;
+        let key = p.key.as_str();
+        let inherit_from_key = p.inherit_from_key();
 
         self.metadata
             .upsert(key, None)
@@ -1306,14 +1303,11 @@ impl SessionService for LiveSessionService {
     }
 
     async fn share_create(&self, params: Value) -> ServiceResult {
-        let key = params
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'key' parameter".to_string())?;
-
-        let visibility = params
-            .get("visibility")
-            .and_then(|v| v.as_str())
+        let p: ShareCreateParams = parse_params(params)?;
+        let key = p.key.as_str();
+        let visibility = p
+            .visibility
+            .as_deref()
             .and_then(|s| s.parse::<ShareVisibility>().ok())
             .unwrap_or(ShareVisibility::Public);
 
@@ -1403,10 +1397,8 @@ impl SessionService for LiveSessionService {
     }
 
     async fn share_list(&self, params: Value) -> ServiceResult {
-        let key = params
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'key' parameter".to_string())?;
+        let p: SessionKeyParams = parse_params(params)?;
+        let key = p.key.as_str();
 
         let share_store = self
             .share_store
@@ -1436,10 +1428,8 @@ impl SessionService for LiveSessionService {
     }
 
     async fn share_revoke(&self, params: Value) -> ServiceResult {
-        let id = params
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'id' parameter".to_string())?;
+        let p: ShareRevokeParams = parse_params(params)?;
+        let id = p.id.as_str();
 
         let share_store = self
             .share_store
@@ -1460,10 +1450,8 @@ impl SessionService for LiveSessionService {
     }
 
     async fn reset(&self, params: Value) -> ServiceResult {
-        let key = params
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'key' parameter".to_string())?;
+        let p: SessionKeyParams = parse_params(params)?;
+        let key = p.key.as_str();
 
         self.store.clear(key).await.map_err(ServiceError::message)?;
         self.metadata.touch(key, 0).await;
@@ -1473,19 +1461,14 @@ impl SessionService for LiveSessionService {
     }
 
     async fn delete(&self, params: Value) -> ServiceResult {
-        let key = params
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'key' parameter".to_string())?;
+        let p: DeleteParams = parse_params(params)?;
+        let key = p.key.as_str();
 
         if key == "main" {
             return Err("cannot delete the main session".into());
         }
 
-        let force = params
-            .get("force")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let force = p.force_or_default();
 
         // Check for worktree cleanup before deleting metadata.
         if let Some(entry) = self.metadata.get(key).await
@@ -1559,14 +1542,9 @@ impl SessionService for LiveSessionService {
     }
 
     async fn fork(&self, params: Value) -> ServiceResult {
-        let parent_key = params
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'key' parameter".to_string())?;
-        let label = params
-            .get("label")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let p: ForkParams = parse_params(params)?;
+        let parent_key = p.key.as_str();
+        let label = p.label;
 
         let messages = self
             .store
@@ -1575,11 +1553,7 @@ impl SessionService for LiveSessionService {
             .map_err(ServiceError::message)?;
         let msg_count = messages.len();
 
-        let fork_point = params
-            .get("forkPoint")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(msg_count);
+        let fork_point = p.fork_point.map(|v| v as usize).unwrap_or(msg_count);
 
         if fork_point > msg_count {
             return Err(format!("forkPoint {fork_point} exceeds message count {msg_count}").into());
@@ -1657,10 +1631,8 @@ impl SessionService for LiveSessionService {
     }
 
     async fn branches(&self, params: Value) -> ServiceResult {
-        let key = params
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'key' parameter".to_string())?;
+        let p: SessionKeyParams = parse_params(params)?;
+        let key = p.key.as_str();
 
         let children = self.metadata.list_children(key).await;
         let items: Vec<Value> = children
@@ -1679,17 +1651,14 @@ impl SessionService for LiveSessionService {
     }
 
     async fn search(&self, params: Value) -> ServiceResult {
-        let query = params
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
+        let p: SearchParams = parse_params(params)?;
+        let query = p.normalized_query();
 
         if query.is_empty() {
             return Ok(serde_json::json!([]));
         }
 
-        let max = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        let max = p.limit_or_default();
 
         let results = self
             .store
@@ -1757,14 +1726,9 @@ impl SessionService for LiveSessionService {
     }
 
     async fn run_detail(&self, params: Value) -> ServiceResult {
-        let session_key = params
-            .get("sessionKey")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'sessionKey' parameter".to_string())?;
-        let run_id = params
-            .get("runId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'runId' parameter".to_string())?;
+        let p: RunDetailParams = parse_params(params)?;
+        let session_key = p.session_key.as_str();
+        let run_id = p.run_id.as_str();
 
         let messages = self
             .store
@@ -1778,6 +1742,16 @@ impl SessionService for LiveSessionService {
         let mut assistant_messages = 0u32;
 
         for msg in &messages {
+            if let Ok(parsed) = serde_json::from_value::<PersistedMessage>(msg.clone()) {
+                match parsed {
+                    PersistedMessage::User { .. } => user_messages += 1,
+                    PersistedMessage::Assistant { .. } => assistant_messages += 1,
+                    PersistedMessage::ToolResult { .. } => tool_calls += 1,
+                    _ => {},
+                }
+                continue;
+            }
+            // Keep legacy fallback for malformed rows that still carry a string role.
             match msg.get("role").and_then(|v| v.as_str()) {
                 Some("user") => user_messages += 1,
                 Some("assistant") => assistant_messages += 1,
