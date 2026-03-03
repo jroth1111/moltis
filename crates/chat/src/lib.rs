@@ -4886,20 +4886,20 @@ impl ChatService for LiveChatService {
                     wrote_files = true;
                 }
 
-                for (idx, fact) in facts.iter().take(128).enumerate() {
-                    let fact_filename = format!(
-                        "fact-{safe_session_key}-{ts}-{:03}.md",
-                        idx.saturating_add(1)
-                    );
-                    let fact_path = memory_dir.join(fact_filename);
-                    let fact_content = format!(
-                        "# Fact\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{}",
-                        fact.trim()
-                    );
-                    if let Err(e) = tokio::fs::write(&fact_path, &fact_content).await {
-                        warn!(error = %e, "compact: failed to write fact memory file");
-                    } else {
-                        wrote_files = true;
+                if !facts.is_empty() {
+                    let facts_filename = format!("compaction-facts-{safe_session_key}-{ts}.md");
+                    let facts_path = memory_dir.join(facts_filename);
+                    if let Some(facts_content) =
+                        format_compaction_facts_document(&session_key, ts, &facts)
+                    {
+                        if let Err(e) = tokio::fs::write(&facts_path, facts_content).await {
+                            warn!(
+                                error = %e,
+                                "compact: failed to write consolidated facts memory file"
+                            );
+                        } else {
+                            wrote_files = true;
+                        }
                     }
                 }
 
@@ -6475,6 +6475,24 @@ fn research_text_from_user_content(user_content: &UserContent) -> &str {
             })
             .unwrap_or(""),
     }
+}
+
+fn format_compaction_facts_document(session_key: &str, ts: u64, facts: &[String]) -> Option<String> {
+    if facts.is_empty() {
+        return None;
+    }
+    let body = facts
+        .iter()
+        .take(128)
+        .enumerate()
+        .map(|(idx, fact)| format!("{}. {}", idx.saturating_add(1), fact.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "# Compaction Facts\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n- **Facts**: {}\n\n{}",
+        facts.len(),
+        body
+    ))
 }
 
 async fn maybe_append_research_context(
@@ -12408,5 +12426,25 @@ mod tests {
             err.to_string()
                 .contains("reranking provider returned empty text response")
         );
+    }
+
+    #[test]
+    fn format_compaction_facts_document_returns_none_for_empty_input() {
+        assert!(format_compaction_facts_document("session-a", 42, &[]).is_none());
+    }
+
+    #[test]
+    fn format_compaction_facts_document_numbers_and_caps_facts() {
+        let facts = (1..=130)
+            .map(|idx| format!("fact-{idx}"))
+            .collect::<Vec<_>>();
+        let doc = format_compaction_facts_document("session-a", 42, &facts).unwrap();
+        assert!(doc.contains("# Compaction Facts"));
+        assert!(doc.contains("**Session**: session-a"));
+        assert!(doc.contains("**Timestamp**: 42"));
+        assert!(doc.contains("**Facts**: 130"));
+        assert!(doc.contains("1. fact-1"));
+        assert!(doc.contains("128. fact-128"));
+        assert!(!doc.contains("129. fact-129"));
     }
 }
