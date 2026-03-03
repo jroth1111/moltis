@@ -178,12 +178,12 @@ impl TinderBrowserTool {
 
         // Handle screenshots: detect base64 image data in output.
         let mut screenshot_path: Option<String> = None;
-        if command == "screenshot" {
-            if let Some(b64_data) = extract_base64_image(&stdout) {
-                match decode_and_save_screenshot(b64_data, &self.data_dir).await {
-                    Ok(path) => screenshot_path = Some(path),
-                    Err(e) => warn!(error = %e, "failed to process screenshot"),
-                }
+        if command == "screenshot"
+            && let Some(b64_data) = extract_base64_image(&stdout)
+        {
+            match decode_and_save_screenshot(b64_data, &self.data_dir).await {
+                Ok(path) => screenshot_path = Some(path),
+                Err(e) => warn!(error = %e, "failed to process screenshot"),
             }
         }
 
