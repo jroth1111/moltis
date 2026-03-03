@@ -492,6 +492,20 @@ pub mod config {
     pub const VALIDATION_ERRORS_TOTAL: &str = "moltis_config_validation_errors_total";
 }
 
+/// Circuit breaker metrics
+pub mod circuit_breaker {
+    /// Total failures recorded by provider and error class
+    pub const FAILURES_TOTAL: &str = "moltis_circuit_breaker_failures_total";
+    /// Circuit state transitions (closed, open, half_open)
+    pub const STATE_TRANSITIONS_TOTAL: &str = "moltis_circuit_breaker_state_transitions_total";
+    /// Requests that would have been blocked in Observe mode
+    pub const OBSERVED_BLOCKS_TOTAL: &str = "moltis_circuit_breaker_observed_blocks_total";
+    /// Requests actually blocked in Enforce mode
+    pub const ENFORCED_BLOCKS_TOTAL: &str = "moltis_circuit_breaker_enforced_blocks_total";
+    /// Successful resets (circuit closed after half-open probe succeeds)
+    pub const RESETS_TOTAL: &str = "moltis_circuit_breaker_resets_total";
+}
+
 /// Common/shared metrics
 pub mod common {
     /// Application errors by type
