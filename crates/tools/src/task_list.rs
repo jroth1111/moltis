@@ -28,8 +28,8 @@ use {
     },
     moltis_agents::tool_registry::AgentTool,
     moltis_tasks::{
-        FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskSpec, TaskStore,
-        TerminalState, TransitionEvent,
+        AutonomyTier, FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskSpec,
+        TaskStore, TerminalState, TransitionEvent,
     },
 };
 
@@ -155,6 +155,16 @@ fn parse_failure_class(s: &str) -> crate::Result<FailureClass> {
     }
 }
 
+/// Parse an `AutonomyTier` from a tool parameter string.
+fn parse_autonomy_tier(s: &str) -> crate::Result<AutonomyTier> {
+    match s {
+        "auto" => Ok(AutonomyTier::Auto),
+        "confirm" => Ok(AutonomyTier::Confirm),
+        "approve" => Ok(AutonomyTier::Approve),
+        other => Err(Error::message(format!("unknown autonomy_tier: {other}"))),
+    }
+}
+
 /// Parse a `HandoffContext` from JSON parameter.
 fn parse_handoff(params: &serde_json::Value) -> HandoffContext {
     let h = params.get("handoff");
@@ -276,6 +286,15 @@ impl AgentTool for TaskListTool {
                 "active_form": {
                     "type": "string",
                     "description": "Present continuous form shown in spinner (e.g. 'Running tests')."
+                },
+                "is_intent": {
+                    "type": "boolean",
+                    "description": "Mark this as a dispatch-managed intent task (long-running, multi-shift). Default: false."
+                },
+                "autonomy_tier": {
+                    "type": "string",
+                    "enum": ["auto", "confirm", "approve"],
+                    "description": "Maximum autonomy tier for shift agents. Only applies when is_intent is true. Default: auto."
                 }
             },
             "required": ["action"]
@@ -304,10 +323,21 @@ impl AgentTool for TaskListTool {
                     })
                     .unwrap_or_default();
 
+                let is_intent = params
+                    .get("is_intent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let autonomy_tier = str_param(&params, "autonomy_tier")
+                    .map(parse_autonomy_tier)
+                    .transpose()?
+                    .unwrap_or_default();
+
                 let mut spec = TaskSpec::new(subject, description);
+                spec.is_intent = is_intent;
+                spec.autonomy_tier = autonomy_tier;
                 if let Some(af) = active_form {
-                    // Store active_form in description suffix for compat (tooling layer ignores it).
-                    let _ = af; // Stored in spec description extension if needed later.
+                    // active_form is a UI hint; not stored in the spec currently.
+                    let _ = af;
                 }
                 if let Some(override_max) = self.max_attempts_override.filter(|&v| v > 0) {
                     spec.max_attempts = override_max;
@@ -797,6 +827,66 @@ mod tests {
             .await
             .unwrap();
         assert!(history["events"].as_array().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn create_intent_task_sets_is_intent_and_tier() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({
+                "action": "create",
+                "subject": "intent task",
+                "description": "do something",
+                "is_intent": true,
+                "autonomy_tier": "confirm"
+            }))
+            .await
+            .unwrap();
+        let id = result["task"]["id"].as_str().unwrap().to_string();
+
+        // Fetch the stored task and inspect the spec via the store directly.
+        let store = t.store();
+        let task = store.get("default", &id).await.unwrap().unwrap();
+        assert!(task.spec.is_intent);
+        assert_eq!(
+            task.spec.autonomy_tier,
+            AutonomyTier::Confirm
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_without_intent_flag_defaults_to_non_intent() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({ "action": "create", "subject": "plain task" }))
+            .await
+            .unwrap();
+        let id = result["task"]["id"].as_str().unwrap().to_string();
+
+        let store = t.store();
+        let task = store.get("default", &id).await.unwrap().unwrap();
+        assert!(!task.spec.is_intent);
+        assert_eq!(
+            task.spec.autonomy_tier,
+            AutonomyTier::Auto
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_unknown_autonomy_tier() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({
+                "action": "create",
+                "subject": "bad tier",
+                "autonomy_tier": "supercharge"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown autonomy_tier"));
     }
 
     #[tokio::test]

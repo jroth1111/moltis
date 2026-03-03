@@ -64,6 +64,24 @@ pub enum CronPayload {
         #[serde(skip_serializing_if = "Option::is_none")]
         to: Option<String>,
     },
+    /// Create a new dispatch-managed intent task in the task store.
+    CreateTask {
+        /// Short imperative title for the new task.
+        subject: String,
+        /// Detailed description (optional).
+        #[serde(default)]
+        description: String,
+        /// Autonomy tier granted to shift agents: "auto" | "confirm" | "approve".
+        #[serde(default = "default_autonomy_tier")]
+        autonomy_tier: String,
+        /// Target task list ID (defaults to "default").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        list_id: Option<String>,
+    },
+}
+
+fn default_autonomy_tier() -> String {
+    "auto".to_string()
 }
 
 /// Where the job executes.

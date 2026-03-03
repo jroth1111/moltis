@@ -1797,6 +1797,12 @@ pub async fn prepare_gateway(
     let deferred_state: Arc<tokio::sync::OnceCell<Arc<GatewayState>>> =
         Arc::new(tokio::sync::OnceCell::new());
 
+    // Deferred task store: populated after TaskListTool is created below.
+    // Used by the cron CreateTask callback, which is constructed before the store.
+    let deferred_task_store: Arc<
+        tokio::sync::OnceCell<Arc<moltis_tasks::TaskStore>>,
+    > = Arc::new(tokio::sync::OnceCell::new());
+
     services =
         services.with_onboarding(Arc::new(crate::onboarding::GatewayOnboardingService::new(
             live_onboarding,
@@ -2055,6 +2061,38 @@ pub async fn prepare_gateway(
         window_ms: config.cron.rate_limit_window_secs * 1000,
     };
 
+    // Build the CreateTask callback for cron jobs that create dispatch-managed tasks.
+    // Uses the deferred task store (populated after TaskListTool is initialised below).
+    let deferred_ts_for_cron = Arc::clone(&deferred_task_store);
+    let on_create_task: moltis_cron::service::CreateTaskFn =
+        Arc::new(move |req: moltis_cron::service::CreateTaskRequest| {
+            let deferred = Arc::clone(&deferred_ts_for_cron);
+            Box::pin(async move {
+                let store = deferred.get().ok_or_else(|| {
+                    moltis_cron::Error::message(
+                        "task store not yet initialized; CreateTask cron job fired too early",
+                    )
+                })?;
+                let tier: moltis_tasks::AutonomyTier = match req.autonomy_tier.as_str() {
+                    "confirm" => moltis_tasks::AutonomyTier::Confirm,
+                    "approve" => moltis_tasks::AutonomyTier::Approve,
+                    _ => moltis_tasks::AutonomyTier::Auto,
+                };
+                let list_id = req.list_id.as_deref().unwrap_or("default");
+                let mut spec =
+                    moltis_tasks::TaskSpec::new(req.subject, req.description);
+                spec.is_intent = true;
+                spec.autonomy_tier = tier;
+                let task = store
+                    .create(list_id, spec, vec![])
+                    .await
+                    .map_err(|e| moltis_cron::Error::message(e.to_string()))?;
+                Ok(moltis_cron::service::CreateTaskResult {
+                    task_id: task.id.0,
+                })
+            })
+        });
+
     let cron_service = moltis_cron::service::CronService::with_events_queue(
         cron_store,
         on_system_event,
@@ -2062,6 +2100,7 @@ pub async fn prepare_gateway(
         Some(on_cron_notify),
         rate_limit_config,
         events_queue,
+        Some(on_create_task),
     );
 
     // Wire cron into gateway services.
@@ -3459,6 +3498,8 @@ pub async fn prepare_gateway(
             .await?
             .with_max_attempts_override(config.tasks.max_attempts_override);
         let task_store = task_list_tool.store();
+        // Populate the deferred store so cron CreateTask jobs can use it.
+        deferred_task_store.set(Arc::clone(&task_store)).ok();
         tool_registry.register(Box::new(task_list_tool));
 
         // Background: promote overdue Retrying tasks back to Pending.
