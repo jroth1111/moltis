@@ -1679,9 +1679,15 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 // Capture pre-turn message snapshot for undo stack.
                 let pre_turn_snapshot: Option<(String, Vec<serde_json::Value>)> = {
                     let inner = ctx.state.inner.read().await;
-                    if let Some(session_key) = inner.active_sessions.get(&ctx.client_conn_id).cloned() {
+                    if let Some(session_key) =
+                        inner.active_sessions.get(&ctx.client_conn_id).cloned()
+                    {
                         if let Some(store) = ctx.state.services.session_store.as_ref() {
-                            store.read(&session_key).await.ok().map(|msgs| (session_key, msgs))
+                            store
+                                .read(&session_key)
+                                .await
+                                .ok()
+                                .map(|msgs| (session_key, msgs))
                         } else {
                             None
                         }
@@ -1690,7 +1696,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     }
                 };
 
-                let result = ctx.state
+                let result = ctx
+                    .state
                     .chat()
                     .await
                     .send(params)
@@ -1700,16 +1707,16 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 // After a successful turn, push the pre-turn snapshot onto the undo stack.
                 // Skip if the message was queued rather than executed synchronously: the
                 // pre-turn snapshot would be stale (the session hasn't changed yet).
-                let was_queued = result
-                    .as_ref()
-                    .ok()
-                    .is_some_and(chat_send_result_is_queued);
+                let was_queued = result.as_ref().ok().is_some_and(chat_send_result_is_queued);
                 if result.is_ok() && !was_queued {
                     if let Some((session_key, snapshot)) = pre_turn_snapshot {
                         let turn_index = {
                             let inner = ctx.state.inner.read().await;
                             // Use undo depth as a proxy for turn count.
-                            inner.undo_managers.get(&session_key).map_or(0, |m| m.undo_depth())
+                            inner
+                                .undo_managers
+                                .get(&session_key)
+                                .map_or(0, |m| m.undo_depth())
                         };
                         let mut inner = ctx.state.inner.write().await;
                         let mgr = inner
@@ -1836,14 +1843,9 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             ErrorShape::new(error_codes::UNAVAILABLE, "no active session")
                         })?
                 };
-                let session_store = ctx
-                    .state
-                    .services
-                    .session_store
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
-                    })?;
+                let session_store = ctx.state.services.session_store.as_ref().ok_or_else(|| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
+                })?;
                 let current_messages = session_store
                     .read(&session_key)
                     .await
@@ -1875,7 +1877,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             "turnIndex": cp.turn_index,
                             "messageCount": cp.messages.len(),
                         }))
-                    }
+                    },
                     None => Ok(serde_json::json!({
                         "ok": false,
                         "reason": "nothing to undo",
@@ -1899,14 +1901,9 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             ErrorShape::new(error_codes::UNAVAILABLE, "no active session")
                         })?
                 };
-                let session_store = ctx
-                    .state
-                    .services
-                    .session_store
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
-                    })?;
+                let session_store = ctx.state.services.session_store.as_ref().ok_or_else(|| {
+                    ErrorShape::new(error_codes::UNAVAILABLE, "session store unavailable")
+                })?;
                 let (checkpoint, manager_before) = {
                     let mut inner = ctx.state.inner.write().await;
                     let mgr = inner
@@ -1934,7 +1931,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             "turnIndex": cp.turn_index,
                             "messageCount": cp.messages.len(),
                         }))
-                    }
+                    },
                     None => Ok(serde_json::json!({
                         "ok": false,
                         "reason": "nothing to redo",

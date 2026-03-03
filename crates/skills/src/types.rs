@@ -234,6 +234,10 @@ pub enum SkillTrust {
 
 impl From<bool> for SkillTrust {
     fn from(trusted: bool) -> Self {
-        if trusted { Self::Trusted } else { Self::Installed }
+        if trusted {
+            Self::Trusted
+        } else {
+            Self::Installed
+        }
     }
 }

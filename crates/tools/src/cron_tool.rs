@@ -135,35 +135,36 @@ fn normalize_schedule_value(schedule: &mut Value) -> Result<()> {
         },
         Value::Object(obj) => {
             take_alias(obj, "kind", &["type", "scheduleKind"]);
-            take_alias(obj, "at_ms", &[
-                "atMs",
-                "at",
-                "timestamp",
-                "time",
-                "timeMs",
-                "time_ms",
-            ]);
-            take_alias(obj, "every_ms", &[
-                "everyMs",
-                "every",
-                "interval",
-                "intervalMs",
-                "interval_ms",
-            ]);
-            take_alias(obj, "anchor_ms", &[
-                "anchorMs",
-                "anchor",
-                "anchorTime",
-                "anchor_time",
-            ]);
-            take_alias(obj, "expr", &[
-                "cronExpr",
-                "cron_expr",
-                "expression",
-                "cron",
-            ]);
-            take_alias(obj, "pattern", &["regex", "match", "messagePattern", "message_pattern"]);
-            take_alias(obj, "channel_filter", &["channelFilter", "channelType", "channel_type"]);
+            take_alias(
+                obj,
+                "at_ms",
+                &["atMs", "at", "timestamp", "time", "timeMs", "time_ms"],
+            );
+            take_alias(
+                obj,
+                "every_ms",
+                &["everyMs", "every", "interval", "intervalMs", "interval_ms"],
+            );
+            take_alias(
+                obj,
+                "anchor_ms",
+                &["anchorMs", "anchor", "anchorTime", "anchor_time"],
+            );
+            take_alias(
+                obj,
+                "expr",
+                &["cronExpr", "cron_expr", "expression", "cron"],
+            );
+            take_alias(
+                obj,
+                "pattern",
+                &["regex", "match", "messagePattern", "message_pattern"],
+            );
+            take_alias(
+                obj,
+                "channel_filter",
+                &["channelFilter", "channelType", "channel_type"],
+            );
 
             if let Some(kind_val) = obj.get_mut("kind") {
                 let kind_raw = kind_val
@@ -314,12 +315,16 @@ fn normalize_payload_value(payload: &mut Value, session_target_hint: Option<&str
             take_alias(obj, "kind", &["payloadKind", "type"]);
             take_alias(obj, "text", &["event", "instruction"]);
             take_alias(obj, "message", &["prompt", "content"]);
-            take_alias(obj, "timeout_secs", &[
-                "timeoutSecs",
-                "timeout",
-                "timeoutSeconds",
-                "timeout_seconds",
-            ]);
+            take_alias(
+                obj,
+                "timeout_secs",
+                &[
+                    "timeoutSecs",
+                    "timeout",
+                    "timeoutSeconds",
+                    "timeout_seconds",
+                ],
+            );
 
             if let Some(timeout_raw) = obj.get("timeout_secs") {
                 let timeout = parse_timeout_seconds(timeout_raw, "payload.timeout_secs")?;
@@ -470,25 +475,37 @@ fn normalize_sandbox_value(sandbox: &mut Value, field: &str) -> Result<()> {
             Ok(())
         },
         Value::Object(obj) => {
-            take_alias(obj, "enabled", &[
-                "sandboxEnabled",
-                "sandbox_enabled",
-                "sandboxed",
-                "useSandbox",
-            ]);
-            take_alias(obj, "image", &[
-                "sandboxImage",
-                "sandbox_image",
-                "containerImage",
-                "imageName",
-            ]);
-            take_alias(obj, "target", &[
-                "mode",
-                "runtime",
-                "executionTarget",
-                "execution_target",
-                "where",
-            ]);
+            take_alias(
+                obj,
+                "enabled",
+                &[
+                    "sandboxEnabled",
+                    "sandbox_enabled",
+                    "sandboxed",
+                    "useSandbox",
+                ],
+            );
+            take_alias(
+                obj,
+                "image",
+                &[
+                    "sandboxImage",
+                    "sandbox_image",
+                    "containerImage",
+                    "imageName",
+                ],
+            );
+            take_alias(
+                obj,
+                "target",
+                &[
+                    "mode",
+                    "runtime",
+                    "executionTarget",
+                    "execution_target",
+                    "where",
+                ],
+            );
 
             if let Some(target_raw) = obj.get("target") {
                 let enabled = parse_sandbox_enabled(target_raw, &format!("{field}.target"))?;
