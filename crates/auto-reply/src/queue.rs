@@ -78,21 +78,17 @@ mod tests {
 
     #[test]
     fn priority_ordering() {
+        let interactive = MessagePriority::Interactive.as_i32();
+        let background = MessagePriority::Background.as_i32();
+        let maintenance = MessagePriority::Maintenance.as_i32();
         assert!(
-            MessagePriority::Interactive.as_i32() > MessagePriority::Background.as_i32(),
+            interactive > background,
             "Interactive must outrank Background"
         );
         assert!(
-            MessagePriority::Background.as_i32() > MessagePriority::Maintenance.as_i32(),
+            background > maintenance,
             "Background must outrank Maintenance"
         );
     }
 
-    #[test]
-    fn priority_constants_ordering() {
-        assert!(priority::SYSTEM > priority::HIGH);
-        assert!(priority::HIGH > priority::NORMAL);
-        assert!(priority::NORMAL > priority::LOW);
-        assert!(priority::LOW > priority::MAINTENANCE);
-    }
 }

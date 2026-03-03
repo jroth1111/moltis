@@ -196,6 +196,7 @@ mod tests {
     use {
         super::*,
         std::{io::Write, path::Path, sync::OnceLock},
+        tokio::sync::Mutex,
     };
 
     fn env_lock() -> &'static Mutex<()> {
