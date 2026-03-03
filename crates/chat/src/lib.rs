@@ -2447,18 +2447,6 @@ fn dequeue_followup_with_priority(
     Some((picked, queued))
 }
 
-fn enqueue_with_limit(
-    entry: &mut Vec<QueuedMessage>,
-    params: Value,
-    max_queue_size: usize,
-) -> Option<usize> {
-    if entry.len() >= max_queue_size {
-        return None;
-    }
-    entry.push(QueuedMessage { params });
-    Some(entry.len())
-}
-
 /// A tool call currently executing within an active agent run.
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveToolCall {
