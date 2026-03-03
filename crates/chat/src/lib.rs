@@ -2392,6 +2392,7 @@ impl LiveChatService {
         state: Arc<dyn ChatRuntime>,
         session_store: Arc<SessionStore>,
         session_metadata: Arc<SqliteSessionMetadata>,
+        provider_health: Arc<moltis_agents::provider_health::ProviderHealthTracker>,
     ) -> Self {
         Self {
             providers,
@@ -2411,22 +2412,12 @@ impl LiveChatService {
             active_reply_medium: Arc::new(RwLock::new(HashMap::new())),
             state_store: None,
             failover_config: moltis_config::schema::FailoverConfig::default(),
-            provider_health: Arc::new(
-                moltis_agents::provider_health::ProviderHealthTracker::default_window(),
-            ),
+            provider_health,
         }
     }
 
     pub fn with_failover(mut self, config: moltis_config::schema::FailoverConfig) -> Self {
         self.failover_config = config;
-        self
-    }
-
-    pub fn with_provider_health(
-        mut self,
-        health: Arc<moltis_agents::provider_health::ProviderHealthTracker>,
-    ) -> Self {
-        self.provider_health = health;
         self
     }
 
@@ -9646,9 +9637,16 @@ mod tests {
             delay: Duration::from_millis(0),
         }));
 
-        let chat = LiveChatService::new(providers, disabled, state, Arc::clone(&store), metadata)
-            .with_tools(Arc::new(RwLock::new(registry)))
-            .with_state_store(Arc::clone(&state_store));
+        let chat = LiveChatService::new(
+            providers,
+            disabled,
+            state,
+            Arc::clone(&store),
+            metadata,
+            Arc::new(moltis_agents::provider_health::ProviderHealthTracker::default_window()),
+        )
+        .with_tools(Arc::new(RwLock::new(registry)))
+        .with_state_store(Arc::clone(&state_store));
 
         let send_result = chat
             .send(serde_json::json!({ "text": "/sh df -h" }))
@@ -9718,9 +9716,16 @@ mod tests {
             delay: Duration::from_secs(5),
         }));
 
-        let chat = LiveChatService::new(providers, disabled, state, store, metadata)
-            .with_tools(Arc::new(RwLock::new(registry)))
-            .with_state_store(Arc::clone(&state_store));
+        let chat = LiveChatService::new(
+            providers,
+            disabled,
+            state,
+            store,
+            metadata,
+            Arc::new(moltis_agents::provider_health::ProviderHealthTracker::default_window()),
+        )
+        .with_tools(Arc::new(RwLock::new(registry)))
+        .with_state_store(Arc::clone(&state_store));
 
         let send = chat
             .send(serde_json::json!({ "text": "/sh long running command" }))
@@ -11535,6 +11540,7 @@ mod tests {
             Arc::new(MockChatRuntime::new()),
             Arc::new(store),
             Arc::new(metadata),
+            Arc::new(moltis_agents::provider_health::ProviderHealthTracker::default_window()),
         );
 
         let result = service
@@ -11557,6 +11563,7 @@ mod tests {
             Arc::new(MockChatRuntime::new()),
             Arc::new(store),
             Arc::new(metadata),
+            Arc::new(moltis_agents::provider_health::ProviderHealthTracker::default_window()),
         );
 
         // Pre-populate active tool calls for a session.
