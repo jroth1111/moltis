@@ -102,7 +102,10 @@ mod tests {
             iteration: 1,
             trace_id: None,
         };
-        let result = hook.handle(HookEvent::BeforeLLMCall, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeLLMCall, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Block(_)));
     }
 
@@ -120,7 +123,10 @@ mod tests {
             iteration: 1,
             trace_id: None,
         };
-        let result = hook.handle(HookEvent::BeforeLLMCall, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeLLMCall, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Continue));
     }
 
@@ -147,7 +153,10 @@ mod tests {
             iteration: 1,
             trace_id: None,
         };
-        let result = hook.handle(HookEvent::BeforeLLMCall, &payload).await.unwrap();
+        let result = hook
+            .handle(HookEvent::BeforeLLMCall, &payload)
+            .await
+            .unwrap();
         assert!(matches!(result, HookAction::Continue));
     }
 

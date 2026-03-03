@@ -558,9 +558,7 @@ mod tests {
 
         // Record server error (not enough to trip).
         let server = make_after_payload("p", Some("500 internal server error"));
-        hook.handle(HookEvent::AfterLLMCall, &server)
-            .await
-            .unwrap();
+        hook.handle(HookEvent::AfterLLMCall, &server).await.unwrap();
 
         let snapshot = hook.snapshot().await;
         let billing_entry = snapshot
@@ -661,9 +659,7 @@ mod tests {
             .unwrap();
 
         let server = make_after_payload("p", Some("500 internal server error"));
-        hook.handle(HookEvent::AfterLLMCall, &server)
-            .await
-            .unwrap();
+        hook.handle(HookEvent::AfterLLMCall, &server).await.unwrap();
 
         assert!(hook.reset_provider("p").await);
         let snapshot = hook.snapshot().await;
