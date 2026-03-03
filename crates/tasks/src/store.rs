@@ -62,8 +62,23 @@ impl TaskStore {
         spec: TaskSpec,
         blocked_by: Vec<TaskId>,
     ) -> Result<Task, TransitionError> {
+        self.create_with_id(list_id, TaskId::new(), spec, blocked_by)
+            .await
+    }
+
+    /// Create a task using a caller-provided ID.
+    ///
+    /// This is used by dispatch to reserve intent state (slot claim) and then
+    /// materialize the corresponding shift task deterministically.
+    pub async fn create_with_id(
+        &self,
+        list_id: &str,
+        id: TaskId,
+        spec: TaskSpec,
+        blocked_by: Vec<TaskId>,
+    ) -> Result<Task, TransitionError> {
         let task = Task {
-            id: TaskId::new(),
+            id,
             list_id: list_id.to_string(),
             spec,
             runtime: TaskRuntime::default(),
@@ -933,6 +948,25 @@ mod tests {
             .expect("exists");
         assert_eq!(fetched.id, task.id);
         assert_eq!(fetched.spec.subject, "test task");
+    }
+
+    #[tokio::test]
+    async fn create_with_id_preserves_provided_id() {
+        let (store, _dir) = test_store().await;
+        let spec = TaskSpec::new("named task", "");
+        let provided = TaskId::new();
+        let task = store
+            .create_with_id("list1", provided.clone(), spec, vec![])
+            .await
+            .expect("create with id");
+        assert_eq!(task.id, provided);
+
+        let fetched = store
+            .get("list1", &provided.0)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.id, provided);
     }
 
     #[tokio::test]

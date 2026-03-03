@@ -61,6 +61,19 @@ pub enum TransitionEvent {
     RenewLease { new_expires_at: OffsetDateTime },
 }
 
+impl TransitionEvent {
+    /// Construct a `RenewLease` event that extends expiry by `duration_secs` from now.
+    ///
+    /// This constructor keeps the `time` crate dependency inside `moltis-tasks`
+    /// so callers (e.g. `moltis-gateway`) don't need to import `time` directly.
+    pub fn renew_lease(duration_secs: u64) -> Self {
+        Self::RenewLease {
+            new_expires_at: OffsetDateTime::now_utc()
+                + time::Duration::seconds(duration_secs as i64),
+        }
+    }
+}
+
 // ── apply ─────────────────────────────────────────────────────────────────────
 
 /// Apply `event` to `task`, returning an updated task on success.
