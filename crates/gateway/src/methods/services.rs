@@ -4526,8 +4526,16 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 async fn reload_hooks(state: &Arc<crate::state::GatewayState>) {
     let disabled = state.inner.read().await.disabled_hooks.clone();
     let session_store = state.services.session_store.as_ref();
+    let memory_session_export_enabled = moltis_config::discover_and_load().memory.session_export;
     let (new_registry, new_info) =
-        crate::server::discover_and_build_hooks(&disabled, session_store, None, None).await;
+        crate::server::discover_and_build_hooks(
+            &disabled,
+            session_store,
+            None,
+            None,
+            memory_session_export_enabled,
+        )
+        .await;
 
     {
         let mut inner = state.inner.write().await;
