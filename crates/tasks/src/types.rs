@@ -1,7 +1,9 @@
 //! Core task domain types: TaskId, TaskSpec, TaskRuntime, FailureClass, HandoffContext.
 
-use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use {
+    serde::{Deserialize, Serialize},
+    time::OffsetDateTime,
+};
 
 use crate::state::RuntimeState;
 

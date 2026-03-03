@@ -3,8 +3,10 @@
 //! `EventLog` writes one row to `task_events` for every successful transition.
 //! It is a diagnostic and audit trail — it is never read back to drive behaviour.
 
-use sqlx::{Row, SqlitePool};
-use time::OffsetDateTime;
+use {
+    sqlx::{Row, SqlitePool},
+    time::OffsetDateTime,
+};
 
 /// A single event record.
 #[derive(Debug, Clone)]

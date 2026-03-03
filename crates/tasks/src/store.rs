@@ -5,8 +5,10 @@
 
 use std::path::Path;
 
-use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
-use time::OffsetDateTime;
+use {
+    sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions},
+    time::OffsetDateTime,
+};
 
 use crate::{
     errors::TransitionError,
@@ -504,16 +506,11 @@ impl TaskStore {
             let task_id = task.id.0.clone();
             let version = task.runtime.version;
             match self
-                .apply_transition(
-                    &list_id,
-                    &task_id,
-                    Some(version),
-                    &TransitionEvent::Fail {
-                        class: FailureClass::TimeoutExceeded,
-                        handoff: HandoffContext::default(),
-                        retry_after: None,
-                    },
-                )
+                .apply_transition(&list_id, &task_id, Some(version), &TransitionEvent::Fail {
+                    class: FailureClass::TimeoutExceeded,
+                    handoff: HandoffContext::default(),
+                    retry_after: None,
+                })
                 .await
             {
                 Ok(_) => reclaimed += 1,
@@ -584,8 +581,10 @@ fn event_type_name(event: &TransitionEvent) -> &'static str {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::types::{FailureClass, HandoffContext};
+    use {
+        super::*,
+        crate::types::{FailureClass, HandoffContext},
+    };
 
     async fn test_store() -> (TaskStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -617,15 +616,10 @@ mod tests {
         let task = store.create("default", spec, vec![]).await.expect("create");
 
         let claimed = store
-            .apply_transition(
-                "default",
-                &task.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent-1".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("default", &task.id.0, None, &TransitionEvent::Claim {
+                owner: "agent-1".into(),
+                lease_duration_secs: None,
+            })
             .await
             .expect("claim");
 
@@ -642,15 +636,10 @@ mod tests {
 
         // Claim once to bump version.
         store
-            .apply_transition(
-                "default",
-                &task.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent-a".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("default", &task.id.0, None, &TransitionEvent::Claim {
+                owner: "agent-a".into(),
+                lease_duration_secs: None,
+            })
             .await
             .expect("first claim");
 
@@ -709,15 +698,10 @@ mod tests {
         let task = store.create("list1", spec, vec![]).await.expect("create");
 
         store
-            .apply_transition(
-                "list1",
-                &task.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("list1", &task.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: None,
+            })
             .await
             .expect("claim");
 
@@ -742,30 +726,20 @@ mod tests {
 
         // Claim then fail with a past retry_after.
         store
-            .apply_transition(
-                "r",
-                &task.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("r", &task.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: None,
+            })
             .await
             .expect("claim");
 
         let past = OffsetDateTime::now_utc() - time::Duration::seconds(60);
         store
-            .apply_transition(
-                "r",
-                &task.id.0,
-                None,
-                &TransitionEvent::Fail {
-                    class: FailureClass::AgentError,
-                    handoff: HandoffContext::default(),
-                    retry_after: Some(past),
-                },
-            )
+            .apply_transition("r", &task.id.0, None, &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: Some(past),
+            })
             .await
             .expect("fail");
 
@@ -785,29 +759,19 @@ mod tests {
             let t = store.create(list, spec, vec![]).await.expect("create");
             // Claim → Active
             let t = store
-                .apply_transition(
-                    list,
-                    &t.id.0,
-                    None,
-                    &TransitionEvent::Claim {
-                        owner: "agent".into(),
-                        lease_duration_secs: None,
-                    },
-                )
+                .apply_transition(list, &t.id.0, None, &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                })
                 .await
                 .expect("claim");
             // Fail → Retrying (with past retry_after)
             store
-                .apply_transition(
-                    list,
-                    &t.id.0,
-                    None,
-                    &TransitionEvent::Fail {
-                        class: FailureClass::AgentError,
-                        handoff: HandoffContext::default(),
-                        retry_after: Some(past),
-                    },
-                )
+                .apply_transition(list, &t.id.0, None, &TransitionEvent::Fail {
+                    class: FailureClass::AgentError,
+                    handoff: HandoffContext::default(),
+                    retry_after: Some(past),
+                })
                 .await
                 .expect("fail");
         }
@@ -820,28 +784,18 @@ mod tests {
             .await
             .expect("create future");
         let t = store
-            .apply_transition(
-                "list-a",
-                &t.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("list-a", &t.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: None,
+            })
             .await
             .expect("claim future");
         store
-            .apply_transition(
-                "list-a",
-                &t.id.0,
-                None,
-                &TransitionEvent::Fail {
-                    class: FailureClass::AgentError,
-                    handoff: HandoffContext::default(),
-                    retry_after: Some(future),
-                },
-            )
+            .apply_transition("list-a", &t.id.0, None, &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: Some(future),
+            })
             .await
             .expect("fail future");
 
@@ -915,15 +869,10 @@ mod tests {
             .await
             .expect("create");
         let claimed = store
-            .apply_transition(
-                "list1",
-                &t.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".into(),
-                    lease_duration_secs: Some(1),
-                },
-            )
+            .apply_transition("list1", &t.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: Some(1),
+            })
             .await
             .expect("claim");
 
@@ -933,15 +882,10 @@ mod tests {
             .await
             .expect("create2");
         store
-            .apply_transition(
-                "list1",
-                &t2.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("list1", &t2.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: None,
+            })
             .await
             .expect("claim2");
 
@@ -976,15 +920,10 @@ mod tests {
             .await
             .expect("create");
         let claimed = store
-            .apply_transition(
-                "z",
-                &t.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".into(),
-                    lease_duration_secs: Some(3600),
-                },
-            )
+            .apply_transition("z", &t.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: Some(3600),
+            })
             .await
             .expect("claim");
 
@@ -994,15 +933,10 @@ mod tests {
             .await
             .expect("create2");
         store
-            .apply_transition(
-                "z",
-                &t2.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("z", &t2.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: None,
+            })
             .await
             .expect("claim2");
 
@@ -1050,15 +984,10 @@ mod tests {
 
         // Claim
         let task = store
-            .apply_transition(
-                "wf",
-                &task.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "bot".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("wf", &task.id.0, None, &TransitionEvent::Claim {
+                owner: "bot".into(),
+                lease_duration_secs: None,
+            })
             .await
             .expect("claim");
         assert!(task.runtime.state.is_active());
@@ -1066,16 +995,11 @@ mod tests {
         // Fail with overdue retry_after
         let past = OffsetDateTime::now_utc() - time::Duration::seconds(5);
         let task = store
-            .apply_transition(
-                "wf",
-                &task.id.0,
-                None,
-                &TransitionEvent::Fail {
-                    class: FailureClass::AgentError,
-                    handoff: HandoffContext::default(),
-                    retry_after: Some(past),
-                },
-            )
+            .apply_transition("wf", &task.id.0, None, &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: Some(past),
+            })
             .await
             .expect("fail");
         assert!(matches!(task.runtime.state, RuntimeState::Retrying { .. }));

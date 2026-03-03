@@ -3,8 +3,7 @@
 //! Guards are pure functions that determine whether a proposed transition is
 //! allowed given the current task state. They are called from `transitions::apply`.
 
-use crate::state::RuntimeState;
-use crate::types::Task;
+use crate::{state::RuntimeState, types::Task};
 
 /// All declared dependencies are in a terminal-completed state.
 #[must_use]
@@ -52,10 +51,14 @@ pub fn under_attempt_budget(attempt: u8, max_attempts: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::state::TerminalState;
-    use crate::types::{FailureClass, HandoffContext, TaskId, TaskSpec};
-    use time::OffsetDateTime;
+    use {
+        super::*,
+        crate::{
+            state::TerminalState,
+            types::{FailureClass, HandoffContext, TaskId, TaskSpec},
+        },
+        time::OffsetDateTime,
+    };
 
     fn make_task(state: RuntimeState) -> Task {
         let spec = TaskSpec::new("test", "");

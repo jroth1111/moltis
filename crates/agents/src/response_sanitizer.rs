@@ -7,8 +7,10 @@
 //! The stripping is done with hand-rolled string scanning (no regex) to match
 //! the existing `strip_base64_blobs` pattern in `runner.rs`.
 
-use crate::leak_detector::{LeakAction, LeakDetector};
-use crate::model::ToolCall;
+use crate::{
+    leak_detector::{LeakAction, LeakDetector},
+    model::ToolCall,
+};
 
 /// Known internal XML tags that should be stripped from LLM responses.
 const INTERNAL_TAGS: &[&str] = &[

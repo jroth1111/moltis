@@ -24,10 +24,12 @@ pub mod transitions;
 pub mod types;
 
 // Convenient top-level re-exports.
-pub use errors::TransitionError;
-pub use event_log::EventLog;
-pub use recovery::{RecoveryPhase, classify_recovery};
-pub use state::{RuntimeState, TerminalState};
-pub use store::TaskStore;
-pub use transitions::{TransitionEvent, apply};
-pub use types::{FailureClass, HandoffContext, Task, TaskId, TaskRuntime, TaskSpec};
+pub use {
+    errors::TransitionError,
+    event_log::EventLog,
+    recovery::{RecoveryPhase, classify_recovery},
+    state::{RuntimeState, TerminalState},
+    store::TaskStore,
+    transitions::{TransitionEvent, apply},
+    types::{FailureClass, HandoffContext, Task, TaskId, TaskRuntime, TaskSpec},
+};

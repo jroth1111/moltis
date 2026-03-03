@@ -2,16 +2,20 @@
 
 use std::{fs, path::Path, sync::Arc};
 
-use async_trait::async_trait;
-use serde_json::{Value, json};
-
-use moltis_gateway::{
-    auth,
-    methods::{MethodContext, MethodRegistry},
-    services::{ChatService, GatewayServices, ServiceResult},
-    state::GatewayState,
+use {
+    async_trait::async_trait,
+    serde_json::{Value, json},
 };
-use moltis_sessions::{store::SessionStore, undo::UndoManager};
+
+use {
+    moltis_gateway::{
+        auth,
+        methods::{MethodContext, MethodRegistry},
+        services::{ChatService, GatewayServices, ServiceResult},
+        state::GatewayState,
+    },
+    moltis_sessions::{store::SessionStore, undo::UndoManager},
+};
 
 struct QueuedOnlyChatService;
 

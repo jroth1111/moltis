@@ -462,15 +462,10 @@ impl AgentTool for TaskListTool {
 
                 let task = self
                     .store
-                    .apply_transition(
-                        list_id,
-                        id,
-                        expected_version,
-                        &TransitionEvent::Claim {
-                            owner,
-                            lease_duration_secs: None,
-                        },
-                    )
+                    .apply_transition(list_id, id, expected_version, &TransitionEvent::Claim {
+                        owner,
+                        lease_duration_secs: None,
+                    })
                     .await
                     .map_err(anyhow::Error::from)?;
 
@@ -486,16 +481,11 @@ impl AgentTool for TaskListTool {
 
                 let task = self
                     .store
-                    .apply_transition(
-                        list_id,
-                        id,
-                        expected_version,
-                        &TransitionEvent::Fail {
-                            class,
-                            handoff,
-                            retry_after: None,
-                        },
-                    )
+                    .apply_transition(list_id, id, expected_version, &TransitionEvent::Fail {
+                        class,
+                        handoff,
+                        retry_after: None,
+                    })
                     .await
                     .map_err(anyhow::Error::from)?;
 
@@ -512,12 +502,10 @@ impl AgentTool for TaskListTool {
 
                 let task = self
                     .store
-                    .apply_transition(
-                        list_id,
-                        id,
-                        expected_version,
-                        &TransitionEvent::Escalate { question, handoff },
-                    )
+                    .apply_transition(list_id, id, expected_version, &TransitionEvent::Escalate {
+                        question,
+                        handoff,
+                    })
                     .await
                     .map_err(anyhow::Error::from)?;
 
@@ -636,8 +624,7 @@ impl TaskListTool {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::TempDir;
+    use {super::*, tempfile::TempDir};
 
     async fn tool(dir: &TempDir) -> TaskListTool {
         TaskListTool::from_data_dir(dir.path())

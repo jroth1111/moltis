@@ -3,10 +3,12 @@
 //! `EventMatcher` loads all event-triggered cron jobs from the store,
 //! compiles their patterns into regexes, and provides fast message matching.
 
-use regex::Regex;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use {
+    regex::Regex,
+    std::sync::Arc,
+    tokio::sync::RwLock,
+    tracing::{debug, warn},
+};
 
 use crate::types::{CronJobId, CronSchedule};
 
@@ -93,13 +95,10 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, (pat, ch))| {
-                (
-                    format!("job-{i}"),
-                    CronSchedule::EventTrigger {
-                        pattern: pat.to_string(),
-                        channel_filter: ch.map(str::to_string),
-                    },
-                )
+                (format!("job-{i}"), CronSchedule::EventTrigger {
+                    pattern: pat.to_string(),
+                    channel_filter: ch.map(str::to_string),
+                })
             })
             .collect()
     }
@@ -140,13 +139,10 @@ mod tests {
     async fn invalid_regex_skipped() {
         let matcher = EventMatcher::new();
         // "[invalid" is not a valid regex
-        let jobs = vec![(
-            "job-bad".to_string(),
-            CronSchedule::EventTrigger {
-                pattern: "[invalid".to_string(),
-                channel_filter: None,
-            },
-        )];
+        let jobs = vec![("job-bad".to_string(), CronSchedule::EventTrigger {
+            pattern: "[invalid".to_string(),
+            channel_filter: None,
+        })];
         matcher.reload(jobs).await;
         // Should have 0 entries (invalid pattern was skipped with a warning)
         let ids = matcher.match_message(None, "anything").await;

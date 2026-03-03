@@ -1,7 +1,6 @@
 //! Typed error for task state-machine violations.
 
-use crate::state::RuntimeState;
-use crate::transitions::TransitionEvent;
+use crate::{state::RuntimeState, transitions::TransitionEvent};
 
 /// An invalid state-machine transition.
 #[derive(Debug, thiserror::Error)]

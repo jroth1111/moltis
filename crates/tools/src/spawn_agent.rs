@@ -4,12 +4,14 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use {async_trait::async_trait, tracing::info};
 
-use crate::{
-    error::Error,
-    params::{bool_param, str_param, u64_param},
+use {
+    crate::{
+        error::Error,
+        params::{bool_param, str_param, u64_param},
+    },
+    moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent},
+    time::OffsetDateTime,
 };
-use moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent};
-use time::OffsetDateTime;
 
 use {
     moltis_agents::{
@@ -385,14 +387,9 @@ impl AgentTool for SpawnAgentTool {
             let new_exp = OffsetDateTime::now_utc()
                 + time::Duration::seconds(self.tasks_config.lease_duration_secs as i64);
             let _ = store
-                .apply_transition(
-                    lid,
-                    &tid.0,
-                    None,
-                    &TransitionEvent::RenewLease {
-                        new_expires_at: new_exp,
-                    },
-                )
+                .apply_transition(lid, &tid.0, None, &TransitionEvent::RenewLease {
+                    new_expires_at: new_exp,
+                })
                 .await;
         }
 
@@ -412,14 +409,9 @@ impl AgentTool for SpawnAgentTool {
                         let new_exp =
                             OffsetDateTime::now_utc() + time::Duration::seconds(lease_secs);
                         let _ = store
-                            .apply_transition(
-                                &lid,
-                                &tid.0,
-                                None,
-                                &TransitionEvent::RenewLease {
-                                    new_expires_at: new_exp,
-                                },
-                            )
+                            .apply_transition(&lid, &tid.0, None, &TransitionEvent::RenewLease {
+                                new_expires_at: new_exp,
+                            })
                             .await;
                     }
                 }))
@@ -472,16 +464,11 @@ impl AgentTool for SpawnAgentTool {
                     let mut handoff = prior_handoff.clone().unwrap_or_default();
                     handoff.observed_error = err.to_string();
                     let _ = store
-                        .apply_transition(
-                            lid,
-                            &tid.0,
-                            None,
-                            &TransitionEvent::Fail {
-                                class,
-                                handoff,
-                                retry_after: None,
-                            },
-                        )
+                        .apply_transition(lid, &tid.0, None, &TransitionEvent::Fail {
+                            class,
+                            handoff,
+                            retry_after: None,
+                        })
                         .await;
                 },
             }
@@ -828,16 +815,13 @@ mod tests {
             provider,
             Arc::new(ToolRegistry::new()),
         )
-        .with_agents_config(agents_config_with_presets(
-            Some("default"),
-            &[(
-                "research",
-                AgentPresetConfig {
-                    delegate_only: true,
-                    ..Default::default()
-                },
-            )],
-        ));
+        .with_agents_config(agents_config_with_presets(Some("default"), &[(
+            "research",
+            AgentPresetConfig {
+                delegate_only: true,
+                ..Default::default()
+            },
+        )]));
 
         let (name, preset) = spawn_tool
             .resolve_preset(&serde_json::json!({ "preset": "research" }))
@@ -858,16 +842,13 @@ mod tests {
             provider,
             Arc::new(ToolRegistry::new()),
         )
-        .with_agents_config(agents_config_with_presets(
-            Some("default"),
-            &[(
-                "default",
-                AgentPresetConfig {
-                    allow_tools: vec!["task_list".to_string()],
-                    ..Default::default()
-                },
-            )],
-        ));
+        .with_agents_config(agents_config_with_presets(Some("default"), &[(
+            "default",
+            AgentPresetConfig {
+                allow_tools: vec!["task_list".to_string()],
+                ..Default::default()
+            },
+        )]));
 
         let (name, preset) = spawn_tool
             .resolve_preset(&serde_json::json!({}))
@@ -910,9 +891,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_lifecycle_completes_on_success() {
-        use moltis_tasks::{RuntimeState, TaskSpec, TaskStore, TransitionEvent};
-        use std::sync::Arc;
-        use tempfile::TempDir;
+        use {
+            moltis_tasks::{RuntimeState, TaskSpec, TaskStore, TransitionEvent},
+            std::sync::Arc,
+            tempfile::TempDir,
+        };
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("tasks.db");
@@ -922,15 +905,10 @@ mod tests {
         let spec = TaskSpec::new("test task", "");
         let task = store.create("default", spec, vec![]).await.unwrap();
         let task = store
-            .apply_transition(
-                "default",
-                &task.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".to_string(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("default", &task.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".to_string(),
+                lease_duration_secs: None,
+            })
             .await
             .unwrap();
         assert!(task.runtime.state.is_active());
@@ -969,9 +947,11 @@ mod tests {
     /// Completed regardless of a custom lease config.
     #[tokio::test]
     async fn test_tasks_config_initial_lease_renew_fires() {
-        use moltis_config::schema::TasksConfig;
-        use moltis_tasks::{RuntimeState, TaskSpec, TaskStore, TransitionEvent};
-        use tempfile::TempDir;
+        use {
+            moltis_config::schema::TasksConfig,
+            moltis_tasks::{RuntimeState, TaskSpec, TaskStore, TransitionEvent},
+            tempfile::TempDir,
+        };
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("tasks.db");
@@ -981,15 +961,10 @@ mod tests {
         let spec = TaskSpec::new("lease-test", "");
         let task = store.create("lst", spec, vec![]).await.unwrap();
         store
-            .apply_transition(
-                "lst",
-                &task.id.0,
-                None,
-                &TransitionEvent::Claim {
-                    owner: "agent".into(),
-                    lease_duration_secs: None,
-                },
-            )
+            .apply_transition("lst", &task.id.0, None, &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: None,
+            })
             .await
             .unwrap();
 

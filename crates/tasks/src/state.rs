@@ -1,7 +1,9 @@
 //! Runtime state enum and terminal state variants.
 
-use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use {
+    serde::{Deserialize, Serialize},
+    time::OffsetDateTime,
+};
 
 use crate::types::{FailureClass, HandoffContext, TaskId};
 
@@ -68,8 +70,10 @@ pub enum RuntimeState {
 // ── Serde helper for Option<OffsetDateTime> ───────────────────────────────────
 
 mod optional_rfc3339 {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use time::OffsetDateTime;
+    use {
+        serde::{Deserialize, Deserializer, Serializer},
+        time::OffsetDateTime,
+    };
 
     pub fn serialize<S: Serializer>(v: &Option<OffsetDateTime>, s: S) -> Result<S::Ok, S::Error> {
         match v {
