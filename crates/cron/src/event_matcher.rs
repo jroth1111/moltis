@@ -63,10 +63,10 @@ impl EventMatcher {
             .iter()
             .filter(|e| {
                 // Check channel filter
-                if let Some(ref filter) = e.channel_filter {
-                    if channel.map_or(true, |ch| ch != filter) {
-                        return false;
-                    }
+                if let Some(ref filter) = e.channel_filter
+                    && channel.is_none_or(|ch| ch != filter)
+                {
+                    return false;
                 }
                 e.pattern.is_match(text)
             })
