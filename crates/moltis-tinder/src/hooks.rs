@@ -56,17 +56,17 @@ impl HookHandler for FunnelGuardHook {
         };
 
         // Guard tinder_funnel advance calls.
-        if tool_name == "tinder_funnel" {
-            if let Some("advance") = arguments.get("action").and_then(|v| v.as_str()) {
-                return self.guard_advance(arguments).await;
-            }
+        if tool_name == "tinder_funnel"
+            && let Some("advance") = arguments.get("action").and_then(|v| v.as_str())
+        {
+            return self.guard_advance(arguments).await;
         }
 
         // Guard tinder_browser type calls for contact pattern leakage.
-        if tool_name == "tinder_browser" {
-            if let Some("type") = arguments.get("command").and_then(|v| v.as_str()) {
-                return self.guard_browser_type(arguments).await;
-            }
+        if tool_name == "tinder_browser"
+            && let Some("type") = arguments.get("command").and_then(|v| v.as_str())
+        {
+            return self.guard_browser_type(arguments).await;
         }
 
         Ok(HookAction::Continue)
