@@ -73,8 +73,7 @@
         "useAwait": "warn"
       },
       "nursery": {
-        "noShadow": "warn",
-        "noUnusedExpressions": "warn"
+        "noShadow": "warn"
       }
     }
   },
