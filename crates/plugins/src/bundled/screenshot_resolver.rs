@@ -190,7 +190,7 @@ fn guess_mime(path: &str) -> &'static str {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::await_holding_lock, clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use {
