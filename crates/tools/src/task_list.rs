@@ -267,15 +267,15 @@ impl TaskStore {
 
             // Ownership enforcement: when the task has an owner and a caller is
             // identified, only the owner (or force=true) may change status or owner.
-            if !force {
-                if let (Some(current_owner), Some(caller)) = (&task.owner, caller_identity) {
-                    let is_owner_mutation = status.is_some() || owner.is_some();
-                    if is_owner_mutation && current_owner != caller {
-                        return Err(Error::message(format!(
-                            "task {task_id} is owned by '{current_owner}'; \
-                             caller '{caller}' cannot modify status or owner"
-                        )));
-                    }
+            if !force
+                && let (Some(current_owner), Some(caller)) = (&task.owner, caller_identity)
+            {
+                let is_owner_mutation = status.is_some() || owner.is_some();
+                if is_owner_mutation && current_owner != caller {
+                    return Err(Error::message(format!(
+                        "task {task_id} is owned by '{current_owner}'; \
+                         caller '{caller}' cannot modify status or owner"
+                    )));
                 }
             }
 
@@ -940,7 +940,14 @@ mod tests {
                 false,
             )
             .await;
-        let err = result.unwrap_err();
+        let err = match result {
+            Ok(_) => {
+                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "expected foreign owner status change to fail",
+                ));
+            }
+            Err(err) => err,
+        };
         assert!(err.to_string().contains("owned by 'owner-a'"));
         assert!(err.to_string().contains("owner-b"));
         Ok(())
