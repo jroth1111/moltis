@@ -2056,6 +2056,42 @@ pub async fn prepare_gateway(
                                 .unwrap_or_default()
                                 .as_millis() as u64,
                         );
+                        #[cfg(feature = "push-notifications")]
+                        {
+                            if !state.has_active_session(&session_key).await {
+                                if let Some(push_service) = state.get_push_service().await {
+                                    let summary = {
+                                        let max_chars = 120;
+                                        let mut truncated =
+                                            delivery_text.chars().take(max_chars).collect::<String>();
+                                        if delivery_text.chars().count() > max_chars {
+                                            truncated.push('…');
+                                        }
+                                        truncated
+                                    };
+                                    let title = if is_heartbeat_turn {
+                                        "Heartbeat update"
+                                    } else {
+                                        "Scheduled task update"
+                                    };
+                                    if let Err(error) = crate::push_routes::send_push_notification(
+                                        &push_service,
+                                        title,
+                                        &summary,
+                                        Some("/chats"),
+                                        Some(&session_key),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            session_key = %session_key,
+                                            error = %error,
+                                            "cron push notification failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else {
                     tracing::debug!(
