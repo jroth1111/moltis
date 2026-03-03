@@ -33,11 +33,17 @@ function flattenKeys(value, prefix = "", out = new Set()) {
 }
 
 async function loadLocaleModule(filePath) {
-	const source = await fs.promises.readFile(filePath, "utf8");
-	const sourceUrl = pathToFileURL(filePath).href;
-	const encoded = Buffer.from(`${source}\n//# sourceURL=${sourceUrl}`, "utf8").toString("base64");
-	const mod = await import(`data:text/javascript;base64,${encoded}`);
-	return mod.default ?? {};
+	// Copy to a temp .mjs file so Node.js v20 treats the locale as ESM.
+	// Node.js <22 does not auto-detect ES module syntax in .js files without
+	// a "type":"module" package.json, causing SyntaxError on export statements.
+	const tmpFile = `${filePath}.${Date.now()}.mjs`;
+	try {
+		fs.copyFileSync(filePath, tmpFile);
+		const mod = await import(pathToFileURL(tmpFile).href);
+		return mod.default ?? {};
+	} finally {
+		fs.rmSync(tmpFile, { force: true });
+	}
 }
 
 function sortedLocaleDirs(baseDir) {
