@@ -52,7 +52,9 @@ pub mod runtime;
 pub use runtime::{ChatRuntime, TtsOverride};
 use {
     chat_error::parse_chat_error,
-    moltis_common::handoff::HandoffContext,
+    moltis_common::handoff::{
+        HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
+    },
     moltis_service_traits::{ChatService, ModelService, ServiceError, ServiceResult},
 };
 
@@ -350,7 +352,9 @@ enum ContextCompactionAction {
 }
 
 #[must_use]
-fn context_compaction_config_from_chat(chat: &moltis_config::ChatConfig) -> ContextCompactionConfig {
+fn context_compaction_config_from_chat(
+    chat: &moltis_config::ChatConfig,
+) -> ContextCompactionConfig {
     let strategy = match chat
         .context_compaction_strategy
         .trim()
@@ -2627,8 +2631,6 @@ async fn mark_self_repair_finished(state_store: Option<&SessionStateStore>, sess
     }
 }
 
-const HANDOFF_NAMESPACE: &str = "handoff";
-
 fn suggested_next_step_for_error(error: &str) -> Option<String> {
     use moltis_agents::classify::{ProviderErrorKind, classify_error_message};
 
@@ -2670,7 +2672,7 @@ async fn persist_handoff_context(
     };
 
     if let Err(error) = store
-        .set(session_key, HANDOFF_NAMESPACE, "latest", &serialized)
+        .set(session_key, HANDOFF_NAMESPACE, HANDOFF_LATEST_KEY, &serialized)
         .await
     {
         warn!(
@@ -2679,6 +2681,78 @@ async fn persist_handoff_context(
             "failed to persist handoff context"
         );
     }
+}
+
+async fn consume_inbound_handoff_context(
+    state_store: Option<&Arc<SessionStateStore>>,
+    session_key: &str,
+) -> Option<HandoffContext> {
+    let Some(store) = state_store else {
+        return None;
+    };
+
+    let raw = match store
+        .get(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to load inbound handoff context"
+            );
+            return None;
+        },
+    };
+
+    let Some(raw) = raw else {
+        return None;
+    };
+
+    if let Err(error) = store
+        .delete(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+        .await
+    {
+        warn!(
+            session = %session_key,
+            error = %error,
+            "failed to clear consumed inbound handoff context"
+        );
+    }
+
+    match serde_json::from_str::<HandoffContext>(&raw) {
+        Ok(handoff) => Some(handoff),
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "invalid inbound handoff context payload"
+            );
+            None
+        },
+    }
+}
+
+fn append_handoff_constraints(system_prompt: &mut String, handoff: &HandoffContext) {
+    if handoff.last_action.is_none()
+        && handoff.observed_error.is_none()
+        && handoff.dead_ends.is_empty()
+        && handoff.suggested_next_step.is_none()
+        && handoff.estimated_tokens.is_none()
+    {
+        return;
+    }
+
+    system_prompt.push_str("\n\n[InterSessionHandoff]\n");
+    system_prompt.push_str("Apply this context from a prior coordinating session.\n");
+    system_prompt.push_str(&handoff.to_message_block());
+    if !handoff.dead_ends.is_empty() {
+        system_prompt.push_str(
+            "\nTreat each do_not_retry item as a hard constraint unless the user explicitly overrides it.",
+        );
+    }
+    system_prompt.push_str("\n[/InterSessionHandoff]");
 }
 
 #[async_trait]
@@ -3784,6 +3858,7 @@ impl ChatService for LiveChatService {
                         &discovered_skills,
                         Some(&runtime_context),
                         Some(&session_store),
+                        state_store.as_ref(),
                         client_seq,
                     )
                     .await
@@ -4112,6 +4187,7 @@ impl ChatService for LiveChatService {
                 &[],
                 Some(&runtime_context),
                 Some(&self.session_store),
+                self.state_store.as_ref(),
                 None, // send_sync: no client seq
             )
             .await
@@ -6670,6 +6746,13 @@ async fn run_with_tools(
     )
     .await;
 
+    if let Some(handoff_context) = consume_inbound_handoff_context(state_store, session_key).await {
+        append_handoff_constraints(&mut system_prompt, &handoff_context);
+    }
+
+    // Mark session as running for self-repair tracking.
+    mark_self_repair_started(state_store.map(|v| v.as_ref()), session_key).await;
+
     let provider_ref = provider.clone();
     let first_result = run_agent_loop_streaming(
         provider,
@@ -6770,6 +6853,9 @@ async fn run_with_tools(
         },
         other => other,
     };
+
+    // Mark session as finished for self-repair tracking.
+    mark_self_repair_finished(state_store.map(|v| v.as_ref()), session_key).await;
 
     // Ensure all runner events (including deltas) are broadcast in order before
     // emitting terminal final/error frames.
@@ -7188,6 +7274,7 @@ async fn run_streaming(
     _skills: &[moltis_skills::types::SkillMetadata],
     runtime_context: Option<&PromptRuntimeContext>,
     session_store: Option<&Arc<SessionStore>>,
+    state_store: Option<&Arc<SessionStateStore>>,
     client_seq: Option<u64>,
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
@@ -7222,6 +7309,10 @@ async fn run_streaming(
         persona.config.chat.research.max_iterations,
     )
     .await;
+
+    if let Some(handoff_context) = consume_inbound_handoff_context(state_store, session_key).await {
+        append_handoff_constraints(&mut system_prompt, &handoff_context);
+    }
 
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage::system(system_prompt));
@@ -9409,6 +9500,55 @@ mod tests {
         .await
         .expect("session_state test table");
         Arc::new(SessionStateStore::new(pool.clone()))
+    }
+
+    #[test]
+    fn append_handoff_constraints_includes_do_not_retry_guidance() {
+        let mut prompt = String::from("base prompt");
+        let mut handoff = HandoffContext {
+            last_action: Some("attempted migration".to_string()),
+            observed_error: Some("tool timeout".to_string()),
+            dead_ends: Vec::new(),
+            suggested_next_step: Some("retry with narrower scope".to_string()),
+            estimated_tokens: Some(512),
+        };
+        handoff.add_dead_end("exec", "timed out", "command exceeded timeout");
+
+        append_handoff_constraints(&mut prompt, &handoff);
+
+        assert!(prompt.contains("[InterSessionHandoff]"));
+        assert!(prompt.contains("do_not_retry"));
+        assert!(prompt.contains("hard constraint"));
+    }
+
+    #[tokio::test]
+    async fn consume_inbound_handoff_context_reads_and_clears_state() {
+        let pool = sqlite_pool().await;
+        let state_store = make_state_store(&pool).await;
+
+        let handoff = HandoffContext {
+            last_action: Some("completed dependency scan".to_string()),
+            observed_error: None,
+            dead_ends: Vec::new(),
+            suggested_next_step: Some("apply patch".to_string()),
+            estimated_tokens: Some(123),
+        };
+        let serialized = serde_json::to_string(&handoff).expect("serialize handoff");
+        state_store
+            .set("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY, &serialized)
+            .await
+            .expect("persist inbound handoff");
+
+        let loaded = consume_inbound_handoff_context(Some(&state_store), "session:target")
+            .await
+            .expect("handoff should be loaded");
+        assert_eq!(loaded.last_action.as_deref(), Some("completed dependency scan"));
+
+        let after = state_store
+            .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+            .await
+            .expect("read inbound handoff after consume");
+        assert!(after.is_none(), "inbound handoff must be consumed exactly once");
     }
 
     #[tokio::test]

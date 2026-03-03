@@ -1,5 +1,9 @@
 use sha2::{Digest, Sha256};
 
+pub const HANDOFF_NAMESPACE: &str = "handoff";
+pub const HANDOFF_LATEST_KEY: &str = "latest";
+pub const HANDOFF_INBOUND_KEY: &str = "inbound";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffDeadEnd {

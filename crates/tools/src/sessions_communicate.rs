@@ -7,11 +7,15 @@
 
 use std::sync::Arc;
 
-use {async_trait::async_trait, futures::future::BoxFuture, serde_json::Value};
+use {
+    async_trait::async_trait, futures::future::BoxFuture, serde_json::Value, tracing::warn,
+};
 
 use {
     moltis_agents::tool_registry::AgentTool,
-    moltis_common::handoff::HandoffContext,
+    moltis_common::handoff::{
+        HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
+    },
     moltis_sessions::{
         metadata::SqliteSessionMetadata, state_store::SessionStateStore, store::SessionStore,
     },
@@ -278,7 +282,7 @@ impl AgentTool for SessionsSendTool {
             .await
             .ok_or_else(|| Error::message(format!("session not found: {key}")))?;
 
-        let mut message = if let Some(ctx) = context {
+        let message = if let Some(ctx) = context {
             format!("[From: {ctx}]\n\n{message}")
         } else {
             message
@@ -293,7 +297,7 @@ impl AgentTool for SessionsSendTool {
             explicit_handoff
         } else if let (Some(store), Some(source_key)) = (&self.state_store, source_session_key) {
             store
-                .get(&source_key, "handoff", "latest")
+                .get(&source_key, HANDOFF_NAMESPACE, HANDOFF_LATEST_KEY)
                 .await
                 .ok()
                 .flatten()
@@ -303,9 +307,33 @@ impl AgentTool for SessionsSendTool {
         };
 
         let handoff_attached = handoff.is_some();
-        if let Some(handoff_context) = handoff {
-            message.push_str("\n\n");
-            message.push_str(&handoff_context.to_message_block());
+        let mut handoff_persisted = false;
+        if let Some(handoff_context) = handoff
+            && let Some(store) = &self.state_store
+        {
+            match serde_json::to_string(&handoff_context) {
+                Ok(serialized) => {
+                    if let Err(error) = store
+                        .set(&key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY, &serialized)
+                        .await
+                    {
+                        warn!(
+                            session = %key,
+                            error = %error,
+                            "sessions_send: failed to persist inbound handoff context"
+                        );
+                    } else {
+                        handoff_persisted = true;
+                    }
+                },
+                Err(error) => {
+                    warn!(
+                        session = %key,
+                        error = %error,
+                        "sessions_send: failed to serialize handoff context"
+                    );
+                },
+            }
         }
 
         let result = (self.send_fn)(SendToSessionRequest {
@@ -323,6 +351,7 @@ impl AgentTool for SessionsSendTool {
             "sent": true,
             "waitForReply": wait_for_reply,
             "handoffAttached": handoff_attached,
+            "handoffPersisted": handoff_persisted,
             "result": result,
         }))
     }
@@ -565,12 +594,11 @@ mod tests {
 
         let send_fn: SendToSessionFn = Arc::new(move |req| {
             Box::pin(async move {
-                assert!(req.message.contains("[HandoffContext]"));
-                assert!(req.message.contains("do_not_retry"));
+                assert!(!req.message.contains("[HandoffContext]"));
                 Ok(serde_json::json!({ "text": "ok" }))
             })
         });
-        let tool = SessionsSendTool::new(metadata, send_fn).with_state_store(state_store);
+        let tool = SessionsSendTool::new(metadata, send_fn).with_state_store(Arc::clone(&state_store));
 
         let result = tool
             .execute(serde_json::json!({
@@ -582,6 +610,14 @@ mod tests {
 
         assert_eq!(result["sent"], true);
         assert_eq!(result["handoffAttached"], true);
+        assert_eq!(result["handoffPersisted"], true);
+
+        let persisted = state_store
+            .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+            .await?
+            .ok_or_else(|| std::io::Error::other("expected inbound handoff"))?;
+        let parsed: HandoffContext = serde_json::from_str(&persisted)?;
+        assert!(!parsed.dead_ends.is_empty());
         Ok(())
     }
 
