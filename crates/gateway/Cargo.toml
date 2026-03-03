@@ -54,6 +54,7 @@ moltis-qmd             = { optional = true, workspace = true }
 moltis-routing         = { workspace = true }
 moltis-service-traits  = { workspace = true }
 moltis-sessions        = { workspace = true }
+moltis-tasks           = { workspace = true }
 moltis-skills          = { workspace = true }
 moltis-tailscale       = { optional = true, workspace = true }
 moltis-telegram        = { workspace = true }

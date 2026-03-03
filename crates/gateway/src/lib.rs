@@ -20,6 +20,7 @@ pub mod broadcast;
 pub mod channel;
 pub mod channel_agent_tools;
 pub mod channel_events;
+pub mod dispatch;
 pub mod channel_outbound;
 pub mod channel_store;
 pub mod chat;

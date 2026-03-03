@@ -3505,6 +3505,17 @@ pub async fn prepare_gateway(
                 }
             });
         }
+        // Background: intent dispatch loop — drives multi-shift agent execution.
+        {
+            let state_for_dispatch = Arc::clone(&state);
+            let store_for_dispatch = Arc::clone(&task_store);
+            let dispatch_config = config.tasks.clone();
+            tokio::spawn(crate::dispatch::run_dispatch_loop(
+                state_for_dispatch,
+                store_for_dispatch,
+                dispatch_config,
+            ));
+        }
 
         // Register built-in voice tools for explicit TTS/STT calls in agents.
         tool_registry.register(Box::new(crate::voice_agent_tools::SpeakTool::new(
