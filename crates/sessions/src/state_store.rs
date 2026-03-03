@@ -3,10 +3,9 @@
 //! Provides a SQLite-backed KV store scoped to `(session_key, namespace, key)`
 //! so that skills and extensions can persist context across messages.
 
-use std::{
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::PathBuf;
+
+use time::OffsetDateTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +45,7 @@ impl From<StateRow> for StateEntry {
 /// can quickly understand what was happening and continue effectively.
 /// The context expires after 24 hours to avoid stale state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HandoffContext {
+pub struct SessionResumeContext {
     /// The primary goal the agent was working toward.
     pub last_goal: Option<String>,
     /// Tasks that were pending when the run ended.
@@ -61,15 +60,15 @@ pub struct HandoffContext {
     pub created_at: i64,
 }
 
-impl HandoffContext {
+impl SessionResumeContext {
     /// Namespace used for storing handoff context in the state store.
     pub const NAMESPACE: &'static str = "handoff";
 
     /// Key used for storing handoff context in the state store.
     pub const KEY: &'static str = "context";
 
-    /// Time-to-live for handoff context (24 hours) in milliseconds.
-    pub const TTL_MS: i64 = 24 * 60 * 60 * 1000;
+    /// Time-to-live for handoff context (24 hours).
+    const TTL: time::Duration = time::Duration::hours(24);
 
     /// Create a new handoff context with the current timestamp.
     pub fn new(
@@ -91,9 +90,10 @@ impl HandoffContext {
 
     /// Check if this context has expired (older than 24 hours).
     pub fn is_expired(&self) -> bool {
-        let now = now_ms();
-        let age_ms = now.saturating_sub(self.created_at);
-        age_ms > Self::TTL_MS
+        let created = OffsetDateTime::from_unix_timestamp(self.created_at / 1000)
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let age = OffsetDateTime::now_utc() - created;
+        age > Self::TTL
     }
 
     /// Format the handoff context as a human-readable summary for injection into system prompts.
@@ -155,10 +155,7 @@ pub struct SessionStateStore {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+    OffsetDateTime::now_utc().unix_timestamp() * 1000
 }
 
 impl SessionStateStore {
@@ -282,12 +279,12 @@ impl SessionStateStore {
     ///
     /// This should be called at the end of a run (success or error) to capture
     /// the essential state for resumption.
-    pub async fn set_handoff(&self, session_key: &str, ctx: &HandoffContext) -> Result<()> {
+    pub async fn set_handoff(&self, session_key: &str, ctx: &SessionResumeContext) -> Result<()> {
         let value = serde_json::to_string(ctx)?;
         self.set(
             session_key,
-            HandoffContext::NAMESPACE,
-            HandoffContext::KEY,
+            SessionResumeContext::NAMESPACE,
+            SessionResumeContext::KEY,
             &value,
         )
         .await
@@ -296,19 +293,27 @@ impl SessionStateStore {
     /// Get handoff context for a session.
     ///
     /// Returns `None` if no handoff exists or if it has expired (older than 24 hours).
-    pub async fn get_handoff(&self, session_key: &str) -> Result<Option<HandoffContext>> {
+    pub async fn get_handoff(&self, session_key: &str) -> Result<Option<SessionResumeContext>> {
         let Some(value) = self
-            .get(session_key, HandoffContext::NAMESPACE, HandoffContext::KEY)
+            .get(
+                session_key,
+                SessionResumeContext::NAMESPACE,
+                SessionResumeContext::KEY,
+            )
             .await?
         else {
             return Ok(None);
         };
 
-        let ctx: HandoffContext = serde_json::from_str(&value)?;
+        let ctx: SessionResumeContext = serde_json::from_str(&value)?;
         if ctx.is_expired() {
             // Clean up expired context
             let _ = self
-                .delete(session_key, HandoffContext::NAMESPACE, HandoffContext::KEY)
+                .delete(
+                    session_key,
+                    SessionResumeContext::NAMESPACE,
+                    SessionResumeContext::KEY,
+                )
                 .await;
             return Ok(None);
         }
@@ -318,8 +323,12 @@ impl SessionStateStore {
 
     /// Clear handoff context for a session.
     pub async fn clear_handoff(&self, session_key: &str) -> Result<bool> {
-        self.delete(session_key, HandoffContext::NAMESPACE, HandoffContext::KEY)
-            .await
+        self.delete(
+            session_key,
+            SessionResumeContext::NAMESPACE,
+            SessionResumeContext::KEY,
+        )
+        .await
     }
 
     /// Run migrations for tests (creates the session_state table in an in-memory DB).
@@ -535,7 +544,7 @@ mod tests {
         let pool = test_pool().await;
         let store = SessionStateStore::new(pool);
 
-        let ctx = HandoffContext::new(
+        let ctx = SessionResumeContext::new(
             Some("Fix the bug in auth module".to_string()),
             vec!["Add tests".to_string(), "Update docs".to_string()],
             None,
@@ -564,7 +573,7 @@ mod tests {
         let pool = test_pool().await;
         let store = SessionStateStore::new(pool);
 
-        let ctx = HandoffContext::new(
+        let ctx = SessionResumeContext::new(
             Some("Deploy to production".to_string()),
             vec![],
             Some("Permission denied".to_string()),
@@ -593,7 +602,8 @@ mod tests {
         let store = SessionStateStore::new(pool);
 
         // Create an expired context by setting created_at to 25 hours ago
-        let mut ctx = HandoffContext::new(Some("Old task".to_string()), vec![], None, None, vec![]);
+        let mut ctx =
+            SessionResumeContext::new(Some("Old task".to_string()), vec![], None, None, vec![]);
         // 25 hours ago in milliseconds
         ctx.created_at = now_ms().saturating_sub(25 * 60 * 60 * 1000);
 
@@ -602,8 +612,8 @@ mod tests {
         store
             .set(
                 "session:expired",
-                HandoffContext::NAMESPACE,
-                HandoffContext::KEY,
+                SessionResumeContext::NAMESPACE,
+                SessionResumeContext::KEY,
                 &value,
             )
             .await
@@ -617,8 +627,8 @@ mod tests {
         let raw = store
             .get(
                 "session:expired",
-                HandoffContext::NAMESPACE,
-                HandoffContext::KEY,
+                SessionResumeContext::NAMESPACE,
+                SessionResumeContext::KEY,
             )
             .await
             .unwrap();
@@ -630,7 +640,7 @@ mod tests {
         let pool = test_pool().await;
         let store = SessionStateStore::new(pool);
 
-        let ctx = HandoffContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
+        let ctx = SessionResumeContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
 
         store.set_handoff("session:clear", &ctx).await.unwrap();
         assert!(store.get_handoff("session:clear").await.unwrap().is_some());
@@ -642,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_handoff_prompt_summary() {
-        let ctx = HandoffContext::new(
+        let ctx = SessionResumeContext::new(
             Some("Fix the bug".to_string()),
             vec!["Add tests".to_string()],
             None,
@@ -661,17 +671,19 @@ mod tests {
 
     #[test]
     fn test_handoff_prompt_summary_empty() {
-        let ctx = HandoffContext::new(None, vec![], None, None, vec![]);
+        let ctx = SessionResumeContext::new(None, vec![], None, None, vec![]);
         let summary = ctx.to_prompt_summary();
         assert!(summary.is_empty());
     }
 
     #[test]
     fn test_handoff_is_expired() {
-        let fresh_ctx = HandoffContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
+        let fresh_ctx =
+            SessionResumeContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
         assert!(!fresh_ctx.is_expired());
 
-        let mut old_ctx = HandoffContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
+        let mut old_ctx =
+            SessionResumeContext::new(Some("Task".to_string()), vec![], None, None, vec![]);
         old_ctx.created_at = now_ms().saturating_sub(25 * 60 * 60 * 1000);
         assert!(old_ctx.is_expired());
     }

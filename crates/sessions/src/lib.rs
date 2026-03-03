@@ -18,7 +18,7 @@ pub use {
     error::{Error, Result},
     key::SessionKey,
     message::{ContentBlock, MessageContent, PersistedMessage},
-    state_store::HandoffContext,
+    state_store::SessionResumeContext,
     store::SearchResult,
 };
 
