@@ -223,6 +223,110 @@ impl BrowserManager {
             BrowserAction::Back => self.go_back(session_id, sandbox).await,
             BrowserAction::Forward => self.go_forward(session_id, sandbox).await,
             BrowserAction::Refresh => self.refresh(session_id, sandbox).await,
+            BrowserAction::Hover { ref_ } => self.hover(session_id, ref_, sandbox).await,
+            BrowserAction::DoubleClick { ref_ } => {
+                self.double_click(session_id, ref_, sandbox).await
+            },
+            BrowserAction::Focus { ref_ } => self.focus(session_id, ref_, sandbox).await,
+            BrowserAction::Drag { from_ref, to_ref } => {
+                self.drag(session_id, from_ref, to_ref, sandbox).await
+            },
+            BrowserAction::Check { ref_ } => self.check(session_id, ref_, sandbox).await,
+            BrowserAction::Uncheck { ref_ } => self.uncheck(session_id, ref_, sandbox).await,
+            BrowserAction::Select { ref_, value } => {
+                self.select(session_id, ref_, &value, sandbox).await
+            },
+            BrowserAction::Press { key } => self.press(session_id, &key, sandbox).await,
+            BrowserAction::Upload { ref_, path } => {
+                self.upload(session_id, ref_, &path, sandbox).await
+            },
+            BrowserAction::Clear { ref_ } => self.clear(session_id, ref_, sandbox).await,
+            // Phase 5: Network
+            BrowserAction::InterceptRequests { url_patterns } => {
+                self.intercept_requests(session_id, url_patterns, sandbox, browser)
+                    .await
+            },
+            BrowserAction::StopIntercept => self.stop_intercept(session_id, sandbox, browser).await,
+            BrowserAction::SetExtraHeaders { headers } => {
+                self.set_extra_headers(session_id, headers, sandbox, browser)
+                    .await
+            },
+            BrowserAction::StartHar => self.start_har(session_id, sandbox, browser).await,
+            BrowserAction::StopHar => self.stop_har(session_id, sandbox, browser).await,
+            // Phase 6: Session state
+            BrowserAction::SaveState { name, encrypt } => {
+                self.save_state(session_id, &name, encrypt, sandbox, browser)
+                    .await
+            },
+            BrowserAction::LoadState { name } => {
+                self.load_state(session_id, &name, sandbox, browser).await
+            },
+            BrowserAction::ListStates => self.list_states(session_id, sandbox, browser).await,
+            BrowserAction::DeleteState { name } => {
+                self.delete_state(session_id, &name, sandbox, browser).await
+            },
+            // Phase 7a: Emulation
+            BrowserAction::SetDevice {
+                width,
+                height,
+                device_scale_factor,
+                mobile,
+            } => {
+                self.set_device(
+                    session_id,
+                    width,
+                    height,
+                    device_scale_factor,
+                    mobile,
+                    sandbox,
+                )
+                .await
+            },
+            BrowserAction::SetGeolocation {
+                latitude,
+                longitude,
+                accuracy,
+            } => {
+                self.set_geolocation(session_id, latitude, longitude, accuracy, sandbox)
+                    .await
+            },
+            BrowserAction::SetTimezone { timezone_id } => {
+                self.set_timezone(session_id, &timezone_id, sandbox).await
+            },
+            BrowserAction::SetLocale { locale } => {
+                self.set_locale(session_id, &locale, sandbox).await
+            },
+            BrowserAction::ClearDevice => self.clear_device(session_id, sandbox).await,
+            // Phase 7b: Screencast
+            BrowserAction::StartScreencast {
+                format,
+                quality,
+                every_nth,
+            } => {
+                self.action_start_screencast(
+                    session_id, &format, quality, every_nth, sandbox, browser,
+                )
+                .await
+            },
+            BrowserAction::StopScreencast => {
+                self.action_stop_screencast(session_id, sandbox, browser)
+                    .await
+            },
+            BrowserAction::GetScreencastFrame => {
+                self.action_get_screencast_frame(session_id, sandbox, browser)
+                    .await
+            },
+            // Phase 7c: Tabs
+            BrowserAction::TabNew { name } => {
+                self.tab_new(session_id, &name, sandbox, browser).await
+            },
+            BrowserAction::TabList => self.tab_list(session_id, sandbox, browser).await,
+            BrowserAction::TabSwitch { name } => {
+                self.tab_switch(session_id, &name, sandbox, browser).await
+            },
+            BrowserAction::TabClose { name } => {
+                self.tab_close(session_id, &name, sandbox, browser).await
+            },
             BrowserAction::Close => self.close(session_id, sandbox).await,
         };
 
@@ -441,38 +545,43 @@ impl BrowserManager {
         // Find element center
         let (x, y) = find_element_by_ref(&page, ref_).await?;
 
-        // Dispatch mouse events
-        let press_cmd = DispatchMouseEventParams::builder()
-            .r#type(DispatchMouseEventType::MousePressed)
-            .x(x)
-            .y(y)
-            .button(MouseButton::Left)
-            .click_count(1)
-            .build()
-            .map_err(|e| Error::Cdp(e.to_string()))?;
-        page.execute(press_cmd)
-            .await
-            .map_err(|e| Error::Cdp(e.to_string()))?;
+        // Dispatch mouse events — behavioral (Bezier + timing) or instant
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            let from = self.pool.get_mouse_pos(&sid).await;
+            crate::stealth::behavior::realistic_click(&page, from, x, y).await?;
+            self.pool.set_mouse_pos(&sid, (x, y)).await;
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!(moltis_metrics::browser::BEHAVIORAL_CLICKS_TOTAL).increment(1);
+            debug!(
+                session_id = sid,
+                ref_ = ref_,
+                x = x,
+                y = y,
+                "clicked element (behavioral)"
+            );
+        } else {
+            self.instant_click(&page, x, y).await?;
+            debug!(
+                session_id = sid,
+                ref_ = ref_,
+                x = x,
+                y = y,
+                "clicked element"
+            );
+        }
 
-        let release_cmd = DispatchMouseEventParams::builder()
-            .r#type(DispatchMouseEventType::MouseReleased)
-            .x(x)
-            .y(y)
-            .button(MouseButton::Left)
-            .click_count(1)
-            .build()
-            .map_err(|e| Error::Cdp(e.to_string()))?;
-        page.execute(release_cmd)
-            .await
-            .map_err(|e| Error::Cdp(e.to_string()))?;
-
-        debug!(
-            session_id = sid,
-            ref_ = ref_,
-            x = x,
-            y = y,
-            "clicked element"
-        );
+        #[cfg(not(feature = "stealth"))]
+        {
+            self.instant_click(&page, x, y).await?;
+            debug!(
+                session_id = sid,
+                ref_ = ref_,
+                x = x,
+                y = y,
+                "clicked element"
+            );
+        }
 
         Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
     }
@@ -492,26 +601,18 @@ impl BrowserManager {
         // Focus the element
         focus_element_by_ref(&page, ref_).await?;
 
-        // Type each character
-        for c in text.chars() {
-            let key_down = DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyDown)
-                .text(c.to_string())
-                .build()
-                .map_err(|e| Error::Cdp(e.to_string()))?;
-            page.execute(key_down)
-                .await
-                .map_err(|e| Error::Cdp(e.to_string()))?;
-
-            let key_up = DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyUp)
-                .text(c.to_string())
-                .build()
-                .map_err(|e| Error::Cdp(e.to_string()))?;
-            page.execute(key_up)
-                .await
-                .map_err(|e| Error::Cdp(e.to_string()))?;
+        // Type text — behavioral (randomised timing) or instant
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            crate::stealth::behavior::realistic_type(&page, text).await?;
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!(moltis_metrics::browser::BEHAVIORAL_TYPES_TOTAL).increment(1);
+        } else {
+            self.instant_type(&page, text).await?;
         }
+
+        #[cfg(not(feature = "stealth"))]
+        self.instant_type(&page, text).await?;
 
         debug!(
             session_id = sid,
@@ -754,6 +855,291 @@ impl BrowserManager {
         Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Extended actions (Phase 4)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Hover the mouse over an element.
+    async fn hover(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "hover")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        let (x, y) = find_element_by_ref(&page, ref_).await?;
+
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            let from = self.pool.get_mouse_pos(&sid).await;
+            crate::stealth::behavior::bezier_mouse_move(&page, from, (x, y)).await?;
+            self.pool.set_mouse_pos(&sid, (x, y)).await;
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!(moltis_metrics::browser::BEHAVIORAL_CLICKS_TOTAL).increment(1);
+        } else {
+            crate::actions::hover_instant(&page, x, y).await?;
+        }
+
+        #[cfg(not(feature = "stealth"))]
+        crate::actions::hover_instant(&page, x, y).await?;
+
+        debug!(session_id = sid, ref_ = ref_, x, y, "hovered element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Double-click an element.
+    async fn double_click(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "double_click")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (x, y) = find_element_by_ref(&page, ref_).await?;
+
+        // Move to element (behavioral or instant) then fire the double-click events
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            let from = self.pool.get_mouse_pos(&sid).await;
+            crate::stealth::behavior::bezier_mouse_move(&page, from, (x, y)).await?;
+            self.pool.set_mouse_pos(&sid, (x, y)).await;
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!(moltis_metrics::browser::BEHAVIORAL_CLICKS_TOTAL).increment(1);
+        } else {
+            crate::actions::hover_instant(&page, x, y).await?;
+        }
+
+        #[cfg(not(feature = "stealth"))]
+        crate::actions::hover_instant(&page, x, y).await?;
+
+        crate::actions::double_click_events(&page, x, y).await?;
+        debug!(
+            session_id = sid,
+            ref_ = ref_,
+            x,
+            y,
+            "double-clicked element"
+        );
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Focus an element via keyboard focus without clicking.
+    async fn focus(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "focus")?;
+        let page = self.pool.get_page(&sid).await?;
+        focus_element_by_ref(&page, ref_).await?;
+        debug!(session_id = sid, ref_ = ref_, "focused element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Drag from one element to another.
+    async fn drag(
+        &self,
+        session_id: Option<&str>,
+        from_ref: u32,
+        to_ref: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "drag")?;
+        let page = self.pool.get_page(&sid).await?;
+        let (from_x, from_y) = find_element_by_ref(&page, from_ref).await?;
+        let (to_x, to_y) = find_element_by_ref(&page, to_ref).await?;
+
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled && self.config.stealth.behavioral {
+            // Bezier approach to source → press → bezier drag to destination → release
+            let current_pos = self.pool.get_mouse_pos(&sid).await;
+            crate::stealth::behavior::bezier_mouse_move(&page, current_pos, (from_x, from_y))
+                .await?;
+            let press = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MousePressed)
+                .x(from_x)
+                .y(from_y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            page.execute(press)
+                .await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            crate::stealth::behavior::bezier_mouse_move(&page, (from_x, from_y), (to_x, to_y))
+                .await?;
+            let release = DispatchMouseEventParams::builder()
+                .r#type(DispatchMouseEventType::MouseReleased)
+                .x(to_x)
+                .y(to_y)
+                .button(MouseButton::Left)
+                .click_count(1)
+                .build()
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            page.execute(release)
+                .await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            self.pool.set_mouse_pos(&sid, (to_x, to_y)).await;
+        } else {
+            crate::actions::drag_instant(&page, from_x, from_y, to_x, to_y).await?;
+        }
+
+        #[cfg(not(feature = "stealth"))]
+        crate::actions::drag_instant(&page, from_x, from_y, to_x, to_y).await?;
+
+        debug!(session_id = sid, from_ref, to_ref, "dragged element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Check a checkbox or radio element.
+    async fn check(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "check")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        crate::actions::check_element(&page, ref_).await?;
+        debug!(session_id = sid, ref_ = ref_, "checked element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Uncheck a checkbox element.
+    async fn uncheck(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "uncheck")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        crate::actions::uncheck_element(&page, ref_).await?;
+        debug!(session_id = sid, ref_ = ref_, "unchecked element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Select an option in a `<select>` element by value.
+    async fn select(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        value: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "select")?;
+        let page = self.pool.get_page(&sid).await?;
+        crate::actions::select_option(&page, ref_, value).await?;
+        debug!(session_id = sid, ref_ = ref_, value, "selected option");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Press a named key or printable character.
+    async fn press(
+        &self,
+        session_id: Option<&str>,
+        key: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "press")?;
+        let page = self.pool.get_page(&sid).await?;
+        crate::actions::press_key(&page, key).await?;
+        debug!(session_id = sid, key, "pressed key");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Upload a file to a file input element.
+    async fn upload(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        path: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "upload")?;
+        let page = self.pool.get_page(&sid).await?;
+        crate::actions::upload_file(&page, ref_, path).await?;
+        debug!(session_id = sid, ref_ = ref_, path, "uploaded file");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Clear an input or textarea element.
+    async fn clear(
+        &self,
+        session_id: Option<&str>,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "clear")?;
+        let page = self.pool.get_page(&sid).await?;
+        scroll_element_into_view(&page, ref_).await?;
+        focus_element_by_ref(&page, ref_).await?;
+        crate::actions::clear_input(&page, ref_).await?;
+        debug!(session_id = sid, ref_ = ref_, "cleared element");
+        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+    }
+
+    /// Click at (x, y) instantly (no movement emulation).
+    async fn instant_click(&self, page: &Page, x: f64, y: f64) -> Result<(), Error> {
+        let press_cmd = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MousePressed)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+        page.execute(press_cmd)
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        let release_cmd = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseReleased)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+        page.execute(release_cmd)
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Type `text` instantly with no per-character delay.
+    async fn instant_type(&self, page: &Page, text: &str) -> Result<(), Error> {
+        for c in text.chars() {
+            let key_down = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .text(c.to_string())
+                .build()
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            page.execute(key_down)
+                .await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+
+            let key_up = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .text(c.to_string())
+                .build()
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+            page.execute(key_up)
+                .await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Highlight an element (for screenshots).
     async fn highlight_element(&self, page: &Page, ref_: u32) -> Result<(), Error> {
         let js = format!(
@@ -787,6 +1173,372 @@ impl BrowserManager {
             .map_err(|e| Error::JsEvalFailed(e.to_string()))?;
 
         Ok(())
+    }
+
+    // ── Phase 5: Network interception & HAR ────────────────────────────────
+
+    async fn intercept_requests(
+        &self,
+        session_id: Option<&str>,
+        url_patterns: Vec<String>,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+
+        let start = Instant::now();
+        self.pool
+            .enable_interception(&sid, url_patterns, Default::default())
+            .await?;
+
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn stop_intercept(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "stop_intercept")?;
+        let start = Instant::now();
+        self.pool.disable_interception(&sid).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn set_extra_headers(
+        &self,
+        session_id: Option<&str>,
+        headers: std::collections::HashMap<String, String>,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+        let start = Instant::now();
+        self.pool.set_extra_headers(&sid, headers).await;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn start_har(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+        let start = Instant::now();
+        self.pool.start_har(&sid).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn stop_har(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "stop_har")?;
+        let start = Instant::now();
+        let har = self.pool.stop_har(&sid).await;
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        if let Some(har_json) = har {
+            resp = resp.with_result(har_json);
+        }
+        Ok((sid, resp))
+    }
+
+    // ── Phase 6: Session state ──────────────────────────────────────────────
+
+    async fn save_state(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        encrypt: bool,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "save_state")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        let state = crate::session_state::capture_state(&page).await?;
+        let path = crate::session_state::save_to_disk(&state, name, encrypt)?;
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        resp = resp.with_url(path.to_string_lossy().into_owned());
+        Ok((sid, resp))
+    }
+
+    async fn load_state(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "load_state")?;
+        let start = Instant::now();
+        let state = crate::session_state::load_from_disk(name)?;
+        let page = self.pool.get_page(&sid).await?;
+        crate::session_state::restore_state(&page, &state).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn list_states(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = session_id
+            .map(String::from)
+            .unwrap_or_else(|| "no-session".to_string());
+        let start = Instant::now();
+        let names = crate::session_state::list_saved()?;
+        let json = serde_json::json!({"states": names});
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        resp = resp.with_result(json);
+        Ok((sid, resp))
+    }
+
+    async fn delete_state(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = session_id
+            .map(String::from)
+            .unwrap_or_else(|| "no-session".to_string());
+        let start = Instant::now();
+        crate::session_state::delete_saved(name)?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    // ── Phase 7a: Emulation ─────────────────────────────────────────────────
+
+    async fn set_device(
+        &self,
+        session_id: Option<&str>,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+        mobile: bool,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "set_device")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::set_device(&page, width, height, device_scale_factor, mobile).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn set_geolocation(
+        &self,
+        session_id: Option<&str>,
+        latitude: f64,
+        longitude: f64,
+        accuracy: f64,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "set_geolocation")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::set_geolocation(&page, latitude, longitude, accuracy).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn set_timezone(
+        &self,
+        session_id: Option<&str>,
+        timezone_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "set_timezone")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::set_timezone(&page, timezone_id).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn set_locale(
+        &self,
+        session_id: Option<&str>,
+        locale: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "set_locale")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::set_locale(&page, locale).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn clear_device(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "clear_device")?;
+        let start = Instant::now();
+        let page = self.pool.get_page(&sid).await?;
+        crate::emulation::clear_device_override(&page).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    // ── Phase 7b: Screencast ────────────────────────────────────────────────
+
+    async fn action_start_screencast(
+        &self,
+        session_id: Option<&str>,
+        format: &str,
+        quality: u8,
+        every_nth: u32,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+        let start = Instant::now();
+        self.pool
+            .start_screencast(&sid, format, quality, every_nth)
+            .await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn action_stop_screencast(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "stop_screencast")?;
+        let start = Instant::now();
+        self.pool.stop_screencast(&sid).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn action_get_screencast_frame(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "get_screencast_frame")?;
+        let start = Instant::now();
+        let frame_b64 = self.pool.get_screencast_frame(&sid).await;
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        if let Some(b64) = frame_b64 {
+            resp = resp.with_result(serde_json::json!({"frame": b64}));
+        }
+        Ok((sid, resp))
+    }
+
+    // ── Phase 7c: Tabs ──────────────────────────────────────────────────────
+
+    async fn tab_new(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = self
+            .pool
+            .get_or_create(session_id, sandbox, browser)
+            .await?;
+        let start = Instant::now();
+        self.pool.new_tab(&sid, name).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn tab_list(
+        &self,
+        session_id: Option<&str>,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = session_id
+            .map(String::from)
+            .unwrap_or_else(|| "no-session".to_string());
+        let start = Instant::now();
+        let tabs = self.pool.list_tabs(&sid).await;
+        let mut resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        resp = resp.with_result(serde_json::json!({"tabs": tabs}));
+        Ok((sid, resp))
+    }
+
+    async fn tab_switch(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "tab_switch")?;
+        let start = Instant::now();
+        self.pool.switch_tab(&sid, name).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
+    }
+
+    async fn tab_close(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = require_session(session_id, "tab_close")?;
+        let start = Instant::now();
+        self.pool.close_tab(&sid, name).await?;
+        let resp =
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+        Ok((sid, resp))
     }
 
     /// Close a specific browser session by ID.

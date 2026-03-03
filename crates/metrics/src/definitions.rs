@@ -264,6 +264,20 @@ pub mod browser {
     pub const ERRORS_TOTAL: &str = "moltis_browser_errors_total";
     /// Browser pool utilization (0-1)
     pub const POOL_UTILIZATION: &str = "moltis_browser_pool_utilization";
+    /// Total stealth JS injections performed
+    pub const STEALTH_INJECTIONS_TOTAL: &str = "moltis_browser_stealth_injections_total";
+    /// Total network interception sessions enabled
+    pub const INTERCEPTIONS_TOTAL: &str = "moltis_browser_interceptions_total";
+    /// Total HAR recordings completed
+    pub const HAR_RECORDINGS_TOTAL: &str = "moltis_browser_har_recordings_total";
+    /// Total session states saved to disk
+    pub const STATE_SAVES_TOTAL: &str = "moltis_browser_state_saves_total";
+    /// Total session states loaded from disk
+    pub const STATE_LOADS_TOTAL: &str = "moltis_browser_state_loads_total";
+    /// Total behavioral (Bezier) clicks performed
+    pub const BEHAVIORAL_CLICKS_TOTAL: &str = "moltis_browser_behavioral_clicks_total";
+    /// Total behavioral (randomised-delay) keyboard types performed
+    pub const BEHAVIORAL_TYPES_TOTAL: &str = "moltis_browser_behavioral_types_total";
 }
 
 /// Canvas (A2UI) metrics
