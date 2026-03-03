@@ -275,11 +275,21 @@ fn verify_pair_proof(public_key: &str, pair_id: &str, nonce: &str, signature: &s
 
 fn decode_base64(value: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
     let value = value.trim();
-    URL_SAFE_NO_PAD
-        .decode(value)
-        .or_else(|_| URL_SAFE.decode(value))
-        .or_else(|_| STANDARD_NO_PAD.decode(value))
-        .or_else(|_| STANDARD.decode(value))
+    if let Ok(v) = URL_SAFE_NO_PAD.decode(value) {
+        tracing::debug!(variant = "url-safe-no-pad", "decoded base64 value");
+        return Ok(v);
+    }
+    if let Ok(v) = URL_SAFE.decode(value) {
+        tracing::debug!(variant = "url-safe", "decoded base64 value");
+        return Ok(v);
+    }
+    if let Ok(v) = STANDARD_NO_PAD.decode(value) {
+        tracing::debug!(variant = "standard-no-pad", "decoded base64 value");
+        return Ok(v);
+    }
+    let v = STANDARD.decode(value)?;
+    tracing::debug!(variant = "standard", "decoded base64 value");
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -374,5 +384,22 @@ mod tests {
             .approve(&request.id)
             .expect_err("unverified approve must fail");
         assert!(matches!(err, Error::PairRequestNotVerified));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_transcript_binding() {
+        let mut state = PairingState::new();
+        let signing_key = SigningKey::random(&mut OsRng);
+        let request = request_with_signing_key(&mut state, &signing_key);
+
+        // Sign a different transcript (wrong pair_id) with the correct key
+        let wrong_transcript = format!("moltis-pairing-v1\nwrong-pair-id\n{}", request.nonce);
+        let signature: Signature = signing_key.sign(wrong_transcript.as_bytes());
+        let wrong_sig = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        let err = state
+            .verify(&request.id, &wrong_sig)
+            .expect_err("wrong transcript must fail verification");
+        assert!(matches!(err, Error::PairRequestInvalidProof));
     }
 }

@@ -177,13 +177,23 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         Box::new(|ctx| {
             Box::pin(async move {
                 let params: PairVerifyParams = parse_params(ctx.params.clone())?;
-                ctx.state
+                if let Err(e) = ctx
+                    .state
                     .inner
                     .write()
                     .await
                     .pairing
                     .verify(&params.id, &params.signature)
-                    .map_err(pairing_error)?;
+                {
+                    crate::services::security_audit(
+                        "pairing.verify_failed",
+                        serde_json::json!({
+                            "pair_id": params.id,
+                            "error": e.to_string(),
+                        }),
+                    );
+                    return Err(pairing_error(e));
+                }
                 Ok(serde_json::json!({ "verified": true }))
             })
         }),
@@ -362,7 +372,7 @@ mod tests {
             .expect("runtime");
 
         runtime.block_on(async {
-            let registry = super::super::MethodRegistry::new();
+            let registry = MethodRegistry::new();
             let state = test_state();
 
             let pair_request = registry
