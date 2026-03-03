@@ -1,6 +1,6 @@
 //! Sub-agent tool: lets the LLM delegate tasks to a child agent loop.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use {async_trait::async_trait, tracing::info};
 
@@ -9,6 +9,7 @@ use crate::{
     params::{bool_param, str_param, u64_param},
 };
 use moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent};
+use time::OffsetDateTime;
 
 use {
     moltis_agents::{
@@ -52,6 +53,8 @@ pub struct SpawnAgentTool {
     on_event: Option<OnSpawnEvent>,
     /// Optional task store for lifecycle management when `task_id` is provided.
     task_store: Option<Arc<TaskStore>>,
+    /// Task orchestration config (lease durations, heartbeat interval).
+    tasks_config: moltis_config::schema::TasksConfig,
 }
 
 impl SpawnAgentTool {
@@ -67,6 +70,7 @@ impl SpawnAgentTool {
             agents_config: None,
             on_event: None,
             task_store: None,
+            tasks_config: moltis_config::schema::TasksConfig::default(),
         }
     }
 
@@ -89,6 +93,12 @@ impl SpawnAgentTool {
     /// automatic lifecycle transitions (Complete / Fail) on exit.
     pub fn with_task_store(mut self, store: Arc<TaskStore>) -> Self {
         self.task_store = Some(store);
+        self
+    }
+
+    /// Set task orchestration config (lease duration, heartbeat interval, etc.).
+    pub fn with_tasks_config(mut self, cfg: moltis_config::schema::TasksConfig) -> Self {
+        self.tasks_config = cfg;
         self
     }
 
@@ -370,6 +380,46 @@ impl AgentTool for SpawnAgentTool {
             tool_context["_session_key"] = session_key.clone();
         }
 
+        // Set initial lease on the linked task before starting the agent loop.
+        if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
+            let new_exp = OffsetDateTime::now_utc()
+                + time::Duration::seconds(self.tasks_config.lease_duration_secs as i64);
+            let _ = store
+                .apply_transition(lid, &tid.0, None, &TransitionEvent::RenewLease {
+                    new_expires_at: new_exp,
+                })
+                .await;
+        }
+
+        // Spawn a heartbeat task that periodically renews the lease while the agent runs.
+        let heartbeat_handle: Option<tokio::task::JoinHandle<()>> =
+            if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
+                let store = Arc::clone(store);
+                let tid = tid.clone();
+                let lid = lid.clone();
+                let lease_secs = self.tasks_config.lease_duration_secs as i64;
+                let hb_secs = self.tasks_config.lease_heartbeat_interval_secs.max(1);
+                Some(tokio::spawn(async move {
+                    let mut iv = tokio::time::interval(Duration::from_secs(hb_secs));
+                    iv.tick().await; // skip the first immediate tick
+                    loop {
+                        iv.tick().await;
+                        let new_exp = OffsetDateTime::now_utc()
+                            + time::Duration::seconds(lease_secs);
+                        let _ = store
+                            .apply_transition(
+                                &lid,
+                                &tid.0,
+                                None,
+                                &TransitionEvent::RenewLease { new_expires_at: new_exp },
+                            )
+                            .await;
+                    }
+                }))
+            } else {
+                None
+            };
+
         // Run the sub-agent loop (no event forwarding, no hooks, no history).
         let user_content = moltis_agents::UserContent::text(task);
         let result = run_agent_loop_with_context(
@@ -396,6 +446,11 @@ impl AgentTool for SpawnAgentTool {
             iterations,
             tool_calls_made,
         });
+
+        // Stop heartbeat — must happen before we apply Complete/Fail.
+        if let Some(h) = heartbeat_handle {
+            h.abort();
+        }
 
         // Apply task lifecycle transition for linked tasks.
         if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
