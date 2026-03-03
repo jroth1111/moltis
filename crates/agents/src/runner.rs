@@ -62,6 +62,25 @@ pub fn classify_error(msg: &str) -> moltis_tasks::FailureClass {
     }
 }
 
+/// Classify an error message into a typed [`moltis_tasks::FailureClass`].
+///
+/// Wraps the private pattern-matching functions so callers (e.g. `spawn_agent`)
+/// can translate a provider error into the task-recovery taxonomy without
+/// duplicating the pattern lists.
+#[must_use]
+pub fn classify_error(msg: &str) -> moltis_tasks::FailureClass {
+    if is_billing_quota_error(msg) {
+        return moltis_tasks::FailureClass::ProviderPermanent;
+    }
+    if is_rate_limit_error(msg) || is_retryable_server_error(msg) {
+        return moltis_tasks::FailureClass::ProviderTransient;
+    }
+    if is_context_window_error(msg) {
+        return moltis_tasks::FailureClass::ContextOverflow;
+    }
+    moltis_tasks::FailureClass::AgentError
+}
+
 /// Base delay for non-rate-limit transient retries.
 const SERVER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -4579,6 +4598,32 @@ mod tests {
         assert_eq!(
             classify_error_message("quota exceeded"),
             ProviderErrorKind::BillingExhausted
+        );
+    }
+
+    #[test]
+    fn test_classify_error_maps_patterns_to_failure_class() {
+        use moltis_tasks::FailureClass;
+
+        assert_eq!(
+            classify_error("insufficient_quota"),
+            FailureClass::ProviderPermanent
+        );
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests"),
+            FailureClass::ProviderTransient
+        );
+        assert_eq!(
+            classify_error("HTTP 500 Internal Server Error"),
+            FailureClass::ProviderTransient
+        );
+        assert_eq!(
+            classify_error("context_length_exceeded"),
+            FailureClass::ContextOverflow
+        );
+        assert_eq!(
+            classify_error("some unrecognised agent error"),
+            FailureClass::AgentError
         );
     }
 
