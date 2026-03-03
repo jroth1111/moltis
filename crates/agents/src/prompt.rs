@@ -82,6 +82,9 @@ pub struct PromptHostRuntimeContext {
     /// Populated from the `_dispatch_tool_deny` request sideband; empty for regular user sessions.
     #[allow(clippy::struct_field_names)]
     pub dispatch_deny: Vec<String>,
+    /// Dispatch autonomy tier for this run (`auto`, `confirm`, `approve`).
+    /// Populated only for internal dispatch-originated turns.
+    pub dispatch_autonomy_tier: Option<String>,
 }
 
 /// Runtime context for sandbox execution routing used by the `exec` tool.

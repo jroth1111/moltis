@@ -346,6 +346,18 @@ impl AgentTool for TaskListTool {
                     .map(parse_autonomy_tier)
                     .transpose()?
                     .unwrap_or_default();
+                let dispatch_autonomy_tier = str_param(&params, "_dispatch_autonomy_tier")
+                    .map(parse_autonomy_tier)
+                    .transpose()?;
+                if is_intent
+                    && let Some(caller_tier) = dispatch_autonomy_tier
+                    && autonomy_tier > caller_tier
+                {
+                    return Err(Error::message(format!(
+                        "autonomy_tier `{autonomy_tier}` exceeds dispatch caller tier `{caller_tier}`"
+                    ))
+                    .into());
+                }
                 let parent_task = str_param_any(&params, &["parent_task", "parentTask"])
                     .map(TaskId::from);
                 let principal = params
@@ -990,6 +1002,28 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unknown autonomy_tier")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_tier_above_dispatch_caller_tier() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({
+                "action": "create",
+                "subject": "escalated intent",
+                "is_intent": true,
+                "autonomy_tier": "approve",
+                "_dispatch_autonomy_tier": "auto",
+            }))
+            .await;
+        assert!(result.is_err(), "create should fail when requested tier exceeds caller tier");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds dispatch caller tier")
         );
     }
 

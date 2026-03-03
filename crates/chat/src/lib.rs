@@ -1440,6 +1440,16 @@ fn apply_request_runtime_context(host: &mut PromptHostRuntimeContext, params: &V
                     .collect()
             })
             .unwrap_or_default();
+        host.dispatch_autonomy_tier = params
+            .get("_dispatch_autonomy_tier")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|tier| !tier.is_empty())
+            .map(str::to_ascii_lowercase)
+            .filter(|tier| matches!(tier.as_str(), "auto" | "confirm" | "approve"));
+    } else {
+        host.dispatch_deny.clear();
+        host.dispatch_autonomy_tier = None;
     }
 
     refresh_runtime_prompt_time(host);
@@ -7277,6 +7287,11 @@ async fn run_with_tools(
     if let Some(tid) = trace_id.as_deref() {
         tool_context["_trace_id"] = serde_json::json!(tid);
     }
+    if let Some(tier) = runtime_context
+        .and_then(|ctx| ctx.host.dispatch_autonomy_tier.as_deref())
+    {
+        tool_context["_dispatch_autonomy_tier"] = serde_json::json!(tier);
+    }
 
     // Research phase: gather context before the main agent turn when enabled.
     let _ = maybe_append_research_context(
@@ -11460,6 +11475,7 @@ mod tests {
         let params = serde_json::json!({
             "_source": "dispatch",
             "_dispatch_tool_deny": ["exec", "spawn_agent"],
+            "_dispatch_autonomy_tier": "confirm",
         });
         let mut host = PromptHostRuntimeContext::default();
         apply_request_runtime_context(&mut host, &params);
@@ -11467,18 +11483,38 @@ mod tests {
             host.dispatch_deny,
             vec!["exec".to_string(), "spawn_agent".to_string()]
         );
+        assert_eq!(host.dispatch_autonomy_tier.as_deref(), Some("confirm"));
     }
 
     #[test]
     fn apply_request_runtime_context_ignores_dispatch_deny_without_dispatch_source() {
         let params = serde_json::json!({
             "_dispatch_tool_deny": ["exec"],
+            "_dispatch_autonomy_tier": "approve",
         });
         let mut host = PromptHostRuntimeContext::default();
         apply_request_runtime_context(&mut host, &params);
         assert!(
             host.dispatch_deny.is_empty(),
             "deny list must be ignored when source is not dispatch"
+        );
+        assert!(
+            host.dispatch_autonomy_tier.is_none(),
+            "dispatch autonomy tier must be ignored when source is not dispatch"
+        );
+    }
+
+    #[test]
+    fn apply_request_runtime_context_rejects_invalid_dispatch_autonomy_tier() {
+        let params = serde_json::json!({
+            "_source": "dispatch",
+            "_dispatch_autonomy_tier": "superuser",
+        });
+        let mut host = PromptHostRuntimeContext::default();
+        apply_request_runtime_context(&mut host, &params);
+        assert!(
+            host.dispatch_autonomy_tier.is_none(),
+            "invalid dispatch autonomy tier must be ignored"
         );
     }
 

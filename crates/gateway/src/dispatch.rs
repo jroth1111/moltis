@@ -336,10 +336,11 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
     // ── 8. Run the shift — blocks until agent completes. ─────────────────────
     let deny_list = denied_tools_for_tier(intent.spec.autonomy_tier);
     let params = serde_json::json!({
-        "text":                prompt,
-        "_session_key":        session_key,
-        "_source":             "dispatch",
-        "_dispatch_tool_deny": deny_list,
+        "text":                    prompt,
+        "_session_key":            session_key,
+        "_source":                 "dispatch",
+        "_dispatch_tool_deny":     deny_list,
+        "_dispatch_autonomy_tier": autonomy_tier_label(intent.spec.autonomy_tier),
     });
 
     let heartbeat = spawn_shift_heartbeat(
@@ -588,6 +589,7 @@ fn denied_tools_for_tier(tier: AutonomyTier) -> Vec<&'static str> {
             "sandbox_packages",
             // Approve-tier (external-write)
             "send_image",
+            "send_message",
             "sessions_send",
             "spawn_agent",
             "cron",
@@ -596,12 +598,21 @@ fn denied_tools_for_tier(tier: AutonomyTier) -> Vec<&'static str> {
         AutonomyTier::Confirm => vec![
             // Approve-tier only (external-write)
             "send_image",
+            "send_message",
             "sessions_send",
             "spawn_agent",
             "cron",
             "process",
         ],
         AutonomyTier::Approve => vec![],
+    }
+}
+
+fn autonomy_tier_label(tier: AutonomyTier) -> &'static str {
+    match tier {
+        AutonomyTier::Auto => "auto",
+        AutonomyTier::Confirm => "confirm",
+        AutonomyTier::Approve => "approve",
     }
 }
 
@@ -1080,6 +1091,10 @@ mod tests {
             "send_image must be denied at Auto tier"
         );
         assert!(
+            denied.contains(&"send_message"),
+            "send_message must be denied at Auto tier"
+        );
+        assert!(
             denied.contains(&"spawn_agent"),
             "spawn_agent must be denied at Auto tier"
         );
@@ -1095,6 +1110,10 @@ mod tests {
         assert!(
             denied.contains(&"send_image"),
             "send_image must be denied at Confirm tier"
+        );
+        assert!(
+            denied.contains(&"send_message"),
+            "send_message must be denied at Confirm tier"
         );
         assert!(
             denied.contains(&"spawn_agent"),
