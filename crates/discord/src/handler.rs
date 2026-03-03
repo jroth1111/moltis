@@ -456,14 +456,18 @@ impl EventHandler for Handler {
             text_len = text.len(),
             "discord dispatching to chat"
         );
-        sink.dispatch_to_chat(&text, reply_to, ChannelMessageMeta {
-            channel_type: ChannelType::Discord,
-            sender_name,
-            username,
-            message_kind: Some(inferred_kind),
-            model: config.model.clone(),
-            audio_filename: None,
-        })
+        sink.dispatch_to_chat(
+            &text,
+            reply_to,
+            ChannelMessageMeta {
+                channel_type: ChannelType::Discord,
+                sender_name,
+                username,
+                message_kind: Some(inferred_kind),
+                model: config.model.clone(),
+                audio_filename: None,
+            },
+        )
         .await;
     }
 

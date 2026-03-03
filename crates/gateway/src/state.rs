@@ -127,10 +127,7 @@ pub struct ConnectedClient {
 #[derive(Debug, Clone)]
 pub enum OutboundWsFrame {
     Text(String),
-    Close {
-        code: u16,
-        reason: String,
-    },
+    Close { code: u16, reason: String },
 }
 
 impl ConnectedClient {
@@ -237,9 +234,12 @@ impl DedupeCache {
         {
             self.entries.remove(&oldest_key);
         }
-        self.entries.insert(key.to_string(), DedupeEntry {
-            inserted_at: Instant::now(),
-        });
+        self.entries.insert(
+            key.to_string(),
+            DedupeEntry {
+                inserted_at: Instant::now(),
+            },
+        );
         false
     }
 
@@ -832,13 +832,14 @@ impl GatewayState {
                     "client not connected",
                 ));
             }
-            inner
-                .pending_client_requests
-                .insert(request_id.clone(), PendingClientRequest {
+            inner.pending_client_requests.insert(
+                request_id.clone(),
+                PendingClientRequest {
                     method: method.into(),
                     sender: tx,
                     created_at: Instant::now(),
-                });
+                },
+            );
             let sent = inner
                 .clients
                 .get(conn_id)
@@ -1162,7 +1163,10 @@ mod tests {
 
         state.close_all_clients_going_away("server restart").await;
 
-        let first = rx1.recv().await.expect("should receive shutting_down event");
+        let first = rx1
+            .recv()
+            .await
+            .expect("should receive shutting_down event");
         let first_text = expect_text_frame(first);
         let frame: serde_json::Value = serde_json::from_str(&first_text).unwrap();
         assert_eq!(frame["event"], "gateway.shutting_down");
@@ -1187,7 +1191,10 @@ mod tests {
             .notify_clients_shutting_down("server is shutting down")
             .await;
 
-        let first = rx1.recv().await.expect("should receive shutting_down event");
+        let first = rx1
+            .recv()
+            .await
+            .expect("should receive shutting_down event");
         let first_text = expect_text_frame(first);
         let frame: serde_json::Value = serde_json::from_str(&first_text).unwrap();
         assert_eq!(frame["event"], "gateway.shutting_down");
