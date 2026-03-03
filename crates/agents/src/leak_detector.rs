@@ -250,6 +250,7 @@ impl LeakDetector {
     /// - `Warn` matches are left in place (caller should log).
     /// - `Block` matches cause the entire content to be rejected — an `Err`
     ///   is returned containing the blocking pattern name.
+    pub fn apply(&self, content: &str) -> Result<String, String> {
         let matches = self.scan(content);
         if matches.is_empty() {
             return Ok(content.to_string());
