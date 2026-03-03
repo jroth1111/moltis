@@ -185,12 +185,30 @@ impl SpawnAgentTool {
         Ok(out)
     }
 
+    fn validate_policy_agent_id(agent_id: &str) -> crate::Result<()> {
+        let is_valid = !agent_id.is_empty()
+            && agent_id.len() <= 50
+            && !agent_id.starts_with('-')
+            && !agent_id.ends_with('-')
+            && agent_id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if is_valid {
+            Ok(())
+        } else {
+            Err(Error::message(
+                "invalid agent_id for spawn policy (expected lowercase slug)",
+            ))
+        }
+    }
+
     async fn load_persona_spawn_policy(
         params: &serde_json::Value,
     ) -> crate::Result<Option<(String, PersonaSpawnPolicy)>> {
         let Some(agent_id) = str_param_any(params, &["agent_id", "_agent_id"]) else {
             return Ok(None);
         };
+        Self::validate_policy_agent_id(agent_id)?;
         let policy_path = moltis_config::agent_workspace_dir(agent_id).join(".spawn-policy.json");
         let content = match tokio::fs::read_to_string(&policy_path).await {
             Ok(content) => content,
@@ -980,6 +998,18 @@ mod tests {
         );
 
         moltis_config::set_data_dir(previous_data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_load_persona_spawn_policy_rejects_invalid_agent_id() {
+        let err =
+            SpawnAgentTool::load_persona_spawn_policy(&serde_json::json!({ "agent_id": "../bad" }))
+                .await
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid agent_id for spawn policy (expected lowercase slug)")
+        );
     }
 
     #[tokio::test]

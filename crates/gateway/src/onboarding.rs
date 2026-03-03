@@ -1,6 +1,6 @@
 //! Gateway adapter: wraps `LiveOnboardingService` to implement `OnboardingService`.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use {async_trait::async_trait, serde_json::Value};
 
