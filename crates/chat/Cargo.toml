@@ -26,6 +26,7 @@ moltis-skills         = { workspace = true }
 moltis-telegram       = { workspace = true }
 moltis-tools          = { workspace = true }
 moltis-voice          = { workspace = true }
+rand                  = { workspace = true }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
 thiserror             = { workspace = true }
