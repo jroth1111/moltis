@@ -3288,6 +3288,12 @@ pub async fn prepare_gateway(
             tool_registry.register(Box::new(moltis_memory::tools::MemorySaveTool::new(
                 Arc::clone(mm),
             )));
+            tool_registry.register(Box::new(moltis_memory::tools::MemoryLearnTool::new(
+                Arc::clone(mm),
+            )));
+            tool_registry.register(Box::new(
+                moltis_memory::tools::MemoryRecallFailuresTool::new(Arc::clone(mm)),
+            ));
         }
 
         // Register session state tool for per-session persistent KV store.
