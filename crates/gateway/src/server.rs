@@ -3550,11 +3550,11 @@ pub async fn prepare_gateway(
             crate::chat::GatewayChatRuntime::from_state(Arc::clone(&state)),
             Arc::clone(&session_store),
             Arc::clone(&session_metadata),
+            Arc::clone(&state.provider_health),
         )
         .with_tools(Arc::clone(&shared_tool_registry))
         .with_state_store(Arc::clone(&session_state_store))
-        .with_failover(config.failover.clone())
-        .with_provider_health(Arc::clone(&state.provider_health));
+        .with_failover(config.failover.clone());
 
         if let Some(ref hooks) = state.inner.read().await.hook_registry {
             chat_service = chat_service.with_hooks_arc(Arc::clone(hooks));
@@ -5144,12 +5144,14 @@ async fn websocket_header_auth_context(
             let Some(verification) = store.verify_api_key(api_key).await.ok().flatten() else {
                 return WsHeaderAuthContext::default();
             };
-            if verification.scopes.is_empty() {
-                return WsHeaderAuthContext::default();
-            }
+            let api_key_scopes = if verification.scopes.is_empty() {
+                None
+            } else {
+                Some(verification.scopes)
+            };
             WsHeaderAuthContext {
                 authenticated: true,
-                api_key_scopes: Some(verification.scopes),
+                api_key_scopes,
             }
         },
         crate::auth_middleware::AuthResult::Allowed(_) => WsHeaderAuthContext {
@@ -6125,7 +6127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_header_auth_accepts_valid_scoped_bearer_api_key() {
+    async fn websocket_header_auth_accepts_valid_bearer_api_key() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = Arc::new(
             auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
@@ -6149,7 +6151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_header_auth_rejects_unscoped_bearer_api_key() {
+    async fn websocket_header_auth_accepts_unscoped_bearer_api_key() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = Arc::new(
             auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
@@ -6167,7 +6169,7 @@ mod tests {
         );
 
         let ctx = websocket_header_auth_context(&headers, Some(&store), false).await;
-        assert!(!ctx.authenticated);
+        assert!(ctx.authenticated);
         assert!(ctx.api_key_scopes.is_none());
     }
 
