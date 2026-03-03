@@ -1707,7 +1707,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 // Skip if the message was queued rather than executed synchronously: the
                 // pre-turn snapshot would be stale (the session hasn't changed yet).
                 let was_queued = result.as_ref().ok().is_some_and(chat_send_result_is_queued);
-                if result.is_ok() && !was_queued
+                if result.is_ok()
+                    && !was_queued
                     && let Some((session_key, snapshot)) = pre_turn_snapshot
                 {
                     let turn_index = {

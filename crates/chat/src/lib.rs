@@ -11472,16 +11472,15 @@ mod tests {
         );
 
         // Pre-populate active tool calls for a session.
-        service
-            .active_tool_calls
-            .write()
-            .await
-            .insert("test-session".into(), vec![ActiveToolCall {
+        service.active_tool_calls.write().await.insert(
+            "test-session".into(),
+            vec![ActiveToolCall {
                 id: "tc_1".into(),
                 name: "bash".into(),
                 arguments: serde_json::json!({}),
                 started_at: 0,
-            }]);
+            }],
+        );
         // Pre-populate active_runs_by_session so abort can find the session.
         let run_id = "test-run".to_string();
         service
