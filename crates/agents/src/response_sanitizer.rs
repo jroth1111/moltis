@@ -7,8 +7,10 @@
 //! The stripping is done with hand-rolled string scanning (no regex) to match
 //! the existing `strip_base64_blobs` pattern in `runner.rs`.
 
-use crate::leak_detector::{LeakAction, LeakDetector};
-use crate::model::ToolCall;
+use crate::{
+    leak_detector::{LeakAction, LeakDetector},
+    model::ToolCall,
+};
 
 /// Known internal XML tags that should be stripped from LLM responses.
 const INTERNAL_TAGS: &[&str] = &[
@@ -287,7 +289,7 @@ pub fn sanitize_with_leak_detection(text: &str, sensitivity: f64) -> String {
                 "blocked content due to potential credential leak"
             );
             "[BLOCKED: potential credential leak]".to_string()
-        }
+        },
     }
 }
 

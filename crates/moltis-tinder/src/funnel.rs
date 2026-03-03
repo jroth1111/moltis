@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::str::FromStr;
+use {
+    serde::{Deserialize, Serialize},
+    std::{fmt, str::FromStr},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,14 +148,13 @@ pub async fn update_funnel(
     new_state: FunnelState,
 ) -> anyhow::Result<()> {
     let now = now_ms();
-    let result = sqlx::query(
-        "UPDATE tinder_matches SET funnel_state = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(new_state.to_string())
-    .bind(now)
-    .bind(id)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE tinder_matches SET funnel_state = ?, updated_at = ? WHERE id = ?")
+            .bind(new_state.to_string())
+            .bind(now)
+            .bind(id)
+            .execute(pool)
+            .await?;
     if result.rows_affected() == 0 {
         anyhow::bail!("match not found: {id}");
     }

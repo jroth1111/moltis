@@ -1725,13 +1725,12 @@ impl ProviderRegistry {
                             if self.has_provider_model(&extra_label, model_id) {
                                 continue;
                             }
-                            let provider =
-                                Arc::new(anthropic::AnthropicProvider::with_alias(
-                                    extra_key.clone(),
-                                    model_id.clone(),
-                                    base_url.clone(),
-                                    Some(extra_label.clone()),
-                                ));
+                            let provider = Arc::new(anthropic::AnthropicProvider::with_alias(
+                                extra_key.clone(),
+                                model_id.clone(),
+                                base_url.clone(),
+                                Some(extra_label.clone()),
+                            ));
                             self.register(
                                 ModelInfo {
                                     id: model_id.clone(),
@@ -3028,10 +3027,12 @@ mod tests {
     #[test]
     fn resolve_api_key_uses_first_extra_key_when_primary_missing() {
         let mut config = ProvidersConfig::default();
-        config.providers.insert("mistral".into(), moltis_config::schema::ProviderEntry {
-            extra_api_keys: vec![secret("sk-extra-1"), secret("sk-extra-2")],
-            ..Default::default()
-        });
+        config
+            .providers
+            .insert("mistral".into(), moltis_config::schema::ProviderEntry {
+                extra_api_keys: vec![secret("sk-extra-1"), secret("sk-extra-2")],
+                ..Default::default()
+            });
 
         let key = resolve_api_key(
             &config,
@@ -3048,12 +3049,14 @@ mod tests {
     fn openai_extra_keys_promote_first_key_and_keep_single_fallback_slot() {
         let mut config = ProvidersConfig::default();
         config.offered = vec!["openai".into()];
-        config.providers.insert("openai".into(), moltis_config::schema::ProviderEntry {
-            models: vec!["gpt-5-mini".into()],
-            fetch_models: false,
-            extra_api_keys: vec![secret("sk-openai-1"), secret("sk-openai-2")],
-            ..Default::default()
-        });
+        config
+            .providers
+            .insert("openai".into(), moltis_config::schema::ProviderEntry {
+                models: vec!["gpt-5-mini".into()],
+                fetch_models: false,
+                extra_api_keys: vec![secret("sk-openai-1"), secret("sk-openai-2")],
+                ..Default::default()
+            });
 
         let reg = ProviderRegistry::from_env_with_config(&config);
         let openai_models: Vec<_> = reg
