@@ -23,10 +23,12 @@ pub enum AuthAction {
         provider: String,
     },
     /// Reset gateway authentication (remove password, sessions, passkeys, API keys).
+    #[cfg(feature = "gateway")]
     ResetPassword,
     /// Reset agent identity and user profile (triggers onboarding on next start).
     ResetIdentity,
     /// Create a new API key for authenticating with the gateway.
+    #[cfg(feature = "gateway")]
     CreateApiKey {
         /// Label for the API key (e.g. "CLI tool", "CI pipeline").
         #[arg(long)]
@@ -43,8 +45,10 @@ pub async fn handle_auth(action: AuthAction) -> Result<()> {
         AuthAction::Login { provider } => login(&provider).await,
         AuthAction::Status => status(),
         AuthAction::Logout { provider } => logout(&provider),
+        #[cfg(feature = "gateway")]
         AuthAction::ResetPassword => reset_password().await,
         AuthAction::ResetIdentity => reset_identity(),
+        #[cfg(feature = "gateway")]
         AuthAction::CreateApiKey { label, scopes } => create_api_key(&label, scopes).await,
     }
 }
@@ -170,6 +174,7 @@ fn reset_identity() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "gateway")]
 async fn reset_password() -> Result<()> {
     let data_dir = moltis_config::data_dir();
     let db_path = data_dir.join("moltis.db");
@@ -185,6 +190,7 @@ async fn reset_password() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "gateway")]
 fn reset_password_success_lines() -> [&'static str; 2] {
     [
         "Authentication reset. Password, sessions, passkeys, and API keys removed.",
@@ -192,6 +198,7 @@ fn reset_password_success_lines() -> [&'static str; 2] {
     ]
 }
 
+#[cfg(feature = "gateway")]
 async fn create_api_key(label: &str, scopes_str: Option<String>) -> Result<()> {
     let data_dir = moltis_config::data_dir();
     let db_path = data_dir.join("moltis.db");
@@ -245,7 +252,7 @@ async fn create_api_key(label: &str, scopes_str: Option<String>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gateway"))]
 mod tests {
     use super::reset_password_success_lines;
 
