@@ -1542,6 +1542,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                 "heartbeat prompt source conflict: config heartbeat.prompt overrides HEARTBEAT.md"
                             );
                         }
+                        let prompt =
+                            moltis_cron::heartbeat::apply_surprise_me(&prompt, patch.surprise_me);
                         // Disable the job when there is no meaningful prompt,
                         // even if the user toggled enabled=true.
                         let has_prompt = prompt_source

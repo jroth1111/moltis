@@ -515,6 +515,7 @@ fn build_schema_map() -> KnownKeys {
                 ("every", Leaf),
                 ("model", Leaf),
                 ("prompt", Leaf),
+                ("surprise_me", Leaf),
                 ("ack_max_chars", Leaf),
                 ("active_hours", active_hours()),
                 ("deliver", Leaf),

@@ -503,6 +503,7 @@ enabled = true                    # Enable periodic heartbeats
 every = "30m"                     # Interval between heartbeats (e.g., "30m", "1h", "6h")
 # model = "anthropic/claude-sonnet-4-20250514"  # Override model for heartbeats
 # prompt = "..."                  # Custom heartbeat prompt (default: built-in)
+surprise_me = false               # Add a proactive "share interesting findings" hint to heartbeat prompt
 ack_max_chars = 300               # Max characters for acknowledgment reply
 deliver = false                   # Deliver heartbeat replies to a channel account
 # channel = "my-bot"              # Channel account identifier (required when deliver = true)

@@ -746,6 +746,9 @@ pub struct HeartbeatConfig {
     pub model: Option<String>,
     /// Custom prompt override. If empty, the built-in default is used.
     pub prompt: Option<String>,
+    /// Enable proactive "surprise me" heartbeat behavior.
+    #[serde(default)]
+    pub surprise_me: bool,
     /// Max characters for an acknowledgment reply before truncation. Defaults to 300.
     pub ack_max_chars: usize,
     /// Active hours window — heartbeats only run during this window.
@@ -771,6 +774,7 @@ impl Default for HeartbeatConfig {
             every: "30m".into(),
             model: None,
             prompt: None,
+            surprise_me: false,
             ack_max_chars: 300,
             active_hours: ActiveHoursConfig::default(),
             deliver: false,

@@ -209,6 +209,11 @@ pub fn parse_interval_ms(s: &str) -> Option<u64> {
 pub const EVENTS_PROMPT_PREFIX: &str = "Events occurred since your last check. \
     Review them and relay anything noteworthy to the user.\n\n";
 
+/// Suffix appended to heartbeat prompts when proactive "surprise me" mode is enabled.
+pub const SURPRISE_ME_SUFFIX: &str = "\
+If you notice something the user would find interesting based on memory and recent activity, \
+share it proactively.";
+
 /// Build a heartbeat prompt that incorporates pending system events.
 ///
 /// If `events` is empty, returns `base_prompt` unchanged.
@@ -235,6 +240,18 @@ pub fn build_event_enriched_prompt(
     buf.push('\n');
     buf.push_str(base_prompt);
     buf
+}
+
+/// Apply proactive "surprise me" guidance to the resolved heartbeat prompt.
+#[must_use]
+pub fn apply_surprise_me(prompt: &str, enabled: bool) -> String {
+    if !enabled {
+        return prompt.to_string();
+    }
+    if prompt.contains(SURPRISE_ME_SUFFIX) {
+        return prompt.to_string();
+    }
+    format!("{prompt}\n\n{SURPRISE_ME_SUFFIX}")
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -407,6 +424,21 @@ mod tests {
             resolve_heartbeat_prompt(Some("Use config prompt"), Some("# Heartbeat\n- Check"));
         assert_eq!(p, "Use config prompt");
         assert_eq!(source, HeartbeatPromptSource::Config);
+    }
+
+    #[test]
+    fn apply_surprise_me_appends_suffix_when_enabled() {
+        let prompt = "Base heartbeat prompt";
+        let with_surprise = apply_surprise_me(prompt, true);
+        assert!(with_surprise.contains(prompt));
+        assert!(with_surprise.contains(SURPRISE_ME_SUFFIX));
+    }
+
+    #[test]
+    fn apply_surprise_me_keeps_prompt_unchanged_when_disabled() {
+        let prompt = "Base heartbeat prompt";
+        let unchanged = apply_surprise_me(prompt, false);
+        assert_eq!(unchanged, prompt);
     }
 
     #[test]

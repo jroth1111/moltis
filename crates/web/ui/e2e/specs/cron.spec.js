@@ -57,9 +57,29 @@ test.describe("Cron jobs page", () => {
 		await navigateAndWait(page, "/settings/heartbeat");
 
 		await expect(page.getByRole("heading", { name: /heartbeat/i })).toBeVisible();
+		await expect(page.getByText("Surprise me (proactive follow-ups)", { exact: true })).toBeVisible();
 		await expect(page.getByText("Deliver to channel", { exact: true })).toBeVisible();
 		await expect(page.getByText("Channel Account", { exact: true })).toBeVisible();
 		await expect(page.getByText("Chat ID", { exact: true })).toBeVisible();
+		expect(pageErrors).toEqual([]);
+	});
+
+	test("heartbeat surprise me toggle persists after save", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await navigateAndWait(page, "/settings/heartbeat");
+
+		const toggle = page.locator('[data-hb="surpriseMe"]');
+		const initialValue = await toggle.isChecked();
+		await toggle.click();
+		await page.getByRole("button", { name: "Save", exact: true }).click();
+
+		await expect
+			.poll(async () => {
+				const response = await sendRpcFromPage(page, "heartbeat.status", {});
+				return response?.payload?.config?.surprise_me;
+			})
+			.toBe(!initialValue);
+
 		expect(pageErrors).toEqual([]);
 	});
 

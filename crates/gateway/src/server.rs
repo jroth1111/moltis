@@ -4660,7 +4660,7 @@ pub async fn prepare_gateway(
     {
         use moltis_cron::{
             heartbeat::{
-                DEFAULT_INTERVAL_MS, HeartbeatPromptSource, parse_interval_ms,
+                DEFAULT_INTERVAL_MS, HeartbeatPromptSource, apply_surprise_me, parse_interval_ms,
                 resolve_heartbeat_prompt,
             },
             types::{CronJobCreate, CronJobPatch, CronPayload, CronSchedule, SessionTarget},
@@ -4685,6 +4685,7 @@ pub async fn prepare_gateway(
                 "heartbeat prompt source conflict: config heartbeat.prompt overrides HEARTBEAT.md"
             );
         }
+        let prompt = apply_surprise_me(&prompt, hb.surprise_me);
 
         // Check if heartbeat job already exists.
         let existing = cron_service.list().await;
