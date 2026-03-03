@@ -1282,7 +1282,10 @@ mod tests {
             None,
         );
         assert!(prompt.contains("## Long-Term Memory"));
-        assert!(prompt.contains("MUST call `memory_save`"));
+        assert!(
+            prompt.contains("When the user explicitly asks you to remember, save, or note something")
+        );
+        assert!(prompt.contains("call `memory_save` so it persists across sessions"));
     }
 
     #[test]
@@ -1324,7 +1327,10 @@ mod tests {
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("Likes coffee"));
         assert!(prompt.contains("memory_search"));
-        assert!(prompt.contains("MUST call `memory_save`"));
+        assert!(
+            prompt.contains("When the user explicitly asks you to remember, save, or note something")
+        );
+        assert!(prompt.contains("call `memory_save` so it persists across sessions"));
     }
 
     #[test]
