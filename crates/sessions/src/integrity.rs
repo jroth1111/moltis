@@ -10,10 +10,11 @@
 
 use std::{
     collections::HashSet,
-    fs::File,
-    io::{BufRead, BufReader},
+    fs::{File, OpenOptions},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
 };
 
+use fd_lock::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::{message::PersistedMessage, store::SessionStore, Result};
@@ -153,62 +154,98 @@ impl SessionStore {
     ///
     /// Returns the updated integrity report with actions taken.
     pub async fn repair_session(&self, key: &str) -> Result<IntegrityReport> {
-        let mut report = self.validate_session_integrity(key).await?;
+        let path = self.path_for(key);
 
-        if report.is_clean() {
-            return Ok(report);
-        }
-
-        // Read only valid typed messages (truncated lines are already skipped).
-        let mut messages = self.read_typed(key).await?;
-        let mut modified = false;
-
-        // Check if there are truncated lines — if so, we need to rewrite.
-        let had_truncated = report
-            .issues
-            .iter()
-            .any(|i| matches!(i, IntegrityIssue::TruncatedLine { .. }));
-
-        if had_truncated {
-            modified = true;
-        }
-
-        // Inject synthetic tool results for orphaned tool calls.
-        let orphaned_ids: Vec<String> = report
-            .issues
-            .iter()
-            .filter_map(|i| match i {
-                IntegrityIssue::ToolCallWithoutResult { tool_call_id, .. } => {
-                    Some(tool_call_id.clone())
-                },
-                _ => None,
-            })
-            .collect();
-
-        if !orphaned_ids.is_empty() {
-            let synthetic_count = orphaned_ids.len();
-            for tool_call_id in orphaned_ids {
-                messages.push(PersistedMessage::tool_result(
-                    &tool_call_id,
-                    "unknown",
-                    None,
-                    false,
-                    None,
-                    Some("session interrupted — synthetic recovery result".to_string()),
-                ));
+        tokio::task::spawn_blocking(move || -> Result<IntegrityReport> {
+            let mut report = IntegrityReport::default();
+            if !path.exists() {
+                return Ok(report);
             }
-            report
-                .actions
-                .push(RecoveryAction::InjectedSyntheticToolResults { count: synthetic_count });
-            modified = true;
-        }
 
-        // Rewrite the session file if anything changed.
-        if modified {
-            self.replace_history_typed(key, &messages).await?;
-        }
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            let mut lock = RwLock::new(file);
+            let mut guard = lock
+                .write()
+                .map_err(|e| crate::Error::lock_failed(e.to_string()))?;
 
-        Ok(report)
+            // Parse all lines while holding the same write lock that append/replace use.
+            let reader_file = guard.try_clone()?;
+            let reader = BufReader::new(reader_file);
+            let mut messages: Vec<PersistedMessage> = Vec::new();
+            let mut truncated_count = 0usize;
+
+            for (line_idx, line) in reader.lines().enumerate() {
+                let line = line?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<PersistedMessage>(trimmed) {
+                    Ok(msg) => messages.push(msg),
+                    Err(_) => {
+                        report.issues.push(IntegrityIssue::TruncatedLine {
+                            line_number: line_idx + 1,
+                        });
+                        truncated_count += 1;
+                    },
+                }
+            }
+
+            if truncated_count > 0 {
+                report.actions.push(RecoveryAction::RemovedTruncatedLines {
+                    count: truncated_count,
+                });
+            }
+
+            check_user_without_response(&messages, &mut report);
+            check_tool_calls_without_results(&messages, &mut report);
+
+            if report.is_clean() {
+                return Ok(report);
+            }
+
+            let orphaned_ids: Vec<String> = report
+                .issues
+                .iter()
+                .filter_map(|i| match i {
+                    IntegrityIssue::ToolCallWithoutResult { tool_call_id, .. } => {
+                        Some(tool_call_id.clone())
+                    },
+                    _ => None,
+                })
+                .collect();
+
+            if !orphaned_ids.is_empty() {
+                let synthetic_count = orphaned_ids.len();
+                for tool_call_id in orphaned_ids {
+                    messages.push(PersistedMessage::tool_result(
+                        &tool_call_id,
+                        "unknown",
+                        None,
+                        false,
+                        None,
+                        Some("session interrupted — synthetic recovery result".to_string()),
+                    ));
+                }
+                report
+                    .actions
+                    .push(RecoveryAction::InjectedSyntheticToolResults {
+                        count: synthetic_count,
+                    });
+            }
+
+            // Atomic rewrite under the same lock used for parsing.
+            guard.set_len(0)?;
+            guard.seek(SeekFrom::Start(0))?;
+            for msg in &messages {
+                let line = serde_json::to_string(msg)?;
+                writeln!(*guard, "{line}")?;
+            }
+            guard.sync_data()?;
+
+            Ok(report)
+        })
+        .await?
     }
 }
 
@@ -321,7 +358,7 @@ mod tests {
 
         // Manually append a truncated line.
         let path = dir.path().join("s1.jsonl");
-        std::fs::OpenOptions::new()
+        OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap()
@@ -519,7 +556,7 @@ mod tests {
         // Append a truncated line.
         use std::io::Write;
         let path = dir.path().join("s1.jsonl");
-        std::fs::OpenOptions::new()
+        OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap()
