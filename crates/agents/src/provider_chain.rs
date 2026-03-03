@@ -515,6 +515,12 @@ mod tests {
         assert_eq!(chain.id(), "primary");
     }
 
+    #[test]
+    fn chain_reports_internal_metrics_emission() {
+        let chain = ProviderChain::single(Arc::new(SuccessProvider { id: "primary" }));
+        assert!(chain.emits_metrics());
+    }
+
     #[tokio::test]
     async fn failover_on_rate_limit() {
         let chain = ProviderChain::new(vec![
