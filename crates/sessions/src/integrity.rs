@@ -96,7 +96,7 @@ impl SessionStore {
     ///
     /// This performs a raw line scan (not using `read_typed`) so it can detect
     /// truncated/malformed lines that would be silently skipped.
-    pub async fn validate_session_integrity(&self, key: &str) -> Result<IntegrityReport> {
+    pub async fn validate_integrity_issues(&self, key: &str) -> Result<IntegrityReport> {
         let path = self.path_for(key);
 
         tokio::task::spawn_blocking(move || -> Result<IntegrityReport> {
@@ -334,7 +334,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.validate_session_integrity("s1").await.unwrap();
+        let report = store.validate_integrity_issues("s1").await.unwrap();
         assert!(report.is_clean());
         assert!(!report.needs_retrigger);
     }
@@ -342,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn empty_session_is_clean() {
         let (store, _dir) = temp_store();
-        let report = store.validate_session_integrity("nonexistent").await.unwrap();
+        let report = store.validate_integrity_issues("nonexistent").await.unwrap();
         assert!(report.is_clean());
     }
 
@@ -365,7 +365,7 @@ mod tests {
             .write_all(b"{\"role\": \"assistant\", \"content\": \"trun\n")
             .unwrap();
 
-        let report = store.validate_session_integrity("s1").await.unwrap();
+        let report = store.validate_integrity_issues("s1").await.unwrap();
         assert!(!report.is_clean());
         assert_eq!(
             report
@@ -386,7 +386,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.validate_session_integrity("s1").await.unwrap();
+        let report = store.validate_integrity_issues("s1").await.unwrap();
         assert!(report.needs_retrigger);
         assert!(report
             .issues
@@ -410,7 +410,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.validate_session_integrity("s1").await.unwrap();
+        let report = store.validate_integrity_issues("s1").await.unwrap();
         assert!(!report.needs_retrigger);
     }
 
@@ -450,7 +450,7 @@ mod tests {
             .unwrap();
         store.append_typed("s1", &assistant_with_tool).await.unwrap();
 
-        let report = store.validate_session_integrity("s1").await.unwrap();
+        let report = store.validate_integrity_issues("s1").await.unwrap();
         assert!(report.issues.iter().any(|i| matches!(
             i,
             IntegrityIssue::ToolCallWithoutResult { tool_call_id, .. } if tool_call_id == "call_orphan"
@@ -513,7 +513,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = store.validate_session_integrity("s1").await.unwrap();
+        let report = store.validate_integrity_issues("s1").await.unwrap();
         assert!(report.is_clean());
     }
 
