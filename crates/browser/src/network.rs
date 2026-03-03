@@ -231,7 +231,7 @@ impl HarRecorder {
 }
 
 /// Tracks the network interception state for a browser instance.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct InterceptionState {
     /// Whether `Fetch.enable` has been called and interception is active.
     pub enabled: bool,
@@ -240,21 +240,9 @@ pub struct InterceptionState {
     /// Extra headers injected into every intercepted request.
     pub extra_headers: HashMap<String, String>,
     /// Broadcast channel for forwarding paused-request events to callers.
-    pub paused_tx: Option<tokio::sync::broadcast::Sender<EventRequestPaused>>,
+    pub paused_tx: Option<tokio::sync::broadcast::Sender<Arc<EventRequestPaused>>>,
     /// Background task that drains CDP `EventRequestPaused` events.
     pub _task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Default for InterceptionState {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            recorder: None,
-            extra_headers: HashMap::new(),
-            paused_tx: None,
-            _task: None,
-        }
-    }
 }
 
 // ── CDP helpers ──────────────────────────────────────────────────────────────

@@ -288,7 +288,7 @@ impl BrowserPool {
             .await
             .map_err(|e| Error::Cdp(format!("intercept event listener: {e}")))?;
 
-        let (paused_tx, _rx) = broadcast::channel::<EventRequestPaused>(32);
+        let (paused_tx, _rx) = broadcast::channel::<Arc<EventRequestPaused>>(32);
         let paused_tx_clone = paused_tx.clone();
         let page_clone = page.clone();
 
