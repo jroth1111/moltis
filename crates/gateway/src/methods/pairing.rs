@@ -1,6 +1,9 @@
 use moltis_protocol::{ErrorShape, error_codes};
 
-use crate::broadcast::{BroadcastOpts, broadcast};
+use crate::{
+    broadcast::{BroadcastEvent, BroadcastOpts, broadcast},
+    broadcast_types::PairResolvedStatus,
+};
 
 use super::MethodRegistry;
 
@@ -35,13 +38,12 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 // Broadcast pair request to operators with pairing scope.
                 broadcast(
                     &ctx.state,
-                    "node.pair.requested",
-                    serde_json::json!({
-                        "id": req.id,
-                        "deviceId": req.device_id,
-                        "displayName": req.display_name,
-                        "platform": req.platform,
-                    }),
+                    BroadcastEvent::pair_requested(
+                        req.id.clone(),
+                        req.device_id.clone(),
+                        req.display_name.clone(),
+                        req.platform.clone(),
+                    ),
                     BroadcastOpts::default(),
                 )
                 .await;
@@ -99,10 +101,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 
                 broadcast(
                     &ctx.state,
-                    "node.pair.resolved",
-                    serde_json::json!({
-                        "id": pair_id, "status": "approved",
-                    }),
+                    BroadcastEvent::pair_resolved_node(pair_id, PairResolvedStatus::Approved),
                     BroadcastOpts::default(),
                 )
                 .await;
@@ -135,10 +134,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 
                 broadcast(
                     &ctx.state,
-                    "node.pair.resolved",
-                    serde_json::json!({
-                        "id": pair_id, "status": "rejected",
-                    }),
+                    BroadcastEvent::pair_resolved_node(pair_id, PairResolvedStatus::Rejected),
                     BroadcastOpts::default(),
                 )
                 .await;
@@ -198,10 +194,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 
                 broadcast(
                     &ctx.state,
-                    "device.pair.resolved",
-                    serde_json::json!({
-                        "id": pair_id, "status": "approved",
-                    }),
+                    BroadcastEvent::pair_resolved_device(pair_id, PairResolvedStatus::Approved),
                     BroadcastOpts::default(),
                 )
                 .await;
@@ -231,10 +224,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 
                 broadcast(
                     &ctx.state,
-                    "device.pair.resolved",
-                    serde_json::json!({
-                        "id": pair_id, "status": "rejected",
-                    }),
+                    BroadcastEvent::pair_resolved_device(pair_id, PairResolvedStatus::Rejected),
                     BroadcastOpts::default(),
                 )
                 .await;

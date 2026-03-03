@@ -12,7 +12,7 @@ use {
     moltis_protocol::{ErrorShape, error_codes},
 };
 
-use crate::broadcast::{BroadcastOpts, broadcast};
+use crate::broadcast::{BroadcastOpts, broadcast_raw};
 
 use super::{MethodContext, MethodRegistry};
 
@@ -879,7 +879,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         .and_then(|e| e.get("key"))
                         .and_then(|k| k.as_str())
                 {
-                    broadcast(
+                    broadcast_raw(
                         &ctx.state,
                         "session",
                         serde_json::json!({
@@ -916,7 +916,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .await
                     .map_err(ErrorShape::from)?;
                 let version = result.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
-                broadcast(
+                broadcast_raw(
                     &ctx.state,
                     "session",
                     serde_json::json!({
@@ -937,7 +937,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     } else {
                         "Sandbox disabled — commands now run on host."
                     };
-                    broadcast(
+                    broadcast_raw(
                         &ctx.state,
                         "chat",
                         serde_json::json!({
@@ -1013,7 +1013,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 if !key.is_empty() {
                     // Remove stale undo manager so deleted session can't be resurrected.
                     ctx.state.inner.write().await.undo_managers.remove(&key);
-                    broadcast(
+                    broadcast_raw(
                         &ctx.state,
                         "session",
                         serde_json::json!({
@@ -1075,7 +1075,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .await
                     .map_err(ErrorShape::from)?;
                 if let Some(key) = result.get("key").and_then(|k| k.as_str()) {
-                    broadcast(
+                    broadcast_raw(
                         &ctx.state,
                         "session",
                         serde_json::json!({
@@ -2459,7 +2459,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .unwrap_or(ctx.request_id.as_str())
                     .to_string();
 
-                broadcast(
+                broadcast_raw(
                     &ctx.state,
                     "skills.install.progress",
                     serde_json::json!({
@@ -2473,7 +2473,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 
                 match ctx.state.services.skills.install(ctx.params.clone()).await {
                     Ok(payload) => {
-                        broadcast(
+                        broadcast_raw(
                             &ctx.state,
                             "skills.install.progress",
                             serde_json::json!({
@@ -2487,7 +2487,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         Ok(payload)
                     },
                     Err(e) => {
-                        broadcast(
+                        broadcast_raw(
                             &ctx.state,
                             "skills.install.progress",
                             serde_json::json!({
@@ -3668,7 +3668,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     )?;
 
                     // Broadcast change
-                    broadcast(
+                    broadcast_raw(
                         &ctx.state,
                         "voice.config.changed",
                         serde_json::json!({ "provider": provider, "enabled": enabled }),
@@ -3942,7 +3942,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     })?;
 
                     // Broadcast voice config change event
-                    broadcast(
+                    broadcast_raw(
                         &ctx.state,
                         "voice.config.changed",
                         serde_json::json!({ "provider": provider }),
@@ -3976,7 +3976,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         )
                     })?;
 
-                    broadcast(
+                    broadcast_raw(
                         &ctx.state,
                         "voice.config.changed",
                         serde_json::json!({ "provider": provider, "settings": true }),
@@ -4034,7 +4034,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     })?;
 
                     // Broadcast voice config change event
-                    broadcast(
+                    broadcast_raw(
                         &ctx.state,
                         "voice.config.changed",
                         serde_json::json!({ "provider": provider, "removed": true }),
@@ -4537,7 +4537,7 @@ async fn reload_hooks(state: &Arc<crate::state::GatewayState>) {
     }
 
     // Broadcast hooks.status event so connected UIs auto-refresh.
-    broadcast(
+    broadcast_raw(
         state,
         "hooks.status",
         serde_json::json!({ "hooks": new_info }),

@@ -59,7 +59,7 @@ use crate::{
     approval::{GatewayApprovalBroadcaster, LiveExecApprovalService},
     auth,
     auth_routes::{AuthState, SharedWebAuthnRegistry, auth_router},
-    broadcast::{BroadcastOpts, broadcast, broadcast_tick},
+    broadcast::{BroadcastOpts, broadcast_raw, broadcast_tick},
     chat::{LiveChatService, LiveModelService},
     methods::MethodRegistry,
     provider_setup::LiveProviderSetupService,
@@ -2036,7 +2036,7 @@ pub async fn prepare_gateway(
             // Spawn async broadcast in a background task since we're in a sync callback.
             let state = Arc::clone(state);
             tokio::spawn(async move {
-                broadcast(
+                broadcast_raw(
                     &state,
                     event,
                     payload,
@@ -2166,7 +2166,7 @@ pub async fn prepare_gateway(
             tokio::spawn(async move {
                 // Broadcast build start event.
                 if let Some(state) = deferred_for_build.get() {
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "sandbox.image.build",
                         serde_json::json!({ "phase": "start", "packages": packages }),
@@ -2191,7 +2191,7 @@ pub async fn prepare_gateway(
                             .store(false, std::sync::atomic::Ordering::Relaxed);
 
                         if let Some(state) = deferred_for_build.get() {
-                            broadcast(
+                            broadcast_raw(
                                 state,
                                 "sandbox.image.build",
                                 serde_json::json!({
@@ -2221,7 +2221,7 @@ pub async fn prepare_gateway(
                             .building_flag
                             .store(false, std::sync::atomic::Ordering::Relaxed);
                         if let Some(state) = deferred_for_build.get() {
-                            broadcast(
+                            broadcast_raw(
                                 state,
                                 "sandbox.image.build",
                                 serde_json::json!({
@@ -2253,7 +2253,7 @@ pub async fn prepare_gateway(
             let pkg_count = packages.len();
             tokio::spawn(async move {
                 if let Some(state) = deferred_for_host.get() {
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "sandbox.host.provision",
                         serde_json::json!({
@@ -2277,7 +2277,7 @@ pub async fn prepare_gateway(
                             "host package provisioning complete"
                         );
                         if let Some(state) = deferred_for_host.get() {
-                            broadcast(
+                            broadcast_raw(
                                 state,
                                 "sandbox.host.provision",
                                 serde_json::json!({
@@ -2299,7 +2299,7 @@ pub async fn prepare_gateway(
                     Err(e) => {
                         warn!("host package provisioning failed: {e}");
                         if let Some(state) = deferred_for_host.get() {
-                            broadcast(
+                            broadcast_raw(
                                 state,
                                 "sandbox.host.provision",
                                 serde_json::json!({
@@ -2352,7 +2352,7 @@ pub async fn prepare_gateway(
         tokio::spawn(async move {
             // Broadcast pull start event.
             if let Some(state) = deferred_for_browser.get() {
-                broadcast(
+                broadcast_raw(
                     state,
                     "browser.image.pull",
                     serde_json::json!({
@@ -2371,7 +2371,7 @@ pub async fn prepare_gateway(
                 Ok(()) => {
                     info!(image = %sandbox_image, "browser container image ready");
                     if let Some(state) = deferred_for_browser.get() {
-                        broadcast(
+                        broadcast_raw(
                             state,
                             "browser.image.pull",
                             serde_json::json!({
@@ -2389,7 +2389,7 @@ pub async fn prepare_gateway(
                 Err(e) => {
                     tracing::warn!(image = %sandbox_image, error = %e, "browser container image pull failed");
                     if let Some(state) = deferred_for_browser.get() {
-                        broadcast(
+                        broadcast_raw(
                             state,
                             "browser.image.pull",
                             serde_json::json!({
@@ -3528,7 +3528,7 @@ pub async fn prepare_gateway(
                     _ => return, // Only broadcast sub-agent lifecycle events.
                 };
                 tokio::spawn(async move {
-                    broadcast(&state, "chat", payload, BroadcastOpts::default()).await;
+                    broadcast_raw(&state, "chat", payload, BroadcastOpts::default()).await;
                 });
             });
             let agents_config = Arc::new(tokio::sync::RwLock::new(config.agents.clone()));
@@ -3592,7 +3592,7 @@ pub async fn prepare_gateway(
             tokio::spawn(async move {
                 let _watcher = _watcher; // keep alive
                 while let Some(_event) = rx.recv().await {
-                    broadcast(
+                    broadcast_raw(
                         &watcher_state,
                         "skills.changed",
                         serde_json::json!({}),
@@ -4033,7 +4033,7 @@ pub async fn prepare_gateway(
                             }
                         }
 
-                        broadcast(
+                        broadcast_raw(
                             &state,
                             "session.recovered",
                             serde_json::json!({
@@ -4123,7 +4123,7 @@ pub async fn prepare_gateway(
                                 ("patched", session_key.as_str())
                             },
                         };
-                        broadcast(
+                        broadcast_raw(
                             &ws_state,
                             "session",
                             serde_json::json!({
@@ -4195,7 +4195,7 @@ pub async fn prepare_gateway(
                         }
                     };
                     if changed && let Ok(payload) = serde_json::to_value(&next) {
-                        broadcast(
+                        broadcast_raw(
                             &update_state,
                             "update.available",
                             payload,
@@ -4359,7 +4359,7 @@ pub async fn prepare_gateway(
                         {
                             obj.insert("providerHealth".to_string(), health_json);
                         }
-                        broadcast(
+                        broadcast_raw(
                             &metrics_state,
                             "metrics.update",
                             payload_json,
@@ -4472,7 +4472,7 @@ pub async fn prepare_gateway(
                                 }),
                             ),
                         };
-                        broadcast(
+                        broadcast_raw(
                             &event_state,
                             event_name,
                             payload,
@@ -4500,7 +4500,7 @@ pub async fn prepare_gateway(
                 match audit_rx.recv().await {
                     Ok(entry) => {
                         if let Ok(payload) = serde_json::to_value(&entry) {
-                            broadcast(
+                            broadcast_raw(
                                 &audit_state,
                                 "network.audit.entry",
                                 payload,
@@ -4528,7 +4528,7 @@ pub async fn prepare_gateway(
                 match rx.recv().await {
                     Ok(entry) => {
                         if let Ok(payload) = serde_json::to_value(&entry) {
-                            broadcast(
+                            broadcast_raw(
                                 &log_state,
                                 "logs.entry",
                                 payload,

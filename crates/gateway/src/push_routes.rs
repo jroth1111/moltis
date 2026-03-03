@@ -149,8 +149,9 @@ async fn subscribe_handler(
     // Broadcast subscription change
     crate::broadcast::broadcast(
         &state.gateway,
-        "push.subscriptions",
-        serde_json::json!({"action": "added"}),
+        crate::broadcast::BroadcastEvent::push_subscriptions(
+            crate::broadcast_types::PushSubscriptionAction::Added,
+        ),
         crate::broadcast::BroadcastOpts::default(),
     )
     .await;
@@ -175,8 +176,9 @@ async fn unsubscribe_handler(
     // Broadcast subscription change
     crate::broadcast::broadcast(
         &state.gateway,
-        "push.subscriptions",
-        serde_json::json!({"action": "removed"}),
+        crate::broadcast::BroadcastEvent::push_subscriptions(
+            crate::broadcast_types::PushSubscriptionAction::Removed,
+        ),
         crate::broadcast::BroadcastOpts::default(),
     )
     .await;

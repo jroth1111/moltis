@@ -17,6 +17,7 @@ pub mod auth_middleware;
 pub mod auth_routes;
 pub mod auth_webauthn;
 pub mod broadcast;
+pub mod broadcast_types;
 pub mod channel;
 pub mod channel_agent_tools;
 pub mod channel_events;

@@ -15,7 +15,7 @@ use {
 };
 
 use crate::{
-    broadcast::{BroadcastOpts, broadcast},
+    broadcast::{BroadcastOpts, broadcast_raw},
     state::GatewayState,
 };
 
@@ -197,7 +197,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 }
             }
 
-            broadcast(
+            broadcast_raw(
                 state,
                 "channel",
                 payload,
@@ -247,7 +247,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 "channel": &meta,
                 "sessionKey": &session_key,
             });
-            broadcast(
+            broadcast_raw(
                 state,
                 "chat",
                 payload,
@@ -465,7 +465,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     return;
                 },
             };
-            broadcast(
+            broadcast_raw(
                 state,
                 "channel",
                 payload,
@@ -754,7 +754,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
             "sessionKey": &session_key,
             "hasAttachments": true,
         });
-        broadcast(
+        broadcast_raw(
             state,
             "chat",
             payload,
@@ -1070,7 +1070,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 }
 
                 // Notify web UI so the session list refreshes.
-                broadcast(
+                broadcast_raw(
                     state,
                     "session",
                     serde_json::json!({
@@ -1235,7 +1235,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         "channel /sessions: switched session"
                     );
 
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "session",
                         serde_json::json!({
@@ -1319,7 +1319,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .await
                         .map_err(|e| ChannelError::external("setting session agent", e))?;
 
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "session",
                         serde_json::json!({
@@ -1440,7 +1440,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
 
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "session",
                         serde_json::json!({
@@ -1532,7 +1532,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .get("version")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "session",
                         serde_json::json!({
@@ -1593,7 +1593,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
 
-                    broadcast(
+                    broadcast_raw(
                         state,
                         "session",
                         serde_json::json!({

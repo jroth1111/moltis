@@ -5,7 +5,11 @@ use {
     tracing::{debug, warn},
 };
 
-use crate::state::GatewayState;
+pub use crate::broadcast_types::BroadcastEvent;
+use crate::{
+    broadcast_types::{TickMemoryPayload, TickPayload},
+    state::GatewayState,
+};
 
 // ── Scope guards ─────────────────────────────────────────────────────────────
 
@@ -41,18 +45,26 @@ pub struct BroadcastOpts {
 /// guards and dropping/closing slow consumers.
 pub async fn broadcast(
     state: &Arc<GatewayState>,
-    event: &str,
-    payload: serde_json::Value,
+    event: BroadcastEvent,
     opts: BroadcastOpts,
 ) {
+    let message = match event.into_message() {
+        Ok(message) => message,
+        Err(e) => {
+            warn!("failed to serialize broadcast payload: {e}");
+            return;
+        },
+    };
+    let event_name = message.event;
+
     let seq = state.next_seq();
     let stream = opts.stream.clone();
     let done = opts.done.then_some(true);
     let channel = opts.channel.clone();
     let frame = EventFrame {
         r#type: "event".into(),
-        event: event.into(),
-        payload: Some(payload),
+        event: event_name.to_string(),
+        payload: Some(message.payload),
         seq: Some(seq),
         state_version: opts.state_version,
         stream,
@@ -72,15 +84,15 @@ pub async fn broadcast(
     if let Some(ref payload) = frame.payload {
         let _ = state
             .graphql_broadcast
-            .send((event.to_string(), payload.clone()));
+            .send((event_name.to_string(), payload.clone()));
     }
 
     let guards = event_scope_guards();
-    let required_scopes = guards.get(event);
+    let required_scopes = guards.get(event_name.as_ref());
 
     let inner = state.inner.read().await;
     debug!(
-        event,
+        event = event_name.as_ref(),
         seq,
         clients = inner.clients.len(),
         "broadcasting event"
@@ -97,7 +109,7 @@ pub async fn broadcast(
         }
 
         // Subscription filter (v4): skip clients not subscribed to this event.
-        if !client.is_subscribed_to(event) {
+        if !client.is_subscribed_to(event_name.as_ref()) {
             continue;
         }
 
@@ -116,6 +128,16 @@ pub async fn broadcast(
     }
 }
 
+/// Legacy/raw bridge for dynamic event names and ad-hoc payloads.
+pub async fn broadcast_raw(
+    state: &Arc<GatewayState>,
+    event: impl Into<String>,
+    payload: serde_json::Value,
+    opts: BroadcastOpts,
+) {
+    broadcast(state, BroadcastEvent::raw(event, payload), opts).await;
+}
+
 /// Broadcast a tick event with the current timestamp and memory stats.
 pub async fn broadcast_tick(
     state: &Arc<GatewayState>,
@@ -129,14 +151,13 @@ pub async fn broadcast_tick(
         .as_millis() as u64;
     broadcast(
         state,
-        "tick",
-        serde_json::json!({
-            "ts": ts,
-            "mem": {
-                "process": process_memory_bytes,
-                "available": system_available_bytes,
-                "total": system_total_bytes
-            }
+        BroadcastEvent::Tick(TickPayload {
+            ts,
+            mem: TickMemoryPayload {
+                process: process_memory_bytes,
+                available: system_available_bytes,
+                total: system_total_bytes,
+            },
         }),
         BroadcastOpts {
             drop_if_slow: true,
