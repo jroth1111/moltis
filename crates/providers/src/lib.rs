@@ -131,6 +131,7 @@ fn subscription_preference_rank(provider_name: &str) -> usize {
     }
 }
 
+#[allow(dead_code)]
 fn oauth_discovery_enabled(config: &ProvidersConfig, provider_name: &str) -> bool {
     config.get(provider_name).is_none_or(|entry| entry.enabled)
 }
@@ -3069,8 +3070,10 @@ mod tests {
 
     #[test]
     fn openai_extra_keys_promote_first_key_and_keep_single_fallback_slot() {
-        let mut config = ProvidersConfig::default();
-        config.offered = vec!["openai".into()];
+        let mut config = ProvidersConfig {
+            offered: vec!["openai".into()],
+            ..Default::default()
+        };
         config.providers.insert(
             "openai".into(),
             moltis_config::schema::ProviderEntry {
