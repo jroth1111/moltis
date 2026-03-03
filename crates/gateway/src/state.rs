@@ -14,7 +14,7 @@ use moltis_metrics::MetricsHandle;
 #[cfg(feature = "metrics")]
 pub use moltis_metrics::{MetricsHistoryPoint, MetricsStore, ProviderTokens, SqliteMetricsStore};
 
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 
 // ── Metrics history ──────────────────────────────────────────────────────────
 
@@ -466,6 +466,9 @@ pub struct GatewayState {
     /// Set to `true` during graceful shutdown. New WebSocket upgrades are
     /// rejected with 503 when this flag is set.
     pub shutting_down: AtomicBool,
+    /// Notified whenever an agent session run completes, so the graceful
+    /// shutdown drain loop can wake without polling.
+    pub session_complete_notify: Arc<Notify>,
 
     // ── Mutable runtime state (single lock) ─────────────────────────────────
     /// All mutable runtime state, behind a single lock.
@@ -548,6 +551,7 @@ impl GatewayState {
             seq: AtomicU64::new(0),
             tts_phrase_counter: AtomicUsize::new(0),
             shutting_down: AtomicBool::new(false),
+            session_complete_notify: Arc::new(Notify::new()),
             #[cfg(feature = "graphql")]
             graphql_broadcast: {
                 let (tx, _) = tokio::sync::broadcast::channel(256);
@@ -593,6 +597,12 @@ impl GatewayState {
             return Arc::clone(c);
         }
         Arc::clone(&self.services.chat)
+    }
+
+    /// Returns a reference to the session-completion [`Notify`] so callers can
+    /// wake the graceful-shutdown drain loop when an agent run finishes.
+    pub fn session_complete_notify(&self) -> &Arc<Notify> {
+        &self.session_complete_notify
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -869,10 +879,9 @@ impl GatewayState {
     /// Notify all connected WebSocket clients that the gateway is shutting
     /// down, then drain all connection state. Clients receive a
     /// `gateway.shutdown` event before being disconnected.
+    #[tracing::instrument(skip(self))]
     pub async fn notify_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
-
-        let mut inner = self.inner.write().await;
 
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let frame = EventFrame::new(
@@ -880,18 +889,26 @@ impl GatewayState {
             serde_json::json!({ "reason": "server shutting down" }),
             seq,
         );
-        if let Ok(json) = serde_json::to_string(&frame) {
-            for client in inner.clients.values() {
-                let _ = client.send(&json);
+        let json = serde_json::to_string(&frame).ok();
+
+        // Clone senders out, then release the read lock before broadcasting.
+        let senders: Vec<mpsc::Sender<String>> = {
+            let inner = self.inner.read().await;
+            inner.clients.values().map(|c| c.sender.clone()).collect()
+        };
+
+        if let Some(json) = json {
+            for sender in &senders {
+                let _ = sender.try_send(json.clone());
             }
         }
 
-        // Drain all state keyed by connection.
+        // Now acquire write to drain state.
+        let mut inner = self.inner.write().await;
         inner.nodes.clear();
         inner.clients.clear();
         inner.active_sessions.clear();
         inner.active_projects.clear();
-
         drop(inner);
 
         #[cfg(feature = "metrics")]

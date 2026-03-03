@@ -12,7 +12,7 @@ use {
     serde::{Deserialize, Serialize},
     serde_json::Value,
     tokio::{
-        sync::{Mutex, OnceCell, OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
+        sync::{Mutex, Notify, OnceCell, OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
         task::AbortHandle,
     },
     tokio_stream::StreamExt,
@@ -2379,6 +2379,8 @@ pub struct LiveChatService {
     active_reply_medium: Arc<RwLock<HashMap<String, ReplyMedium>>>,
     /// Optional session state store for self-repair run lifecycle tracking.
     state_store: Option<Arc<SessionStateStore>>,
+    /// Notified when an agent run finishes, waking the graceful-shutdown drain.
+    session_drain_notify: Option<Arc<Notify>>,
     /// Failover configuration for automatic model/provider failover.
     failover_config: moltis_config::schema::FailoverConfig,
 }
@@ -2408,6 +2410,7 @@ impl LiveChatService {
             active_tool_calls: Arc::new(RwLock::new(HashMap::new())),
             active_reply_medium: Arc::new(RwLock::new(HashMap::new())),
             state_store: None,
+            session_drain_notify: None,
             failover_config: moltis_config::schema::FailoverConfig::default(),
         }
     }
@@ -2424,6 +2427,11 @@ impl LiveChatService {
 
     pub fn with_state_store(mut self, state_store: Arc<SessionStateStore>) -> Self {
         self.state_store = Some(state_store);
+        self
+    }
+
+    pub fn with_session_drain_notify(mut self, notify: Arc<Notify>) -> Self {
+        self.session_drain_notify = Some(notify);
         self
     }
 
@@ -2944,6 +2952,7 @@ impl ChatService for LiveChatService {
             let session_store = Arc::clone(&self.session_store);
             let session_metadata = Arc::clone(&self.session_metadata);
             let state_store = self.state_store.clone();
+            let drain_notify = self.session_drain_notify.clone();
             let tool_registry = Arc::clone(&self.tool_registry);
             let session_key_clone = session_key.clone();
             let message_queue = Arc::clone(&self.message_queue);
@@ -3006,6 +3015,9 @@ impl ChatService for LiveChatService {
                     session_metadata.touch(&session_key_clone, count).await;
                 }
                 mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
+                if let Some(ref n) = drain_notify {
+                    n.notify_waiters();
+                }
 
                 active_runs.write().await.remove(&run_id_clone);
                 let mut runs_by_session = active_runs_by_session.write().await;
@@ -3341,6 +3353,7 @@ impl ChatService for LiveChatService {
         let session_store = Arc::clone(&self.session_store);
         let session_metadata = Arc::clone(&self.session_metadata);
         let state_store = self.state_store.clone();
+        let drain_notify = self.session_drain_notify.clone();
         let session_agent_id_clone = session_agent_id.clone();
         let session_key_clone = session_key.clone();
         let accept_language = params
@@ -3833,6 +3846,9 @@ impl ChatService for LiveChatService {
                 }
             }
             mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
+            if let Some(ref n) = drain_notify {
+                n.notify_waiters();
+            }
 
             active_runs.write().await.remove(&run_id_clone);
             let mut runs_by_session = active_runs_by_session.write().await;
@@ -4091,6 +4107,9 @@ impl ChatService for LiveChatService {
             .await
         };
         mark_self_repair_finished(self.state_store.as_deref(), &session_key).await;
+        if let Some(ref n) = self.session_drain_notify {
+            n.notify_waiters();
+        }
 
         // Persist assistant response (even empty ones — needed for LLM history coherence).
         if let Some(ref assistant_output) = result {
@@ -4198,6 +4217,9 @@ impl ChatService for LiveChatService {
 
         if aborted && let Some(ref key) = resolved_session_key {
             mark_self_repair_finished(self.state_store.as_deref(), key).await;
+            if let Some(ref n) = self.session_drain_notify {
+                n.notify_waiters();
+            }
             self.active_thinking_text.write().await.remove(key);
             self.active_tool_calls.write().await.remove(key);
             self.active_reply_medium.write().await.remove(key);

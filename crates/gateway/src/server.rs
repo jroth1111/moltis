@@ -3553,6 +3553,7 @@ pub async fn prepare_gateway(
         )
         .with_tools(Arc::clone(&shared_tool_registry))
         .with_state_store(Arc::clone(&session_state_store))
+        .with_session_drain_notify(Arc::clone(state.session_complete_notify()))
         .with_failover(config.failover.clone());
 
         if let Some(ref hooks) = state.inner.read().await.hook_registry {
@@ -4881,27 +4882,35 @@ pub async fn start_gateway(
 
             // 3. Drain in-flight agent runs (up to 30s).
             if let Some(ref state_store) = shutdown_state.services.session_state_store {
-                let drain_deadline =
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-                loop {
+                let notify = Arc::clone(shutdown_state.session_complete_notify());
+                let drain = async {
+                    loop {
+                        let running = state_store
+                            .list_running_sessions()
+                            .await
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        if running == 0 {
+                            info!("all in-flight agent runs drained");
+                            break;
+                        }
+                        debug!(running, "waiting for in-flight agent runs to complete");
+                        notify.notified().await;
+                    }
+                };
+                if tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+                    .await
+                    .is_err()
+                {
                     let running = state_store
                         .list_running_sessions()
                         .await
                         .map(|v| v.len())
                         .unwrap_or(0);
-                    if running == 0 || tokio::time::Instant::now() >= drain_deadline {
-                        if running > 0 {
-                            warn!(
-                                running,
-                                "shutdown drain deadline exceeded, proceeding with exit"
-                            );
-                        } else {
-                            info!("all in-flight agent runs drained");
-                        }
-                        break;
-                    }
-                    debug!(running, "waiting for in-flight agent runs to complete");
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    warn!(
+                        running,
+                        "shutdown drain deadline exceeded, proceeding with exit"
+                    );
                 }
             }
 
