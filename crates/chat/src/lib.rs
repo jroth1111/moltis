@@ -42,7 +42,7 @@ use {
         store::SessionStore,
     },
     moltis_skills::discover::SkillDiscoverer,
-    moltis_tools::policy::{ToolPolicy, effective_tool_policy},
+    moltis_tools::policy::effective_tool_policy,
 };
 
 pub mod chat_error;
@@ -2449,6 +2449,59 @@ pub struct ActiveToolCall {
     pub started_at: u64,
 }
 
+/// Accumulates path-scoped rules discovered across agent turns.
+///
+/// Deduplicates by source file path so the same `.rules.md` is never appended
+/// twice, and enforces a total character budget.
+struct PathRulesAccumulator {
+    seen: HashSet<PathBuf>,
+    rules_text: String,
+    total_chars: usize,
+}
+
+impl PathRulesAccumulator {
+    const BUDGET: usize = 4_000;
+
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            rules_text: String::new(),
+            total_chars: 0,
+        }
+    }
+
+    fn add(&mut self, rules: &[moltis_projects::ScopedRule]) {
+        for rule in rules {
+            if self.total_chars >= Self::BUDGET {
+                break;
+            }
+            if self.seen.contains(&rule.source_path) {
+                continue;
+            }
+            self.seen.insert(rule.source_path.clone());
+            let remaining = Self::BUDGET.saturating_sub(self.total_chars);
+            let body = if rule.body.len() > remaining {
+                &rule.body[..remaining]
+            } else {
+                &rule.body
+            };
+            if !self.rules_text.is_empty() {
+                self.rules_text.push_str("\n\n");
+            }
+            self.rules_text.push_str(body);
+            self.total_chars += body.len();
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        if self.rules_text.is_empty() {
+            None
+        } else {
+            Some(&self.rules_text)
+        }
+    }
+}
+
 pub struct LiveChatService {
     providers: Arc<RwLock<ProviderRegistry>>,
     model_store: Arc<RwLock<DisabledModelsStore>>,
@@ -2483,6 +2536,8 @@ pub struct LiveChatService {
     /// Per-session flag: whether the PreCompact memory flush has already fired
     /// in the current compaction window.  Reset when a full Compact fires.
     pre_compact_flushed: Arc<RwLock<HashMap<String, bool>>>,
+    /// Per-session path-scoped rules accumulated from tool call file paths.
+    path_rules: Arc<RwLock<HashMap<String, PathRulesAccumulator>>>,
 }
 
 impl LiveChatService {
@@ -2513,6 +2568,7 @@ impl LiveChatService {
             state_store: None,
             failover_config: moltis_config::schema::FailoverConfig::default(),
             pre_compact_flushed: Arc::new(RwLock::new(HashMap::new())),
+            path_rules: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -2647,12 +2703,12 @@ impl LiveChatService {
         "main".to_string()
     }
 
-    /// Resolve the project context prompt section for a session.
+    /// Resolve the project context prompt section and project directory for a session.
     async fn resolve_project_context(
         &self,
         session_key: &str,
         conn_id: Option<&str>,
-    ) -> Option<String> {
+    ) -> (Option<String>, Option<PathBuf>) {
         let project_id = if let Some(cid) = conn_id {
             self.state.active_project_id(cid).await
         } else {
@@ -2668,29 +2724,39 @@ impl LiveChatService {
                 .and_then(|e| e.project_id),
         };
 
-        let pid = project_id?;
-        let val = self
+        let Some(pid) = project_id else {
+            return (None, None);
+        };
+        let Ok(val) = self
             .state
             .project_service()
             .get(serde_json::json!({"id": pid}))
             .await
-            .ok()?;
-        let dir = val.get("directory").and_then(|v| v.as_str())?;
-        let files = match moltis_projects::context::load_context_files(Path::new(dir)) {
+        else {
+            return (None, None);
+        };
+        let Some(dir) = val.get("directory").and_then(|v| v.as_str()) else {
+            return (None, None);
+        };
+        let project_dir = PathBuf::from(dir);
+        let files = match moltis_projects::context::load_context_files(&project_dir) {
             Ok(f) => f,
             Err(e) => {
                 warn!("failed to load project context: {e}");
-                return None;
+                return (None, Some(project_dir));
             },
         };
-        let project: moltis_projects::Project = serde_json::from_value(val.clone()).ok()?;
+        let project: moltis_projects::Project = match serde_json::from_value(val.clone()) {
+            Ok(p) => p,
+            Err(_) => return (None, Some(project_dir)),
+        };
         let worktree_dir = self
             .session_metadata
             .get(session_key)
             .await
             .and_then(|e| e.worktree_branch)
             .and_then(|_| {
-                let wt_path = Path::new(dir).join(".moltis-worktrees").join(session_key);
+                let wt_path = project_dir.join(".moltis-worktrees").join(session_key);
                 if wt_path.exists() {
                     Some(wt_path)
                 } else {
@@ -2702,8 +2768,120 @@ impl LiveChatService {
             context_files: files,
             worktree_dir,
         };
-        Some(ctx.to_prompt_section())
+        (Some(ctx.to_prompt_section()), Some(project_dir))
     }
+
+    /// Accumulate path-scoped rules for file paths seen in recent session history.
+    ///
+    /// Extracts file-like paths from recent tool call arguments, loads applicable
+    /// `.rules.md` files, and returns the accumulated rules text.
+    async fn resolve_scoped_rules(
+        &self,
+        session_key: &str,
+        project_dir: &Path,
+    ) -> Option<String> {
+        // Load recent session history to extract file paths from tool arguments
+        let messages = self.session_store.read_last_n(session_key, 50).await.ok()?;
+        let mut file_paths: Vec<PathBuf> = Vec::new();
+
+        // Scan for tool_use arguments containing file-like paths
+        for msg in &messages {
+            if let Some(content) = msg.get("content") {
+                extract_file_paths_from_content(content, &mut file_paths);
+            }
+        }
+
+        if file_paths.is_empty() {
+            return self
+                .path_rules
+                .read()
+                .await
+                .get(session_key)
+                .and_then(|acc| acc.text().map(String::from));
+        }
+
+        let mut accumulators = self.path_rules.write().await;
+        let accumulator = accumulators
+            .entry(session_key.to_string())
+            .or_insert_with(PathRulesAccumulator::new);
+
+        for path in &file_paths {
+            if let Ok(rules) =
+                moltis_projects::load_path_scoped_rules(project_dir, path)
+            {
+                accumulator.add(&rules);
+            }
+        }
+
+        accumulator.text().map(String::from)
+    }
+}
+
+/// Extract file-like paths from a JSON content value (tool_use arguments).
+fn extract_file_paths_from_content(content: &Value, paths: &mut Vec<PathBuf>) {
+    match content {
+        Value::String(s) => {
+            if looks_like_file_path(s) {
+                paths.push(PathBuf::from(s));
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                // Look for tool_use blocks
+                if let Some("tool_use") = item.get("type").and_then(|v| v.as_str()) {
+                    if let Some(input) = item.get("input") {
+                        extract_file_paths_from_value(input, paths);
+                    }
+                }
+                extract_file_paths_from_content(item, paths);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                extract_file_paths_from_content(v, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract file-like paths from a tool arguments value.
+fn extract_file_paths_from_value(value: &Value, paths: &mut Vec<PathBuf>) {
+    match value {
+        Value::String(s) => {
+            if looks_like_file_path(s) {
+                paths.push(PathBuf::from(s));
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                extract_file_paths_from_value(item, paths);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                extract_file_paths_from_value(v, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Heuristic: does this string look like a filesystem path?
+fn looks_like_file_path(s: &str) -> bool {
+    if s.len() < 2 || s.len() > 500 {
+        return false;
+    }
+    // Must start with /, ./, or ~/
+    if !(s.starts_with('/') || s.starts_with("./") || s.starts_with("~/")) {
+        return false;
+    }
+    // Should not contain control chars or common non-path characters
+    if s.contains('\n') || s.contains('\r') || s.contains('\0') {
+        return false;
+    }
+    // Should have a reasonable file extension or be a directory
+    true
 }
 
 /// RAII guard that ensures self-repair cleanup happens when dropped.
@@ -3439,9 +3617,25 @@ impl ChatService for LiveChatService {
         }
 
         // Resolve project context for this connection's active project.
-        let project_context = self
+        let (project_context, project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+
+        // Accumulate path-scoped rules from recent tool history and fold
+        // into project context so they reach the system prompt without changing
+        // the run_with_tools parameter list.
+        let project_context = if let Some(ref dir) = project_dir {
+            if let Some(rules) = self.resolve_scoped_rules(&session_key, dir).await {
+                let mut ctx = project_context.unwrap_or_default();
+                ctx.push_str("\n\n## Path-Scoped Rules\n\n");
+                ctx.push_str(&rules);
+                Some(ctx)
+            } else {
+                project_context
+            }
+        } else {
+            project_context
+        };
 
         // Dispatch MessageReceived hook (read-only).
         if let Some(ref hooks) = self.hook_registry {
@@ -5274,7 +5468,7 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let project_context = self
+        let (project_context, _project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
 
@@ -5399,7 +5593,7 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let project_context = self
+        let (project_context, _project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
 
