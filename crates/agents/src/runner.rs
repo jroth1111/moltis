@@ -4467,26 +4467,23 @@ mod tests {
         for _ in 0..20 {
             // None → base 2_000; jitter range [1_500, 2_500].
             let v = next_rate_limit_retry_ms(None);
-            assert!(v >= 1_500 && v <= 2_500, "None case out of range: {v}");
+            assert!((1_500..=2_500).contains(&v), "None case out of range: {v}");
 
             // Some(2_000) → base 4_000; jitter range [3_000, 5_000].
             let v = next_rate_limit_retry_ms(Some(2_000));
-            assert!(
-                v >= 3_000 && v <= 5_000,
-                "Some(2_000) case out of range: {v}"
-            );
+            assert!((3_000..=5_000).contains(&v), "Some(2_000) case out of range: {v}");
 
             // Some(30_000) → base clamped to 60_000; jitter range [45_000, 60_000].
             let v = next_rate_limit_retry_ms(Some(30_000));
             assert!(
-                v >= 45_000 && v <= 60_000,
+                (45_000..=60_000).contains(&v),
                 "Some(30_000) case out of range: {v}"
             );
 
             // Some(60_000) → base clamped to 60_000; jitter range [45_000, 60_000].
             let v = next_rate_limit_retry_ms(Some(60_000));
             assert!(
-                v >= 45_000 && v <= 60_000,
+                (45_000..=60_000).contains(&v),
                 "Some(60_000) case out of range: {v}"
             );
         }
