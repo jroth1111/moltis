@@ -35,8 +35,8 @@ use {
     moltis_config::schema::TasksConfig,
     moltis_service_traits::ServiceError,
     moltis_tasks::{
-        AutonomyTier, FailureClass, HandoffContext, IntentStore, ObjectiveSnapshot, RuntimeState,
-        Task, TaskSpec, TaskStore, TerminalState, TransitionError, TransitionEvent,
+        AutonomyTier, HandoffContext, IntentStore, ObjectiveSnapshot, RuntimeState, Task, TaskSpec,
+        TaskStore, TerminalState, TransitionError, TransitionEvent,
     },
     serde_json::Value,
     tracing::{debug, info, warn},
@@ -532,6 +532,10 @@ fn extract_tokens(result: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use {
+        crate::services::ServiceResult,
+        moltis_tasks::FailureClass,
+    };
 
     // ── classify_shifts ───────────────────────────────────────────────────
 
@@ -832,5 +836,194 @@ mod tests {
     fn build_shift_prompt_empty_description_omitted() {
         let p = build_shift_prompt("subject only", "", &None);
         assert!(!p.contains("## Details"));
+    }
+
+    // ── E2E: full dispatch cycle ──────────────────────────────────────────────
+
+    use async_trait::async_trait;
+
+    struct OkChatService;
+
+    #[async_trait]
+    impl crate::services::ChatService for OkChatService {
+        async fn send(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!({ "inputTokens": 100, "outputTokens": 50 }))
+        }
+        async fn abort(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!({}))
+        }
+        async fn cancel_queued(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!({ "cleared": 0 }))
+        }
+        async fn history(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!([]))
+        }
+        async fn inject(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!({}))
+        }
+        async fn clear(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        async fn compact(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!({}))
+        }
+        async fn context(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!({}))
+        }
+        async fn raw_prompt(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!({ "prompt": "" }))
+        }
+        async fn full_context(
+            &self,
+            _p: Value,
+        ) -> ServiceResult {
+            Ok(serde_json::json!([]))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_cycle_claims_pending_intent_and_creates_shift() {
+        let store = make_store().await;
+
+        // Create a pending intent task.
+        let mut spec = TaskSpec::new("E2E intent", "do some work");
+        spec.is_intent = true;
+        let intent = store
+            .create("default", spec, vec![])
+            .await
+            .expect("create intent");
+
+        let intent_store = IntentStore::from_pool(store.pool().clone());
+        let ctx = DispatchContext {
+            task_store: Arc::clone(&store),
+            intent_store,
+            chat: Arc::new(OkChatService),
+            config: TasksConfig::default(),
+        };
+
+        let dispatched = run_cycle(&ctx).await.expect("run_cycle");
+        assert_eq!(dispatched, 1, "one intent should have been dispatched");
+
+        // Intent should be Active now.
+        let updated_intent = store
+            .get("default", &intent.id.0)
+            .await
+            .expect("get intent")
+            .expect("intent exists");
+        assert!(
+            matches!(updated_intent.runtime.state, RuntimeState::Active { .. }),
+            "intent should be Active after dispatch"
+        );
+
+        // A child shift should have been created and completed.
+        let shifts = store
+            .list_shifts_for_intent(&intent.id.0)
+            .await
+            .expect("list shifts");
+        assert_eq!(shifts.len(), 1, "exactly one shift created");
+        assert!(
+            matches!(
+                shifts[0].runtime.state,
+                RuntimeState::Terminal(TerminalState::Completed)
+            ),
+            "shift should be Completed; got {:?}",
+            shifts[0].runtime.state
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_skips_intent_with_active_shift() {
+        let store = make_store().await;
+
+        // Create intent and manually give it an active child shift.
+        let mut spec = TaskSpec::new("double-dispatch test", "");
+        spec.is_intent = true;
+        let intent = store
+            .create("default", spec, vec![])
+            .await
+            .expect("create intent");
+        store
+            .apply_transition(
+                "default",
+                &intent.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim intent");
+
+        let mut shift_spec = TaskSpec::new("shift 1", "");
+        shift_spec.parent_task = Some(intent.id.clone());
+        let shift = store
+            .create("default", shift_spec, vec![])
+            .await
+            .expect("create shift");
+        store
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim shift");
+
+        let intent_store = IntentStore::from_pool(store.pool().clone());
+        let ctx = DispatchContext {
+            task_store: Arc::clone(&store),
+            intent_store,
+            chat: Arc::new(OkChatService),
+            config: TasksConfig::default(),
+        };
+
+        let dispatched = run_cycle(&ctx).await.expect("run_cycle");
+        assert_eq!(dispatched, 0, "should skip intent that already has an active shift");
+    }
+
+    #[tokio::test]
+    async fn run_cycle_empty_store_dispatches_nothing() {
+        let store = make_store().await;
+        let intent_store = IntentStore::from_pool(store.pool().clone());
+        let ctx = DispatchContext {
+            task_store: Arc::clone(&store),
+            intent_store,
+            chat: Arc::new(OkChatService),
+            config: TasksConfig::default(),
+        };
+        let dispatched = run_cycle(&ctx).await.expect("run_cycle");
+        assert_eq!(dispatched, 0);
     }
 }
