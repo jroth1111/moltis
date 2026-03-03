@@ -426,6 +426,7 @@ mod tests {
                     output_tokens: 1,
                     ..Default::default()
                 },
+            ..Default::default()
             })
         }
 
@@ -727,6 +728,7 @@ mod tests {
                     output_tokens: 1,
                     ..Default::default()
                 },
+            ..Default::default()
             })
         }
 

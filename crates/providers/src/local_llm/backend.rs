@@ -537,6 +537,7 @@ pub mod gguf {
                     output_tokens,
                     ..Default::default()
                 },
+                confidence: None,
             })
         }
 
@@ -951,6 +952,7 @@ print(json.dumps({{"text": response, "input_tokens": input_tokens, "output_token
                     output_tokens,
                     ..Default::default()
                 },
+                confidence: None,
             })
         }
 

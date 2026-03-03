@@ -107,6 +107,7 @@ impl LlmProvider for GenaiProvider {
             text,
             tool_calls: vec![],
             usage,
+            confidence: None,
         })
     }
 

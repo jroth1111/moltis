@@ -393,7 +393,7 @@ pub trait LlmProvider: Send + Sync {
 }
 
 /// Response from an LLM completion call.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CompletionResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,

@@ -273,6 +273,7 @@ impl LlmProvider for KimiCodeProvider {
             text,
             tool_calls,
             usage,
+            confidence: None,
         })
     }
 
@@ -558,6 +559,7 @@ mod tests {
                 text,
                 tool_calls,
                 usage,
+                confidence: None,
             })
         }
     }

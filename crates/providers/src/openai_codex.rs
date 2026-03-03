@@ -755,6 +755,7 @@ impl LlmProvider for OpenAiCodexProvider {
                 output_tokens,
                 ..Default::default()
             },
+            confidence: None,
         })
     }
 
