@@ -35,8 +35,8 @@ use {
     moltis_config::schema::TasksConfig,
     moltis_service_traits::ServiceError,
     moltis_tasks::{
-        AutonomyTier, HandoffContext, IntentStore, ObjectiveSnapshot, RuntimeState, TaskSpec,
-        TaskStore, TerminalState, TransitionError, TransitionEvent,
+        AutonomyTier, FailureClass, HandoffContext, IntentStore, ObjectiveSnapshot, RuntimeState,
+        Task, TaskSpec, TaskStore, TerminalState, TransitionError, TransitionEvent,
     },
     serde_json::Value,
     tracing::{debug, info, warn},
@@ -115,7 +115,7 @@ async fn run_cycle(ctx: &DispatchContext) -> Result<usize, anyhow::Error> {
 /// Process a single intent task. Returns `true` if a shift was dispatched.
 async fn process_intent(
     ctx: &DispatchContext,
-    intent: moltis_tasks::Task,
+    intent: Task,
 ) -> Result<bool, anyhow::Error> {
     let list_id = intent.list_id.clone();
     let intent_id = intent.id.0.clone();
@@ -137,13 +137,80 @@ async fn process_intent(
         intent
     };
 
-    // ── 2. Guard: one shift at a time. ────────────────────────────────────────
-    if ctx.task_store.has_non_terminal_child(&intent_id).await? {
-        debug!(intent_id = %intent_id, "intent already has a non-terminal shift — skipping");
-        return Ok(false);
-    }
+    // ── 2. Classify child shifts to decide how to proceed. ────────────────────
+    let shift = match classify_shifts(&ctx.task_store, &intent_id).await? {
+        ShiftClassification::InProgress => {
+            debug!(intent_id = %intent_id, "intent has an active/escalated shift — skipping");
+            return Ok(false);
+        },
+        ShiftClassification::RetryPending => {
+            debug!(
+                intent_id = %intent_id,
+                "intent has a retrying shift — waiting for retry timer"
+            );
+            return Ok(false);
+        },
+        ShiftClassification::RecoverPending(pending_shift) => {
+            // Recovery path: a shift from a previous attempt was promoted back
+            // to Pending by the retry-promotion sweep. Reclaim and re-run it
+            // instead of creating a duplicate.
+            info!(
+                intent_id = %intent_id,
+                shift_id = %pending_shift.id.0,
+                "recovering pending shift from previous attempt"
+            );
+            pending_shift
+        },
+        ShiftClassification::NeedsNew => {
+            // ── 3. Get or create IntentState. ─────────────────────────────────
+            let intent_state = match ctx.intent_store.get(&intent_id).await? {
+                Some(s) => s,
+                None => {
+                    ctx.intent_store
+                        .create(
+                            &intent_id,
+                            &list_id,
+                            ctx.config.intent_token_budget,
+                            Some(ctx.config.intent_spin_threshold),
+                        )
+                        .await?
+                },
+            };
 
-    // ── 3. Get or create IntentState. ─────────────────────────────────────────
+            // ── 4. Budget check before spawning shift. ────────────────────────
+            if intent_state.is_over_budget() {
+                escalate(ctx, &list_id, &intent_id, "Token budget exhausted").await?;
+                return Ok(false);
+            }
+
+            // ── 5. Create new shift task. ──────────────────────────────────────
+            // shift_count+1 gives the next shift number; used for subject only.
+            let next_num = intent_state.shift_count + 1;
+            let mut shift_spec = TaskSpec::new(
+                format!("{}: shift {}", intent.spec.subject, next_num),
+                "Dispatch-managed execution shift.",
+            );
+            shift_spec.parent_task = Some(intent.id.clone());
+            ctx.task_store.create(&list_id, shift_spec, vec![]).await?
+        },
+    };
+
+    // ── 3/5 (continued). Claim the shift (Pending → Active). ─────────────────
+    // Applies whether the shift is freshly-created or recovered from a retry.
+    ctx.task_store
+        .apply_transition(
+            &list_id,
+            &shift.id.0,
+            None,
+            &TransitionEvent::Claim {
+                owner: "dispatch".into(),
+                lease_duration_secs: Some(ctx.config.lease_duration_secs),
+            },
+        )
+        .await?;
+
+    // ── 6. Get current IntentState (create if first shift) and register shift. ─
+    // Read unconditionally: both `NeedsNew` and `RecoverPending` paths need it.
     let intent_state = match ctx.intent_store.get(&intent_id).await? {
         Some(s) => s,
         None => {
@@ -158,34 +225,9 @@ async fn process_intent(
         },
     };
 
-    // ── 4. Budget check before spawning shift. ────────────────────────────────
-    if intent_state.is_over_budget() {
-        escalate(ctx, &list_id, &intent_id, "Token budget exhausted").await?;
-        return Ok(false);
-    }
-
-    // ── 5. Create and claim shift task. ───────────────────────────────────────
+    // shift_count is the number of shifts dispatched so far; +1 is this shift.
     let shift_num = intent_state.shift_count + 1;
-    let mut shift_spec = TaskSpec::new(
-        format!("{}: shift {}", intent.spec.subject, shift_num),
-        "Dispatch-managed execution shift.",
-    );
-    shift_spec.parent_task = Some(intent.id.clone());
 
-    let shift = ctx.task_store.create(&list_id, shift_spec, vec![]).await?;
-    ctx.task_store
-        .apply_transition(
-            &list_id,
-            &shift.id.0,
-            None,
-            &TransitionEvent::Claim {
-                owner: "dispatch".into(),
-                lease_duration_secs: Some(ctx.config.lease_duration_secs),
-            },
-        )
-        .await?;
-
-    // ── 6. Register active shift in IntentState. ──────────────────────────────
     let intent_state = ctx
         .intent_store
         .set_active_shift(&intent_id, &shift.id.0, intent_state.version)
@@ -294,6 +336,64 @@ async fn process_intent(
     }
 
     Ok(true)
+}
+
+// ── Recovery: shift classification ────────────────────────────────────────────
+
+/// Outcome of classifying a set of child shifts for dispatch purposes.
+enum ShiftClassification {
+    /// A shift is currently Active or AwaitingHuman — skip this cycle.
+    InProgress,
+    /// A shift is in Retrying state — wait for the retry timer to fire.
+    RetryPending,
+    /// An existing Pending shift (from a previous retry) is ready to reclaim.
+    RecoverPending(Task),
+    /// No non-terminal children — dispatch loop should create a new shift.
+    NeedsNew,
+}
+
+/// Inspect all child shifts of an intent and decide what the dispatch loop
+/// should do.
+///
+/// Priority:
+/// 1. Any Active / AwaitingHuman → `InProgress` (wait, don't double-dispatch)
+/// 2. Any Retrying → `RetryPending` (retry timer hasn't fired yet)
+/// 3. Any Pending → `RecoverPending` (reclaim and re-run the existing shift)
+/// 4. Otherwise → `NeedsNew` (all children are terminal)
+async fn classify_shifts(
+    store: &Arc<TaskStore>,
+    intent_id: &str,
+) -> Result<ShiftClassification, anyhow::Error> {
+    let children = store.list_shifts_for_intent(intent_id).await?;
+
+    for child in &children {
+        match &child.runtime.state {
+            RuntimeState::Active { .. } | RuntimeState::AwaitingHuman { .. } => {
+                return Ok(ShiftClassification::InProgress);
+            },
+            RuntimeState::Retrying { .. } => {
+                // Keep scanning — an Active shift takes priority over Retrying.
+                continue;
+            },
+            _ => {},
+        }
+    }
+
+    // Second pass: check for Retrying (after confirming no Active/AwaitingHuman).
+    for child in &children {
+        if matches!(child.runtime.state, RuntimeState::Retrying { .. }) {
+            return Ok(ShiftClassification::RetryPending);
+        }
+    }
+
+    // Third pass: look for an existing Pending shift to recover.
+    for child in children {
+        if matches!(child.runtime.state, RuntimeState::Pending) {
+            return Ok(ShiftClassification::RecoverPending(child));
+        }
+    }
+
+    Ok(ShiftClassification::NeedsNew)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -432,6 +532,232 @@ fn extract_tokens(result: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── classify_shifts ───────────────────────────────────────────────────
+
+    async fn make_store() -> Arc<TaskStore> {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("tasks").join("tasks.db");
+        let store = TaskStore::open(&db_path).await.expect("open store");
+        // Keep dir alive by leaking (acceptable in tests).
+        std::mem::forget(dir);
+        Arc::new(store)
+    }
+
+    #[tokio::test]
+    async fn classify_shifts_needs_new_when_no_children() {
+        let store = make_store().await;
+        let result = classify_shifts(&store, "no-such-intent")
+            .await
+            .expect("classify");
+        assert!(matches!(result, ShiftClassification::NeedsNew));
+    }
+
+    #[tokio::test]
+    async fn classify_shifts_in_progress_when_active_child() {
+        let store = make_store().await;
+
+        // Create an intent and an Active shift.
+        let intent_spec = {
+            let mut s = TaskSpec::new("intent", "desc");
+            s.is_intent = true;
+            s
+        };
+        let intent = store
+            .create("default", intent_spec, vec![])
+            .await
+            .expect("create intent");
+        store
+            .apply_transition(
+                "default",
+                &intent.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim intent");
+
+        let mut shift_spec = TaskSpec::new("shift 1", "");
+        shift_spec.parent_task = Some(intent.id.clone());
+        let shift = store
+            .create("default", shift_spec, vec![])
+            .await
+            .expect("create shift");
+        store
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim shift");
+
+        let result = classify_shifts(&store, &intent.id.0)
+            .await
+            .expect("classify");
+        assert!(matches!(result, ShiftClassification::InProgress));
+    }
+
+    #[tokio::test]
+    async fn classify_shifts_recover_pending_after_retry_promotion() {
+        let store = make_store().await;
+
+        // Create an intent.
+        let intent_spec = {
+            let mut s = TaskSpec::new("intent", "");
+            s.is_intent = true;
+            s
+        };
+        let intent = store
+            .create("default", intent_spec, vec![])
+            .await
+            .expect("create intent");
+        store
+            .apply_transition(
+                "default",
+                &intent.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim intent");
+
+        // Create a shift, claim it, then fail it (→ Retrying).
+        let mut shift_spec = TaskSpec::new("shift 1", "");
+        shift_spec.parent_task = Some(intent.id.clone());
+        let shift = store
+            .create("default", shift_spec, vec![])
+            .await
+            .expect("create shift");
+        store
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim shift");
+        store
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Fail {
+                    class: FailureClass::AgentError,
+                    handoff: HandoffContext::default(),
+                    retry_after: None,
+                },
+            )
+            .await
+            .expect("fail shift");
+
+        // While Retrying → dispatch should wait.
+        let result = classify_shifts(&store, &intent.id.0)
+            .await
+            .expect("classify");
+        assert!(
+            matches!(result, ShiftClassification::RetryPending),
+            "expected RetryPending while shift is Retrying"
+        );
+
+        // Promote back to Pending (simulates retry-promotion sweep).
+        store
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::PromoteRetry,
+            )
+            .await
+            .expect("promote retry");
+
+        // Now dispatch should recover the Pending shift.
+        let result = classify_shifts(&store, &intent.id.0)
+            .await
+            .expect("classify after promotion");
+        assert!(
+            matches!(result, ShiftClassification::RecoverPending(_)),
+            "expected RecoverPending after promotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_shifts_needs_new_when_all_terminal() {
+        let store = make_store().await;
+
+        let intent_spec = {
+            let mut s = TaskSpec::new("intent", "");
+            s.is_intent = true;
+            s
+        };
+        let intent = store
+            .create("default", intent_spec, vec![])
+            .await
+            .expect("create intent");
+        store
+            .apply_transition(
+                "default",
+                &intent.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim intent");
+
+        // Create and complete a shift.
+        let mut shift_spec = TaskSpec::new("shift 1", "");
+        shift_spec.parent_task = Some(intent.id.clone());
+        let shift = store
+            .create("default", shift_spec, vec![])
+            .await
+            .expect("create shift");
+        store
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "dispatch".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim shift");
+        store
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Complete,
+            )
+            .await
+            .expect("complete shift");
+
+        let result = classify_shifts(&store, &intent.id.0)
+            .await
+            .expect("classify");
+        assert!(
+            matches!(result, ShiftClassification::NeedsNew),
+            "expected NeedsNew when all shifts are terminal"
+        );
+    }
 
     // ── denied_tools_for_tier ──────────────────────────────────────────────
 
