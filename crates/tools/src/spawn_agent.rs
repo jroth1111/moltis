@@ -956,4 +956,81 @@ mod tests {
             updated.runtime.state
         );
     }
+
+    /// Verify that `with_tasks_config` is wired correctly: the initial `RenewLease`
+    /// fires before the agent loop (visible in the event log) and the task ends
+    /// Completed regardless of a custom lease config.
+    #[tokio::test]
+    async fn test_tasks_config_initial_lease_renew_fires() {
+        use moltis_config::schema::TasksConfig;
+        use moltis_tasks::{RuntimeState, TaskSpec, TaskStore, TransitionEvent};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("tasks.db");
+        let store = Arc::new(TaskStore::open(&db_path).await.unwrap());
+
+        // Create a task and claim it (no lease, so lease_expires_at starts as None).
+        let spec = TaskSpec::new("lease-test", "");
+        let task = store.create("lst", spec, vec![]).await.unwrap();
+        store
+            .apply_transition(
+                "lst",
+                &task.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider {
+            response: "done".into(),
+            model_id: "mock".into(),
+        });
+        let custom_cfg = TasksConfig {
+            lease_duration_secs: 7200,
+            lease_heartbeat_interval_secs: 300,
+            ..TasksConfig::default()
+        };
+        let spawn_tool = SpawnAgentTool::new(
+            make_empty_provider_registry(),
+            provider,
+            Arc::new(ToolRegistry::new()),
+        )
+        .with_task_store(Arc::clone(&store))
+        .with_tasks_config(custom_cfg);
+
+        spawn_tool
+            .execute(serde_json::json!({
+                "task": "do work",
+                "task_id": task.id.0,
+                "list_id": "lst",
+            }))
+            .await
+            .unwrap();
+
+        // Task must be terminal after a successful run.
+        let final_task = store.get("lst", &task.id.0).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                final_task.runtime.state,
+                RuntimeState::Terminal(moltis_tasks::TerminalState::Completed)
+            ),
+            "expected Completed, got {:?}",
+            final_task.runtime.state
+        );
+
+        // The event log must contain a RenewLease entry — proof the pre-loop
+        // lease set fired with the custom config.
+        let history = store
+            .event_log()
+            .history("lst", &task.id.0)
+            .await
+            .unwrap();
+        let has_renew = history.iter().any(|e| e.event_type == "RenewLease");
+        assert!(has_renew, "expected a RenewLease event in log; got: {history:?}");
+    }
 }
