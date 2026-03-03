@@ -1,10 +1,11 @@
-//! Typed parameter structs for complex session RPC methods.
+//! Typed parameter structs for session RPC methods.
 //!
-//! Only methods with non-trivial parameter shapes (multi-field with defaults,
-//! null-vs-absent semantics, precedence logic) get dedicated structs here.
-//! Simple key-only handlers use inline `.get(...)` directly.
+//! Complex handlers keep parameter semantics here (defaults, null-vs-absent,
+//! precedence logic, and legacy aliases). Session methods parse via
+//! `parse_params(...)` and avoid ad-hoc JSON traversal.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::services::ServiceError;
 
@@ -44,6 +45,158 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+/// Lossy optional string: non-string values are treated as absent.
+fn optional_string_lossy<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| value.as_str().map(str::to_owned)))
+}
+
+/// Lossy optional bool: non-bool values are treated as absent.
+fn optional_bool_lossy<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| value.as_bool()))
+}
+
+/// Lossy optional u64: non-u64 values are treated as absent.
+fn optional_u64_lossy<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| value.as_u64()))
+}
+
+/// Params for handlers that only need a session `key`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionKeyParams {
+    pub key: String,
+}
+
+/// Params for `session.preview`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewParams {
+    pub key: String,
+    #[serde(default, deserialize_with = "optional_u64_lossy")]
+    pub limit: Option<u64>,
+}
+
+impl PreviewParams {
+    #[must_use]
+    pub fn limit_or_default(&self) -> usize {
+        self.limit.unwrap_or(5) as usize
+    }
+}
+
+/// Params for `session.resolve`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveParams {
+    pub key: String,
+    #[serde(
+        default,
+        alias = "inherit_agent_from",
+        deserialize_with = "optional_string_lossy"
+    )]
+    pub inherit_agent_from: Option<String>,
+}
+
+impl ResolveParams {
+    #[must_use]
+    pub fn inherit_from_key(&self) -> Option<&str> {
+        self.inherit_agent_from
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+}
+
+/// Params for `session.share_create`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareCreateParams {
+    pub key: String,
+    #[serde(default, deserialize_with = "optional_string_lossy")]
+    pub visibility: Option<String>,
+}
+
+/// Params for `session.share_revoke`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRevokeParams {
+    pub id: String,
+}
+
+/// Params for `session.delete`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteParams {
+    pub key: String,
+    #[serde(default, deserialize_with = "optional_bool_lossy")]
+    pub force: Option<bool>,
+}
+
+impl DeleteParams {
+    #[must_use]
+    pub fn force_or_default(&self) -> bool {
+        self.force.unwrap_or(false)
+    }
+}
+
+/// Params for `session.fork`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkParams {
+    pub key: String,
+    #[serde(default, deserialize_with = "optional_string_lossy")]
+    pub label: Option<String>,
+    #[serde(
+        default,
+        alias = "fork_point",
+        deserialize_with = "optional_u64_lossy"
+    )]
+    pub fork_point: Option<u64>,
+}
+
+/// Params for `session.search`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchParams {
+    #[serde(default, deserialize_with = "optional_string_lossy")]
+    pub query: Option<String>,
+    #[serde(default, deserialize_with = "optional_u64_lossy")]
+    pub limit: Option<u64>,
+}
+
+impl SearchParams {
+    #[must_use]
+    pub fn normalized_query(&self) -> &str {
+        self.query.as_deref().unwrap_or("").trim()
+    }
+
+    #[must_use]
+    pub fn limit_or_default(&self) -> usize {
+        self.limit.unwrap_or(20) as usize
+    }
+}
+
+/// Params for `session.run_detail`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDetailParams {
+    #[serde(alias = "session_key")]
+    pub session_key: String,
+    #[serde(alias = "run_id")]
+    pub run_id: String,
 }
 
 /// Params for `session.voice_generate`.
@@ -242,5 +395,72 @@ mod tests {
         let v = json!({"not_key": true});
         let err = parse_params::<PatchParams>(v).unwrap_err();
         assert!(err.to_string().contains("key"));
+    }
+
+    #[test]
+    fn preview_params_limit_defaults_and_invalid_limit_is_ignored() {
+        let missing: PreviewParams = serde_json::from_value(json!({ "key": "main" })).unwrap();
+        assert_eq!(missing.limit_or_default(), 5);
+
+        let invalid: PreviewParams =
+            serde_json::from_value(json!({ "key": "main", "limit": "bad" })).unwrap();
+        assert_eq!(invalid.limit, None);
+        assert_eq!(invalid.limit_or_default(), 5);
+    }
+
+    #[test]
+    fn resolve_params_accepts_aliases_and_filters_blank_inherit() {
+        let legacy: ResolveParams = serde_json::from_value(json!({
+            "key": "main",
+            "inherit_agent_from": "parent-1",
+        }))
+        .unwrap();
+        assert_eq!(legacy.inherit_from_key(), Some("parent-1"));
+
+        let camel: ResolveParams = serde_json::from_value(json!({
+            "key": "main",
+            "inheritAgentFrom": "   ",
+        }))
+        .unwrap();
+        assert_eq!(camel.inherit_from_key(), None);
+    }
+
+    #[test]
+    fn search_params_invalid_types_fall_back_to_defaults() {
+        let p: SearchParams =
+            serde_json::from_value(json!({ "query": 123, "limit": "many" })).unwrap();
+        assert_eq!(p.normalized_query(), "");
+        assert_eq!(p.limit_or_default(), 20);
+    }
+
+    #[test]
+    fn delete_params_force_defaults_false_on_invalid_type() {
+        let p: DeleteParams =
+            serde_json::from_value(json!({ "key": "main", "force": "true" })).unwrap();
+        assert_eq!(p.force, None);
+        assert!(!p.force_or_default());
+    }
+
+    #[test]
+    fn fork_params_accepts_legacy_fork_point_alias() {
+        let p: ForkParams = serde_json::from_value(json!({
+            "key": "main",
+            "label": 1234,
+            "fork_point": 9,
+        }))
+        .unwrap();
+        assert_eq!(p.label, None);
+        assert_eq!(p.fork_point, Some(9));
+    }
+
+    #[test]
+    fn run_detail_params_accepts_legacy_snake_case_fields() {
+        let p: RunDetailParams = serde_json::from_value(json!({
+            "session_key": "main",
+            "run_id": "run-abc",
+        }))
+        .unwrap();
+        assert_eq!(p.session_key, "main");
+        assert_eq!(p.run_id, "run-abc");
     }
 }
