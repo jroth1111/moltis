@@ -43,7 +43,7 @@ pub struct ObjectiveSnapshot {
     /// Child tasks in Completed state.
     #[serde(default)]
     pub child_completed: u32,
-    /// Child tasks in terminal Failed/Cancelled state.
+    /// Child tasks in terminal Failed/Canceled state.
     #[serde(default)]
     pub child_failed: u32,
 }
@@ -175,10 +175,10 @@ impl IntentStore {
         row.map(Self::row_to_state).transpose()
     }
 
-    /// Set the active shift and increment shift_count with CAS.
+    /// Set the active shift with CAS.
     ///
     /// Called just before dispatching a new shift — atomically records which
-    /// shift is running and bumps the counter.
+    /// shift is running if and only if no shift is already active.
     pub async fn set_active_shift(
         &self,
         intent_id: &str,
@@ -191,9 +191,10 @@ impl IntentStore {
 
         let rows = sqlx::query(
             "UPDATE intent_state \
-             SET active_shift_id = ?, shift_count = shift_count + 1, \
+             SET active_shift_id = ?, \
                  version = ?, updated_at = ? \
-             WHERE intent_id = ? AND version = ?",
+             WHERE intent_id = ? AND version = ? \
+               AND active_shift_id IS NULL",
         )
         .bind(shift_id)
         .bind(nv)
@@ -217,9 +218,52 @@ impl IntentStore {
             .ok_or_else(|| TransitionError::NotFound(intent_id.to_string()))
     }
 
+    /// Clear an active shift slot with CAS.
+    ///
+    /// Used when the dispatcher reserved the slot but failed before a shift
+    /// could be executed (for example, task claim race). This method does not
+    /// mutate counters or snapshots.
+    pub async fn clear_active_shift(
+        &self,
+        intent_id: &str,
+        shift_id: &str,
+        expected_version: u64,
+    ) -> Result<IntentState, TransitionError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ev = expected_version as i64;
+        let nv = ev + 1;
+
+        let rows = sqlx::query(
+            "UPDATE intent_state \
+             SET active_shift_id = NULL, version = ?, updated_at = ? \
+             WHERE intent_id = ? AND version = ? AND active_shift_id = ?",
+        )
+        .bind(nv)
+        .bind(now)
+        .bind(intent_id)
+        .bind(ev)
+        .bind(shift_id)
+        .execute(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?
+        .rows_affected();
+
+        if rows == 0 {
+            return Err(TransitionError::VersionConflict {
+                expected: expected_version,
+                actual: expected_version + 1,
+            });
+        }
+
+        self.get(intent_id)
+            .await?
+            .ok_or_else(|| TransitionError::NotFound(intent_id.to_string()))
+    }
+
     /// Finalize a completed shift within an existing transaction.
     ///
     /// - Clears `active_shift_id`.
+    /// - Increments `shift_count`.
     /// - Adds `tokens_delta` to `tokens_used`.
     /// - Compares `new_snapshot` to the stored one; if identical, increments
     ///   `spin_count`, otherwise resets it to 0.
@@ -230,6 +274,7 @@ impl IntentStore {
     pub async fn finalize_shift_tx(
         tx: &mut Transaction<'_, Sqlite>,
         intent_id: &str,
+        shift_id: &str,
         new_snapshot: ObjectiveSnapshot,
         tokens_delta: u64,
         expected_version: u64,
@@ -244,6 +289,16 @@ impl IntentStore {
                 expected: expected_version,
                 actual: current.version,
             });
+        }
+        if current
+            .active_shift_id
+            .as_ref()
+            .map(|id| id.0.as_str())
+            != Some(shift_id)
+        {
+            return Err(TransitionError::Other(
+                "intent active shift does not match finalized shift".to_string(),
+            ));
         }
 
         // Determine spin delta.
@@ -263,7 +318,8 @@ impl IntentStore {
 
         let rows = sqlx::query(
             "UPDATE intent_state \
-             SET active_shift_id = NULL, tokens_used = ?, snapshot_json = ?, \
+             SET active_shift_id = NULL, shift_count = shift_count + 1, \
+                 tokens_used = ?, snapshot_json = ?, \
                  spin_count = ?, version = ?, updated_at = ? \
              WHERE intent_id = ? AND version = ?",
         )
@@ -291,7 +347,7 @@ impl IntentStore {
             intent_id: current.intent_id,
             list_id: current.list_id,
             active_shift_id: None,
-            shift_count: current.shift_count,
+            shift_count: current.shift_count.saturating_add(1),
             tokens_used: current.tokens_used.saturating_add(tokens_delta),
             tokens_budget: current.tokens_budget,
             snapshot: new_snapshot,
@@ -318,12 +374,12 @@ impl IntentStore {
         task_store: &crate::store::TaskStore,
     ) -> Result<usize, TransitionError> {
         // One JOIN query: find intent_state rows where active_shift_id points at
-        // a task that is NOT Active/AwaitingHuman.
+        // a task that is NOT Active.
         let rows = sqlx::query(
             "SELECT i.intent_id, i.version \
              FROM intent_state i \
              LEFT JOIN tasks t ON t.id = i.active_shift_id \
-                              AND t.state_name IN ('Active', 'AwaitingHuman') \
+                              AND t.state_name = 'Active' \
              WHERE i.active_shift_id IS NOT NULL \
                AND t.id IS NULL",
         )
@@ -392,7 +448,7 @@ impl IntentStore {
                AND NOT EXISTS ( \
                    SELECT 1 FROM tasks c \
                    WHERE c.parent_task = t.id \
-                     AND c.state_name NOT IN ('Completed', 'Failed', 'Cancelled') \
+                     AND c.state_name NOT IN ('Completed', 'Failed', 'Canceled') \
                )",
         )
         .bind(cutoff)
@@ -733,7 +789,7 @@ mod tests {
     // ── set_active_shift ──────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn set_active_shift_increments_count() {
+    async fn set_active_shift_sets_slot_without_incrementing_count() {
         let (_ts, is, _dir) = test_stores().await;
         let id = TaskId::new();
         let shift_id = TaskId::new();
@@ -745,7 +801,7 @@ mod tests {
             .expect("set_active_shift");
 
         assert_eq!(updated.active_shift_id, Some(shift_id.clone()));
-        assert_eq!(updated.shift_count, 1);
+        assert_eq!(updated.shift_count, 0);
         assert_eq!(updated.version, 1);
     }
 
@@ -762,6 +818,49 @@ mod tests {
             matches!(result, Err(TransitionError::VersionConflict { .. })),
             "expected VersionConflict"
         );
+    }
+
+    #[tokio::test]
+    async fn set_active_shift_rejects_when_slot_already_occupied() {
+        let (_ts, is, _dir) = test_stores().await;
+        let id = TaskId::new();
+        let shift_a = TaskId::new();
+        let shift_b = TaskId::new();
+
+        intent_store_create(&is, &id).await;
+        let updated = is
+            .set_active_shift(&id.0, &shift_a.0, 0)
+            .await
+            .expect("set_active_shift A");
+
+        let result = is
+            .set_active_shift(&id.0, &shift_b.0, updated.version)
+            .await;
+        assert!(
+            matches!(result, Err(TransitionError::VersionConflict { .. })),
+            "expected conflict when slot is already occupied"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_active_shift_releases_reserved_slot() {
+        let (_ts, is, _dir) = test_stores().await;
+        let id = TaskId::new();
+        let shift = TaskId::new();
+
+        intent_store_create(&is, &id).await;
+        let reserved = is
+            .set_active_shift(&id.0, &shift.0, 0)
+            .await
+            .expect("reserve slot");
+        assert_eq!(reserved.active_shift_id, Some(shift.clone()));
+
+        let cleared = is
+            .clear_active_shift(&id.0, &shift.0, reserved.version)
+            .await
+            .expect("clear slot");
+        assert!(cleared.active_shift_id.is_none());
+        assert_eq!(cleared.version, reserved.version + 1);
     }
 
     // ── finalize_shift_tx ─────────────────────────────────────────────────────
@@ -786,6 +885,7 @@ mod tests {
         let (updated, is_spinning) = IntentStore::finalize_shift_tx(
             &mut tx,
             &id.0,
+            &shift_id.0,
             new_snapshot.clone(),
             1500,
             1, // version after set_active_shift
@@ -796,6 +896,7 @@ mod tests {
 
         assert!(!is_spinning);
         assert!(updated.active_shift_id.is_none());
+        assert_eq!(updated.shift_count, 1);
         assert_eq!(updated.tokens_used, 1500);
         assert_eq!(updated.spin_count, 0); // snapshot changed from default
         assert_eq!(updated.version, 2);
@@ -815,7 +916,14 @@ mod tests {
         // Finalize with same (default) snapshot — spin.
         let mut tx = task_store.begin_tx().await.expect("begin");
         let (s1, spinning) =
-            IntentStore::finalize_shift_tx(&mut tx, &id.0, ObjectiveSnapshot::default(), 0, 1)
+            IntentStore::finalize_shift_tx(
+                &mut tx,
+                &id.0,
+                "shift-1",
+                ObjectiveSnapshot::default(),
+                0,
+                1,
+            )
                 .await
                 .expect("finalize 1");
         tx.commit().await.expect("commit 1");
@@ -830,7 +938,14 @@ mod tests {
 
         let mut tx = task_store.begin_tx().await.expect("begin 2");
         let (s2, spinning) =
-            IntentStore::finalize_shift_tx(&mut tx, &id.0, ObjectiveSnapshot::default(), 0, 3)
+            IntentStore::finalize_shift_tx(
+                &mut tx,
+                &id.0,
+                "shift-2",
+                ObjectiveSnapshot::default(),
+                0,
+                3,
+            )
                 .await
                 .expect("finalize 2");
         tx.commit().await.expect("commit 2");
@@ -845,7 +960,14 @@ mod tests {
 
         let mut tx = task_store.begin_tx().await.expect("begin 3");
         let (s3, spinning) =
-            IntentStore::finalize_shift_tx(&mut tx, &id.0, ObjectiveSnapshot::default(), 0, 5)
+            IntentStore::finalize_shift_tx(
+                &mut tx,
+                &id.0,
+                "shift-3",
+                ObjectiveSnapshot::default(),
+                0,
+                5,
+            )
                 .await
                 .expect("finalize 3");
         tx.commit().await.expect("commit 3");
@@ -866,7 +988,14 @@ mod tests {
         is.set_active_shift(&id.0, "s1", 0).await.expect("set s1"); // version=1
         let mut tx = task_store.begin_tx().await.expect("tx1");
         let (s1, _) =
-            IntentStore::finalize_shift_tx(&mut tx, &id.0, ObjectiveSnapshot::default(), 0, 1)
+            IntentStore::finalize_shift_tx(
+                &mut tx,
+                &id.0,
+                "s1",
+                ObjectiveSnapshot::default(),
+                0,
+                1,
+            )
                 .await
                 .expect("finalize s1"); // version=2
         tx.commit().await.expect("commit1");
@@ -876,7 +1005,14 @@ mod tests {
         is.set_active_shift(&id.0, "s2", 2).await.expect("set s2"); // version=3
         let mut tx = task_store.begin_tx().await.expect("tx2");
         let (s2, _) =
-            IntentStore::finalize_shift_tx(&mut tx, &id.0, ObjectiveSnapshot::default(), 0, 3)
+            IntentStore::finalize_shift_tx(
+                &mut tx,
+                &id.0,
+                "s2",
+                ObjectiveSnapshot::default(),
+                0,
+                3,
+            )
                 .await
                 .expect("finalize s2"); // version=4
         tx.commit().await.expect("commit2");
@@ -889,9 +1025,10 @@ mod tests {
             ..Default::default()
         };
         let mut tx = task_store.begin_tx().await.expect("tx3");
-        let (s3, spinning) = IntentStore::finalize_shift_tx(&mut tx, &id.0, progress, 100, 5)
-            .await
-            .expect("finalize s3"); // version=6
+        let (s3, spinning) =
+            IntentStore::finalize_shift_tx(&mut tx, &id.0, "s3", progress, 100, 5)
+                .await
+                .expect("finalize s3"); // version=6
         tx.commit().await.expect("commit3");
 
         assert!(!spinning, "progress should not trigger spin escalation");
@@ -910,6 +1047,7 @@ mod tests {
         let result = IntentStore::finalize_shift_tx(
             &mut tx,
             &id.0,
+            "s0",
             ObjectiveSnapshot::default(),
             0,
             99, // stale

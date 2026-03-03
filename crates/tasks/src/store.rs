@@ -480,7 +480,7 @@ impl TaskStore {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM tasks \
              WHERE parent_task = ? \
-             AND state_name NOT IN ('Completed', 'Failed', 'Cancelled')",
+             AND state_name NOT IN ('Completed', 'Failed', 'Canceled')",
         )
         .bind(intent_id)
         .fetch_one(&self.pool)
