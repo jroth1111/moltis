@@ -398,6 +398,43 @@ pub struct CompletionResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+    /// Confidence metrics for the response, if available from the provider.
+    pub confidence: Option<ConfidenceMetrics>,
+}
+
+/// Confidence metrics for an LLM response.
+///
+/// Provides uncertainty quantification to help identify when the model
+/// may be uncertain about its output. Lower confidence scores may indicate
+/// a need for clarification or human review.
+#[derive(Debug, Clone, Default)]
+pub struct ConfidenceMetrics {
+    /// Overall confidence score in the range [0.0, 1.0].
+    /// Higher values indicate more confidence.
+    pub score: Option<f64>,
+    /// Log probabilities of generated tokens, if available.
+    pub logprobs: Option<Vec<f64>>,
+    /// Reason for low confidence, if known.
+    pub uncertainty_reason: Option<String>,
+}
+
+impl ConfidenceMetrics {
+    /// Threshold below which the model should be asked to clarify.
+    pub const RETRY_THRESHOLD: f64 = 0.4;
+    /// Threshold below which the response should be escalated to human.
+    pub const ESCALATE_THRESHOLD: f64 = 0.6;
+
+    /// Check if confidence is below the retry threshold.
+    pub fn should_retry(&self) -> bool {
+        self.score.map_or(false, |s| s < Self::RETRY_THRESHOLD)
+    }
+
+    /// Check if confidence is below the escalate threshold (but above retry).
+    pub fn should_escalate(&self) -> bool {
+        self.score.map_or(false, |s| {
+            s >= Self::RETRY_THRESHOLD && s < Self::ESCALATE_THRESHOLD
+        })
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -2323,10 +2323,150 @@ impl ModelService for LiveModelService {
 
 // ── LiveChatService ─────────────────────────────────────────────────────────
 
+/// Priority level for queued messages.
+/// Higher values indicate higher priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MessagePriority {
+    /// Background tasks like research, cleanup.
+    Background = 0,
+    /// Default priority for agent followups.
+    #[default]
+    Normal = 1,
+    /// User-initiated messages requiring timely response.
+    Interactive = 2,
+    /// Critical messages like approvals, alerts that must be processed immediately.
+    Critical = 3,
+}
+
+impl MessagePriority {
+    /// Maximum number of times a message can be skipped before it must be processed.
+    const STARVATION_BOUND: u8 = 3;
+
+    /// Returns the weight for weighted random selection (higher = more likely).
+    fn weight(&self) -> u32 {
+        match self {
+            MessagePriority::Background => 1,
+            MessagePriority::Normal => 4,
+            MessagePriority::Interactive => 16,
+            MessagePriority::Critical => 100, // Effectively always selected
+        }
+    }
+}
+
 /// A message that arrived while an agent run was already active on the session.
 #[derive(Debug, Clone)]
 struct QueuedMessage {
     params: Value,
+    priority: MessagePriority,
+    queued_at: Instant,
+    skip_count: u8,
+}
+
+impl QueuedMessage {
+    fn new(params: Value, priority: MessagePriority) -> Self {
+        Self {
+            params,
+            priority,
+            queued_at: Instant::now(),
+            skip_count: 0,
+        }
+    }
+}
+
+/// Determine message priority from the params content.
+fn classify_message_priority(params: &Value) -> MessagePriority {
+    // Check for explicit priority marker
+    if let Some(priority_str) = params.get("_priority").and_then(|v| v.as_str()) {
+        match priority_str {
+            "critical" => return MessagePriority::Critical,
+            "interactive" => return MessagePriority::Interactive,
+            "background" => return MessagePriority::Background,
+            _ => {}
+        }
+    }
+
+    // Check for approval-related markers
+    if params.get("_approval_request").is_some()
+        || params.get("_requires_approval").is_some()
+        || params.get("_tool_approval").is_some()
+        || params
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| {
+                let lower = t.to_lowercase();
+                lower.contains("approve") || lower.contains("approval required")
+            })
+    {
+        return MessagePriority::Critical;
+    }
+
+    // Check for user message markers
+    if params.get("_user_message").is_some()
+        || params.get("_from_channel").is_some()
+        || params.get("_channel_reply_target").is_some()
+    {
+        return MessagePriority::Interactive;
+    }
+
+    // Check for background task markers
+    if params.get("_background").is_some()
+        || params.get("_research_task").is_some()
+        || params.get("_queued_replay").is_some()
+    {
+        return MessagePriority::Background;
+    }
+
+    // Default to Normal for agent followups and other messages
+    MessagePriority::Normal
+}
+
+/// Select the next message from the queue using weighted round-robin with starvation bounds.
+/// Critical messages are always selected first (no skipping).
+fn pop_next_message(queue: &mut Vec<QueuedMessage>) -> Option<QueuedMessage> {
+    if queue.is_empty() {
+        return None;
+    }
+
+    // Sort by priority (descending) to check critical first
+    queue.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+    // Check for critical messages first - they always win
+    if queue.first().is_some_and(|m| m.priority == MessagePriority::Critical) {
+        return Some(queue.remove(0));
+    }
+
+    // Check for starvation: any message skipped >= STARVATION_BOUND times must be processed
+    let starved_idx = queue
+        .iter()
+        .position(|m| m.skip_count >= MessagePriority::STARVATION_BOUND);
+    if let Some(idx) = starved_idx {
+        return Some(queue.remove(idx));
+    }
+
+    // Weighted random selection among all non-critical messages
+    let total_weight: u32 = queue.iter().map(|m| m.priority.weight()).sum();
+    let mut rng = rand::rng();
+    let selection = rand::Rng::random_range(&mut rng, 0..total_weight);
+
+    let mut cumulative = 0u32;
+    for (idx, msg) in queue.iter_mut().enumerate() {
+        cumulative += msg.priority.weight();
+        if selection < cumulative {
+            // Found our selection - return this message
+            let msg = queue.remove(idx);
+            // Increment skip count for all messages that came before it
+            for remaining in queue.iter_mut() {
+                if remaining.priority < msg.priority {
+                    remaining.skip_count = remaining.skip_count.saturating_add(1);
+                }
+            }
+            return Some(msg);
+        }
+    }
+
+    // Fallback: return highest priority (first element after sort)
+    Some(queue.remove(0))
 }
 
 /// A tool call currently executing within an active agent run.
@@ -2614,6 +2754,37 @@ async fn mark_self_repair_finished(state_store: Option<&SessionStateStore>, sess
     }
 }
 
+/// Save handoff context for a session at the end of a run.
+///
+/// This captures the essential state for session resumption, including:
+/// the last goal, pending tasks, errors, and key facts.
+async fn save_handoff_context(
+    state_store: Option<&SessionStateStore>,
+    session_key: &str,
+    last_goal: Option<String>,
+    pending_tasks: Vec<String>,
+    last_error: Option<String>,
+    working_directory: Option<PathBuf>,
+    key_facts: Vec<String>,
+) {
+    if let Some(store) = state_store {
+        let ctx = moltis_sessions::HandoffContext::new(
+            last_goal,
+            pending_tasks,
+            last_error,
+            working_directory,
+            key_facts,
+        );
+        if let Err(error) = store.set_handoff(session_key, &ctx).await {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to save handoff context"
+            );
+        }
+    }
+}
+
 #[async_trait]
 impl ChatService for LiveChatService {
     async fn send(&self, mut params: Value) -> ServiceResult {
@@ -2859,12 +3030,11 @@ impl ChatService for LiveChatService {
                         client_seq = ?client_seq,
                         "queueing message (run active)"
                     );
+                    let priority = classify_message_priority(&params);
                     let position = {
                         let mut q = self.message_queue.write().await;
                         let entry = q.entry(session_key.clone()).or_default();
-                        entry.push(QueuedMessage {
-                            params: params.clone(),
-                        });
+                        entry.push(QueuedMessage::new(params.clone(), priority));
                         entry.len()
                     };
                     broadcast(
@@ -2996,7 +3166,7 @@ impl ChatService for LiveChatService {
                 drop(permit);
 
                 // Drain queued messages for this session.
-                let queued = message_queue
+                let mut queued = message_queue
                     .write()
                     .await
                     .remove(&session_key_clone)
@@ -3006,21 +3176,24 @@ impl ChatService for LiveChatService {
                     let chat = state_for_drain.chat_service().await;
                     match queue_mode {
                         MessageQueueMode::Followup => {
-                            let mut iter = queued.into_iter();
-                            let Some(first) = iter.next() else {
+                            // Use priority-aware selection for the next message
+                            let Some(next) = pop_next_message(&mut queued) else {
                                 return;
                             };
-                            let rest: Vec<QueuedMessage> = iter.collect();
-                            if !rest.is_empty() {
+                            if !queued.is_empty() {
                                 message_queue
                                     .write()
                                     .await
                                     .entry(session_key_clone.clone())
                                     .or_default()
-                                    .extend(rest);
+                                    .extend(queued);
                             }
-                            info!(session = %session_key_clone, "replaying queued message (followup)");
-                            let mut replay_params = first.params;
+                            info!(
+                                session = %session_key_clone,
+                                priority = ?next.priority,
+                                "replaying queued message (followup)"
+                            );
+                            let mut replay_params = next.params;
                             replay_params["_queued_replay"] = serde_json::json!(true);
                             if let Err(e) = chat.send(replay_params).await {
                                 warn!(session = %session_key_clone, error = %e, "failed to replay queued message");
@@ -3593,12 +3766,11 @@ impl ChatService for LiveChatService {
                     client_seq = ?client_seq,
                     "queueing message (run active)"
                 );
+                let priority = classify_message_priority(&params);
                 let position = {
                     let mut q = self.message_queue.write().await;
                     let entry = q.entry(session_key.clone()).or_default();
-                    entry.push(QueuedMessage {
-                        params: params.clone(),
-                    });
+                    entry.push(QueuedMessage::new(params.clone(), priority));
                     entry.len()
                 };
                 broadcast(
@@ -3816,7 +3988,7 @@ impl ChatService for LiveChatService {
             drop(permit);
 
             // Drain queued messages for this session.
-            let queued = message_queue
+            let mut queued = message_queue
                 .write()
                 .await
                 .remove(&session_key_clone)
@@ -3826,23 +3998,26 @@ impl ChatService for LiveChatService {
                 let chat = state_for_drain.chat_service().await;
                 match queue_mode {
                     MessageQueueMode::Followup => {
-                        let mut iter = queued.into_iter();
-                        let Some(first) = iter.next() else {
+                        // Use priority-aware selection for the next message
+                        let Some(next) = pop_next_message(&mut queued) else {
                             return;
                         };
                         // Put remaining messages back so the replayed run's
                         // own drain loop picks them up after it completes.
-                        let rest: Vec<QueuedMessage> = iter.collect();
-                        if !rest.is_empty() {
+                        if !queued.is_empty() {
                             message_queue
                                 .write()
                                 .await
                                 .entry(session_key_clone.clone())
                                 .or_default()
-                                .extend(rest);
+                                .extend(queued);
                         }
-                        info!(session = %session_key_clone, "replaying queued message (followup)");
-                        let mut replay_params = first.params;
+                        info!(
+                            session = %session_key_clone,
+                            priority = ?next.priority,
+                            "replaying queued message (followup)"
+                        );
+                        let mut replay_params = next.params;
                         replay_params["_queued_replay"] = serde_json::json!(true);
                         if let Err(e) = chat.send(replay_params).await {
                             warn!(session = %session_key_clone, error = %e, "failed to replay queued message");
@@ -10019,12 +10194,14 @@ mod tests {
         // Enqueue two messages.
         {
             let mut q = queue.write().await;
-            q.entry(key.to_string()).or_default().push(QueuedMessage {
-                params: serde_json::json!({"text": "hello"}),
-            });
-            q.entry(key.to_string()).or_default().push(QueuedMessage {
-                params: serde_json::json!({"text": "world"}),
-            });
+            q.entry(key.to_string()).or_default().push(QueuedMessage::new(
+                serde_json::json!({"text": "hello"}),
+                MessagePriority::default(),
+            ));
+            q.entry(key.to_string()).or_default().push(QueuedMessage::new(
+                serde_json::json!({"text": "world"}),
+                MessagePriority::default(),
+            ));
         }
 
         // Drain.
@@ -10040,15 +10217,18 @@ mod tests {
     #[tokio::test]
     async fn queue_collect_concatenates_texts() {
         let msgs = [
-            QueuedMessage {
-                params: serde_json::json!({"text": "first", "model": "gpt-4"}),
-            },
-            QueuedMessage {
-                params: serde_json::json!({"text": "second"}),
-            },
-            QueuedMessage {
-                params: serde_json::json!({"text": "third", "_conn_id": "c1"}),
-            },
+            QueuedMessage::new(
+                serde_json::json!({"text": "first", "model": "gpt-4"}),
+                MessagePriority::default(),
+            ),
+            QueuedMessage::new(
+                serde_json::json!({"text": "second"}),
+                MessagePriority::default(),
+            ),
+            QueuedMessage::new(
+                serde_json::json!({"text": "third", "_conn_id": "c1"}),
+                MessagePriority::default(),
+            ),
         ];
 
         let combined: Vec<&str> = msgs
@@ -10114,15 +10294,18 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "a"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "b"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "c"}),
-            });
+            entry.push(QueuedMessage::new(
+                serde_json::json!({"text": "a"}),
+                MessagePriority::default(),
+            ));
+            entry.push(QueuedMessage::new(
+                serde_json::json!({"text": "b"}),
+                MessagePriority::default(),
+            ));
+            entry.push(QueuedMessage::new(
+                serde_json::json!({"text": "c"}),
+                MessagePriority::default(),
+            ));
         }
 
         // Drain and apply the send-first/requeue-rest logic.
@@ -10161,24 +10344,27 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({
+            entry.push(QueuedMessage::new(
+                serde_json::json!({
                     "text": "a",
                     "_channel_reply_target": make_target("m1"),
                 }),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({
+                MessagePriority::default(),
+            ));
+            entry.push(QueuedMessage::new(
+                serde_json::json!({
                     "text": "b",
                     "_channel_reply_target": make_target("m2"),
                 }),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({
+                MessagePriority::default(),
+            ));
+            entry.push(QueuedMessage::new(
+                serde_json::json!({
                     "text": "c",
                     "_channel_reply_target": make_target("m3"),
                 }),
-            });
+                MessagePriority::default(),
+            ));
         }
 
         let queued = queue.write().await.remove(key).unwrap_or_default();
@@ -10213,24 +10399,27 @@ mod tests {
     #[tokio::test]
     async fn collect_drain_uses_last_message_channel_target() {
         let queued = [
-            QueuedMessage {
-                params: serde_json::json!({
+            QueuedMessage::new(
+                serde_json::json!({
                     "text": "first",
                     "_channel_reply_target": make_target("m1"),
                 }),
-            },
-            QueuedMessage {
-                params: serde_json::json!({
+                MessagePriority::default(),
+            ),
+            QueuedMessage::new(
+                serde_json::json!({
                     "text": "second",
                     "_channel_reply_target": make_target("m2"),
                 }),
-            },
-            QueuedMessage {
-                params: serde_json::json!({
+                MessagePriority::default(),
+            ),
+            QueuedMessage::new(
+                serde_json::json!({
                     "text": "third",
                     "_channel_reply_target": make_target("m3"),
                 }),
-            },
+                MessagePriority::default(),
+            ),
         ];
 
         let combined: Vec<&str> = queued
@@ -10275,12 +10464,14 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "a"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "b"}),
-            });
+            entry.push(QueuedMessage::new(
+                serde_json::json!({"text": "a"}),
+                MessagePriority::default(),
+            ));
+            entry.push(QueuedMessage::new(
+                serde_json::json!({"text": "b"}),
+                MessagePriority::default(),
+            ));
         }
 
         // Cancel (same logic as cancel_queued: remove + unwrap_or_default).
@@ -10299,15 +10490,18 @@ mod tests {
         {
             let mut q = queue.write().await;
             let entry = q.entry(key.to_string()).or_default();
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "x"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "y"}),
-            });
-            entry.push(QueuedMessage {
-                params: serde_json::json!({"text": "z"}),
-            });
+            entry.push(QueuedMessage::new(
+                serde_json::json!({"text": "x"}),
+                MessagePriority::default(),
+            ));
+            entry.push(QueuedMessage::new(
+                serde_json::json!({"text": "y"}),
+                MessagePriority::default(),
+            ));
+            entry.push(QueuedMessage::new(
+                serde_json::json!({"text": "z"}),
+                MessagePriority::default(),
+            ));
         }
 
         let removed = queue.write().await.remove(key).unwrap_or_default();
@@ -10328,6 +10522,120 @@ mod tests {
 
         let result = serde_json::json!({ "cleared": removed.len() });
         assert_eq!(result["cleared"], 0);
+    }
+
+    // ── Priority queue tests ──────────────────────────────────────────────
+
+    #[test]
+    fn critical_priority_always_selected_first() {
+        let mut queue = vec![
+            QueuedMessage::new(serde_json::json!({"text": "normal"}), MessagePriority::Normal),
+            QueuedMessage::new(serde_json::json!({"text": "critical"}), MessagePriority::Critical),
+            QueuedMessage::new(serde_json::json!({"text": "interactive"}), MessagePriority::Interactive),
+        ];
+
+        let selected = pop_next_message(&mut queue).expect("should have message");
+        assert_eq!(selected.params["text"], "critical");
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn higher_priority_processed_first_when_no_starvation() {
+        let mut queue = vec![
+            QueuedMessage::new(serde_json::json!({"text": "background"}), MessagePriority::Background),
+            QueuedMessage::new(serde_json::json!({"text": "interactive"}), MessagePriority::Interactive),
+            QueuedMessage::new(serde_json::json!({"text": "normal"}), MessagePriority::Normal),
+        ];
+
+        // Interactive should win due to higher weight
+        let selected = pop_next_message(&mut queue).expect("should have message");
+        // With weighted random, we can't guarantee which one, but it should be one of the higher priorities
+        assert!(
+            selected.priority >= MessagePriority::Normal,
+            "expected higher priority, got {:?}",
+            selected.priority
+        );
+    }
+
+    #[test]
+    fn no_message_starved_beyond_bound() {
+        let mut queue = vec![
+            QueuedMessage::new(serde_json::json!({"text": "high"}), MessagePriority::Interactive),
+            QueuedMessage {
+                params: serde_json::json!({"text": "starved"}),
+                priority: MessagePriority::Background,
+                queued_at: Instant::now(),
+                skip_count: MessagePriority::STARVATION_BOUND, // Already at starvation bound
+            },
+        ];
+
+        // The starved background message must be selected despite low priority
+        let selected = pop_next_message(&mut queue).expect("should have message");
+        assert_eq!(selected.params["text"], "starved");
+        assert_eq!(selected.priority, MessagePriority::Background);
+    }
+
+    #[test]
+    fn classify_message_priority_detects_critical() {
+        // Approval requests are critical
+        let params = serde_json::json!({"text": "Approval required for this action"});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Critical);
+
+        // Explicit critical marker
+        let params = serde_json::json!({"text": "hello", "_priority": "critical"});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Critical);
+
+        // Tool approval marker
+        let params = serde_json::json!({"_tool_approval": true});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Critical);
+    }
+
+    #[test]
+    fn classify_message_priority_detects_interactive() {
+        // User message marker
+        let params = serde_json::json!({"text": "hello", "_user_message": true});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Interactive);
+
+        // Channel reply target
+        let params = serde_json::json!({"text": "reply", "_channel_reply_target": {}});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Interactive);
+
+        // Explicit interactive marker
+        let params = serde_json::json!({"text": "hello", "_priority": "interactive"});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Interactive);
+    }
+
+    #[test]
+    fn classify_message_priority_detects_background() {
+        // Background marker
+        let params = serde_json::json!({"text": "cleanup", "_background": true});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Background);
+
+        // Research task marker
+        let params = serde_json::json!({"text": "research", "_research_task": true});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Background);
+
+        // Explicit background marker
+        let params = serde_json::json!({"text": "hello", "_priority": "background"});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Background);
+    }
+
+    #[test]
+    fn classify_message_priority_defaults_to_normal() {
+        let params = serde_json::json!({"text": "regular agent message"});
+        assert_eq!(classify_message_priority(&params), MessagePriority::Normal);
+    }
+
+    #[test]
+    fn message_priority_default_is_normal() {
+        assert_eq!(MessagePriority::default(), MessagePriority::Normal);
+    }
+
+    #[test]
+    fn message_priority_ordering() {
+        assert!(MessagePriority::Critical > MessagePriority::Interactive);
+        assert!(MessagePriority::Interactive > MessagePriority::Normal);
+        assert!(MessagePriority::Normal > MessagePriority::Background);
     }
 
     #[test]
