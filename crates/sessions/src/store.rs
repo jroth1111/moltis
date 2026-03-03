@@ -34,6 +34,8 @@ pub struct SessionIntegrityReport {
     pub removed_malformed_lines: u64,
     pub appended_assistant_messages: u64,
     pub injected_tool_results: u64,
+    pub replay_candidate: Option<String>,
+    pub replay_blocked_by_tool_side_effects: bool,
 }
 
 /// Append-only JSONL session storage with file locking.
@@ -330,6 +332,61 @@ impl SessionStore {
                 appended_assistant_messages,
                 injected_tool_results,
             })
+        })
+        .await?
+    }
+
+    /// Remove malformed JSONL lines from a session file and rewrite it atomically.
+    ///
+    /// Returns the number of malformed lines removed.
+    pub async fn repair(&self, key: &str) -> Result<usize> {
+        let path = self.path_for(key);
+
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            if !path.exists() {
+                return Ok(0);
+            }
+
+            let file = File::open(&path)?;
+            let reader = BufReader::new(file);
+            let mut valid_lines: Vec<String> = Vec::new();
+            let mut removed = 0usize;
+
+            for line in reader.lines() {
+                let line = line?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(_) => valid_lines.push(trimmed.to_string()),
+                    Err(_) => {
+                        removed = removed.saturating_add(1);
+                    },
+                }
+            }
+
+            if removed == 0 {
+                return Ok(0);
+            }
+
+            let temp_path = path.with_extension(format!("jsonl.repair.{}", uuid::Uuid::new_v4()));
+            let tmp = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)?;
+            let mut lock = RwLock::new(tmp);
+            let mut guard = lock
+                .write()
+                .map_err(|e| Error::lock_failed(e.to_string()))?;
+            for line in &valid_lines {
+                writeln!(*guard, "{line}")?;
+            }
+            guard.sync_data()?;
+            drop(guard);
+            fs::rename(&temp_path, &path)?;
+
+            Ok(removed)
         })
         .await?
     }
@@ -1373,5 +1430,40 @@ mod tests {
         assert_eq!(report.removed_malformed_lines, 0);
         assert_eq!(report.injected_tool_results, 0);
         assert_eq!(report.appended_assistant_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn test_repair_removes_malformed_lines() {
+        let (store, dir) = temp_store();
+        let path = dir.path().join("repair.jsonl");
+        let raw = format!(
+            "{}\n{}\n{}\n",
+            json!({"role": "user", "content": "ok"}),
+            "{not valid json}",
+            json!({"role": "assistant", "content": "still ok"})
+        );
+        fs::write(path, raw).unwrap();
+
+        let removed = store.repair("repair").await.unwrap();
+        assert_eq!(removed, 1);
+
+        let repaired = store.read("repair").await.unwrap();
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0]["content"], "ok");
+        assert_eq!(repaired[1]["content"], "still ok");
+    }
+
+    #[tokio::test]
+    async fn test_repair_noop_for_clean_or_missing_file() {
+        let (store, _dir) = temp_store();
+        assert_eq!(store.repair("missing").await.unwrap(), 0);
+
+        store
+            .append("clean", &json!({"role": "user", "content": "ok"}))
+            .await
+            .unwrap();
+        assert_eq!(store.repair("clean").await.unwrap(), 0);
+        let cleaned = store.read("clean").await.unwrap();
+        assert_eq!(cleaned.len(), 1);
     }
 }
