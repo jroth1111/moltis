@@ -13,9 +13,10 @@ pub mod types;
 pub mod worktree;
 
 pub use {
+    context::load_path_scoped_rules,
     error::{Error, Result},
     store::{ProjectStore, SqliteProjectStore, TomlProjectStore},
-    types::{ContextFile, Project, ProjectContext},
+    types::{ContextFile, Project, ProjectContext, ScopedRule},
     worktree::WorktreeManager,
 };
 

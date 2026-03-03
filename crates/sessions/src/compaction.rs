@@ -129,8 +129,7 @@ async fn move_to_workspace_strategy(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
+    use {super::*, serde_json::json};
 
     #[tokio::test]
     async fn truncate_keeps_last_n() {

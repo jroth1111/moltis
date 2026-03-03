@@ -340,11 +340,15 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+<<<<<<< HEAD
     use std::io::Write;
 
     use moltis_sessions::message::{PersistedFunction, PersistedMessage, PersistedToolCall};
 
     use super::*;
+=======
+    use {super::*, std::time::Duration};
+>>>>>>> fix/audit-hardening-phase1
 
     async fn make_store() -> (SessionStateStore, sqlx::SqlitePool, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

@@ -9,9 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use async_trait::async_trait;
-use base64::Engine;
-use tracing::{debug, warn};
+use {
+    async_trait::async_trait,
+    base64::Engine,
+    tracing::{debug, warn},
+};
 
 use moltis_common::{
     Result,

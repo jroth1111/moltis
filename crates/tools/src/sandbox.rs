@@ -480,6 +480,10 @@ pub struct SandboxConfig {
     pub wasm_epoch_interval_ms: Option<u64>,
     /// Per-tool WASM limits (fuel/memory). Falls back to built-in defaults when absent.
     pub wasm_tool_limits: Option<WasmToolLimits>,
+    /// Minimum pre-warmed containers to keep ready. 0 = pool disabled (default).
+    pub pool_min_warm: u32,
+    /// Maximum pool slots. Defaults to `pool_min_warm * 2` when 0.
+    pub pool_max: u32,
 }
 
 impl Default for SandboxConfig {
@@ -502,6 +506,8 @@ impl Default for SandboxConfig {
             wasm_fuel_limit: None,
             wasm_epoch_interval_ms: None,
             wasm_tool_limits: None,
+            pool_min_warm: 0,
+            pool_max: 0,
         }
     }
 }
@@ -555,6 +561,8 @@ impl From<&moltis_config::schema::SandboxConfig> for SandboxConfig {
             wasm_fuel_limit: cfg.wasm_fuel_limit,
             wasm_epoch_interval_ms: cfg.wasm_epoch_interval_ms,
             wasm_tool_limits: cfg.wasm_tool_limits.as_ref().map(WasmToolLimits::from),
+            pool_min_warm: cfg.pool_min_warm,
+            pool_max: cfg.pool_max,
         }
     }
 }
@@ -597,8 +605,9 @@ pub trait Sandbox: Send + Sync {
     /// Clean up sandbox resources.
     async fn cleanup(&self, id: &SandboxId) -> Result<()>;
 
-    /// Whether this backend provides actual isolation.
-    /// Returns `false` for `NoSandbox` (pass-through to host).
+    /// Whether this backend provides actual container/WASM isolation.
+    /// Returns `false` for backends that execute directly on the host
+    /// (`NoSandbox`, `RestrictedHostSandbox`).
     fn is_real(&self) -> bool {
         true
     }
@@ -1330,8 +1339,23 @@ pub async fn container_disk_usage() -> Result<ContainerDiskUsage> {
 /// Returns the number of containers removed.
 pub async fn clean_all_containers(container_prefix: &str) -> Result<usize> {
     let containers = list_running_containers(container_prefix).await?;
+    clean_containers_inner(&containers, false).await
+}
+
+/// Remove non-pool containers whose name starts with `container_prefix`.
+///
+/// This is intended for startup GC where pooled slots should survive.
+pub async fn clean_session_containers(container_prefix: &str) -> Result<usize> {
+    let containers = list_running_containers(container_prefix).await?;
+    clean_containers_inner(&containers, true).await
+}
+
+async fn clean_containers_inner(containers: &[RunningContainer], skip_pool: bool) -> Result<usize> {
     let mut removed = 0;
-    for c in &containers {
+    for c in containers {
+        if skip_pool && is_pool_container_name(&c.name) {
+            continue;
+        }
         // Stop running containers first.
         if c.state == ContainerRunState::Running {
             let _ = stop_container(&c.name).await;
@@ -1344,6 +1368,10 @@ pub async fn clean_all_containers(container_prefix: &str) -> Result<usize> {
         }
     }
     Ok(removed)
+}
+
+fn is_pool_container_name(name: &str) -> bool {
+    name.contains("-moltis-pool-")
 }
 
 /// Stop a container by name. Detects the backend from the available CLIs.
@@ -2136,8 +2164,10 @@ impl Sandbox for RestrictedHostSandbox {
         "restricted-host"
     }
 
+    /// `restricted-host` applies OS-level isolation (env clearing, rlimits)
+    /// but commands still run directly on the host — no container boundary.
     fn is_real(&self) -> bool {
-        true
+        false
     }
 
     async fn ensure_ready(&self, _id: &SandboxId, _image_override: Option<&str>) -> Result<()> {
@@ -5119,6 +5149,11 @@ pub struct SandboxRouter {
     /// Whether a sandbox image pre-build is currently in progress.
     /// Used by the gateway to show a banner in the UI.
     pub building_flag: std::sync::atomic::AtomicBool,
+    /// Pre-warmed sandbox pool. When set, sessions try to acquire a pool slot
+    /// instead of creating a new container from scratch.
+    pool: Option<Arc<crate::sandbox_pool::SandboxPool>>,
+    /// Pool guards held by sessions. Dropping a guard returns the slot to the pool.
+    pool_guards: RwLock<HashMap<String, crate::sandbox_pool::PoolGuard>>,
 }
 
 impl SandboxRouter {
@@ -5136,6 +5171,8 @@ impl SandboxRouter {
             event_tx,
             prepared_sessions: RwLock::new(HashSet::new()),
             building_flag: std::sync::atomic::AtomicBool::new(false),
+            pool: None,
+            pool_guards: RwLock::new(HashMap::new()),
         }
     }
 
@@ -5151,7 +5188,15 @@ impl SandboxRouter {
             event_tx,
             prepared_sessions: RwLock::new(HashSet::new()),
             building_flag: std::sync::atomic::AtomicBool::new(false),
+            pool: None,
+            pool_guards: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Attach a pre-warmed sandbox pool to this router.
+    pub fn with_pool(mut self, pool: Arc<crate::sandbox_pool::SandboxPool>) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// Subscribe to sandbox lifecycle events.
@@ -5209,6 +5254,41 @@ impl SandboxRouter {
         self.overrides.write().await.remove(session_key);
     }
 
+    /// Try to acquire a pre-warmed pool slot for a session.
+    ///
+    /// Returns the pool slot's [`SandboxId`] if a slot was acquired or already
+    /// held, or `None` if no pool is configured or all slots are occupied.
+    /// The guard is stored internally and released when [`cleanup_session`] is called.
+    ///
+    /// Idempotent: calling this multiple times for the same session returns the
+    /// existing assignment without consuming another slot.
+    pub async fn try_acquire_pool_slot(&self, session_key: &str) -> Option<SandboxId> {
+        // Fast path: session already holds a pool slot.
+        if let Some(guard) = self.pool_guards.read().await.get(session_key) {
+            return Some(guard.sandbox_id());
+        }
+        let pool = self.pool.as_ref()?;
+        let guard = pool.try_acquire()?;
+        let sid = guard.sandbox_id();
+        self.pool_guards
+            .write()
+            .await
+            .insert(session_key.to_string(), guard);
+        debug!(session = session_key, sandbox_id = %sid, "acquired pool slot");
+        Some(sid)
+    }
+
+    /// Resolve the [`SandboxId`] for a session, preferring a pool assignment.
+    ///
+    /// If the session already holds a pool slot, that slot's ID is returned.
+    /// Otherwise falls back to [`sandbox_id_for`].
+    pub async fn resolve_sandbox_id(&self, session_key: &str) -> SandboxId {
+        if let Some(guard) = self.pool_guards.read().await.get(session_key) {
+            return guard.sandbox_id();
+        }
+        self.sandbox_id_for(session_key)
+    }
+
     /// Derive a SandboxId for a given session key.
     /// The key is sanitized for use as a container name (only alphanumeric, dash, underscore, dot).
     pub fn sandbox_id_for(&self, session_key: &str) -> SandboxId {
@@ -5229,9 +5309,21 @@ impl SandboxRouter {
     }
 
     /// Clean up sandbox resources for a session.
+    ///
+    /// If the session holds a pool slot, the guard is released (returning the
+    /// slot to the pool) instead of destroying the container.
     pub async fn cleanup_session(&self, session_key: &str) -> Result<()> {
-        let id = self.sandbox_id_for(session_key);
-        self.backend.cleanup(&id).await?;
+        // If this session has a pool guard, clean the pooled sandbox first to
+        // avoid cross-session state leakage, then release the guard.
+        if let Some(guard) = self.pool_guards.write().await.remove(session_key) {
+            let sid = guard.sandbox_id();
+            self.backend.cleanup(&sid).await?;
+            drop(guard);
+            debug!(session = session_key, sandbox_id = %sid, "released and reset pool slot");
+        } else {
+            let id = self.sandbox_id_for(session_key);
+            self.backend.cleanup(&id).await?;
+        }
         self.remove_override(session_key).await;
         self.clear_prepared_session(session_key).await;
         Ok(())
@@ -5240,6 +5332,11 @@ impl SandboxRouter {
     /// Access the sandbox backend.
     pub fn backend(&self) -> &Arc<dyn Sandbox> {
         &self.backend
+    }
+
+    /// Access the pre-warmed sandbox pool, if configured.
+    pub fn pool(&self) -> Option<&Arc<crate::sandbox_pool::SandboxPool>> {
+        self.pool.as_ref()
     }
 
     /// Access the global sandbox mode.
@@ -5345,6 +5442,10 @@ mod tests {
         fn exec_calls(&self) -> usize {
             self.exec_calls.load(Ordering::SeqCst)
         }
+
+        fn cleanup_calls(&self) -> usize {
+            self.cleanup_calls.load(Ordering::SeqCst)
+        }
     }
 
     #[test]
@@ -5397,6 +5498,12 @@ mod tests {
         assert_eq!(SandboxMode::Off.to_string(), "off");
         assert_eq!(SandboxMode::NonMain.to_string(), "non-main");
         assert_eq!(SandboxMode::All.to_string(), "all");
+    }
+
+    #[test]
+    fn test_is_pool_container_name() {
+        assert!(is_pool_container_name("moltis-sandbox-moltis-pool-0"));
+        assert!(!is_pool_container_name("moltis-sandbox-session-main"));
     }
 
     #[test]
@@ -6030,6 +6137,26 @@ mod tests {
         assert!(!router.mark_preparing_once("main").await);
         router.clear_prepared_session("main").await;
         assert!(router.mark_preparing_once("main").await);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_session_resets_pooled_slot() {
+        let backend = Arc::new(TestSandbox::new("docker", None, None));
+        let backend_dyn: Arc<dyn Sandbox> = backend.clone();
+        let pool =
+            Arc::new(crate::sandbox_pool::SandboxPool::new(backend_dyn.clone(), 1, 1, None).await);
+        let router =
+            SandboxRouter::with_backend(SandboxConfig::default(), backend_dyn).with_pool(pool);
+
+        let sid = router
+            .try_acquire_pool_slot("session-1")
+            .await
+            .expect("pool slot");
+        assert!(sid.key.contains("moltis-pool-"));
+
+        let before = backend.cleanup_calls();
+        router.cleanup_session("session-1").await.expect("cleanup");
+        assert_eq!(backend.cleanup_calls(), before + 1);
     }
 
     #[tokio::test]
@@ -6932,8 +7059,9 @@ mod tests {
 
         #[test]
         fn test_restricted_host_sandbox_is_real() {
+            // restricted-host runs directly on the host — not a real container backend.
             let sandbox = RestrictedHostSandbox::new(SandboxConfig::default());
-            assert!(sandbox.is_real());
+            assert!(!sandbox.is_real());
         }
 
         #[tokio::test]

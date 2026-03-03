@@ -2076,9 +2076,29 @@ pub async fn prepare_gateway(
         .timezone
         .as_ref()
         .map(|tz| tz.name().to_string());
-    let sandbox_router = Arc::new(moltis_tools::sandbox::SandboxRouter::new(
-        sandbox_config.clone(),
-    ));
+    let mut sandbox_router = moltis_tools::sandbox::SandboxRouter::new(sandbox_config.clone());
+
+    // Pre-warm sandbox pool when configured.
+    if sandbox_config.pool_min_warm > 0 {
+        if sandbox_config.scope == moltis_tools::sandbox::SandboxScope::Shared {
+            let pool = moltis_tools::sandbox_pool::SandboxPool::new(
+                Arc::clone(sandbox_router.backend()),
+                sandbox_config.pool_min_warm,
+                sandbox_config.pool_max,
+                sandbox_config.image.as_deref(),
+            )
+            .await;
+            sandbox_router = sandbox_router.with_pool(Arc::new(pool));
+        } else {
+            warn!(
+                scope = ?sandbox_config.scope,
+                pool_min_warm = sandbox_config.pool_min_warm,
+                "sandbox pool is only supported with shared scope; ignoring pool settings"
+            );
+        }
+    }
+
+    let sandbox_router = Arc::new(sandbox_router);
 
     // ── Trusted-network proxy + audit ────────────────────────────────────
     #[cfg(feature = "trusted-network")]
@@ -2325,7 +2345,7 @@ pub async fn prepare_gateway(
         let prefix = sandbox_router.config().container_prefix.clone();
         tokio::spawn(async move {
             if let Some(prefix) = prefix {
-                match moltis_tools::sandbox::clean_all_containers(&prefix).await {
+                match moltis_tools::sandbox::clean_session_containers(&prefix).await {
                     Ok(0) => {},
                     Ok(n) => info!(
                         removed = n,
@@ -3435,9 +3455,56 @@ pub async fn prepare_gateway(
         ));
 
         // Register shared task coordination tool for multi-agent workflows.
-        tool_registry.register(Box::new(moltis_tools::task_list::TaskListTool::new(
-            &data_dir,
-        )));
+        let task_list_tool = moltis_tools::task_list::TaskListTool::from_data_dir(&data_dir)
+            .await?
+            .with_max_attempts_override(config.tasks.max_attempts_override);
+        let task_store = task_list_tool.store();
+        tool_registry.register(Box::new(task_list_tool));
+
+        // Background: promote overdue Retrying tasks back to Pending.
+        {
+            let store_for_retry = Arc::clone(&task_store);
+            let poll_secs = config.tasks.retry_poll_interval_secs;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(1)));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    match store_for_retry.promote_due_retries_all().await {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "promoted overdue retrying tasks to pending")
+                        },
+                        Ok(_) => {},
+                        Err(e) => {
+                            tracing::warn!(error = %e, "retry promotion sweep failed")
+                        },
+                    }
+                }
+            });
+        }
+        // Background: reclaim Active tasks with expired leases (zombie agents).
+        {
+            let store_for_zombie = Arc::clone(&task_store);
+            let poll_secs = config.tasks.zombie_poll_interval_secs;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(1)));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    match store_for_zombie.expire_zombie_leases_all().await {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "reclaimed zombie tasks with expired leases")
+                        },
+                        Ok(_) => {},
+                        Err(e) => {
+                            tracing::warn!(error = %e, "zombie lease sweep failed")
+                        },
+                    }
+                }
+            });
+        }
 
         // Register built-in voice tools for explicit TTS/STT calls in agents.
         tool_registry.register(Box::new(crate::voice_agent_tools::SpeakTool::new(
@@ -3532,13 +3599,20 @@ pub async fn prepare_gateway(
                 });
             });
             let agents_config = Arc::new(tokio::sync::RwLock::new(config.agents.clone()));
+            let tool_policy_resolver: moltis_tools::policy::ToolPolicyResolver = Arc::new(|| {
+                let latest_config = moltis_config::discover_and_load();
+                moltis_tools::policy::effective_tool_policy(&latest_config)
+            });
             let spawn_tool = moltis_tools::spawn_agent::SpawnAgentTool::new(
                 Arc::clone(&registry),
                 default_provider,
                 base_tools,
             )
             .with_on_event(on_spawn_event)
-            .with_agents_config(agents_config);
+            .with_agents_config(agents_config)
+            .with_task_store(Arc::clone(&task_store))
+            .with_tasks_config(config.tasks.clone())
+            .with_tool_policy_resolver(tool_policy_resolver);
             tool_registry.register(Box::new(spawn_tool));
         }
 
@@ -6009,23 +6083,25 @@ pub(crate) async fn discover_and_build_hooks(
     Option<Arc<moltis_common::hooks::HookRegistry>>,
     Vec<crate::state::DiscoveredHookInfo>,
 ) {
-    use moltis_plugins::{
-        bundled::{
-            boot_md::BootMdHook,
-            circuit_breaker::CircuitBreakerHook,
-            command_logger::CommandLoggerHook,
-            cost_guard::{CostGuardHook, CostTrackerHook},
-            estop::EstopHook,
-            leak_detector::LeakDetectorHook,
-            prompt_guard::PromptGuardHook,
-            screenshot_resolver::ScreenshotResolverHook,
-            session_memory::SessionMemoryHook,
+    use {
+        moltis_plugins::{
+            bundled::{
+                boot_md::BootMdHook,
+                circuit_breaker::CircuitBreakerHook,
+                command_logger::CommandLoggerHook,
+                cost_guard::{CostGuardHook, CostTrackerHook},
+                estop::EstopHook,
+                leak_detector::LeakDetectorHook,
+                prompt_guard::PromptGuardHook,
+                screenshot_resolver::ScreenshotResolverHook,
+                session_memory::SessionMemoryHook,
+            },
+            hook_discovery::{FsHookDiscoverer, HookDiscoverer, HookSource},
+            hook_eligibility::check_hook_eligibility,
+            shell_hook::ShellHookHandler,
         },
-        hook_discovery::{FsHookDiscoverer, HookDiscoverer, HookSource},
-        hook_eligibility::check_hook_eligibility,
-        shell_hook::ShellHookHandler,
+        moltis_tinder::FunnelGuardHook,
     };
-    use moltis_tinder::FunnelGuardHook;
 
     let db_pool = db_pool.or_else(|| HOOK_DB_POOL.get().cloned());
     let estop_flag = estop_flag.or_else(|| HOOK_ESTOP_FLAG.get().cloned());

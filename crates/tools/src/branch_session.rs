@@ -29,6 +29,10 @@ impl AgentTool for BranchSessionTool {
         "branch_session"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["session"]
+    }
+
     fn description(&self) -> &str {
         "Fork the current session into a new branch at a given message index. \
          Messages up to fork_point are copied to the new session. \

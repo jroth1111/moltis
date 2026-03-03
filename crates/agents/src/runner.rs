@@ -42,6 +42,26 @@ fn resolve_agent_max_iterations(configured: usize) -> usize {
     configured
 }
 
+/// Classify an error message into a typed [`moltis_tasks::FailureClass`].
+///
+/// Wraps the `classify` module's pattern-matching so callers (e.g. `spawn_agent`)
+/// can translate a provider error into the task-recovery taxonomy without
+/// duplicating the pattern lists.
+#[must_use]
+pub fn classify_error(msg: &str) -> moltis_tasks::FailureClass {
+    use crate::classify::ProviderErrorKind;
+    match classify_error_message(msg) {
+        ProviderErrorKind::BillingExhausted | ProviderErrorKind::NonRetryableRateLimit => {
+            moltis_tasks::FailureClass::ProviderPermanent
+        },
+        ProviderErrorKind::RateLimit
+        | ProviderErrorKind::ServerError
+        | ProviderErrorKind::Timeout => moltis_tasks::FailureClass::ProviderTransient,
+        ProviderErrorKind::ContextWindow => moltis_tasks::FailureClass::ContextOverflow,
+        _ => moltis_tasks::FailureClass::AgentError,
+    }
+}
+
 /// Base delay for non-rate-limit transient retries.
 const SERVER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -222,6 +242,11 @@ pub enum RunnerEvent {
     RetryingAfterError {
         error: String,
         delay_ms: u64,
+    },
+    /// Agent response has drifted significantly from the original user intent.
+    IntentDrift {
+        drift_score: f64,
+        iteration: usize,
     },
 }
 
@@ -575,6 +600,20 @@ pub async fn run_agent_loop_with_context(
     });
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
 
+    // Intent drift detection: track how far agent responses wander from the original goal.
+    let original_intent = match user_content {
+        UserContent::Text(t) => t.clone(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let mut intent_tracker = IntentTracker::new(&original_intent);
+
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
         &tool_schemas
@@ -925,6 +964,19 @@ pub async fn run_agent_loop_with_context(
             });
         }
 
+        // Check intent drift when the agent is iterating with tool calls.
+        {
+            let current_intent = response.text.as_deref().unwrap_or("");
+            let (drift_score, is_drifted) =
+                intent_tracker.check_drift(current_intent, trace_id.as_deref());
+            if is_drifted && let Some(cb) = on_event {
+                cb(RunnerEvent::IntentDrift {
+                    drift_score,
+                    iteration: iterations,
+                });
+            }
+        }
+
         // Append assistant message with tool calls.
         // Save any answer text for fallback — when the final iteration returns
         // empty, this becomes the result. Don't emit as ThinkingText because
@@ -969,11 +1021,13 @@ pub async fn run_agent_loop_with_context(
                 let _tc_id = tc.id.clone();
                 let trace_id = trace_id.clone();
 
+                // SECURITY: context fields (including _session_key) must overwrite any
+                // LLM-provided values in args.  Do not change merge order or direction.
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
                 {
                     for (k, v) in ctx_obj {
-                        args_obj.insert(k.clone(), v.clone());
+                        args_obj.insert(k.clone(), v.clone()); // context wins
                     }
                 }
                 async move {
@@ -1719,8 +1773,14 @@ pub async fn run_agent_loop_streaming(
                 .join(" ")
         );
         // check_drift logs warnings internally when drift is detected.
-        let (_drift_score, _is_drifted) =
+        let (drift_score, is_drifted) =
             intent_tracker.check_drift(&current_intent, trace_id.as_deref());
+        if is_drifted && let Some(cb) = on_event {
+            cb(RunnerEvent::IntentDrift {
+                drift_score,
+                iteration: iterations,
+            });
+        }
 
         // Append assistant message with tool calls.
         //
@@ -1776,11 +1836,13 @@ pub async fn run_agent_loop_streaming(
                 let tc_name = tc.name.clone();
                 let trace_id = trace_id.clone();
 
+                // SECURITY: context fields (including _session_key) must overwrite any
+                // LLM-provided values in args.  Do not change merge order or direction.
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
                 {
                     for (k, v) in ctx_obj {
-                        args_obj.insert(k.clone(), v.clone());
+                        args_obj.insert(k.clone(), v.clone()); // context wins
                     }
                 }
                 async move {
@@ -4521,6 +4583,32 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_error_maps_patterns_to_failure_class() {
+        use moltis_tasks::FailureClass;
+
+        assert_eq!(
+            classify_error("insufficient_quota"),
+            FailureClass::ProviderPermanent
+        );
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests"),
+            FailureClass::ProviderTransient
+        );
+        assert_eq!(
+            classify_error("HTTP 500 Internal Server Error"),
+            FailureClass::ProviderTransient
+        );
+        assert_eq!(
+            classify_error("context_length_exceeded"),
+            FailureClass::ContextOverflow
+        );
+        assert_eq!(
+            classify_error("some unrecognised agent error"),
+            FailureClass::AgentError
+        );
+    }
+
+    #[test]
     fn test_next_retry_delay_skips_billing_quota_errors() {
         let mut server_retries_remaining = 2u8;
         let mut rate_limit_retries_remaining = 2u8;
@@ -4845,5 +4933,32 @@ mod tests {
             assert!(v >= 1);
             assert!(v <= RATE_LIMIT_MAX_RETRY_MS);
         }
+    }
+
+    /// Verify that the tool context merge overwrites any LLM-supplied value for
+    /// security-sensitive fields like `_session_key`.  If this merge order ever
+    /// changes the protection in `require_mutation_caller()` disappears silently.
+    #[test]
+    fn test_tool_context_session_key_overwrites_llm_provided() {
+        // Simulate LLM-supplied args that attempt to forge the session key.
+        let mut args = serde_json::json!({ "_session_key": "evil", "other": 1 });
+
+        // Runtime context contains the real session key.
+        let ctx = serde_json::json!({ "_session_key": "real-session-abc" });
+
+        // Apply the same merge logic used in run_with_tools.
+        if let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object()) {
+            for (k, v) in ctx_obj {
+                args_obj.insert(k.clone(), v.clone()); // context wins
+            }
+        }
+
+        assert_eq!(
+            args["_session_key"].as_str().unwrap(),
+            "real-session-abc",
+            "context must overwrite LLM-supplied _session_key"
+        );
+        // Other args are preserved.
+        assert_eq!(args["other"], 1);
     }
 }

@@ -4,9 +4,11 @@
 //! transient failures (e.g. 5xx) do not share cooldown state with permanent
 //! ones (e.g. exhausted billing quota).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 use {
@@ -526,5 +528,29 @@ mod tests {
 
         assert!(hook.reset_provider("p").await);
         assert!(hook.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn does_not_treat_zero_tokens_with_text_as_failure() {
+        let hook = CircuitBreakerHook::new(1, 60);
+        let payload = HookPayload::AfterLLMCall {
+            session_key: "s1".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            text: Some("ok".into()),
+            tool_calls: vec![],
+            input_tokens: 100,
+            output_tokens: 0,
+            iteration: 1,
+            error: None,
+            trace_id: None,
+        };
+        hook.handle(HookEvent::AfterLLMCall, &payload)
+            .await
+            .unwrap();
+        let snapshot = hook.snapshot().await;
+        let state = snapshot.iter().find(|s| s.provider == "p").unwrap();
+        assert_eq!(state.state, "closed");
+        assert_eq!(state.failure_count, 0);
     }
 }

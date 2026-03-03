@@ -651,6 +651,10 @@ impl AgentTool for ShowMapTool {
         "show_map"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["location"]
+    }
+
     fn description(&self) -> &str {
         "Show a map image to the user for one or more locations. Displays destination \
          pins and an optional blue pin at the user's current location, plus clickable \

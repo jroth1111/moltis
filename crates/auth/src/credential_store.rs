@@ -612,10 +612,10 @@ impl CredentialStore {
         .await?;
 
         let mut result = Vec::with_capacity(rows.len());
-        for (key, value, encrypted) in rows {
+        for (key, value, _encrypted) in rows {
             #[cfg(feature = "vault")]
             let plaintext = {
-                if encrypted != 0 {
+                if _encrypted != 0 {
                     if let Some(ref vault) = self.vault {
                         let aad = format!("env:{key}");
                         match vault.decrypt_string(&value, &aad).await {

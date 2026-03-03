@@ -55,6 +55,14 @@ pub trait AgentTool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> serde_json::Value;
     async fn execute(&self, params: serde_json::Value) -> Result<serde_json::Value>;
+
+    /// Semantic categories this tool belongs to (e.g. `["code", "files"]`).
+    ///
+    /// Used by the dynamic tool selector to include only relevant tools for a
+    /// given task. Tools with no categories are always included.
+    fn categories(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// Where a tool originates from.
@@ -159,6 +167,19 @@ impl ToolRegistry {
     /// Return a cloned tool handle by name.
     pub fn get_arc(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
         self.tools.get(name).map(|e| Arc::clone(&e.tool))
+    }
+
+    /// Return the categories for a tool by name.
+    pub fn categories_for(&self, name: &str) -> &'static [&'static str] {
+        self.tools
+            .get(name)
+            .map(|e| e.tool.categories())
+            .unwrap_or(&[])
+    }
+
+    /// Return the source for a tool by name.
+    pub fn source_for(&self, name: &str) -> Option<&ToolSource> {
+        self.tools.get(name).map(|e| &e.source)
     }
 
     /// Dispatch a tool call by name: check rate limit, then execute.

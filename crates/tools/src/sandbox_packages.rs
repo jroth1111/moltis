@@ -367,6 +367,10 @@ impl AgentTool for SandboxPackagesTool {
         "sandbox_packages"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["code"]
+    }
+
     fn description(&self) -> &str {
         "List packages pre-installed in the sandbox container, grouped by category. \
          Call this before running commands that need specific tools (image processing, \

@@ -159,6 +159,8 @@ fn build_schema_map() -> KnownKeys {
             ("wasm_fuel_limit", Leaf),
             ("wasm_epoch_interval_ms", Leaf),
             ("wasm_tool_limits", wasm_tool_limits()),
+            ("pool_min_warm", Leaf),
+            ("pool_max", Leaf),
         ]))
     };
 
@@ -502,6 +504,16 @@ fn build_schema_map() -> KnownKeys {
             Struct(HashMap::from([
                 ("rate_limit_max", Leaf),
                 ("rate_limit_window_secs", Leaf),
+            ])),
+        ),
+        (
+            "tasks",
+            Struct(HashMap::from([
+                ("retry_poll_interval_secs", Leaf),
+                ("max_attempts_override", Leaf),
+                ("lease_duration_secs", Leaf),
+                ("lease_heartbeat_interval_secs", Leaf),
+                ("zombie_poll_interval_secs", Leaf),
             ])),
         ),
         ("env", Map(Box::new(Leaf))),
@@ -957,6 +969,29 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             category: "security",
             path: "tools.exec.sandbox.mode".into(),
             message: "sandbox mode is disabled — commands run without isolation".into(),
+        });
+    }
+
+    if config.tools.exec.sandbox.pool_min_warm > 0
+        && !config.tools.exec.sandbox.scope.eq_ignore_ascii_case("shared")
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "tools.exec.sandbox.scope".into(),
+            message: "sandbox pool requires scope = \"shared\"; pool settings will be ignored"
+                .into(),
+        });
+    }
+
+    if config.tools.exec.sandbox.pool_max > 0
+        && config.tools.exec.sandbox.pool_max < config.tools.exec.sandbox.pool_min_warm
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "tools.exec.sandbox.pool_max".into(),
+            message: "pool_max must be greater than or equal to pool_min_warm".into(),
         });
     }
 
@@ -1634,6 +1669,43 @@ mode = "off"
             .iter()
             .find(|d| d.path == "tools.exec.sandbox.mode");
         assert!(warning.is_some(), "expected warning for sandbox mode off");
+    }
+
+    #[test]
+    fn sandbox_pool_with_non_shared_scope_warned() {
+        let toml = r#"
+[tools.exec.sandbox]
+scope = "session"
+pool_min_warm = 1
+"#;
+        let result = validate_toml_str(toml);
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "tools.exec.sandbox.scope");
+        assert!(
+            warning.is_some(),
+            "expected warning for pool_min_warm with non-shared scope"
+        );
+    }
+
+    #[test]
+    fn sandbox_pool_max_less_than_min_is_error() {
+        let toml = r#"
+[tools.exec.sandbox]
+scope = "shared"
+pool_min_warm = 4
+pool_max = 2
+"#;
+        let result = validate_toml_str(toml);
+        let error = result
+            .diagnostics
+            .iter()
+            .find(|d| d.severity == Severity::Error && d.path == "tools.exec.sandbox.pool_max");
+        assert!(
+            error.is_some(),
+            "expected error for pool_max < pool_min_warm"
+        );
     }
 
     #[test]

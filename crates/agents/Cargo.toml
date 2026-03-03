@@ -19,6 +19,7 @@ regex           = { workspace = true }
 moltis-config   = { workspace = true }
 moltis-sessions = { workspace = true }
 moltis-skills   = { workspace = true }
+moltis-tasks    = { workspace = true }
 reqwest         = { workspace = true }
 secrecy         = { workspace = true }
 serde           = { workspace = true }

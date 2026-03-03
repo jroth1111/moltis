@@ -32,6 +32,10 @@ impl AgentTool for CreateSkillTool {
         "create_skill"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["skills"]
+    }
+
     fn description(&self) -> &str {
         "Create a new personal skill. Writes a SKILL.md file to <data_dir>/skills/<name>/. \
          This is persistent workspace storage (not sandbox ~/skills). \
@@ -133,6 +137,10 @@ impl AgentTool for UpdateSkillTool {
         "update_skill"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["skills"]
+    }
+
     fn description(&self) -> &str {
         "Update an existing personal skill. Overwrites the SKILL.md file."
     }
@@ -230,6 +238,10 @@ impl DeleteSkillTool {
 impl AgentTool for DeleteSkillTool {
     fn name(&self) -> &str {
         "delete_skill"
+    }
+
+    fn categories(&self) -> &'static [&'static str] {
+        &["skills", "destructive"]
     }
 
     fn description(&self) -> &str {

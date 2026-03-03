@@ -40,6 +40,7 @@ default-members = [
   "crates/swift-bridge",
   "crates/tailscale",
   "crates/telegram",
+  "crates/tasks",
   "crates/tls",
   "crates/tools",
   "crates/vault",
@@ -90,6 +91,7 @@ members = [
   "crates/swift-bridge",
   "crates/tailscale",
   "crates/telegram",
+  "crates/tasks",
   "crates/tls",
   "crates/tools",
   "crates/vault",
@@ -148,7 +150,7 @@ sqlx = { features = ["migrate", "runtime-tokio", "sqlite"], version = "0.8" }
 # HTTP client
 reqwest = { features = ["json", "stream"], version = "0.12" }
 # UUID
-uuid = { features = ["v4"], version = "1" }
+uuid = { features = ["v4", "v7"], version = "1" }
 # Async
 async-stream = "0.3"
 async-trait  = "0.1"
@@ -173,6 +175,7 @@ bytes        = "1"
 encoding_rs  = "0.8"
 fd-lock      = "4"
 genai        = "0.5"
+globset      = "0.4"
 # GraphQL
 async-graphql      = "7"
 async-graphql-axum = "7"
@@ -319,6 +322,7 @@ moltis-swift-bridge    = { path = "crates/swift-bridge" }
 moltis-tailscale       = { path = "crates/tailscale" }
 moltis-telegram        = { path = "crates/telegram" }
 moltis-tls             = { path = "crates/tls" }
+moltis-tasks           = { path = "crates/tasks" }
 moltis-tools           = { path = "crates/tools" }
 moltis-vault           = { path = "crates/vault" }
 moltis-voice           = { path = "crates/voice" }

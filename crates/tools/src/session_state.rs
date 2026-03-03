@@ -31,6 +31,10 @@ impl AgentTool for SessionStateTool {
         "session_state"
     }
 
+    fn categories(&self) -> &'static [&'static str] {
+        &["session"]
+    }
+
     fn description(&self) -> &str {
         "Persist and retrieve key-value state scoped to the current session and a namespace. \
          Use this to remember information across messages within a session. \
