@@ -116,6 +116,40 @@ fn would_create_cycle(tasks: &HashMap<String, Task>, task_id: &str, new_deps: &[
     false
 }
 
+/// Parameters for updating a task.
+pub struct TaskUpdateParams<'a> {
+    pub list_id: &'a str,
+    pub task_id: &'a str,
+    pub status: Option<TaskStatus>,
+    pub subject: Option<String>,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub blocked_by: Option<Vec<String>>,
+    pub proof: Option<String>,
+    pub caller_identity: Option<&'a str>,
+    pub trace_id: Option<&'a str>,
+    pub force: bool,
+}
+
+impl<'a> TaskUpdateParams<'a> {
+    /// Create params with the two required fields; all optional fields default to `None`/`false`.
+    pub fn new(list_id: &'a str, task_id: &'a str) -> Self {
+        Self {
+            list_id,
+            task_id,
+            status: None,
+            subject: None,
+            description: None,
+            owner: None,
+            blocked_by: None,
+            proof: None,
+            caller_identity: None,
+            trace_id: None,
+            force: false,
+        }
+    }
+}
+
 impl TaskStore {
     pub fn new(base_dir: &Path) -> Self {
         Self {
@@ -237,21 +271,21 @@ impl TaskStore {
         Ok(list.tasks.get(task_id).cloned())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update(
-        &self,
-        list_id: &str,
-        task_id: &str,
-        status: Option<TaskStatus>,
-        subject: Option<String>,
-        description: Option<String>,
-        owner: Option<String>,
-        blocked_by: Option<Vec<String>>,
-        proof: Option<String>,
-        caller_identity: Option<&str>,
-        trace_id: Option<&str>,
-        force: bool,
-    ) -> crate::Result<Task> {
+    pub async fn update(&self, params: TaskUpdateParams<'_>) -> crate::Result<Task> {
+        let TaskUpdateParams {
+            list_id,
+            task_id,
+            status,
+            subject,
+            description,
+            owner,
+            blocked_by,
+            proof,
+            caller_identity,
+            trace_id,
+            force,
+        } = params;
+
         self.ensure_list(list_id).await?;
         let mut lists = self.lists.write().await;
         let list = lists
@@ -267,9 +301,7 @@ impl TaskStore {
 
             // Ownership enforcement: when the task has an owner and a caller is
             // identified, only the owner (or force=true) may change status or owner.
-            if !force
-                && let (Some(current_owner), Some(caller)) = (&task.owner, caller_identity)
-            {
+            if !force && let (Some(current_owner), Some(caller)) = (&task.owner, caller_identity) {
                 let is_owner_mutation = status.is_some() || owner.is_some();
                 if is_owner_mutation && current_owner != caller {
                     return Err(Error::message(format!(
@@ -572,9 +604,9 @@ impl AgentTool for TaskListTool {
                     .unwrap_or(false);
                 let task = self
                     .store
-                    .update(
+                    .update(TaskUpdateParams {
                         list_id,
-                        id,
+                        task_id: id,
                         status,
                         subject,
                         description,
@@ -584,7 +616,7 @@ impl AgentTool for TaskListTool {
                         caller_identity,
                         trace_id,
                         force,
-                    )
+                    })
                     .await?;
                 Ok(serde_json::json!({
                     "ok": true,
@@ -926,26 +958,20 @@ mod tests {
 
         // owner-b tries to change status → rejected.
         let result = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("owner-b"),
-                None,
-                false,
-            )
+            .update(TaskUpdateParams {
+                list_id: "default",
+                task_id: &task.id,
+                status: Some(TaskStatus::Completed),
+                caller_identity: Some("owner-b"),
+                ..TaskUpdateParams::new("default", &task.id)
+            })
             .await;
         let err = match result {
             Ok(_) => {
                 return Err(Box::<dyn std::error::Error + Send + Sync>::from(
                     "expected foreign owner status change to fail",
                 ));
-            }
+            },
             Err(err) => err,
         };
         assert!(err.to_string().contains("owned by 'owner-a'"));
@@ -965,19 +991,11 @@ mod tests {
 
         // owner-a changes status → allowed.
         let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("owner-a"),
-                None,
-                false,
-            )
+            .update(TaskUpdateParams {
+                status: Some(TaskStatus::Completed),
+                caller_identity: Some("owner-a"),
+                ..TaskUpdateParams::new("default", &task.id)
+            })
             .await?;
         assert_eq!(updated.status, TaskStatus::Completed);
         Ok(())
@@ -995,19 +1013,11 @@ mod tests {
 
         // owner-b updates subject (metadata) → allowed.
         let updated = store
-            .update(
-                "default",
-                &task.id,
-                None,
-                Some("updated subject".into()),
-                None,
-                None,
-                None,
-                None,
-                Some("owner-b"),
-                None,
-                false,
-            )
+            .update(TaskUpdateParams {
+                subject: Some("updated subject".into()),
+                caller_identity: Some("owner-b"),
+                ..TaskUpdateParams::new("default", &task.id)
+            })
             .await?;
         assert_eq!(updated.subject, "updated subject");
         Ok(())
@@ -1023,19 +1033,11 @@ mod tests {
 
         // No owner set — any caller can change status.
         let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::InProgress),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("anyone"),
-                None,
-                false,
-            )
+            .update(TaskUpdateParams {
+                status: Some(TaskStatus::InProgress),
+                caller_identity: Some("anyone"),
+                ..TaskUpdateParams::new("default", &task.id)
+            })
             .await?;
         assert_eq!(updated.status, TaskStatus::InProgress);
         Ok(())
@@ -1053,19 +1055,12 @@ mod tests {
 
         // owner-b with force=true → allowed.
         let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("owner-b"),
-                None,
-                true,
-            )
+            .update(TaskUpdateParams {
+                status: Some(TaskStatus::Completed),
+                caller_identity: Some("owner-b"),
+                force: true,
+                ..TaskUpdateParams::new("default", &task.id)
+            })
             .await?;
         assert_eq!(updated.status, TaskStatus::Completed);
         Ok(())
@@ -1084,19 +1079,12 @@ mod tests {
         store.claim("default", &task.id, "worker", None).await?;
 
         let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                Some("tests passed, coverage 95%".into()),
-                Some("worker"),
-                None,
-                false,
-            )
+            .update(TaskUpdateParams {
+                status: Some(TaskStatus::Completed),
+                proof: Some("tests passed, coverage 95%".into()),
+                caller_identity: Some("worker"),
+                ..TaskUpdateParams::new("default", &task.id)
+            })
             .await?;
         assert_eq!(updated.proof.as_deref(), Some("tests passed, coverage 95%"));
         assert!(updated.completed_at.is_some());
@@ -1114,19 +1102,11 @@ mod tests {
         store.claim("default", &task.id, "worker", None).await?;
 
         let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("worker"),
-                None,
-                false,
-            )
+            .update(TaskUpdateParams {
+                status: Some(TaskStatus::Completed),
+                caller_identity: Some("worker"),
+                ..TaskUpdateParams::new("default", &task.id)
+            })
             .await?;
         assert_eq!(updated.status, TaskStatus::Completed);
         assert!(updated.proof.is_none());
@@ -1176,19 +1156,11 @@ mod tests {
             .await?;
 
         let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::InProgress),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("trace-abc-123"),
-                false,
-            )
+            .update(TaskUpdateParams {
+                status: Some(TaskStatus::InProgress),
+                trace_id: Some("trace-abc-123"),
+                ..TaskUpdateParams::new("default", &task.id)
+            })
             .await?;
         assert_eq!(updated.last_trace_id.as_deref(), Some("trace-abc-123"));
         Ok(())
