@@ -47,13 +47,35 @@ where
     Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
+/// Human-readable JSON type name for diagnostic logging.
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// Lossy optional string: non-string values are treated as absent.
 fn optional_string_lossy<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<Value>::deserialize(deserializer)?;
-    Ok(raw.and_then(|value| value.as_str().map(str::to_owned)))
+    Ok(raw.and_then(|value| {
+        if let Some(s) = value.as_str() {
+            Some(s.to_owned())
+        } else {
+            tracing::debug!(
+                actual_type = value_type_name(&value),
+                "ignoring wrong-type field in session params, expected string"
+            );
+            None
+        }
+    }))
 }
 
 /// Lossy optional bool: non-bool values are treated as absent.
@@ -62,7 +84,17 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<Value>::deserialize(deserializer)?;
-    Ok(raw.and_then(|value| value.as_bool()))
+    Ok(raw.and_then(|value| {
+        if let Some(b) = value.as_bool() {
+            Some(b)
+        } else {
+            tracing::debug!(
+                actual_type = value_type_name(&value),
+                "ignoring wrong-type field in session params, expected bool"
+            );
+            None
+        }
+    }))
 }
 
 /// Lossy optional u64: non-u64 values are treated as absent.
@@ -71,7 +103,17 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<Value>::deserialize(deserializer)?;
-    Ok(raw.and_then(|value| value.as_u64()))
+    Ok(raw.and_then(|value| {
+        if let Some(n) = value.as_u64() {
+            Some(n)
+        } else {
+            tracing::debug!(
+                actual_type = value_type_name(&value),
+                "ignoring wrong-type field in session params, expected u64"
+            );
+            None
+        }
+    }))
 }
 
 /// Params for handlers that only need a session `key`.
@@ -159,11 +201,7 @@ pub struct ForkParams {
     pub key: String,
     #[serde(default, deserialize_with = "optional_string_lossy")]
     pub label: Option<String>,
-    #[serde(
-        default,
-        alias = "fork_point",
-        deserialize_with = "optional_u64_lossy"
-    )]
+    #[serde(default, alias = "fork_point", deserialize_with = "optional_u64_lossy")]
     pub fork_point: Option<u64>,
 }
 
@@ -239,9 +277,7 @@ pub enum VoiceTarget {
 
 /// Parse a `serde_json::Value` into a typed param struct, mapping
 /// deserialization errors to the service error format.
-pub fn parse_params<T: serde::de::DeserializeOwned>(
-    params: Value,
-) -> Result<T, ServiceError> {
+pub fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, ServiceError> {
     serde_json::from_value(params).map_err(ServiceError::message)
 }
 
