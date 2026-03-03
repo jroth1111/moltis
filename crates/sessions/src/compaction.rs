@@ -126,6 +126,7 @@ async fn move_to_workspace_strategy(
     })
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use {super::*, serde_json::json};
