@@ -6,10 +6,12 @@
 /// Represented as a UUID v4 string for easy logging and serialization.
 /// All fields are `Option<String>` so callers that don't have a trace context
 /// can pass `None` without breaking backward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TraceId(pub String);
 
 impl TraceId {
     /// Generate a new random trace ID (UUID v4).
+    #[must_use]
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
