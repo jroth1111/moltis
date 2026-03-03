@@ -19,6 +19,14 @@ pub struct SearchResult {
     pub message_index: usize,
 }
 
+/// Session read output with malformed-line statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadResult<T> {
+    pub messages: Vec<T>,
+    pub skipped_lines: usize,
+    pub total_lines: usize,
+}
+
 /// Outcome of validating and repairing a session JSONL file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionIntegrityReport {
@@ -114,33 +122,66 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Read all messages from a session file.
-    pub async fn read(&self, key: &str) -> Result<Vec<serde_json::Value>> {
+    /// Read all messages from a session file and return skip statistics.
+    pub async fn read_with_stats(&self, key: &str) -> Result<ReadResult<serde_json::Value>> {
         let path = self.path_for(key);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>> {
+        let result = tokio::task::spawn_blocking(move || -> Result<ReadResult<serde_json::Value>> {
             if !path.exists() {
-                return Ok(vec![]);
+                return Ok(ReadResult {
+                    messages: vec![],
+                    skipped_lines: 0,
+                    total_lines: 0,
+                });
             }
             let file = File::open(&path)?;
             let reader = BufReader::new(file);
             let mut messages = Vec::new();
+            let mut skipped_lines = 0usize;
+            let mut total_lines = 0usize;
             for line in reader.lines() {
                 let line = line?;
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
+                total_lines = total_lines.saturating_add(1);
                 match serde_json::from_str(trimmed) {
                     Ok(val) => messages.push(val),
-                    Err(e) => {
-                        tracing::warn!("skipping malformed JSONL line: {e}");
+                    Err(_) => {
+                        skipped_lines = skipped_lines.saturating_add(1);
                     },
                 }
             }
-            Ok(messages)
+            Ok(ReadResult {
+                messages,
+                skipped_lines,
+                total_lines,
+            })
         })
-        .await?
+        .await??;
+
+        #[cfg(feature = "metrics")]
+        if result.skipped_lines > 0 {
+            moltis_metrics::counter!(moltis_metrics::session::JSONL_LINES_SKIPPED)
+                .increment(result.skipped_lines as u64);
+        }
+
+        Ok(result)
+    }
+
+    /// Read all messages from a session file.
+    pub async fn read(&self, key: &str) -> Result<Vec<serde_json::Value>> {
+        let result = self.read_with_stats(key).await?;
+        if result.skipped_lines > 0 {
+            tracing::warn!(
+                session = %key,
+                skipped_lines = result.skipped_lines,
+                total_lines = result.total_lines,
+                "session JSONL read skipped malformed lines"
+            );
+        }
+        Ok(result.messages)
     }
 
     /// Read all messages from a session that match a given `run_id`.
@@ -189,7 +230,8 @@ impl SessionStore {
                                     value.get("tool_calls").and_then(|v| v.as_array())
                                 {
                                     for call in tool_calls {
-                                        let Some(id) = call.get("id").and_then(|v| v.as_str()) else {
+                                        let Some(id) = call.get("id").and_then(|v| v.as_str())
+                                        else {
                                             continue;
                                         };
                                         let tool_name = call
@@ -236,7 +278,9 @@ impl SessionStore {
                     None,
                     false,
                     None,
-                    Some("Recovered: tool call interrupted before result was persisted".to_string()),
+                    Some(
+                        "Recovered: tool call interrupted before result was persisted".to_string(),
+                    ),
                 );
                 let value = serde_json::to_value(&synthetic)?;
                 valid_lines.push(serde_json::to_string(&value)?);
@@ -689,6 +733,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_with_stats_counts_malformed_lines() {
+        let (store, dir) = temp_store();
+        let path = dir.path().join("stats.jsonl");
+        let raw = format!(
+            "{}\n{}\n{}\n\n",
+            json!({"role": "user", "content": "ok"}),
+            "{not valid json}",
+            json!({"role": "assistant", "content": "still ok"})
+        );
+        fs::write(path, raw).unwrap();
+
+        let result = store.read_with_stats("stats").await.unwrap();
+        assert_eq!(result.total_lines, 3);
+        assert_eq!(result.skipped_lines, 1);
+        assert_eq!(result.messages.len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_read_last_n() {
         let (store, _dir) = temp_store();
 
@@ -1100,11 +1162,17 @@ mod tests {
 
         // Filename must not be empty and must be a .jsonl file.
         assert!(!filename.is_empty());
-        assert!(filename.ends_with(".jsonl"), "expected .jsonl, got {filename}");
+        assert!(
+            filename.ends_with(".jsonl"),
+            "expected .jsonl, got {filename}"
+        );
 
         // Archive file must exist under archive/.
         let archive_path = dir.path().join("archive").join(&filename);
-        assert!(archive_path.exists(), "archive file not found: {archive_path:?}");
+        assert!(
+            archive_path.exists(),
+            "archive file not found: {archive_path:?}"
+        );
 
         // Archive file must contain the same number of lines as messages.
         let content = fs::read_to_string(&archive_path).unwrap();
@@ -1127,7 +1195,10 @@ mod tests {
             .unwrap();
 
         // Colons must be replaced by underscores in the filename.
-        assert!(!filename.contains(':'), "filename must not contain colons: {filename}");
+        assert!(
+            !filename.contains(':'),
+            "filename must not contain colons: {filename}"
+        );
         let archive_path = dir.path().join("archive").join(&filename);
         assert!(archive_path.exists());
     }
@@ -1146,7 +1217,10 @@ mod tests {
         let mut same_second_pair: Option<(String, String)> = None;
         for _ in 0..32 {
             let first = store
-                .archive_to_cold_store("session:abc", &[json!({"role": "user", "content": "first"})])
+                .archive_to_cold_store(
+                    "session:abc",
+                    &[json!({"role": "user", "content": "first"})],
+                )
                 .await
                 .unwrap();
             let second = store
@@ -1187,7 +1261,10 @@ mod tests {
 
         for i in 0..10 {
             store
-                .append("main", &json!({"role": "user", "content": format!("msg-{i}")}))
+                .append(
+                    "main",
+                    &json!({"role": "user", "content": format!("msg-{i}")}),
+                )
                 .await
                 .unwrap();
         }
@@ -1207,7 +1284,10 @@ mod tests {
 
         for i in 0..3 {
             store
-                .append("main", &json!({"role": "user", "content": format!("msg-{i}")}))
+                .append(
+                    "main",
+                    &json!({"role": "user", "content": format!("msg-{i}")}),
+                )
                 .await
                 .unwrap();
         }
@@ -1251,7 +1331,10 @@ mod tests {
         raw.push('\n');
         fs::write(&path, raw).unwrap();
 
-        let report = store.validate_session_integrity("repair:case").await.unwrap();
+        let report = store
+            .validate_session_integrity("repair:case")
+            .await
+            .unwrap();
         assert!(report.recovered);
         assert_eq!(report.removed_malformed_lines, 1);
         assert_eq!(report.injected_tool_results, 1);
