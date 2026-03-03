@@ -7,7 +7,7 @@
 use std::{
     pin::Pin,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use {async_trait::async_trait, tokio_stream::Stream, tracing::warn};
@@ -418,7 +418,7 @@ mod tests {
         super::*,
         crate::model::{ChatMessage, StreamEvent, Usage},
         async_trait::async_trait,
-        std::sync::Mutex,
+        std::{sync::Mutex, time::Duration},
         tokio_stream::StreamExt,
     };
 
@@ -1013,15 +1013,11 @@ mod tests {
 
     #[test]
     fn parse_retry_after_integer() {
-        assert_eq!(
-            parse_retry_after_ms("retry-after: 60"),
-            Some(60_000)
-        );
+        assert_eq!(parse_retry_after_ms("retry-after: 60"), Some(60_000));
     }
 
     #[test]
     fn non_retryable_rate_limit_should_failover() {
         assert!(ProviderErrorKind::NonRetryableRateLimit.should_failover());
     }
-
 }
