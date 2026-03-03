@@ -1,0 +1,4 @@
+ALTER TABLE agents ADD COLUMN allowed_tools TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE agents ADD COLUMN denied_tools TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE agents ADD COLUMN delegate_only INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN system_prompt_suffix TEXT;

@@ -2,12 +2,12 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use {async_trait::async_trait, tracing::info};
+use {async_trait::async_trait, serde::Deserialize, tracing::info};
 
 use {
     crate::{
         error::Error,
-        params::{bool_param, str_param, u64_param},
+        params::{bool_param, str_param, str_param_any, u64_param},
     },
     moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent},
     time::OffsetDateTime,
@@ -63,6 +63,18 @@ pub struct SpawnAgentTool {
     /// Global tool policy resolver — enforced on all sub-agent tool registries.
     /// Resolved at spawn time so policy updates are picked up without restart.
     tool_policy_resolver: crate::policy::ToolPolicyResolver,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PersonaSpawnPolicy {
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    denied_tools: Vec<String>,
+    #[serde(default)]
+    delegate_only: bool,
+    #[serde(default)]
+    system_prompt_suffix: Option<String>,
 }
 
 impl SpawnAgentTool {
@@ -150,6 +162,13 @@ impl SpawnAgentTool {
         let arr = raw
             .as_array()
             .ok_or_else(|| Error::message(format!("parameter '{key}' must be an array")))?;
+        Self::normalize_tool_names_array(arr, key)
+    }
+
+    fn normalize_tool_names_array(
+        arr: &[serde_json::Value],
+        key: &str,
+    ) -> crate::Result<Vec<String>> {
         let mut out = Vec::new();
         for (idx, item) in arr.iter().enumerate() {
             let name = item.as_str().ok_or_else(|| {
@@ -164,6 +183,59 @@ impl SpawnAgentTool {
             out.push(trimmed.to_string());
         }
         Ok(out)
+    }
+
+    async fn load_persona_spawn_policy(
+        params: &serde_json::Value,
+    ) -> crate::Result<Option<(String, PersonaSpawnPolicy)>> {
+        let Some(agent_id) = str_param_any(params, &["agent_id", "_agent_id"]) else {
+            return Ok(None);
+        };
+        let policy_path = moltis_config::agent_workspace_dir(agent_id).join(".spawn-policy.json");
+        let content = match tokio::fs::read_to_string(&policy_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(Error::message(format!(
+                    "failed to read agent policy '{}': {error}",
+                    policy_path.display()
+                )));
+            },
+        };
+        let policy = serde_json::from_str::<PersonaSpawnPolicy>(&content).map_err(|error| {
+            Error::message(format!(
+                "failed to parse agent policy '{}': {error}",
+                policy_path.display()
+            ))
+        })?;
+        Ok(Some((agent_id.to_string(), policy)))
+    }
+
+    fn apply_persona_policy(
+        allow_tools: Vec<String>,
+        mut deny_tools: Vec<String>,
+        mut delegate_only: bool,
+        policy: &PersonaSpawnPolicy,
+    ) -> (Vec<String>, Vec<String>, bool) {
+        let allow_tools = if policy.allowed_tools.is_empty() {
+            allow_tools
+        } else if allow_tools.is_empty() {
+            policy.allowed_tools.clone()
+        } else {
+            let allowed: HashSet<&str> = policy.allowed_tools.iter().map(String::as_str).collect();
+            allow_tools
+                .into_iter()
+                .filter(|tool| allowed.contains(tool.as_str()))
+                .collect()
+        };
+
+        for denied in &policy.denied_tools {
+            if !deny_tools.iter().any(|tool| tool == denied) {
+                deny_tools.push(denied.clone());
+            }
+        }
+        delegate_only |= policy.delegate_only;
+        (allow_tools, deny_tools, delegate_only)
     }
 
     fn build_sub_tools(
@@ -236,6 +308,9 @@ impl SpawnAgentTool {
         }
         if let Some(trace_id) = params.get("_trace_id") {
             tool_context["_trace_id"] = trace_id.clone();
+        }
+        if let Some(agent_id) = params.get("_agent_id") {
+            tool_context["_agent_id"] = agent_id.clone();
         }
         tool_context
     }
@@ -371,6 +446,10 @@ impl AgentTool for SpawnAgentTool {
                     "type": "string",
                     "description": "Optional spawn preset from config.agents.presets."
                 },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Optional agent persona id whose spawn policy should be enforced."
+                },
                 "model": {
                     "type": "string",
                     "description": "Model ID to use (e.g. a cheaper model). If not specified, uses the parent's current model."
@@ -439,7 +518,7 @@ impl AgentTool for SpawnAgentTool {
             .or_else(|| preset.as_ref().and_then(|p| p.model.clone()));
 
         let explicit_allow_tools = Self::parse_tool_name_array(&params, "allow_tools")?;
-        let allow_tools = if explicit_allow_tools.is_empty() {
+        let mut allow_tools = if explicit_allow_tools.is_empty() {
             preset
                 .as_ref()
                 .map(|p| p.allow_tools.clone())
@@ -449,7 +528,7 @@ impl AgentTool for SpawnAgentTool {
         };
 
         let explicit_deny_tools = Self::parse_tool_name_array(&params, "deny_tools")?;
-        let deny_tools = if explicit_deny_tools.is_empty() {
+        let mut deny_tools = if explicit_deny_tools.is_empty() {
             preset
                 .as_ref()
                 .map(|p| p.deny_tools.clone())
@@ -458,11 +537,21 @@ impl AgentTool for SpawnAgentTool {
             explicit_deny_tools
         };
 
-        let delegate_only = bool_param(
+        let mut delegate_only = bool_param(
             &params,
             "delegate_only",
             preset.as_ref().map(|p| p.delegate_only).unwrap_or(false),
         );
+        let mut persona_suffix = None;
+        if let Some((persona_id, policy)) = Self::load_persona_spawn_policy(&params).await? {
+            (allow_tools, deny_tools, delegate_only) =
+                Self::apply_persona_policy(allow_tools, deny_tools, delegate_only, &policy);
+            persona_suffix = policy.system_prompt_suffix;
+            info!(
+                agent_id = %persona_id,
+                "applied persona spawn policy to sub-agent request"
+            );
+        }
         let include_context = bool_param(&params, "include_context", false);
         let context_max_tokens =
             u64_param(&params, "context_max_tokens", 4000).clamp(256, 32000) as u32;
@@ -526,6 +615,14 @@ impl AgentTool for SpawnAgentTool {
             .and_then(|p| p.system_prompt_suffix.as_ref())
             .map(|suffix| suffix.trim())
             .filter(|v| !v.is_empty())
+        {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(extra);
+        }
+        if let Some(extra) = persona_suffix
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
         {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(extra);
@@ -684,7 +781,10 @@ mod tests {
     use {
         super::*,
         moltis_agents::model::{ChatMessage, CompletionResponse, StreamEvent, Usage},
-        std::pin::Pin,
+        std::{
+            pin::Pin,
+            sync::{Mutex, OnceLock},
+        },
         tokio_stream::Stream,
     };
 
@@ -782,17 +882,24 @@ mod tests {
         Arc::new(tokio::sync::RwLock::new(cfg))
     }
 
+    fn data_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn test_build_tool_context_propagates_session_and_trace_ids() {
         let params = serde_json::json!({
             "_session_key": "main",
             "_trace_id": "trace-abc-123",
+            "_agent_id": "researcher",
         });
 
         let context = SpawnAgentTool::build_tool_context(&params, 1);
         assert_eq!(context[SPAWN_DEPTH_KEY], 2);
         assert_eq!(context["_session_key"], "main");
         assert_eq!(context["_trace_id"], "trace-abc-123");
+        assert_eq!(context["_agent_id"], "researcher");
     }
 
     #[test]
@@ -812,6 +919,67 @@ mod tests {
             },
             other => panic!("expected user text message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_apply_persona_policy_intersects_allows_and_unions_denies() {
+        let policy = PersonaSpawnPolicy {
+            allowed_tools: vec!["read_file".to_string(), "web_search".to_string()],
+            denied_tools: vec!["exec".to_string(), "write_file".to_string()],
+            delegate_only: true,
+            system_prompt_suffix: None,
+        };
+        let (allow_tools, deny_tools, delegate_only) = SpawnAgentTool::apply_persona_policy(
+            vec!["read_file".to_string(), "exec".to_string()],
+            vec!["browser".to_string(), "exec".to_string()],
+            false,
+            &policy,
+        );
+        assert_eq!(allow_tools, vec!["read_file".to_string()]);
+        assert!(deny_tools.contains(&"browser".to_string()));
+        assert!(deny_tools.contains(&"exec".to_string()));
+        assert!(deny_tools.contains(&"write_file".to_string()));
+        assert!(delegate_only);
+    }
+
+    #[tokio::test]
+    async fn test_load_persona_spawn_policy_from_agent_workspace() {
+        let _guard = data_dir_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let previous_data_dir = moltis_config::data_dir();
+        let temp = tempfile::tempdir().unwrap();
+        moltis_config::set_data_dir(temp.path().to_path_buf());
+
+        let agent_dir = moltis_config::agent_workspace_dir("reviewer");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        tokio::fs::write(
+            agent_dir.join(".spawn-policy.json"),
+            r#"{
+  "allowed_tools": ["read_file"],
+  "denied_tools": ["exec"],
+  "delegate_only": true,
+  "system_prompt_suffix": "Use strict review mode."
+}"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = SpawnAgentTool::load_persona_spawn_policy(
+            &serde_json::json!({ "_agent_id": "reviewer" }),
+        )
+        .await
+        .unwrap();
+        assert!(loaded.is_some());
+        let (agent_id, policy) = loaded.unwrap();
+        assert_eq!(agent_id, "reviewer");
+        assert_eq!(policy.allowed_tools, vec!["read_file".to_string()]);
+        assert_eq!(policy.denied_tools, vec!["exec".to_string()]);
+        assert!(policy.delegate_only);
+        assert_eq!(
+            policy.system_prompt_suffix.as_deref(),
+            Some("Use strict review mode.")
+        );
+
+        moltis_config::set_data_dir(previous_data_dir);
     }
 
     #[tokio::test]

@@ -73,6 +73,7 @@ impl GatewayOnboardingService {
                 emoji: None,
                 theme: agent.theme.clone(),
                 description: None,
+                ..Default::default()
             };
 
             match self.agent_persona_store.create(params).await {

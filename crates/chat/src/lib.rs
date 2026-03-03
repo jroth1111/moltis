@@ -27,9 +27,8 @@ use {
         model::{StreamEvent, values_to_chat_messages},
         multimodal::parse_data_uri,
         prompt::{
-            FIRST_CHAT_IDENTITY_PROMPT,
-            PromptHostRuntimeContext, PromptRuntimeContext, PromptSandboxRuntimeContext,
-            VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime,
+            FIRST_CHAT_IDENTITY_PROMPT, PromptHostRuntimeContext, PromptRuntimeContext,
+            PromptSandboxRuntimeContext, VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime,
             build_system_prompt_with_session_runtime,
         },
         runner::{RunnerEvent, run_agent_loop_streaming},
@@ -6305,10 +6304,7 @@ fn should_trigger_first_chat_identity_moment(
     source: Option<&str>,
     marker_exists: bool,
 ) -> bool {
-    is_onboarded
-        && history_raw.is_empty()
-        && !marker_exists
-        && !is_autonomous_turn_source(source)
+    is_onboarded && history_raw.is_empty() && !marker_exists && !is_autonomous_turn_source(source)
 }
 
 async fn mark_first_chat_identity_moment_done(agent_id: &str) {
@@ -6783,6 +6779,7 @@ fn build_tool_context(
     conn_id: Option<&str>,
     source: Option<&str>,
     trace_id: Option<&str>,
+    agent_id: Option<&str>,
 ) -> Value {
     let mut tool_context = serde_json::json!({
         "_session_key": session_key,
@@ -6798,6 +6795,9 @@ fn build_tool_context(
     }
     if let Some(tid) = trace_id {
         tool_context["_trace_id"] = serde_json::json!(tid);
+    }
+    if let Some(agent_id) = agent_id {
+        tool_context["_agent_id"] = serde_json::json!(agent_id);
     }
     tool_context
 }
@@ -7350,6 +7350,7 @@ async fn run_with_tools(
         conn_id.as_deref(),
         source.as_deref(),
         trace_id.as_deref(),
+        Some(agent_id),
     );
 
     // Research phase: gather context before the main agent turn when enabled.
@@ -9941,6 +9942,7 @@ mod tests {
             Some("conn-1"),
             Some("cron"),
             Some("trace-1"),
+            Some("researcher"),
         );
 
         assert_eq!(ctx["_session_key"], "session:abc");
@@ -9948,13 +9950,15 @@ mod tests {
         assert_eq!(ctx["_conn_id"], "conn-1");
         assert_eq!(ctx["_source"], "cron");
         assert_eq!(ctx["_trace_id"], "trace-1");
+        assert_eq!(ctx["_agent_id"], "researcher");
     }
 
     #[test]
     fn build_tool_context_omits_source_when_absent() {
-        let ctx = build_tool_context("main", None, None, None, None);
+        let ctx = build_tool_context("main", None, None, None, None, None);
         assert_eq!(ctx["_session_key"], "main");
         assert!(ctx.get("_source").is_none());
+        assert!(ctx.get("_agent_id").is_none());
     }
 
     #[test]
