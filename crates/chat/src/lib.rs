@@ -117,7 +117,7 @@ async fn broadcast(
 }
 
 #[cfg(feature = "metrics")]
-use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
+use moltis_metrics::{counter, histogram, labels, llm as llm_metrics, memory as mem_metrics};
 
 /// Convert session-crate `MessageContent` to agents-crate `UserContent`.
 ///
@@ -6122,11 +6122,45 @@ impl moltis_agents::memory_writer::MemoryWriter for AgentScopedMemoryWriter {
 struct AgentScopedMemorySearchTool {
     manager: Arc<moltis_memory::manager::MemoryManager>,
     agent_id: String,
+    provider: Arc<dyn moltis_agents::model::LlmProvider>,
+}
+
+struct ProviderBackedRerankClient {
+    provider: Arc<dyn moltis_agents::model::LlmProvider>,
+}
+
+impl ProviderBackedRerankClient {
+    fn new(provider: Arc<dyn moltis_agents::model::LlmProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl moltis_memory::reranking::LlmClient for ProviderBackedRerankClient {
+    async fn complete(&self, prompt: &str, _model: Option<&str>) -> anyhow::Result<String> {
+        let response = self
+            .provider
+            .complete(&[ChatMessage::user(prompt)], &[])
+            .await?;
+        let text = response.text.unwrap_or_default();
+        if text.trim().is_empty() {
+            anyhow::bail!("reranking provider returned empty text response");
+        }
+        Ok(text)
+    }
 }
 
 impl AgentScopedMemorySearchTool {
-    fn new(manager: Arc<moltis_memory::manager::MemoryManager>, agent_id: String) -> Self {
-        Self { manager, agent_id }
+    fn new(
+        manager: Arc<moltis_memory::manager::MemoryManager>,
+        agent_id: String,
+        provider: Arc<dyn moltis_agents::model::LlmProvider>,
+    ) -> Self {
+        Self {
+            manager,
+            agent_id,
+            provider,
+        }
     }
 }
 
@@ -6177,6 +6211,37 @@ impl AgentTool for AgentScopedMemorySearchTool {
             .into_iter()
             .filter(|result| is_path_in_agent_memory_scope(Path::new(&result.path), &self.agent_id))
             .collect();
+
+        if self.manager.llm_reranking_enabled() && !results.is_empty() {
+            #[cfg(feature = "metrics")]
+            counter!(mem_metrics::RERANK_ATTEMPTS_TOTAL).increment(1);
+            #[cfg(feature = "metrics")]
+            let rerank_start = std::time::Instant::now();
+
+            let client: Arc<dyn moltis_memory::reranking::LlmClient> = Arc::new(
+                ProviderBackedRerankClient::new(Arc::clone(&self.provider)),
+            );
+            let reranker = moltis_memory::reranking::LlmReranker::new(client)
+                .with_max_candidates(search_limit);
+            match moltis_memory::reranking::RerankerProvider::rerank(
+                &reranker,
+                query,
+                results.clone(),
+                search_limit,
+            )
+            .await
+            {
+                Ok(reranked) => results = reranked,
+                Err(error) => {
+                    warn!(%error, "memory_search: reranking failed, using hybrid order");
+                    #[cfg(feature = "metrics")]
+                    counter!(mem_metrics::RERANK_FAILURES_TOTAL).increment(1);
+                },
+            }
+            #[cfg(feature = "metrics")]
+            histogram!(mem_metrics::RERANK_LATENCY_SECONDS)
+                .record(rerank_start.elapsed().as_secs_f64());
+        }
         results.truncate(limit);
 
         let include_citations = moltis_memory::search::SearchResult::should_include_citations(
@@ -6346,6 +6411,7 @@ fn install_agent_scoped_memory_tools(
     registry: &mut ToolRegistry,
     manager: &Arc<moltis_memory::manager::MemoryManager>,
     agent_id: &str,
+    provider: Arc<dyn moltis_agents::model::LlmProvider>,
 ) {
     let had_search = registry.unregister("memory_search");
     let had_get = registry.unregister("memory_get");
@@ -6356,6 +6422,7 @@ fn install_agent_scoped_memory_tools(
         registry.register(Box::new(AgentScopedMemorySearchTool::new(
             Arc::clone(manager),
             agent_id_owned.clone(),
+            Arc::clone(&provider),
         )));
     }
     if had_get {
@@ -6487,7 +6554,12 @@ async fn run_with_tools(
         }
     };
     if tools_enabled && let Some(manager) = state.memory_manager() {
-        install_agent_scoped_memory_tools(&mut filtered_registry, manager, agent_id);
+        install_agent_scoped_memory_tools(
+            &mut filtered_registry,
+            manager,
+            agent_id,
+            Arc::clone(&provider),
+        );
     }
 
     // Build system prompt:
@@ -12273,5 +12345,68 @@ mod tests {
             mode: Some(ToolMode::Auto),
         };
         assert_eq!(effective_tool_mode(&text), ToolMode::Text);
+    }
+
+    struct RerankClientTestProvider {
+        response_text: Option<String>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RerankClientTestProvider {
+        fn name(&self) -> &str {
+            "rerank-test"
+        }
+
+        fn id(&self) -> &str {
+            "rerank-test-model"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[Value],
+        ) -> Result<moltis_agents::model::CompletionResponse> {
+            Ok(moltis_agents::model::CompletionResponse {
+                text: self.response_text.clone(),
+                tool_calls: vec![],
+                usage: Default::default(),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_backed_rerank_client_returns_llm_text() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(RerankClientTestProvider {
+            response_text: Some("[0.9, 0.5]".to_string()),
+        });
+        let client = ProviderBackedRerankClient::new(provider);
+
+        let response = moltis_memory::reranking::LlmClient::complete(&client, "test prompt", None)
+            .await
+            .unwrap();
+        assert_eq!(response, "[0.9, 0.5]");
+    }
+
+    #[tokio::test]
+    async fn provider_backed_rerank_client_rejects_empty_text() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(RerankClientTestProvider {
+            response_text: Some("   ".to_string()),
+        });
+        let client = ProviderBackedRerankClient::new(provider);
+
+        let err = moltis_memory::reranking::LlmClient::complete(&client, "test prompt", None)
+            .await
+            .expect_err("empty rerank text should fail");
+        assert!(
+            err.to_string()
+                .contains("reranking provider returned empty text response")
+        );
     }
 }

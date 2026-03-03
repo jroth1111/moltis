@@ -144,6 +144,12 @@ pub mod memory {
     pub const SEARCHES_TOTAL: &str = "moltis_memory_searches_total";
     /// Memory search duration in seconds
     pub const SEARCH_DURATION_SECONDS: &str = "moltis_memory_search_duration_seconds";
+    /// Total reranking attempts for memory search results.
+    pub const RERANK_ATTEMPTS_TOTAL: &str = "moltis_memory_rerank_attempts_total";
+    /// Total reranking failures for memory search results.
+    pub const RERANK_FAILURES_TOTAL: &str = "moltis_memory_rerank_failures_total";
+    /// Reranking latency in seconds.
+    pub const RERANK_LATENCY_SECONDS: &str = "moltis_memory_rerank_latency_seconds";
     /// Total number of embeddings generated
     pub const EMBEDDINGS_GENERATED_TOTAL: &str = "moltis_memory_embeddings_generated_total";
     /// Number of documents in memory
