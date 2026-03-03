@@ -455,4 +455,168 @@ mod tests {
         assert_eq!(task.state_name(), "Pending");
         assert!(!task.is_terminal());
     }
+
+    // ── AutonomyTier tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn autonomy_tier_ordering() {
+        assert!(AutonomyTier::Auto < AutonomyTier::Confirm);
+        assert!(AutonomyTier::Confirm < AutonomyTier::Approve);
+        assert!(AutonomyTier::Auto < AutonomyTier::Approve);
+    }
+
+    #[test]
+    fn autonomy_tier_default_is_auto() {
+        assert_eq!(AutonomyTier::default(), AutonomyTier::Auto);
+    }
+
+    #[test]
+    fn autonomy_tier_display() {
+        assert_eq!(AutonomyTier::Auto.to_string(), "auto");
+        assert_eq!(AutonomyTier::Confirm.to_string(), "confirm");
+        assert_eq!(AutonomyTier::Approve.to_string(), "approve");
+    }
+
+    #[test]
+    fn autonomy_tier_serde_roundtrip() {
+        let tier = AutonomyTier::Confirm;
+        let json = serde_json::to_string(&tier).unwrap();
+        assert_eq!(json, "\"confirm\"");
+        let back: AutonomyTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tier);
+    }
+
+    // ── TaskPrincipal tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn task_principal_serde_roundtrip() {
+        let p = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "biz-123".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: TaskPrincipal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn task_principal_account_id_defaults_empty() {
+        let json = r#"{"channel":"web","sender":"user42"}"#;
+        let p: TaskPrincipal = serde_json::from_str(json).unwrap();
+        assert_eq!(p.account_id, "");
+    }
+
+    #[test]
+    fn canonical_list_id_is_stable() {
+        let p = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "".into(),
+        };
+        let id1 = p.canonical_list_id();
+        let id2 = p.canonical_list_id();
+        assert_eq!(id1, id2, "must be deterministic");
+    }
+
+    #[test]
+    fn canonical_list_id_hides_sender() {
+        let p = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "".into(),
+        };
+        let id = p.canonical_list_id();
+        assert!(!id.contains("+15551234567"), "sender must be hashed, not plaintext");
+        assert!(id.starts_with("v1:whatsapp:"), "must include version and channel prefix");
+    }
+
+    #[test]
+    fn canonical_list_id_sanitizes_channel() {
+        let p = TaskPrincipal {
+            channel: "evil/../path".into(),
+            sender: "user".into(),
+            account_id: "".into(),
+        };
+        let id = p.canonical_list_id();
+        assert!(!id.contains('/'), "slashes must be stripped from channel");
+        assert!(!id.contains('.'), "dots must be stripped from channel");
+    }
+
+    #[test]
+    fn canonical_list_id_differs_by_account() {
+        let p1 = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "acct-A".into(),
+        };
+        let p2 = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "acct-B".into(),
+        };
+        assert_ne!(
+            p1.canonical_list_id(),
+            p2.canonical_list_id(),
+            "different accounts must produce different list IDs"
+        );
+    }
+
+    #[test]
+    fn canonical_list_id_differs_by_sender() {
+        let p1 = TaskPrincipal {
+            channel: "web".into(),
+            sender: "alice".into(),
+            account_id: "".into(),
+        };
+        let p2 = TaskPrincipal {
+            channel: "web".into(),
+            sender: "bob".into(),
+            account_id: "".into(),
+        };
+        assert_ne!(p1.canonical_list_id(), p2.canonical_list_id());
+    }
+
+    // ── TaskSpec dispatch fields ────────────────────────────────────────────
+
+    #[test]
+    fn task_spec_new_defaults() {
+        let spec = TaskSpec::new("test", "desc");
+        assert!(!spec.is_intent, "is_intent defaults false");
+        assert!(spec.principal.is_none(), "principal defaults None");
+        assert!(spec.parent_task.is_none(), "parent_task defaults None");
+    }
+
+    #[test]
+    fn task_spec_serde_backward_compat() {
+        // JSON without the new fields should deserialize with defaults.
+        let json = r#"{
+            "subject": "old task",
+            "description": "",
+            "priority": 2,
+            "max_attempts": 3,
+            "created_at": "2026-03-04T00:00:00Z"
+        }"#;
+        let spec: TaskSpec = serde_json::from_str(json).unwrap();
+        assert!(!spec.is_intent);
+        assert!(spec.principal.is_none());
+        assert!(spec.parent_task.is_none());
+    }
+
+    #[test]
+    fn task_spec_serde_with_dispatch_fields() {
+        let mut spec = TaskSpec::new("intent task", "find restaurants");
+        spec.is_intent = true;
+        spec.principal = Some(TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "biz-1".into(),
+        });
+        spec.parent_task = None;
+
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: TaskSpec = serde_json::from_str(&json).unwrap();
+        assert!(back.is_intent);
+        assert_eq!(back.principal.as_ref().unwrap().channel, "whatsapp");
+    }
 }
