@@ -107,10 +107,10 @@ fn would_create_cycle(tasks: &HashMap<String, Task>, task_id: &str, new_deps: &[
         if current == task_id {
             return true;
         }
-        if visited.insert(current.clone()) {
-            if let Some(t) = tasks.get(&current) {
-                stack.extend(t.blocked_by.iter().cloned());
-            }
+        if visited.insert(current.clone())
+            && let Some(t) = tasks.get(&current)
+        {
+            stack.extend(t.blocked_by.iter().cloned());
         }
     }
     false
@@ -280,13 +280,13 @@ impl TaskStore {
             }
 
             // Status transition: Pending → Completed is forbidden (must pass through InProgress).
-            if let Some(TaskStatus::Completed) = &status {
-                if task.status == TaskStatus::Pending {
-                    return Err(Error::message(format!(
-                        "task {task_id} cannot transition from pending to completed directly; \
-                         set status to in_progress first"
-                    )));
-                }
+            if let Some(TaskStatus::Completed) = &status
+                && task.status == TaskStatus::Pending
+            {
+                return Err(Error::message(format!(
+                    "task {task_id} cannot transition from pending to completed directly; \
+                     set status to in_progress first"
+                )));
             }
 
             // Validate new blocked_by list.
