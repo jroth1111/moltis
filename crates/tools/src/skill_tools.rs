@@ -33,7 +33,7 @@ impl AgentTool for CreateSkillTool {
     }
 
     fn categories(&self) -> &'static [&'static str] {
-        &["code"]
+        &["skills"]
     }
 
     fn description(&self) -> &str {
@@ -138,7 +138,7 @@ impl AgentTool for UpdateSkillTool {
     }
 
     fn categories(&self) -> &'static [&'static str] {
-        &["code"]
+        &["skills"]
     }
 
     fn description(&self) -> &str {
@@ -241,7 +241,7 @@ impl AgentTool for DeleteSkillTool {
     }
 
     fn categories(&self) -> &'static [&'static str] {
-        &["code"]
+        &["skills", "destructive"]
     }
 
     fn description(&self) -> &str {

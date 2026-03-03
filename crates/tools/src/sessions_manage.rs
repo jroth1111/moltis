@@ -150,7 +150,7 @@ impl AgentTool for SessionsDeleteTool {
     }
 
     fn categories(&self) -> &'static [&'static str] {
-        &["session"]
+        &["session", "destructive"]
     }
 
     fn description(&self) -> &str {
