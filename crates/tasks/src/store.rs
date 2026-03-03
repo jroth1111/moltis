@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use {
-    sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions},
+    sqlx::{Row, Sqlite, SqlitePool, Transaction, sqlite::SqliteConnectOptions},
     time::OffsetDateTime,
 };
 
@@ -83,10 +83,20 @@ impl TaskStore {
             .map_err(|e| TransitionError::Other(e.to_string()))?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let version = task.runtime.version as i64;
+        let is_intent: i64 = if task.spec.is_intent { 1 } else { 0 };
+        let parent_task = task.spec.parent_task.as_ref().map(|id| id.0.as_str());
+        let principal_json = task
+            .spec
+            .principal
+            .as_ref()
+            .map(|p| serde_json::to_string(p).map_err(|e| TransitionError::Other(e.to_string())))
+            .transpose()?;
+        let state_name = task.runtime.state.name();
 
         sqlx::query(
-            "INSERT INTO tasks (id, list_id, spec_json, runtime_json, blocked_by, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO tasks (id, list_id, spec_json, runtime_json, blocked_by, version, \
+             created_at, updated_at, is_intent, parent_task, principal_json, state_name) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&task.id.0)
         .bind(&task.list_id)
@@ -96,6 +106,10 @@ impl TaskStore {
         .bind(version)
         .bind(now)
         .bind(now)
+        .bind(is_intent)
+        .bind(parent_task)
+        .bind(principal_json.as_deref())
+        .bind(state_name)
         .execute(&self.pool)
         .await
         .map_err(TransitionError::Storage)?;
@@ -219,14 +233,16 @@ impl TaskStore {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let new_version = updated.runtime.version as i64;
         let old_version = from_version as i64;
+        let state_name = updated.runtime.state.name();
 
         let rows_affected = sqlx::query(
-            "UPDATE tasks SET runtime_json = ?, version = ?, updated_at = ? \
+            "UPDATE tasks SET runtime_json = ?, version = ?, updated_at = ?, state_name = ? \
              WHERE list_id = ? AND id = ? AND version = ?",
         )
         .bind(&runtime_json)
         .bind(new_version)
         .bind(now)
+        .bind(state_name)
         .bind(&updated.list_id)
         .bind(&updated.id.0)
         .bind(old_version)
@@ -334,10 +350,203 @@ impl TaskStore {
         &self.log
     }
 
-    /// Return the underlying pool (test-only accessor).
-    #[cfg(test)]
-    fn pool(&self) -> &SqlitePool {
+    /// Return the underlying SQLite pool.
+    ///
+    /// Used by the dispatch layer for cross-store transactional finalization
+    /// (intent_state + task_outputs share the same pool).
+    pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Begin an explicit transaction on the shared pool.
+    pub async fn begin_tx(&self) -> Result<Transaction<'_, Sqlite>, TransitionError> {
+        self.pool.begin().await.map_err(TransitionError::Storage)
+    }
+
+    /// Read a single task using an existing transaction.
+    pub async fn get_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        list_id: &str,
+        task_id: &str,
+    ) -> Result<Option<Task>, TransitionError> {
+        let row = sqlx::query(
+            "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
+             FROM tasks WHERE list_id = ? AND id = ?",
+        )
+        .bind(list_id)
+        .bind(task_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        row.map(|r| {
+            Self::row_to_task(
+                r.get::<String, _>("id"),
+                r.get::<String, _>("list_id"),
+                r.get::<String, _>("spec_json"),
+                r.get::<String, _>("runtime_json"),
+                r.get::<String, _>("blocked_by"),
+                r.get::<i64, _>("version"),
+            )
+        })
+        .transpose()
+    }
+
+    /// Apply a transition within an existing transaction (no auto-commit).
+    ///
+    /// The caller is responsible for committing the transaction. This enables
+    /// atomic multi-table operations (e.g. finalize shift + update intent state).
+    pub async fn apply_transition_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        list_id: &str,
+        task_id: &str,
+        expected_version: Option<u64>,
+        event: &TransitionEvent,
+    ) -> Result<Task, TransitionError> {
+        let current = Self::get_tx(tx, list_id, task_id)
+            .await?
+            .ok_or_else(|| TransitionError::NotFound(task_id.to_string()))?;
+
+        if let Some(expected) = expected_version
+            && current.runtime.version != expected
+        {
+            return Err(TransitionError::VersionConflict {
+                expected,
+                actual: current.runtime.version,
+            });
+        }
+
+        let from_state = current.runtime.state.name();
+        let from_version = current.runtime.version;
+        let updated = apply(current, event)?;
+
+        let runtime_json = serde_json::to_string(&updated.runtime)
+            .map_err(|e| TransitionError::Other(e.to_string()))?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let new_version = updated.runtime.version as i64;
+        let old_version = from_version as i64;
+        let to_state = updated.runtime.state.name();
+
+        let rows_affected = sqlx::query(
+            "UPDATE tasks SET runtime_json = ?, version = ?, updated_at = ?, state_name = ? \
+             WHERE list_id = ? AND id = ? AND version = ?",
+        )
+        .bind(&runtime_json)
+        .bind(new_version)
+        .bind(now)
+        .bind(to_state)
+        .bind(&updated.list_id)
+        .bind(&updated.id.0)
+        .bind(old_version)
+        .execute(&mut **tx)
+        .await
+        .map_err(TransitionError::Storage)?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(TransitionError::VersionConflict {
+                expected: from_version,
+                actual: from_version + 1,
+            });
+        }
+
+        let event_type = event_type_name(event);
+        sqlx::query(
+            "INSERT INTO task_events (task_id, list_id, event_type, from_state, to_state, agent_id, detail, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&updated.id.0)
+        .bind(&updated.list_id)
+        .bind(event_type)
+        .bind(from_state)
+        .bind(to_state)
+        .bind(updated.runtime.owner.as_deref())
+        .bind(None::<&str>)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        Ok(updated)
+    }
+
+    /// Check whether any child task (parent_task = intent_id) is in a
+    /// non-terminal state. Used as a guard before creating new shifts.
+    pub async fn has_non_terminal_child(
+        &self,
+        intent_id: &str,
+    ) -> Result<bool, TransitionError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM tasks \
+             WHERE parent_task = ? \
+             AND state_name NOT IN ('Completed', 'Failed', 'Cancelled')",
+        )
+        .bind(intent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        let count: i64 = row.get("cnt");
+        Ok(count > 0)
+    }
+
+    /// List intent tasks in actionable states (Pending or Active).
+    ///
+    /// Used by the dispatch loop to find intents that need a new shift or
+    /// are currently being executed.
+    pub async fn list_actionable_intents(&self) -> Result<Vec<Task>, TransitionError> {
+        let rows = sqlx::query(
+            "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
+             FROM tasks \
+             WHERE is_intent = 1 AND state_name IN ('Pending', 'Active') \
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        rows.into_iter()
+            .map(|r| {
+                Self::row_to_task(
+                    r.get::<String, _>("id"),
+                    r.get::<String, _>("list_id"),
+                    r.get::<String, _>("spec_json"),
+                    r.get::<String, _>("runtime_json"),
+                    r.get::<String, _>("blocked_by"),
+                    r.get::<i64, _>("version"),
+                )
+            })
+            .collect()
+    }
+
+    /// List child shift tasks for a given intent.
+    pub async fn list_shifts_for_intent(
+        &self,
+        intent_id: &str,
+    ) -> Result<Vec<Task>, TransitionError> {
+        let rows = sqlx::query(
+            "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
+             FROM tasks \
+             WHERE parent_task = ? \
+             ORDER BY created_at ASC",
+        )
+        .bind(intent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        rows.into_iter()
+            .map(|r| {
+                Self::row_to_task(
+                    r.get::<String, _>("id"),
+                    r.get::<String, _>("list_id"),
+                    r.get::<String, _>("spec_json"),
+                    r.get::<String, _>("runtime_json"),
+                    r.get::<String, _>("blocked_by"),
+                    r.get::<i64, _>("version"),
+                )
+            })
+            .collect()
     }
 
     /// List tasks in `Retrying` state whose `retry_after` has passed.
