@@ -393,7 +393,7 @@ pub trait LlmProvider: Send + Sync {
 }
 
 /// Response from an LLM completion call.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CompletionResponse {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
@@ -403,18 +403,6 @@ pub struct CompletionResponse {
     pub confidence: Option<f64>,
     /// Optional reasoning/thinking content (e.g., from Claude's extended thinking).
     pub reasoning: Option<String>,
-}
-
-impl Default for CompletionResponse {
-    fn default() -> Self {
-        Self {
-            text: None,
-            tool_calls: Vec::new(),
-            usage: Usage::default(),
-            confidence: None,
-            reasoning: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
