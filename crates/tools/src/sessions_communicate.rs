@@ -510,7 +510,9 @@ mod tests {
                 assert!(req.message.contains("compile error"));
                 // Verify the handoff context is attached.
                 assert!(req.handoff.is_some());
-                let handoff = req.handoff.as_ref().unwrap();
+                let Some(handoff) = req.handoff.as_ref() else {
+                    panic!("expected handoff to be present");
+                };
                 assert_eq!(handoff.dead_ends.len(), 1);
                 assert_eq!(handoff.last_action.as_deref(), Some("building"));
                 Ok(serde_json::json!({ "text": "ok" }))
