@@ -131,6 +131,7 @@ fn subscription_preference_rank(provider_name: &str) -> usize {
     }
 }
 
+#[allow(dead_code)]
 fn oauth_discovery_enabled(config: &ProvidersConfig, provider_name: &str) -> bool {
     config.get(provider_name).is_none_or(|entry| entry.enabled)
 }
