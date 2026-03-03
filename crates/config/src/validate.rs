@@ -973,7 +973,7 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
     }
 
     if config.tools.exec.sandbox.pool_min_warm > 0
-        && config.tools.exec.sandbox.scope.to_ascii_lowercase() != "shared"
+        && !config.tools.exec.sandbox.scope.eq_ignore_ascii_case("shared")
     {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,

@@ -2542,6 +2542,8 @@ pub struct LiveChatService {
     pre_compact_flushed: Arc<RwLock<HashMap<String, bool>>>,
     /// Per-session+project path-scoped rules accumulated from tool call file paths.
     path_rules: Arc<RwLock<HashMap<(String, PathBuf), PathRulesAccumulator>>>,
+    /// Cached chat configuration (immutable at runtime).
+    chat_config: moltis_config::ChatConfig,
 }
 
 impl LiveChatService {
@@ -2573,6 +2575,7 @@ impl LiveChatService {
             failover_config: moltis_config::schema::FailoverConfig::default(),
             pre_compact_flushed: Arc::new(RwLock::new(HashMap::new())),
             path_rules: Arc::new(RwLock::new(HashMap::new())),
+            chat_config: moltis_config::discover_and_load().chat,
         }
     }
 
@@ -2825,11 +2828,11 @@ impl LiveChatService {
 
 fn normalize_extracted_file_path(path: &Path, project_dir: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
-    if raw == "~" || raw.starts_with("~/") {
-        if let Some(home) = moltis_config::home_dir() {
-            let suffix = raw.strip_prefix("~/").unwrap_or("");
-            return home.join(suffix);
-        }
+    if (raw == "~" || raw.starts_with("~/"))
+        && let Some(home) = moltis_config::home_dir()
+    {
+        let suffix = raw.strip_prefix("~/").unwrap_or("");
+        return home.join(suffix);
     }
 
     if path.is_absolute() {
@@ -3341,9 +3344,8 @@ impl ChatService for LiveChatService {
             let permit: OwnedSemaphorePermit = match session_sem.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    let chat_cfg = moltis_config::discover_and_load().chat;
-                    let queue_mode = chat_cfg.message_queue_mode;
-                    let max_queue_size = chat_cfg.message_queue_max_size;
+                    let queue_mode = self.chat_config.message_queue_mode;
+                    let max_queue_size = self.chat_config.message_queue_max_size;
                     let priority = resolve_queue_priority(&params);
                     info!(
                         session = %session_key,
@@ -3429,6 +3431,7 @@ impl ChatService for LiveChatService {
                 .and_then(|v| v.as_str())
                 .map(String::from);
             let conn_id_for_tool = conn_id.clone();
+            let chat_config_for_drain = self.chat_config.clone();
 
             let handle = tokio::spawn(async move {
                 let permit = permit; // hold permit until command run completes
@@ -3506,9 +3509,8 @@ impl ChatService for LiveChatService {
                     .remove(&session_key_clone)
                     .unwrap_or_default();
                 if !queued.is_empty() {
-                    let chat_cfg = moltis_config::discover_and_load().chat;
-                    let queue_mode = chat_cfg.message_queue_mode;
-                    let starvation_bound = chat_cfg.priority_starvation_bound;
+                    let queue_mode = chat_config_for_drain.message_queue_mode;
+                    let starvation_bound = chat_config_for_drain.priority_starvation_bound;
                     let chat = state_for_drain.chat_service().await;
                     match queue_mode {
                         MessageQueueMode::Followup => {
@@ -4181,9 +4183,8 @@ impl ChatService for LiveChatService {
             Ok(p) => p,
             Err(_) => {
                 // Active run — enqueue and return immediately.
-                let chat_cfg = moltis_config::discover_and_load().chat;
-                let queue_mode = chat_cfg.message_queue_mode;
-                let max_queue_size = chat_cfg.message_queue_max_size;
+                let queue_mode = self.chat_config.message_queue_mode;
+                let max_queue_size = self.chat_config.message_queue_max_size;
                 let priority = resolve_queue_priority(&params);
                 info!(
                     session = %session_key,
@@ -4257,6 +4258,7 @@ impl ChatService for LiveChatService {
         let message_queue_priority_streak = Arc::clone(&self.message_queue_priority_streak);
         let state_for_drain = Arc::clone(&self.state);
         let deferred_channel_target = deferred_channel_target.clone();
+        let chat_config_for_drain = self.chat_config.clone();
 
         let handle = tokio::spawn(async move {
             let permit = permit; // hold permit until agent run completes
@@ -4439,9 +4441,8 @@ impl ChatService for LiveChatService {
                 .remove(&session_key_clone)
                 .unwrap_or_default();
             if !queued.is_empty() {
-                let chat_cfg = moltis_config::discover_and_load().chat;
-                let queue_mode = chat_cfg.message_queue_mode;
-                let starvation_bound = chat_cfg.priority_starvation_bound;
+                let queue_mode = chat_config_for_drain.message_queue_mode;
+                let starvation_bound = chat_config_for_drain.priority_starvation_bound;
                 let chat = state_for_drain.chat_service().await;
                 match queue_mode {
                     MessageQueueMode::Followup => {
