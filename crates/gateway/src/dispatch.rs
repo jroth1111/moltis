@@ -217,7 +217,15 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
             },
             ShiftClassification::NeedsNew => {
                 if intent_state.is_over_budget() {
-                    escalate(ctx, &list_id, &intent_id, "Token budget exhausted").await?;
+                    if let Err(err) =
+                        escalate(ctx, &list_id, &intent_id, "Token budget exhausted").await
+                    {
+                        warn!(
+                            intent_id = %intent_id,
+                            error = %err,
+                            "failed to escalate over-budget intent"
+                        );
+                    }
                     return Ok(false);
                 }
 
@@ -345,97 +353,110 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
     let shift_result = ctx.chat.send_sync(params).await;
     heartbeat.abort();
 
-    // ── 9. Extract token usage (best-effort; 0 on parse failure). ─────────────
-    let tokens_used = match &shift_result {
-        Ok(v) => extract_tokens(v),
-        Err(_) => 0,
-    };
+    let finalized = async {
+        // ── 9. Extract token usage (best-effort; 0 on parse failure). ─────────
+        let tokens_used = match &shift_result {
+            Ok(v) => extract_tokens(v),
+            Err(_) => 0,
+        };
 
-    // ── 10. Build structural snapshot for spin detection. ─────────────────────
-    let new_snapshot = build_snapshot(ctx, &intent_id).await?;
+        // ── 10. Build structural snapshot for spin detection. ─────────────────
+        let new_snapshot = build_snapshot(ctx, &intent_id).await?;
 
-    // ── 11. Atomic finalization. ──────────────────────────────────────────────
-    let mut tx = ctx.task_store.begin_tx().await?;
+        // ── 11. Atomic finalization. ──────────────────────────────────────────
+        let mut tx = ctx.task_store.begin_tx().await?;
 
-    // Re-read shift state: agent may have escalated mid-turn.
-    let shift_now = TaskStore::get_tx(&mut tx, &list_id, &shift.id.0)
-        .await?
-        .ok_or_else(|| TransitionError::NotFound(shift.id.0.clone()))?;
+        // Re-read shift state: agent may have escalated mid-turn.
+        let shift_now = TaskStore::get_tx(&mut tx, &list_id, &shift.id.0)
+            .await?
+            .ok_or_else(|| TransitionError::NotFound(shift.id.0.clone()))?;
 
-    let mut failure_class: Option<FailureClass> = None;
-    if matches!(shift_now.runtime.state, RuntimeState::Active { .. }) {
-        match &shift_result {
-            Ok(_) => {
-                TaskStore::apply_transition_tx(
-                    &mut tx,
-                    &list_id,
-                    &shift.id.0,
-                    None,
-                    &TransitionEvent::Complete,
-                )
-                .await?;
-            },
-            Err(err) => {
-                let class = classify_shift_error(&err.to_string());
-                failure_class = Some(class.clone());
-                TaskStore::apply_transition_tx(
-                    &mut tx,
-                    &list_id,
-                    &shift.id.0,
-                    None,
-                    &TransitionEvent::Fail {
-                        class,
-                        handoff: HandoffContext {
-                            observed_error: err.to_string(),
-                            ..HandoffContext::default()
+        let mut failure_class: Option<FailureClass> = None;
+        if matches!(shift_now.runtime.state, RuntimeState::Active { .. }) {
+            match &shift_result {
+                Ok(_) => {
+                    TaskStore::apply_transition_tx(
+                        &mut tx,
+                        &list_id,
+                        &shift.id.0,
+                        None,
+                        &TransitionEvent::Complete,
+                    )
+                    .await?;
+                },
+                Err(err) => {
+                    let class = classify_shift_error(&err.to_string());
+                    failure_class = Some(class.clone());
+                    TaskStore::apply_transition_tx(
+                        &mut tx,
+                        &list_id,
+                        &shift.id.0,
+                        None,
+                        &TransitionEvent::Fail {
+                            class,
+                            handoff: HandoffContext {
+                                observed_error: err.to_string(),
+                                ..HandoffContext::default()
+                            },
+                            retry_after: None,
                         },
-                        retry_after: None,
-                    },
-                )
-                .await?;
-            },
+                    )
+                    .await?;
+                },
+            }
         }
+        // If shift is already terminal or AwaitingHuman (mid-turn escalation), skip transition.
+
+        // Persist shift output for future context injection.
+        let output_text = match &shift_result {
+            Ok(v) => v
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            Err(e) => format!("[shift error: {e}]"),
+        };
+        let (input_toks, output_toks) = match &shift_result {
+            Ok(v) => extract_token_pair(v),
+            Err(_) => (0, 0),
+        };
+        OutputStore::insert_tx(
+            &mut tx,
+            &intent_id,
+            &shift.id.0,
+            &list_id,
+            shift_num,
+            &output_text,
+            input_toks,
+            output_toks,
+        )
+        .await?;
+
+        let (final_state, is_spinning) = IntentStore::finalize_shift_tx(
+            &mut tx,
+            &intent_id,
+            &shift.id.0,
+            new_snapshot,
+            tokens_used,
+            slot_state.version,
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("finalize commit: {e}"))?;
+
+        Ok::<_, anyhow::Error>((tokens_used, failure_class, final_state, is_spinning))
     }
-    // If shift is already terminal or AwaitingHuman (mid-turn escalation), skip transition.
+    .await;
 
-    // Persist shift output for future context injection.
-    let output_text = match &shift_result {
-        Ok(v) => v
-            .get("text")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Err(e) => format!("[shift error: {e}]"),
+    let (tokens_used, failure_class, final_state, is_spinning) = match finalized {
+        Ok(result) => result,
+        Err(err) => {
+            clear_slot_best_effort(ctx, &intent_id, &shift.id.0, slot_state.version).await;
+            return Err(err);
+        },
     };
-    let (input_toks, output_toks) = match &shift_result {
-        Ok(v) => extract_token_pair(v),
-        Err(_) => (0, 0),
-    };
-    OutputStore::insert_tx(
-        &mut tx,
-        &intent_id,
-        &shift.id.0,
-        &list_id,
-        shift_num,
-        &output_text,
-        input_toks,
-        output_toks,
-    )
-    .await?;
-
-    let (final_state, is_spinning) = IntentStore::finalize_shift_tx(
-        &mut tx,
-        &intent_id,
-        &shift.id.0,
-        new_snapshot,
-        tokens_used,
-        slot_state.version,
-    )
-    .await?;
-
-    tx.commit()
-        .await
-        .map_err(|e| anyhow::anyhow!("finalize commit: {e}"))?;
 
     // ── 12. Log shift result. ─────────────────────────────────────────────────
     match &shift_result {
@@ -455,32 +476,29 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
     }
 
     // ── 13. Post-finalization escalation checks. ──────────────────────────────
-    if let Some(class) = &failure_class
-        && class.requires_human()
-    {
-        escalate(
-            ctx,
-            &list_id,
-            &intent_id,
-            "Shift execution requires human intervention",
-        )
-        .await?;
+    let escalation_reason = if let Some(class) = &failure_class {
+        if class.requires_human() {
+            Some("Shift execution requires human intervention")
+        } else {
+            None
+        }
     } else if is_spinning {
-        escalate(
-            ctx,
-            &list_id,
-            &intent_id,
-            "No measurable progress after consecutive shifts",
-        )
-        .await?;
+        Some("No measurable progress after consecutive shifts")
     } else if final_state.is_over_budget() {
-        escalate(
-            ctx,
-            &list_id,
-            &intent_id,
-            "Token budget exhausted after shift",
-        )
-        .await?;
+        Some("Token budget exhausted after shift")
+    } else {
+        None
+    };
+
+    if let Some(reason) = escalation_reason
+        && let Err(err) = escalate(ctx, &list_id, &intent_id, reason).await
+    {
+        warn!(
+            intent_id = %intent_id,
+            reason = reason,
+            error = %err,
+            "failed to escalate intent after shift finalization"
+        );
     }
 
     Ok(true)
@@ -595,7 +613,8 @@ async fn escalate(
     reason: &str,
 ) -> Result<(), TransitionError> {
     info!(intent_id = %intent_id, reason = reason, "escalating intent to AwaitingHuman");
-    ctx.task_store
+    match ctx
+        .task_store
         .apply_transition(
             list_id,
             intent_id,
@@ -606,7 +625,11 @@ async fn escalate(
             },
         )
         .await
-        .map(|_| ())
+    {
+        Ok(_) | Err(TransitionError::InvalidTransition { .. }) => Ok(()),
+        Err(TransitionError::VersionConflict { .. }) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn spawn_shift_heartbeat(
@@ -652,6 +675,26 @@ async fn cancel_shift_best_effort(task_store: &TaskStore, list_id: &str, shift_i
                 .await;
         },
         _ => {},
+    }
+}
+
+async fn clear_slot_best_effort(
+    ctx: &DispatchContext,
+    intent_id: &str,
+    shift_id: &str,
+    expected_version: u64,
+) {
+    if let Err(err) = ctx
+        .intent_store
+        .clear_active_shift(intent_id, shift_id, expected_version)
+        .await
+    {
+        warn!(
+            intent_id = %intent_id,
+            shift_id = %shift_id,
+            error = %err,
+            "failed to clear active shift slot during dispatch cleanup"
+        );
     }
 }
 

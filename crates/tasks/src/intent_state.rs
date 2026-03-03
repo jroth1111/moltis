@@ -369,12 +369,12 @@ impl IntentStore {
         task_store: &crate::store::TaskStore,
     ) -> Result<usize, TransitionError> {
         // One JOIN query: find intent_state rows where active_shift_id points at
-        // a task that is NOT Active.
+        // a task that is neither Active nor AwaitingHuman.
         let rows = sqlx::query(
             "SELECT i.intent_id, i.version \
              FROM intent_state i \
              LEFT JOIN tasks t ON t.id = i.active_shift_id \
-                              AND t.state_name = 'Active' \
+                              AND t.state_name IN ('Active', 'AwaitingHuman') \
              WHERE i.active_shift_id IS NOT NULL \
                AND t.id IS NULL",
         )
