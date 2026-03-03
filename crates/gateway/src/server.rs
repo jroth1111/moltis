@@ -2072,10 +2072,15 @@ pub async fn prepare_gateway(
                         "task store not yet initialized; CreateTask cron job fired too early",
                     )
                 })?;
-                let tier: moltis_tasks::AutonomyTier = match req.autonomy_tier.as_str() {
+                let tier: moltis_tasks::AutonomyTier = match req.autonomy_tier.trim() {
+                    "auto" => moltis_tasks::AutonomyTier::Auto,
                     "confirm" => moltis_tasks::AutonomyTier::Confirm,
                     "approve" => moltis_tasks::AutonomyTier::Approve,
-                    _ => moltis_tasks::AutonomyTier::Auto,
+                    other => {
+                        return Err(moltis_cron::Error::message(format!(
+                            "invalid createTask autonomy_tier `{other}`"
+                        )));
+                    },
                 };
                 let principal = req
                     .principal_json
@@ -2083,17 +2088,29 @@ pub async fn prepare_gateway(
                     .map(serde_json::from_str::<moltis_tasks::TaskPrincipal>)
                     .transpose()
                     .map_err(|e| moltis_cron::Error::message(format!("invalid principal_json: {e}")))?;
+                let resolved_list_id = if req.list_id.trim().is_empty() || req.list_id == "default" {
+                    principal
+                        .as_ref()
+                        .map(moltis_tasks::TaskPrincipal::canonical_list_id)
+                        .unwrap_or_else(|| "default".to_string())
+                } else {
+                    req.list_id.trim().to_string()
+                };
                 let mut spec = moltis_tasks::TaskSpec::new(req.subject, req.description);
                 spec.is_intent = req.is_intent;
                 spec.autonomy_tier = tier;
                 spec.principal = principal;
+                let mut seen = HashSet::new();
                 let blocked_by = req
                     .blocked_by
                     .into_iter()
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| !id.is_empty())
+                    .filter(|id| seen.insert(id.clone()))
                     .map(moltis_tasks::TaskId::from)
-                    .collect();
+                    .collect::<Vec<_>>();
                 let task = store
-                    .create(&req.list_id, spec, blocked_by)
+                    .create(&resolved_list_id, spec, blocked_by)
                     .await
                     .map_err(|e| moltis_cron::Error::message(e.to_string()))?;
                 Ok(moltis_cron::service::CreateTaskResult { task_id: task.id.0 })

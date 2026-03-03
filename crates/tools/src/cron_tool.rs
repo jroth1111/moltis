@@ -498,13 +498,18 @@ fn normalize_payload_value(payload: &mut Value, session_target_hint: Option<&str
                                 })?
                                 .iter()
                                 .map(|v| {
-                                    v.as_str().map(|s| Value::String(s.to_string())).ok_or_else(
-                                        || {
-                                            Error::message(
-                                                "payload.blocked_by entries must be strings",
-                                            )
-                                        },
-                                    )
+                                    let s = v.as_str().ok_or_else(|| {
+                                        Error::message(
+                                            "payload.blocked_by entries must be strings",
+                                        )
+                                    })?;
+                                    let trimmed = s.trim();
+                                    if trimmed.is_empty() {
+                                        return Err(Error::message(
+                                            "payload.blocked_by entries must be non-empty strings",
+                                        ));
+                                    }
+                                    Ok(Value::String(trimmed.to_string()))
                                 })
                                 .collect::<Result<Vec<_>>>()
                         })
@@ -1233,6 +1238,32 @@ mod tests {
 
         assert_eq!(add_result["payload"]["kind"], "createTask");
         assert_eq!(add_result["payload"]["description"], "");
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_create_task_with_empty_blocked_by_entry() {
+        let tool = make_tool();
+        let err = tool
+            .execute(json!({
+                "action": "add",
+                "job": {
+                    "name": "bad blocked_by",
+                    "schedule": { "kind": "at", "at_ms": 1234567890000u64 },
+                    "payload": {
+                        "kind": "createTask",
+                        "list_id": "default",
+                        "subject": "Do work",
+                        "blocked_by": ["dep-1", "   "]
+                    }
+                }
+            }))
+            .await
+            .expect_err("empty blocked_by entries must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("blocked_by entries must be non-empty strings")
+        );
     }
 
     #[tokio::test]

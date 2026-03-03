@@ -623,15 +623,10 @@ impl CronService {
                         output_tokens: None,
                     })
                 } else {
-                    warn!(
-                        id = %job.id,
-                        "CreateTask payload received but no on_create_task callback registered"
-                    );
-                    Ok(AgentTurnResult {
-                        output: "create_task not configured".to_string(),
-                        input_tokens: None,
-                        output_tokens: None,
-                    })
+                    Err(Error::message(format!(
+                        "CreateTask payload received but no on_create_task callback is configured (job: {})",
+                        job.id
+                    )))
                 }
             },
         };
@@ -782,7 +777,12 @@ fn validate_job_spec(job: &CronJob) -> Result<()> {
         _ => {},
     }
     if let CronPayload::CreateTask {
-        list_id, subject, ..
+        list_id,
+        subject,
+        autonomy_tier,
+        principal_json,
+        blocked_by,
+        ..
     } = &job.payload
     {
         if list_id.trim().is_empty() {
@@ -790,6 +790,30 @@ fn validate_job_spec(job: &CronJob) -> Result<()> {
         }
         if subject.trim().is_empty() {
             return Err(Error::message("createTask payload requires non-empty subject"));
+        }
+        match autonomy_tier.trim() {
+            "auto" | "confirm" | "approve" => {},
+            other => {
+                return Err(Error::message(format!(
+                    "createTask payload has invalid autonomy_tier `{other}` (expected auto|confirm|approve)"
+                )));
+            },
+        }
+        if let Some(raw_principal) = principal_json {
+            let trimmed = raw_principal.trim();
+            if trimmed.is_empty() {
+                return Err(Error::message(
+                    "createTask payload principal_json must not be empty when provided",
+                ));
+            }
+            serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {
+                Error::message(format!("createTask payload principal_json is invalid JSON: {e}"))
+            })?;
+        }
+        if blocked_by.iter().any(|id| id.trim().is_empty()) {
+            return Err(Error::message(
+                "createTask payload blocked_by entries must be non-empty strings",
+            ));
         }
     }
     if let CronPayload::AgentTurn {
@@ -1764,8 +1788,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_create_task_without_callback_succeeds_with_warning() {
-        // Without a callback, the job should still return Ok (logged as warn).
+    async fn execute_create_task_without_callback_records_error_run() {
+        // Without a callback, the job should fail fast and record an Error run.
         let store = Arc::new(InMemoryStore::new());
         let svc = make_svc(store.clone(), noop_system_event(), noop_agent_turn());
 
@@ -1796,9 +1820,77 @@ mod tests {
         svc.run(&job.id, true).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Job should still be recorded as Ok (no callback is not an error).
+        // Job must be recorded as Error when callback is missing.
         let runs = svc.runs(&job.id, 10).await.unwrap();
         assert!(!runs.is_empty());
-        assert_eq!(runs[0].status, RunStatus::Ok);
+        assert_eq!(runs[0].status, RunStatus::Error);
+        assert!(
+            runs[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("no on_create_task callback"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_payload_rejects_invalid_autonomy_tier() {
+        let store = Arc::new(InMemoryStore::new());
+        let svc = make_svc(store, noop_system_event(), noop_agent_turn());
+        let err = svc
+            .add(CronJobCreate {
+                id: None,
+                name: "bad-tier".into(),
+                schedule: CronSchedule::At { at_ms: 1 },
+                payload: CronPayload::CreateTask {
+                    list_id: "default".into(),
+                    subject: "work".into(),
+                    description: "".into(),
+                    is_intent: true,
+                    autonomy_tier: "root".into(),
+                    principal_json: None,
+                    blocked_by: vec![],
+                },
+                session_target: SessionTarget::Isolated,
+                delete_after_run: false,
+                enabled: true,
+                system: false,
+                sandbox: CronSandboxConfig::default(),
+                wake_mode: CronWakeMode::default(),
+            })
+            .await
+            .expect_err("invalid tier must be rejected");
+
+        assert!(err.to_string().contains("invalid autonomy_tier"));
+    }
+
+    #[tokio::test]
+    async fn create_task_payload_rejects_invalid_principal_json() {
+        let store = Arc::new(InMemoryStore::new());
+        let svc = make_svc(store, noop_system_event(), noop_agent_turn());
+        let err = svc
+            .add(CronJobCreate {
+                id: None,
+                name: "bad-principal-json".into(),
+                schedule: CronSchedule::At { at_ms: 1 },
+                payload: CronPayload::CreateTask {
+                    list_id: "default".into(),
+                    subject: "work".into(),
+                    description: "".into(),
+                    is_intent: true,
+                    autonomy_tier: "auto".into(),
+                    principal_json: Some("{not-json}".into()),
+                    blocked_by: vec![],
+                },
+                session_target: SessionTarget::Isolated,
+                delete_after_run: false,
+                enabled: true,
+                system: false,
+                sandbox: CronSandboxConfig::default(),
+                wake_mode: CronWakeMode::default(),
+            })
+            .await
+            .expect_err("invalid principal_json must be rejected");
+
+        assert!(err.to_string().contains("principal_json is invalid JSON"));
     }
 }
