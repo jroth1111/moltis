@@ -2773,7 +2773,7 @@ async fn save_handoff_context(
     key_facts: Vec<String>,
 ) {
     if let Some(store) = state_store {
-        let ctx = moltis_sessions::HandoffContext::new(
+        let ctx = moltis_sessions::SessionResumeContext::new(
             last_goal,
             pending_tasks,
             last_error,

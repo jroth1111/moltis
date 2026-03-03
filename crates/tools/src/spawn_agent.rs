@@ -2,7 +2,10 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use {async_trait::async_trait, tracing::info};
+use {
+    async_trait::async_trait,
+    tracing::{debug, info},
+};
 
 use crate::{
     error::Error,
@@ -49,6 +52,7 @@ pub struct SpawnAgentTool {
     tool_registry: Arc<ToolRegistry>,
     agents_config: Option<Arc<tokio::sync::RwLock<AgentsConfig>>>,
     on_event: Option<OnSpawnEvent>,
+    session_state_store: Option<Arc<moltis_sessions::state_store::SessionStateStore>>,
 }
 
 impl SpawnAgentTool {
@@ -63,6 +67,7 @@ impl SpawnAgentTool {
             tool_registry,
             agents_config: None,
             on_event: None,
+            session_state_store: None,
         }
     }
 
@@ -78,6 +83,15 @@ impl SpawnAgentTool {
         agents_config: Arc<tokio::sync::RwLock<AgentsConfig>>,
     ) -> Self {
         self.agents_config = Some(agents_config);
+        self
+    }
+
+    /// Attach a session state store for saving handoff context on completion.
+    pub fn with_session_state_store(
+        mut self,
+        store: Arc<moltis_sessions::state_store::SessionStateStore>,
+    ) -> Self {
+        self.session_state_store = Some(store);
         self
     }
 
@@ -351,6 +365,23 @@ impl AgentTool for SpawnAgentTool {
             tool_calls_made,
         });
 
+        // Save handoff context (best-effort, non-fatal).
+        let completion_error = result.as_ref().err().map(|e| e.to_string());
+        if let Some(ref store) = self.session_state_store {
+            if let Some(session_key) = params.get("_session_key").and_then(|v| v.as_str()) {
+                let ctx = moltis_sessions::state_store::SessionResumeContext::new(
+                    Some(task.to_string()),
+                    vec![],
+                    completion_error.clone(),
+                    None,
+                    vec![],
+                );
+                if let Err(e) = store.set_handoff(session_key, &ctx).await {
+                    debug!(error = %e, "failed to save handoff context (non-fatal)");
+                }
+            }
+        }
+
         let result = result?;
 
         info!(
@@ -409,6 +440,7 @@ mod tests {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                ..Default::default()
             })
         }
 
