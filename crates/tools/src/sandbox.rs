@@ -5130,6 +5130,11 @@ pub struct SandboxRouter {
     /// Whether a sandbox image pre-build is currently in progress.
     /// Used by the gateway to show a banner in the UI.
     pub building_flag: std::sync::atomic::AtomicBool,
+    /// Pre-warmed sandbox pool. When set, sessions try to acquire a pool slot
+    /// instead of creating a new container from scratch.
+    pool: Option<Arc<crate::sandbox_pool::SandboxPool>>,
+    /// Pool guards held by sessions. Dropping a guard returns the slot to the pool.
+    pool_guards: RwLock<HashMap<String, crate::sandbox_pool::PoolGuard>>,
 }
 
 impl SandboxRouter {
@@ -5147,6 +5152,8 @@ impl SandboxRouter {
             event_tx,
             prepared_sessions: RwLock::new(HashSet::new()),
             building_flag: std::sync::atomic::AtomicBool::new(false),
+            pool: None,
+            pool_guards: RwLock::new(HashMap::new()),
         }
     }
 
@@ -5162,7 +5169,15 @@ impl SandboxRouter {
             event_tx,
             prepared_sessions: RwLock::new(HashSet::new()),
             building_flag: std::sync::atomic::AtomicBool::new(false),
+            pool: None,
+            pool_guards: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Attach a pre-warmed sandbox pool to this router.
+    pub fn with_pool(mut self, pool: Arc<crate::sandbox_pool::SandboxPool>) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// Subscribe to sandbox lifecycle events.
@@ -5220,6 +5235,41 @@ impl SandboxRouter {
         self.overrides.write().await.remove(session_key);
     }
 
+    /// Try to acquire a pre-warmed pool slot for a session.
+    ///
+    /// Returns the pool slot's [`SandboxId`] if a slot was acquired or already
+    /// held, or `None` if no pool is configured or all slots are occupied.
+    /// The guard is stored internally and released when [`cleanup_session`] is called.
+    ///
+    /// Idempotent: calling this multiple times for the same session returns the
+    /// existing assignment without consuming another slot.
+    pub async fn try_acquire_pool_slot(&self, session_key: &str) -> Option<SandboxId> {
+        // Fast path: session already holds a pool slot.
+        if let Some(guard) = self.pool_guards.read().await.get(session_key) {
+            return Some(guard.sandbox_id());
+        }
+        let pool = self.pool.as_ref()?;
+        let guard = pool.try_acquire()?;
+        let sid = guard.sandbox_id();
+        self.pool_guards
+            .write()
+            .await
+            .insert(session_key.to_string(), guard);
+        debug!(session = session_key, sandbox_id = %sid, "acquired pool slot");
+        Some(sid)
+    }
+
+    /// Resolve the [`SandboxId`] for a session, preferring a pool assignment.
+    ///
+    /// If the session already holds a pool slot, that slot's ID is returned.
+    /// Otherwise falls back to [`sandbox_id_for`].
+    pub async fn resolve_sandbox_id(&self, session_key: &str) -> SandboxId {
+        if let Some(guard) = self.pool_guards.read().await.get(session_key) {
+            return guard.sandbox_id();
+        }
+        self.sandbox_id_for(session_key)
+    }
+
     /// Derive a SandboxId for a given session key.
     /// The key is sanitized for use as a container name (only alphanumeric, dash, underscore, dot).
     pub fn sandbox_id_for(&self, session_key: &str) -> SandboxId {
@@ -5240,9 +5290,23 @@ impl SandboxRouter {
     }
 
     /// Clean up sandbox resources for a session.
+    ///
+    /// If the session holds a pool slot, the guard is released (returning the
+    /// slot to the pool) instead of destroying the container.
     pub async fn cleanup_session(&self, session_key: &str) -> Result<()> {
-        let id = self.sandbox_id_for(session_key);
-        self.backend.cleanup(&id).await?;
+        // If this session has a pool guard, release it (RAII returns the slot).
+        let had_pool_slot = self
+            .pool_guards
+            .write()
+            .await
+            .remove(session_key)
+            .is_some();
+        if had_pool_slot {
+            debug!(session = session_key, "released pool slot");
+        } else {
+            let id = self.sandbox_id_for(session_key);
+            self.backend.cleanup(&id).await?;
+        }
         self.remove_override(session_key).await;
         self.clear_prepared_session(session_key).await;
         Ok(())
@@ -5251,6 +5315,11 @@ impl SandboxRouter {
     /// Access the sandbox backend.
     pub fn backend(&self) -> &Arc<dyn Sandbox> {
         &self.backend
+    }
+
+    /// Access the pre-warmed sandbox pool, if configured.
+    pub fn pool(&self) -> Option<&Arc<crate::sandbox_pool::SandboxPool>> {
+        self.pool.as_ref()
     }
 
     /// Access the global sandbox mode.

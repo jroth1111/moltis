@@ -486,7 +486,10 @@ impl AgentTool for ExecTool {
         let result = if let Some(ref router) = self.sandbox_router {
             let sk = session_key.unwrap_or("main");
             if is_sandboxed {
-                let id = router.sandbox_id_for(sk);
+                // Try to acquire a pool slot (no-op if pool is unset or this
+                // session already holds one). Falls back to on-demand sandbox.
+                router.try_acquire_pool_slot(sk).await;
+                let id = router.resolve_sandbox_id(sk).await;
                 let image = router.resolve_image(sk, None).await;
                 let backend = router.backend();
                 info!(session = sk, sandbox_id = %id, backend = backend.backend_name(), image, "sandbox ensure_ready");
