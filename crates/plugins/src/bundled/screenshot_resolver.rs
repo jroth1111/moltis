@@ -192,11 +192,8 @@ fn guess_mime(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        io::Write,
-        path::Path,
-        sync::{Mutex, OnceLock},
-    };
+    use std::{io::Write, path::Path, sync::OnceLock};
+    use tokio::sync::Mutex;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -250,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn injects_image_when_screenshot_path_is_present() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_lock().lock().await;
         let (dir, path) = prepare_media_file();
         let _data_dir = DataDirOverride::new(dir.path());
 
@@ -285,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn skips_already_injected_screenshot() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_lock().lock().await;
         let (dir, path) = prepare_media_file();
         let _data_dir = DataDirOverride::new(dir.path());
 
@@ -313,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_paths_outside_media_root() {
-        let _guard = env_lock().lock().expect("env lock");
+        let _guard = env_lock().lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let media = dir.path().join("media");
         std::fs::create_dir_all(&media).expect("media dir");
