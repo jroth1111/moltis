@@ -3126,6 +3126,11 @@ fn append_handoff_constraints(system_prompt: &mut String, handoff: &HandoffConte
 #[async_trait]
 impl ChatService for LiveChatService {
     async fn send(&self, mut params: Value) -> ServiceResult {
+        // Internal-only dispatch sideband must not be accepted from external callers.
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("_dispatch_tool_deny");
+        }
+
         // Support both text-only and multimodal content.
         // - "text": string → plain text message
         // - "content": array → multimodal content (text + images)
