@@ -1,16 +1,12 @@
-//! Provider failover chain with per-provider circuit breakers.
+//! Provider failover chain with outbound throttling and health tracking.
 //!
 //! `ProviderChain` wraps a primary `LlmProvider` with a list of fallbacks.
 //! When the primary fails with a retryable error (rate limit, auth, server error),
-//! it automatically tries the next provider in the chain, skipping any that have
-//! their circuit breaker tripped.
+//! it automatically tries the next provider in the chain.
 
 use std::{
     pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -30,62 +26,16 @@ pub use crate::classify::{
     extract_retry_after_ms, parse_retry_after_ms, parse_retry_delay_ms_from_fragment,
 };
 
-// ── Circuit breaker (same pattern as embeddings_fallback.rs) ─────────────
-
-/// Circuit breaker state for a single provider.
-struct ProviderState {
-    consecutive_failures: AtomicUsize,
-    last_failure: Mutex<Option<Instant>>,
-}
-
-impl ProviderState {
-    fn new() -> Self {
-        Self {
-            consecutive_failures: AtomicUsize::new(0),
-            last_failure: Mutex::new(None),
-        }
-    }
-
-    fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::SeqCst);
-    }
-
-    fn record_failure(&self) {
-        self.consecutive_failures.fetch_add(1, Ordering::SeqCst);
-        *self.last_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-    }
-
-    /// Returns `true` when the circuit is open (provider should be skipped).
-    fn is_tripped(&self, threshold: usize, cooldown: Duration) -> bool {
-        let failures = self.consecutive_failures.load(Ordering::SeqCst);
-        if failures < threshold {
-            return false;
-        }
-        let last = self.last_failure.lock().unwrap_or_else(|e| e.into_inner());
-        match *last {
-            Some(t) if t.elapsed() < cooldown => true,
-            _ => {
-                drop(last);
-                self.consecutive_failures.store(0, Ordering::SeqCst);
-                false
-            },
-        }
-    }
-}
-
 /// A provider entry in the failover chain.
 struct ChainEntry {
     provider: Arc<dyn LlmProvider>,
-    state: ProviderState,
 }
 
-/// Failover chain that tries providers in order, with circuit breakers.
+/// Failover chain that tries providers in order.
 ///
 /// Implements `LlmProvider` itself so callers don't need to know about failover.
 pub struct ProviderChain {
     chain: Vec<ChainEntry>,
-    cb_threshold: usize,
-    cb_cooldown: Duration,
     rate_limiter: Option<Arc<ProviderRateLimiter>>,
     health_tracker: Arc<ProviderHealthTracker>,
 }
@@ -96,15 +46,10 @@ impl ProviderChain {
         let config = moltis_config::discover_and_load();
         let chain = providers
             .into_iter()
-            .map(|provider| ChainEntry {
-                provider,
-                state: ProviderState::new(),
-            })
+            .map(|provider| ChainEntry { provider })
             .collect();
         Self {
             chain,
-            cb_threshold: 3,
-            cb_cooldown: Duration::from_secs(60),
             rate_limiter: ProviderRateLimiter::from_config(&config.tools.provider_rate_limit),
             health_tracker: global_tracker(),
         }
@@ -113,13 +58,6 @@ impl ProviderChain {
     /// Build a chain with one provider (no failover). Useful as a passthrough.
     pub fn single(provider: Arc<dyn LlmProvider>) -> Self {
         Self::new(vec![provider])
-    }
-
-    /// Override the circuit breaker threshold and cooldown.
-    pub fn with_circuit_breaker(mut self, threshold: usize, cooldown: Duration) -> Self {
-        self.cb_threshold = threshold;
-        self.cb_cooldown = cooldown;
-        self
     }
 
     /// Override the outbound provider rate limiter.
@@ -167,10 +105,6 @@ impl LlmProvider for ProviderChain {
         let start = Instant::now();
 
         for entry in &self.chain {
-            if entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
-                continue;
-            }
-
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
             let attempt_start = Instant::now();
@@ -206,7 +140,6 @@ impl LlmProvider for ProviderChain {
 
             match entry.provider.complete(messages, tools).await {
                 Ok(resp) => {
-                    entry.state.record_success();
                     self.health_tracker.record_success(
                         &provider_name,
                         &model_id,
@@ -281,8 +214,6 @@ impl LlmProvider for ProviderChain {
                         limiter.note_retry_after_ms(&provider_name, &model_id, retry_after_ms);
                     }
 
-                    entry.state.record_failure();
-
                     // Record error metrics
                     #[cfg(feature = "metrics")]
                     {
@@ -329,17 +260,12 @@ impl LlmProvider for ProviderChain {
         messages: Vec<ChatMessage>,
         tools: Vec<serde_json::Value>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
-        // For streaming, we try the first non-tripped provider.
+        // For streaming, we choose a provider up-front.
         // If the stream yields an Error event, we can't transparently retry
         // mid-stream, so we pick the best available provider upfront.
         let mut selected = None;
-        let mut delayed_candidate: Option<(&ChainEntry, Duration)> = None;
         let mut limiter_rejections: Vec<String> = Vec::new();
         for entry in &self.chain {
-            if entry.state.is_tripped(self.cb_threshold, self.cb_cooldown) {
-                continue;
-            }
-
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
 
@@ -350,10 +276,8 @@ impl LlmProvider for ProviderChain {
                         break;
                     },
                     RateLimitDecision::Wait(delay) => {
-                        if delayed_candidate.is_none() {
-                            delayed_candidate = Some((entry, delay));
-                        }
-                        continue;
+                        selected = Some((entry, Some(delay)));
+                        break;
                     },
                     RateLimitDecision::Rejected(retry_after) => {
                         limiter_rejections.push(format!(
@@ -370,12 +294,6 @@ impl LlmProvider for ProviderChain {
             }
         }
 
-        if selected.is_none()
-            && let Some((entry, delay)) = delayed_candidate
-        {
-            selected = Some((entry, Some(delay)));
-        }
-
         let Some((selected, initial_delay)) = selected else {
             let message = if limiter_rejections.is_empty() {
                 "all providers in failover chain unavailable for streaming".to_string()
@@ -390,7 +308,6 @@ impl LlmProvider for ProviderChain {
 
         let provider_name = selected.provider.name().to_string();
         let model_id = selected.provider.id().to_string();
-        let state = &selected.state;
         let health_tracker = Arc::clone(&self.health_tracker);
         let limiter = self.rate_limiter.clone();
         let start = Instant::now();
@@ -417,7 +334,6 @@ impl LlmProvider for ProviderChain {
                         .record(start.elapsed().as_secs_f64());
                     },
                     StreamEvent::Done(usage) => {
-                        state.record_success();
                         health_tracker.record_success(
                             &provider_name,
                             &model_id,
@@ -445,7 +361,6 @@ impl LlmProvider for ProviderChain {
                         }
                     },
                     StreamEvent::Error(msg) => {
-                        state.record_failure();
                         let kind = classify_error_message(msg);
                         health_tracker.record_failure(
                             &provider_name,
@@ -503,6 +418,7 @@ mod tests {
         super::*,
         crate::model::{ChatMessage, StreamEvent, Usage},
         async_trait::async_trait,
+        std::sync::Mutex,
         tokio_stream::StreamExt,
     };
 
@@ -665,36 +581,126 @@ mod tests {
         assert_eq!(resp.text.as_deref(), Some("ok"));
     }
 
+    struct StreamingTextProvider {
+        id: &'static str,
+        text: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingTextProvider {
+        fn name(&self) -> &str {
+            "streaming-text"
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> anyhow::Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: Some(self.text.to_string()),
+                tool_calls: vec![],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            self.stream_with_tools(vec![], vec![])
+        }
+
+        fn stream_with_tools(
+            &self,
+            _messages: Vec<ChatMessage>,
+            _tools: Vec<serde_json::Value>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::iter(vec![
+                StreamEvent::Delta(self.text.to_string()),
+                StreamEvent::Done(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                }),
+            ]))
+        }
+    }
+
     #[tokio::test]
     async fn streaming_rate_limiter_rejects_primary_then_uses_fallback() {
         let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
         cfg.enabled = true;
         cfg.wait_on_limit = false;
         cfg.defaults.max_requests_per_window = 10;
-        cfg.providers.insert(
-            "failing".to_string(),
-            moltis_config::schema::ProviderRateLimitWindowConfig {
-                window_secs: 60,
-                max_requests_per_window: 0,
-            },
-        );
         let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
+        limiter.note_retry_after_ms("streaming-text", "primary", 10_000);
 
         let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
+            Arc::new(StreamingTextProvider {
                 id: "primary",
-                error_msg: "500 internal server error",
+                text: "from-primary",
             }),
-            Arc::new(SuccessProvider { id: "fallback" }),
+            Arc::new(StreamingTextProvider {
+                id: "fallback",
+                text: "from-fallback",
+            }),
         ])
         .with_rate_limiter(Some(limiter));
 
         let mut stream = chain.stream(vec![]);
-        let event = stream.next().await.expect("expected stream event");
-        assert!(
-            matches!(event, StreamEvent::Done(_)),
-            "expected fallback stream completion, got: {event:?}"
-        );
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::Delta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "from-fallback");
+    }
+
+    #[tokio::test]
+    async fn streaming_rate_limiter_waits_then_uses_primary() {
+        let mut cfg = moltis_config::schema::ProviderRateLimitConfig::default();
+        cfg.enabled = true;
+        cfg.wait_on_limit = true;
+        cfg.defaults.max_requests_per_window = 10;
+        let limiter = ProviderRateLimiter::from_config(&cfg).unwrap();
+        limiter.note_retry_after_ms("streaming-text", "primary", 40);
+
+        let chain = ProviderChain::new(vec![
+            Arc::new(StreamingTextProvider {
+                id: "primary",
+                text: "from-primary",
+            }),
+            Arc::new(StreamingTextProvider {
+                id: "fallback",
+                text: "from-fallback",
+            }),
+        ])
+        .with_rate_limiter(Some(limiter));
+
+        let start = Instant::now();
+        let mut stream = chain.stream(vec![]);
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::Delta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "from-primary");
+        assert!(start.elapsed() >= Duration::from_millis(30));
     }
 
     #[tokio::test]
@@ -743,46 +749,6 @@ mod tests {
             err.to_string()
                 .contains("all providers in failover chain failed")
         );
-    }
-
-    #[tokio::test]
-    async fn circuit_breaker_trips_after_three_failures() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "flaky",
-                error_msg: "500 internal server error",
-            }),
-            Arc::new(SuccessProvider { id: "backup" }),
-        ]);
-
-        // Fail 3 times to trip the circuit breaker on the first provider.
-        for _ in 0..3 {
-            let _ = chain.complete(&[], &[]).await;
-        }
-
-        // After tripping, the flaky provider should be skipped.
-        assert!(chain.chain[0].state.is_tripped(3, Duration::from_secs(60)));
-    }
-
-    #[tokio::test]
-    async fn stream_uses_first_non_tripped() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "tripped",
-                error_msg: "500 error",
-            }),
-            Arc::new(SuccessProvider { id: "backup" }),
-        ]);
-
-        // Trip the first provider.
-        for _ in 0..3 {
-            let _ = chain.complete(&[], &[]).await;
-        }
-
-        // Stream should use backup.
-        let mut stream = chain.stream(vec![]);
-        let event = stream.next().await.unwrap();
-        assert!(matches!(event, StreamEvent::Done(_)));
     }
 
     #[test]
@@ -1058,37 +1024,4 @@ mod tests {
         assert!(ProviderErrorKind::NonRetryableRateLimit.should_failover());
     }
 
-    #[tokio::test]
-    async fn configurable_cb_threshold_one_failure() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "flaky",
-                error_msg: "500 internal server error",
-            }),
-            Arc::new(SuccessProvider { id: "backup" }),
-        ])
-        .with_circuit_breaker(1, Duration::from_secs(60));
-
-        // First failure should trip the breaker (threshold=1).
-        let _ = chain.complete(&[], &[]).await;
-        assert!(chain.chain[0].state.is_tripped(1, Duration::from_secs(60)));
-    }
-
-    #[tokio::test]
-    async fn configurable_cb_cooldown() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "flaky",
-                error_msg: "500 internal server error",
-            }),
-            Arc::new(SuccessProvider { id: "backup" }),
-        ])
-        .with_circuit_breaker(1, Duration::from_millis(50));
-
-        let _ = chain.complete(&[], &[]).await;
-        assert!(chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!chain.chain[0].state.is_tripped(1, Duration::from_millis(50)));
-    }
 }
