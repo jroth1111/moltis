@@ -918,6 +918,56 @@ mod tests {
     }
 
     #[test]
+    fn message_hook_payloads_serialize_trace_id() {
+        let received = HookPayload::MessageReceived {
+            session_key: "s".into(),
+            content: "hello".into(),
+            channel: Some("telegram".into()),
+            trace_id: Some("tid-recv".into()),
+        };
+        let json = serde_json::to_string(&received).unwrap();
+        assert!(json.contains("tid-recv"));
+        let deser: HookPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.event(), HookEvent::MessageReceived);
+
+        let sending = HookPayload::MessageSending {
+            session_key: "s".into(),
+            content: "reply".into(),
+            trace_id: Some("tid-send".into()),
+        };
+        let json = serde_json::to_string(&sending).unwrap();
+        assert!(json.contains("tid-send"));
+        let deser: HookPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.event(), HookEvent::MessageSending);
+
+        let sent = HookPayload::MessageSent {
+            session_key: "s".into(),
+            content: "reply".into(),
+            trace_id: Some("tid-done".into()),
+        };
+        let json = serde_json::to_string(&sent).unwrap();
+        assert!(json.contains("tid-done"));
+        let deser: HookPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.event(), HookEvent::MessageSent);
+    }
+
+    #[test]
+    fn message_hook_payloads_deserialize_without_trace_id() {
+        // Backward compat: old payloads without trace_id should still deserialize.
+        let json = r#"{"event":"MessageReceived","session_key":"s","content":"hi","channel":null}"#;
+        let deser: HookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(deser.event(), HookEvent::MessageReceived);
+
+        let json = r#"{"event":"MessageSending","session_key":"s","content":"bye"}"#;
+        let deser: HookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(deser.event(), HookEvent::MessageSending);
+
+        let json = r#"{"event":"MessageSent","session_key":"s","content":"bye"}"#;
+        let deser: HookPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(deser.event(), HookEvent::MessageSent);
+    }
+
+    #[test]
     fn llm_hook_payloads_serialize_round_trip() {
         let before = HookPayload::BeforeLLMCall {
             session_key: "s".into(),
