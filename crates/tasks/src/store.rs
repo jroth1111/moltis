@@ -332,6 +332,12 @@ impl TaskStore {
         &self.log
     }
 
+    /// Return the underlying pool (test-only accessor).
+    #[cfg(test)]
+    fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// List tasks in `Retrying` state whose `retry_after` has passed.
     pub async fn due_retries(&self, list_id: &str) -> Result<Vec<Task>, TransitionError> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
@@ -785,5 +791,155 @@ mod tests {
             .expect("retrying");
         assert_eq!(retrying_a.len(), 1);
         assert_eq!(retrying_a[0].spec.subject, "not-yet");
+    }
+
+    #[tokio::test]
+    async fn update_metadata_changes_spec_without_bumping_version() {
+        let (store, _dir) = test_store().await;
+        let task = store
+            .create("list1", TaskSpec::new("original", "desc"), vec![])
+            .await
+            .expect("create");
+        let v0 = task.runtime.version;
+
+        let updated = store
+            .update_metadata("list1", &task.id.0, Some("renamed"), Some("new desc"), None)
+            .await
+            .expect("update_metadata");
+
+        assert_eq!(updated.spec.subject, "renamed");
+        assert_eq!(updated.spec.description, "new desc");
+        // Version must NOT be incremented by metadata-only update.
+        assert_eq!(updated.runtime.version, v0);
+    }
+
+    #[tokio::test]
+    async fn update_metadata_none_fields_unchanged() {
+        let (store, _dir) = test_store().await;
+        let task = store
+            .create("list1", TaskSpec::new("subject", "desc"), vec![])
+            .await
+            .expect("create");
+
+        // Pass None for subject and description — only blocked_by changes.
+        let updated = store
+            .update_metadata("list1", &task.id.0, None, None, Some(&[]))
+            .await
+            .expect("update_metadata");
+
+        assert_eq!(updated.spec.subject, "subject");
+        assert_eq!(updated.spec.description, "desc");
+        assert!(updated.blocked_by.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_leases_returns_only_expired() {
+        let (store, _dir) = test_store().await;
+
+        // Task claimed with an already-expired lease (1 second in the past).
+        let t = store
+            .create("list1", TaskSpec::new("exp", ""), vec![])
+            .await
+            .expect("create");
+        let claimed = store
+            .apply_transition(
+                "list1",
+                &t.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: Some(1),
+                },
+            )
+            .await
+            .expect("claim");
+
+        // Task claimed without a lease — should NOT appear in expired_leases.
+        let t2 = store
+            .create("list1", TaskSpec::new("no-lease", ""), vec![])
+            .await
+            .expect("create2");
+        store
+            .apply_transition(
+                "list1",
+                &t2.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim2");
+
+        // Force the first task's lease into the past by patching the JSON.
+        let past = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+        let mut rt = claimed.runtime.clone();
+        rt.state = RuntimeState::Active {
+            owner: "agent".into(),
+            lease_expires_at: Some(past),
+        };
+        let rt_json = serde_json::to_string(&rt).expect("serialize");
+        sqlx::query("UPDATE tasks SET runtime_json = ? WHERE list_id = ? AND id = ?")
+            .bind(&rt_json)
+            .bind("list1")
+            .bind(&claimed.id.0)
+            .execute(store.pool())
+            .await
+            .expect("patch runtime");
+
+        let expired = store.expired_leases("list1").await.expect("expired_leases");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, claimed.id);
+    }
+
+    #[tokio::test]
+    async fn integration_create_claim_fail_promote() {
+        let (store, _dir) = test_store().await;
+
+        let task = store
+            .create("wf", TaskSpec::new("e2e", ""), vec![])
+            .await
+            .expect("create");
+        assert_eq!(task.runtime.state, RuntimeState::Pending);
+
+        // Claim
+        let task = store
+            .apply_transition(
+                "wf",
+                &task.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "bot".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim");
+        assert!(task.runtime.state.is_active());
+
+        // Fail with overdue retry_after
+        let past = OffsetDateTime::now_utc() - time::Duration::seconds(5);
+        let task = store
+            .apply_transition(
+                "wf",
+                &task.id.0,
+                None,
+                &TransitionEvent::Fail {
+                    class: FailureClass::AgentError,
+                    handoff: HandoffContext::default(),
+                    retry_after: Some(past),
+                },
+            )
+            .await
+            .expect("fail");
+        assert!(matches!(task.runtime.state, RuntimeState::Retrying { .. }));
+
+        // promote_due_retries_all should pick it up
+        let n = store.promote_due_retries_all().await.expect("promote");
+        assert_eq!(n, 1);
+
+        let final_task = store.get("wf", &task.id.0).await.expect("get").expect("exists");
+        assert_eq!(final_task.runtime.state, RuntimeState::Pending);
     }
 }

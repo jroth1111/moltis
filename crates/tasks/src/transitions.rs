@@ -550,4 +550,178 @@ mod tests {
             panic!("expected Active state with lease");
         }
     }
+
+    // ── Cancel from every non-terminal state ─────────────────────────────
+
+    #[test]
+    fn pending_cancel_goes_terminal_canceled() {
+        let task = pending_task();
+        let result = apply(task, &TransitionEvent::Cancel { reason: "stop".into() })
+            .expect("cancel pending");
+        assert!(matches!(
+            result.runtime.state,
+            RuntimeState::Terminal(TerminalState::Canceled { .. })
+        ));
+    }
+
+    #[test]
+    fn blocked_cancel_goes_terminal_canceled() {
+        let task = pending_task();
+        let blocked = apply(
+            task,
+            &TransitionEvent::Block {
+                waiting_on: vec![TaskId::from("dep-1")],
+            },
+        )
+        .expect("block");
+        let result = apply(blocked, &TransitionEvent::Cancel { reason: "stop".into() })
+            .expect("cancel blocked");
+        assert!(matches!(
+            result.runtime.state,
+            RuntimeState::Terminal(TerminalState::Canceled { .. })
+        ));
+    }
+
+    #[test]
+    fn retrying_cancel_goes_terminal_canceled() {
+        let task = active_task("agent");
+        let retrying = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
+        .expect("fail");
+        let result = apply(retrying, &TransitionEvent::Cancel { reason: "abort".into() })
+            .expect("cancel retrying");
+        assert!(matches!(
+            result.runtime.state,
+            RuntimeState::Terminal(TerminalState::Canceled { .. })
+        ));
+    }
+
+    #[test]
+    fn awaiting_human_cancel_goes_terminal_canceled() {
+        let task = active_task("agent");
+        let awaiting = apply(
+            task,
+            &TransitionEvent::Escalate {
+                question: "help?".into(),
+                handoff: HandoffContext::default(),
+            },
+        )
+        .expect("escalate");
+        let result = apply(awaiting, &TransitionEvent::Cancel { reason: "abort".into() })
+            .expect("cancel awaiting");
+        assert!(matches!(
+            result.runtime.state,
+            RuntimeState::Terminal(TerminalState::Canceled { .. })
+        ));
+    }
+
+    // ── Handoff propagation ───────────────────────────────────────────────
+
+    #[test]
+    fn fail_copies_handoff_to_retrying_state() {
+        let task = active_task("agent");
+        let handoff = HandoffContext {
+            observed_error: "boom".into(),
+            last_action: "tried X".into(),
+            ..Default::default()
+        };
+
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: handoff.clone(),
+                retry_after: None,
+            },
+        )
+        .expect("fail");
+
+        // runtime.handoff and Retrying.handoff should match what we passed.
+        assert_eq!(
+            result.runtime.handoff.as_ref().map(|h| &h.observed_error),
+            Some(&handoff.observed_error)
+        );
+        if let RuntimeState::Retrying { handoff: hc, .. } = &result.runtime.state {
+            assert_eq!(hc.observed_error, "boom");
+        } else {
+            panic!("expected Retrying state");
+        }
+    }
+
+    #[test]
+    fn fail_copies_handoff_to_awaiting_human_state() {
+        let task = active_task("agent");
+        let handoff = HandoffContext {
+            observed_error: "perm error".into(),
+            ..Default::default()
+        };
+
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::ProviderPermanent, // requires_human()
+                handoff: handoff.clone(),
+                retry_after: None,
+            },
+        )
+        .expect("fail→awaiting_human");
+
+        if let RuntimeState::AwaitingHuman { handoff: hc, .. } = &result.runtime.state {
+            assert_eq!(hc.observed_error, "perm error");
+        } else {
+            panic!("expected AwaitingHuman state");
+        }
+    }
+
+    // ── Custom retry_after override ───────────────────────────────────────
+
+    #[test]
+    fn fail_with_custom_retry_after_sets_retrying_timestamp() {
+        let task = active_task("agent");
+        let future = OffsetDateTime::now_utc() + time::Duration::seconds(999);
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::AgentError,
+                handoff: HandoffContext::default(),
+                retry_after: Some(future),
+            },
+        )
+        .expect("fail");
+        if let RuntimeState::Retrying { retry_after, .. } = result.runtime.state {
+            // Allow ±5s around the expected value.
+            let delta = (retry_after - future).abs();
+            assert!(delta < time::Duration::seconds(5), "retry_after mismatch: {retry_after}");
+        } else {
+            panic!("expected Retrying state");
+        }
+    }
+
+    // ── Non-retryable failure class → Terminal ────────────────────────────
+
+    #[test]
+    fn non_retryable_failure_class_goes_terminal() {
+        let mut task = active_task("agent");
+        task.spec.max_attempts = 10; // budget not exhausted
+        // MaxAttemptsExceeded is !is_retryable() → Terminal regardless of budget
+        let result = apply(
+            task,
+            &TransitionEvent::Fail {
+                class: FailureClass::MaxAttemptsExceeded,
+                handoff: HandoffContext::default(),
+                retry_after: None,
+            },
+        )
+        .expect("fail non-retryable");
+        assert!(matches!(
+            result.runtime.state,
+            RuntimeState::Terminal(TerminalState::Failed { .. })
+        ));
+    }
 }

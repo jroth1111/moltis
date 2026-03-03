@@ -124,4 +124,46 @@ mod tests {
             RecoveryPhase::TerminalFailure
         );
     }
+
+    #[test]
+    fn tool_error_is_retryable() {
+        let phase = classify_recovery(&FailureClass::ToolError, 1, 5);
+        assert_ne!(phase, RecoveryPhase::TerminalFailure);
+        assert_ne!(phase, RecoveryPhase::HumanEscalation);
+    }
+
+    #[test]
+    fn timeout_exceeded_is_retryable() {
+        let phase = classify_recovery(&FailureClass::TimeoutExceeded, 1, 5);
+        assert_ne!(phase, RecoveryPhase::TerminalFailure);
+        assert_ne!(phase, RecoveryPhase::HumanEscalation);
+    }
+
+    #[test]
+    fn max_attempts_exceeded_is_non_retryable_terminal() {
+        // MaxAttemptsExceeded is !is_retryable() → TerminalFailure even with budget remaining.
+        let phase = classify_recovery(&FailureClass::MaxAttemptsExceeded, 1, 10);
+        assert_eq!(phase, RecoveryPhase::TerminalFailure);
+    }
+
+    #[test]
+    fn deferred_retry_has_future_timestamp() {
+        let phase = classify_recovery(&FailureClass::ProviderTransient, 2, 5);
+        if let RecoveryPhase::DeferredRetry { retry_after } = phase {
+            assert!(retry_after > OffsetDateTime::now_utc(), "retry_after must be in the future");
+        } else {
+            panic!("expected DeferredRetry, got {phase:?}");
+        }
+    }
+
+    #[test]
+    fn backoff_seconds_values() {
+        assert_eq!(backoff_seconds(0), 5);
+        assert_eq!(backoff_seconds(1), 5);
+        assert_eq!(backoff_seconds(2), 20);
+        assert_eq!(backoff_seconds(3), 60);
+        assert_eq!(backoff_seconds(4), 180);
+        assert_eq!(backoff_seconds(5), 300);
+        assert_eq!(backoff_seconds(100), 300); // capped
+    }
 }

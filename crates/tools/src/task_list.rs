@@ -69,17 +69,18 @@ fn task_view(task: &Task) -> serde_json::Value {
     let blocked_by: Vec<&str> = task.blocked_by.iter().map(|id| id.0.as_str()).collect();
 
     let mut v = json!({
-        "id":          task.id.0,
-        "list_id":     task.list_id,
-        "subject":     task.spec.subject,
-        "description": task.spec.description,
-        "status":      status,
-        "owner":       task.runtime.owner,
-        "blocked_by":  blocked_by,
-        "attempt":     task.runtime.attempt,
-        "version":     task.runtime.version,
-        "created_at":  task.spec.created_at.unix_timestamp(),
-        "updated_at":  task.runtime.last_transition_at.unix_timestamp(),
+        "id":           task.id.0,
+        "list_id":      task.list_id,
+        "subject":      task.spec.subject,
+        "description":  task.spec.description,
+        "status":       status,
+        "owner":        task.runtime.owner,
+        "blocked_by":   blocked_by,
+        "attempt":      task.runtime.attempt,
+        "max_attempts": task.spec.max_attempts,
+        "version":      task.runtime.version,
+        "created_at":   task.spec.created_at.unix_timestamp(),
+        "updated_at":   task.runtime.last_transition_at.unix_timestamp(),
     });
 
     // Include failure context if present.
@@ -639,6 +640,28 @@ mod tests {
         TaskListTool::from_data_dir(dir.path())
             .await
             .expect("init tool")
+    }
+
+    async fn tool_with_max_attempts(dir: &TempDir, override_val: u8) -> TaskListTool {
+        TaskListTool::from_data_dir(dir.path())
+            .await
+            .expect("init tool")
+            .with_max_attempts_override(Some(override_val))
+    }
+
+    #[tokio::test]
+    async fn max_attempts_override_applied_on_create() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool_with_max_attempts(&tmp, 7).await;
+        let result = t
+            .execute(json!({ "action": "create", "subject": "limited" }))
+            .await
+            .unwrap();
+        let id = result["task"]["id"].as_str().unwrap().to_string();
+
+        // Retrieve the stored spec and check max_attempts was overridden.
+        let got = t.execute(json!({ "action": "get", "id": id })).await.unwrap();
+        assert_eq!(got["task"]["max_attempts"], 7);
     }
 
     #[tokio::test]
