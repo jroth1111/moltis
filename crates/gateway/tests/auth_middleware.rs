@@ -270,12 +270,97 @@ async fn session_cookie_auth_succeeds() {
 async fn api_key_auth_succeeds() {
     let (addr, store) = start_auth_server().await;
     store.set_initial_password("testpass123").await.unwrap();
-    let (_id, raw_key) = store.create_api_key("test", None).await.unwrap();
+    let scopes = vec!["operator.read".to_string()];
+    let (_id, raw_key) = store.create_api_key("test", Some(&scopes)).await.unwrap();
 
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("http://{addr}/api/bootstrap"))
         .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+/// Legacy API key rows with no scopes are rejected.
+#[cfg(feature = "web-ui")]
+#[tokio::test]
+async fn api_key_without_scopes_returns_401() {
+    let (addr, store) = start_auth_server().await;
+    store.set_initial_password("testpass123").await.unwrap();
+    let scopes = vec!["operator.read".to_string()];
+    let (id, raw_key) = store.create_api_key("legacy", Some(&scopes)).await.unwrap();
+    sqlx::query("UPDATE api_keys SET scopes = NULL WHERE id = ?")
+        .bind(id)
+        .execute(store.db_pool())
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/bootstrap"))
+        .header("Authorization", format!("Bearer {raw_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+/// API key creation requires at least one scope.
+#[cfg(feature = "web-ui")]
+#[tokio::test]
+async fn create_api_key_requires_scopes() {
+    let (addr, store) = start_auth_server().await;
+    store.set_initial_password("testpass123").await.unwrap();
+    let session = store.create_session().await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/auth/api-keys"))
+        .header("Cookie", format!("moltis_session={session}"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"label":"test-key"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// API key creation rejects an empty scope list.
+#[cfg(feature = "web-ui")]
+#[tokio::test]
+async fn create_api_key_rejects_empty_scope_list() {
+    let (addr, store) = start_auth_server().await;
+    store.set_initial_password("testpass123").await.unwrap();
+    let session = store.create_session().await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/auth/api-keys"))
+        .header("Cookie", format!("moltis_session={session}"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"label":"test-key","scopes":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+/// API key creation succeeds when scopes are provided.
+#[cfg(feature = "web-ui")]
+#[tokio::test]
+async fn create_api_key_accepts_valid_scopes() {
+    let (addr, store) = start_auth_server().await;
+    store.set_initial_password("testpass123").await.unwrap();
+    let session = store.create_session().await.unwrap();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/auth/api-keys"))
+        .header("Cookie", format!("moltis_session={session}"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"label":"test-key","scopes":["operator.read"]}"#)
         .send()
         .await
         .unwrap();
@@ -613,7 +698,8 @@ async fn reset_auth_requires_session() {
 async fn revoked_api_key_returns_401() {
     let (addr, store) = start_auth_server().await;
     store.set_initial_password("testpass123").await.unwrap();
-    let (id, raw_key) = store.create_api_key("test", None).await.unwrap();
+    let scopes = vec!["operator.read".to_string()];
+    let (id, raw_key) = store.create_api_key("test", Some(&scopes)).await.unwrap();
     store.revoke_api_key(id).await.unwrap();
 
     let client = reqwest::Client::new();

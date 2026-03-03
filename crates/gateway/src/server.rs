@@ -4922,7 +4922,9 @@ pub async fn start_gateway(
             info!("shutdown signal received; entering drain mode");
 
             if let Some(hooks) = state_for_shutdown.inner.read().await.hook_registry.clone() {
-                if let Err(e) = hooks.dispatch(&moltis_common::hooks::HookPayload::GatewayStop).await
+                if let Err(e) = hooks
+                    .dispatch(&moltis_common::hooks::HookPayload::GatewayStop)
+                    .await
                 {
                     tracing::warn!("GatewayStop hook dispatch failed: {e}");
                 }
@@ -4944,8 +4946,7 @@ pub async fn start_gateway(
             } else {
                 warn!(
                     drain_secs = drain_timeout.as_secs(),
-                    remaining_runs,
-                    "forcing shutdown with in-flight agent runs still active"
+                    remaining_runs, "forcing shutdown with in-flight agent runs still active"
                 );
             }
 
@@ -5052,11 +5053,7 @@ async fn ws_upgrade_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if state.gateway.is_shutting_down() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "gateway is shutting down",
-        )
-            .into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, "gateway is shutting down").into_response();
     }
 
     // ── CSWSH protection ────────────────────────────────────────────────
@@ -6277,7 +6274,14 @@ mod tests {
                 .unwrap(),
         );
         store.set_initial_password("supersecret").await.unwrap();
-        let (_id, raw_key) = store.create_api_key("ws", None).await.unwrap();
+        let scopes = vec!["operator.read".to_string()];
+        let (key_id, raw_key) = store.create_api_key("ws", Some(&scopes)).await.unwrap();
+        // Simulate a legacy key created before scope enforcement.
+        sqlx::query("UPDATE api_keys SET scopes = NULL WHERE id = ?")
+            .bind(key_id)
+            .execute(store.db_pool())
+            .await
+            .unwrap();
 
         let mut headers = axum::http::HeaderMap::new();
         let auth_value = format!("Bearer {raw_key}");

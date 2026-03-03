@@ -332,10 +332,17 @@ mod tests {
     #[tokio::test]
     async fn check_auth_rejects_unscoped_api_key() {
         let store = test_credential_store().await;
-        let (_id, raw_key) = store
-            .create_api_key("unscoped", None)
+        let scopes = vec!["operator.read".to_string()];
+        let (key_id, raw_key) = store
+            .create_api_key("legacy-unscoped", Some(&scopes))
             .await
             .expect("create api key");
+        // Simulate a legacy key created before scope enforcement.
+        sqlx::query("UPDATE api_keys SET scopes = NULL WHERE id = ?")
+            .bind(key_id)
+            .execute(store.db_pool())
+            .await
+            .expect("null out scopes");
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,

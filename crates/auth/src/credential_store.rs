@@ -50,7 +50,9 @@ pub struct ApiKeyEntry {
     pub label: String,
     pub key_prefix: String,
     pub created_at: String,
-    /// Scopes granted to this API key. Empty/None means no access (must specify scopes).
+    /// Scopes granted to this API key.
+    /// `None` is only possible for legacy keys that were created before scope
+    /// enforcement and are treated as no-access by auth checks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 }
@@ -59,7 +61,7 @@ pub struct ApiKeyEntry {
 #[derive(Debug, Clone)]
 pub struct ApiKeyVerification {
     pub key_id: i64,
-    /// Scopes granted to this key. Empty means no access (key must specify scopes).
+    /// Scopes granted to this key. Empty means no access.
     pub scopes: Vec<String>,
 }
 
@@ -438,23 +440,26 @@ impl CredentialStore {
 
     // ── API Keys ─────────────────────────────────────────────────────────
 
-    /// Generate a new API key with optional scopes. Returns (id, raw_key).
+    /// Generate a new API key with required scopes. Returns (id, raw_key).
     /// The raw key is only shown once — we store only its SHA-256 hash.
-    ///
-    /// If `scopes` is None or empty, the key will have no access until scopes are set.
     pub async fn create_api_key(
         &self,
         label: &str,
         scopes: Option<&[String]>,
     ) -> anyhow::Result<(i64, String)> {
+        let scopes = scopes
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("at least one scope is required"))?;
+        for scope in scopes {
+            if !VALID_SCOPES.contains(&scope.as_str()) {
+                anyhow::bail!("invalid scope: {scope}");
+            }
+        }
+
         let raw_key = format!("mk_{}", generate_token());
         let prefix = &raw_key[..raw_key.len().min(11)]; // "mk_" + 8 chars
         let hash = sha256_hex(&raw_key);
-
-        // Store scopes as JSON array, or NULL when omitted (means no access until scopes are assigned)
-        let scopes_json = scopes
-            .filter(|s| !s.is_empty())
-            .map(|s| serde_json::to_string(s).unwrap_or_default());
+        let scopes_json = serde_json::to_string(scopes)?;
 
         let result = sqlx::query(
             "INSERT INTO api_keys (label, key_hash, key_prefix, scopes) VALUES (?, ?, ?, ?)",
@@ -1001,17 +1006,30 @@ mod tests {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = CredentialStore::new(pool).await.unwrap();
 
-        // Create API key without scopes (full access)
-        let (id, raw_key) = store.create_api_key("test key", None).await.unwrap();
+        // API keys must declare at least one scope.
+        let empty_scopes: Vec<String> = Vec::new();
+        assert!(store.create_api_key("test key", None).await.is_err());
+        assert!(
+            store
+                .create_api_key("test key", Some(&empty_scopes))
+                .await
+                .is_err()
+        );
+
+        let scopes = vec!["operator.read".to_string()];
+        let (id, raw_key) = store
+            .create_api_key("test key", Some(&scopes))
+            .await
+            .unwrap();
         assert!(id > 0);
         assert!(raw_key.starts_with("mk_"));
 
-        // Verify returns Some with empty scopes (no access — key must specify scopes)
+        // Verify returns the stored scopes.
         let verification = store.verify_api_key(&raw_key).await.unwrap();
         assert!(verification.is_some());
         let v = verification.unwrap();
         assert_eq!(v.key_id, id);
-        assert!(v.scopes.is_empty()); // empty = no access
+        assert_eq!(v.scopes, scopes);
 
         // Invalid key returns None
         assert!(store.verify_api_key("mk_bogus").await.unwrap().is_none());
@@ -1019,7 +1037,7 @@ mod tests {
         let keys = store.list_api_keys().await.unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].label, "test key");
-        assert!(keys[0].scopes.is_none()); // None = full access
+        assert_eq!(keys[0].scopes, Some(vec!["operator.read".to_string()]));
 
         store.revoke_api_key(id).await.unwrap();
         assert!(store.verify_api_key(&raw_key).await.unwrap().is_none());
@@ -1053,21 +1071,41 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].scopes, Some(scopes.clone()));
 
-        // Create another key without scopes for comparison
-        let (id2, raw_key2) = store.create_api_key("full access key", None).await.unwrap();
+        // Create another key with a different scope set for comparison.
+        let other_scopes = vec!["operator.write".to_string()];
+        let (id2, raw_key2) = store
+            .create_api_key("write key", Some(&other_scopes))
+            .await
+            .unwrap();
 
         let keys = store.list_api_keys().await.unwrap();
         assert_eq!(keys.len(), 2);
 
         // Find each key and verify scopes
         let scoped = keys.iter().find(|k| k.id == id).unwrap();
-        let full = keys.iter().find(|k| k.id == id2).unwrap();
-        assert_eq!(scoped.scopes, Some(scopes));
-        assert!(full.scopes.is_none()); // None = no scopes specified (no access)
+        let other = keys.iter().find(|k| k.id == id2).unwrap();
+        assert_eq!(scoped.scopes, Some(scopes.clone()));
+        assert_eq!(other.scopes, Some(other_scopes.clone()));
 
         // Verify both keys work
-        assert!(store.verify_api_key(&raw_key).await.unwrap().is_some());
-        assert!(store.verify_api_key(&raw_key2).await.unwrap().is_some());
+        assert_eq!(
+            store
+                .verify_api_key(&raw_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .scopes,
+            scopes
+        );
+        assert_eq!(
+            store
+                .verify_api_key(&raw_key2)
+                .await
+                .unwrap()
+                .unwrap()
+                .scopes,
+            other_scopes
+        );
     }
 
     #[tokio::test]
@@ -1082,7 +1120,8 @@ mod tests {
         let token = store.create_session().await.unwrap();
         assert!(store.validate_session(&token).await.unwrap());
 
-        let (_id, raw_key) = store.create_api_key("test", None).await.unwrap();
+        let scopes = vec!["operator.admin".to_string()];
+        let (_id, raw_key) = store.create_api_key("test", Some(&scopes)).await.unwrap();
         assert!(store.verify_api_key(&raw_key).await.unwrap().is_some());
 
         store

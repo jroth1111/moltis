@@ -31,8 +31,8 @@ pub enum AuthAction {
         /// Label for the API key (e.g. "CLI tool", "CI pipeline").
         #[arg(long)]
         label: String,
-        /// Comma-separated list of scopes. If omitted, the key has full access.
-        /// Valid scopes: operator.read, operator.write, operator.approvals, operator.pairing
+        /// Comma-separated list of scopes (required).
+        /// Valid scopes: operator.admin, operator.read, operator.write, operator.approvals, operator.pairing
         #[arg(long)]
         scopes: Option<String>,
     },
@@ -202,21 +202,26 @@ async fn create_api_key(label: &str, scopes_str: Option<String>) -> Result<()> {
         );
     }
 
-    // Parse and validate scopes
-    let scopes: Option<Vec<String>> = if let Some(ref s) = scopes_str {
-        let parsed: Vec<String> = s.split(',').map(|s| s.trim().to_string()).collect();
-        for scope in &parsed {
-            if !moltis_gateway::auth::VALID_SCOPES.contains(&scope.as_str()) {
-                anyhow::bail!(
-                    "Invalid scope: {scope}\nValid scopes: {}",
-                    moltis_gateway::auth::VALID_SCOPES.join(", ")
-                );
-            }
+    // Parse and validate scopes.
+    let scopes_raw = scopes_str
+        .ok_or_else(|| anyhow::anyhow!("at least one scope is required (pass --scopes)"))?;
+    let scopes: Vec<String> = scopes_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if scopes.is_empty() {
+        anyhow::bail!("at least one scope is required (pass --scopes)");
+    }
+    for scope in &scopes {
+        if !moltis_gateway::auth::VALID_SCOPES.contains(&scope.as_str()) {
+            anyhow::bail!(
+                "Invalid scope: {scope}\nValid scopes: {}",
+                moltis_gateway::auth::VALID_SCOPES.join(", ")
+            );
         }
-        Some(parsed)
-    } else {
-        None
-    };
+    }
 
     // Connect to database and create the key
     let db_url = format!("sqlite:{}", db_path.display());
@@ -224,17 +229,13 @@ async fn create_api_key(label: &str, scopes_str: Option<String>) -> Result<()> {
     let config = moltis_config::discover_and_load();
     let store = moltis_gateway::auth::CredentialStore::with_config(pool, &config.auth).await?;
 
-    let (id, raw_key) = store.create_api_key(label, scopes.as_deref()).await?;
+    let (id, raw_key) = store.create_api_key(label, Some(&scopes)).await?;
 
     println!("API key created successfully!");
     println!();
     println!("  ID:     {id}");
     println!("  Label:  {label}");
-    if let Some(ref s) = scopes {
-        println!("  Scopes: {}", s.join(", "));
-    } else {
-        println!("  Scopes: Full access (all scopes)");
-    }
+    println!("  Scopes: {}", scopes.join(", "));
     println!();
     println!("Key (save this now, it won't be shown again):");
     println!();
