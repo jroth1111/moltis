@@ -184,10 +184,10 @@ impl CircuitBreakerHook {
             if p != provider {
                 continue;
             }
-            if let CircuitState::Open { opened_at } = state {
-                if opened_at.elapsed() < self.reset_timeout {
-                    return Some((*kind, enforcement_for(kind)));
-                }
+            if let CircuitState::Open { opened_at } = state
+                && opened_at.elapsed() < self.reset_timeout
+            {
+                return Some((*kind, enforcement_for(kind)));
             }
         }
         None
@@ -202,23 +202,23 @@ impl CircuitBreakerHook {
             .cloned()
             .collect();
         for key in keys {
-            if let Some(CircuitState::Open { opened_at }) = states.get(&key) {
-                if opened_at.elapsed() >= self.reset_timeout {
-                    info!(
-                        provider = %key.0,
-                        error_class = ?key.1,
-                        "circuit-breaker: timeout elapsed, entering half-open"
-                    );
-                    #[cfg(feature = "metrics")]
-                    counter!(
-                        "moltis_circuit_breaker_state_transitions_total",
-                        labels::PROVIDER => key.0.clone(),
-                        labels::ERROR_TYPE => format!("{:?}", key.1),
-                        "to_state" => "half_open"
-                    )
-                    .increment(1);
-                    states.insert(key, CircuitState::HalfOpen);
-                }
+            if let Some(CircuitState::Open { opened_at }) = states.get(&key)
+                && opened_at.elapsed() >= self.reset_timeout
+            {
+                info!(
+                    provider = %key.0,
+                    error_class = ?key.1,
+                    "circuit-breaker: timeout elapsed, entering half-open"
+                );
+                #[cfg(feature = "metrics")]
+                counter!(
+                    "moltis_circuit_breaker_state_transitions_total",
+                    labels::PROVIDER => key.0.clone(),
+                    labels::ERROR_TYPE => format!("{:?}", key.1),
+                    "to_state" => "half_open"
+                )
+                .increment(1);
+                states.insert(key, CircuitState::HalfOpen);
             }
         }
     }
