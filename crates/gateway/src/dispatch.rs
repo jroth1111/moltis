@@ -35,8 +35,8 @@ use {
     moltis_config::schema::TasksConfig,
     moltis_service_traits::ServiceError,
     moltis_tasks::{
-        AutonomyTier, HandoffContext, IntentStore, ObjectiveSnapshot, RuntimeState, Task, TaskSpec,
-        TaskStore, TerminalState, TransitionError, TransitionEvent,
+        AutonomyTier, HandoffContext, IntentStore, ObjectiveSnapshot, OutputStore, RuntimeState,
+        ShiftOutput, Task, TaskSpec, TaskStore, TerminalState, TransitionError, TransitionEvent,
     },
     serde_json::Value,
     tracing::{debug, info, warn},
@@ -55,7 +55,13 @@ pub async fn run_dispatch_loop(
     task_store: Arc<TaskStore>,
     config: TasksConfig,
 ) {
+    if !config.dispatch_enabled {
+        debug!("dispatch loop disabled (tasks.dispatch_enabled = false) — not starting");
+        return;
+    }
+
     let intent_store = IntentStore::from_pool(task_store.pool().clone());
+    let output_store = OutputStore::from_pool(task_store.pool().clone());
     let poll_secs = config.dispatch_poll_interval_secs.max(1);
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
@@ -68,6 +74,7 @@ pub async fn run_dispatch_loop(
         let ctx = DispatchContext {
             task_store: Arc::clone(&task_store),
             intent_store: intent_store.clone(),
+            output_store: output_store.clone(),
             chat,
             config: config.clone(),
         };
@@ -85,6 +92,7 @@ pub async fn run_dispatch_loop(
 struct DispatchContext {
     task_store: Arc<TaskStore>,
     intent_store: IntentStore,
+    output_store: OutputStore,
     chat: Arc<dyn crate::services::ChatService>,
     config: TasksConfig,
 }
@@ -93,10 +101,28 @@ struct DispatchContext {
 
 /// Run one full scan-and-dispatch cycle. Returns the number of shifts started.
 async fn run_cycle(ctx: &DispatchContext) -> Result<usize, anyhow::Error> {
+    // Hard cap on concurrent shift execution before querying intents.
+    let active = ctx.task_store.count_active_shifts().await?;
+    if active >= ctx.config.max_concurrent_shifts {
+        debug!(
+            active = active,
+            max = ctx.config.max_concurrent_shifts,
+            "max_concurrent_shifts reached — skipping cycle"
+        );
+        return Ok(0);
+    }
+
     let intents = ctx.task_store.list_actionable_intents().await?;
     let mut dispatched = 0usize;
 
     for intent in intents {
+        // Re-check concurrency limit per intent in case we dispatched inside
+        // this loop and reached the cap before exhausting the intent list.
+        let active_now = ctx.task_store.count_active_shifts().await?;
+        if active_now >= ctx.config.max_concurrent_shifts {
+            break;
+        }
+
         let intent_id = intent.id.0.clone();
         match process_intent(ctx, intent).await {
             Ok(true) => dispatched += 1,
@@ -180,6 +206,25 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
                 return Ok(false);
             }
 
+            // ── 4b. Cooldown: don't start a new shift too soon after the last. ─
+            if ctx.config.shift_cooldown_secs > 0 && intent_state.shift_count > 0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let last_updated = intent_state.updated_at.unix_timestamp();
+                let elapsed = (now - last_updated).max(0) as u64;
+                if elapsed < ctx.config.shift_cooldown_secs {
+                    debug!(
+                        intent_id = %intent_id,
+                        elapsed_secs = elapsed,
+                        cooldown_secs = ctx.config.shift_cooldown_secs,
+                        "shift cooldown active — skipping"
+                    );
+                    return Ok(false);
+                }
+            }
+
             // ── 5. Create new shift task. ──────────────────────────────────────
             // shift_count+1 gives the next shift number; used for subject only.
             let next_num = intent_state.shift_count + 1;
@@ -237,12 +282,19 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
         "dispatching shift"
     );
 
-    // ── 7. Build shift session key and system prompt. ─────────────────────────
+    // ── 7. Load recent outputs and build shift session key + prompt. ──────────
+    let recent_outputs = ctx
+        .output_store
+        .list_recent(&intent_id, 2)
+        .await
+        .unwrap_or_default();
+
     let session_key = format!("dispatch:intent:{intent_id}:shift:{shift_num}");
     let prompt = build_shift_prompt(
         &intent.spec.subject,
         &intent.spec.description,
         &intent.runtime.handoff,
+        &recent_outputs,
     );
 
     // ── 8. Run the shift — blocks until agent completes. ─────────────────────
@@ -285,6 +337,31 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
         .await?;
     }
     // If shift is already terminal or AwaitingHuman (mid-turn escalation), skip.
+
+    // Persist shift output for future context injection.
+    let output_text = match &shift_result {
+        Ok(v) => v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(e) => format!("[shift error: {e}]"),
+    };
+    let (input_toks, output_toks) = match &shift_result {
+        Ok(v) => extract_token_pair(v),
+        Err(_) => (0, 0),
+    };
+    OutputStore::insert_tx(
+        &mut tx,
+        &intent_id,
+        &shift.id.0,
+        &list_id,
+        shift_num,
+        &output_text,
+        input_toks,
+        output_toks,
+    )
+    .await?;
 
     let (final_state, is_spinning) = IntentStore::finalize_shift_tx(
         &mut tx,
@@ -469,8 +546,9 @@ fn build_shift_prompt(
     subject: &str,
     description: &str,
     handoff: &Option<HandoffContext>,
+    recent_outputs: &[ShiftOutput],
 ) -> String {
-    let mut parts = Vec::with_capacity(4);
+    let mut parts = Vec::with_capacity(5);
 
     parts.push(format!("## Objective\n{subject}"));
 
@@ -483,6 +561,22 @@ fn build_shift_prompt(
         if !ctx.is_empty() {
             parts.push(format!("## Previous Attempt Context\n{ctx}"));
         }
+    }
+
+    if !recent_outputs.is_empty() {
+        let mut history = String::from("The following outputs were produced by previous shifts:\n");
+        for out in recent_outputs {
+            let preview = if out.output.len() > 2_000 {
+                format!("{}…", &out.output[..2_000])
+            } else {
+                out.output.clone()
+            };
+            history.push_str(&format!(
+                "\n### Shift {} output\n{preview}\n",
+                out.shift_num
+            ));
+        }
+        parts.push(format!("## Prior Shift History\n{history}"));
     }
 
     parts.push(
@@ -520,9 +614,9 @@ async fn build_snapshot(
     Ok(snapshot)
 }
 
-/// Extract total tokens used from a `send_sync` response.
-/// Returns 0 if the fields are absent or not numeric.
-fn extract_tokens(result: &Value) -> u64 {
+/// Extract `(input_tokens, output_tokens)` from a `send_sync` response.
+/// Returns `(0, 0)` if the fields are absent or not numeric.
+fn extract_token_pair(result: &Value) -> (u64, u64) {
     let input = result
         .get("inputTokens")
         .and_then(Value::as_u64)
@@ -531,7 +625,14 @@ fn extract_tokens(result: &Value) -> u64 {
         .get("outputTokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    input.saturating_add(output)
+    (input, output)
+}
+
+/// Extract total tokens used from a `send_sync` response.
+/// Returns 0 if the fields are absent or not numeric.
+fn extract_tokens(result: &Value) -> u64 {
+    let (i, o) = extract_token_pair(result);
+    i.saturating_add(o)
 }
 
 #[cfg(test)]
@@ -824,7 +925,7 @@ mod tests {
 
     #[test]
     fn build_shift_prompt_no_handoff() {
-        let p = build_shift_prompt("Find restaurants", "Near London", &None);
+        let p = build_shift_prompt("Find restaurants", "Near London", &None, &[]);
         assert!(p.contains("Find restaurants"));
         assert!(p.contains("Near London"));
         assert!(p.contains("task_list"));
@@ -839,7 +940,7 @@ mod tests {
             dead_ends: vec![],
             suggested_next_step: "try Bing".into(),
         };
-        let p = build_shift_prompt("Find restaurants", "", &Some(h));
+        let p = build_shift_prompt("Find restaurants", "", &Some(h), &[]);
         assert!(p.contains("searched Google"));
         assert!(p.contains("403 forbidden"));
         assert!(p.contains("try Bing"));
@@ -847,7 +948,7 @@ mod tests {
 
     #[test]
     fn build_shift_prompt_empty_description_omitted() {
-        let p = build_shift_prompt("subject only", "", &None);
+        let p = build_shift_prompt("subject only", "", &None, &[]);
         assert!(!p.contains("## Details"));
     }
 
@@ -904,9 +1005,11 @@ mod tests {
             .expect("create intent");
 
         let intent_store = IntentStore::from_pool(store.pool().clone());
+        let output_store = OutputStore::from_pool(store.pool().clone());
         let ctx = DispatchContext {
             task_store: Arc::clone(&store),
             intent_store,
+            output_store,
             chat: Arc::new(OkChatService),
             config: TasksConfig::default(),
         };
@@ -985,9 +1088,11 @@ mod tests {
             .expect("claim shift");
 
         let intent_store = IntentStore::from_pool(store.pool().clone());
+        let output_store = OutputStore::from_pool(store.pool().clone());
         let ctx = DispatchContext {
             task_store: Arc::clone(&store),
             intent_store,
+            output_store,
             chat: Arc::new(OkChatService),
             config: TasksConfig::default(),
         };
@@ -1003,9 +1108,11 @@ mod tests {
     async fn run_cycle_empty_store_dispatches_nothing() {
         let store = make_store().await;
         let intent_store = IntentStore::from_pool(store.pool().clone());
+        let output_store = OutputStore::from_pool(store.pool().clone());
         let ctx = DispatchContext {
             task_store: Arc::clone(&store),
             intent_store,
+            output_store,
             chat: Arc::new(OkChatService),
             config: TasksConfig::default(),
         };
