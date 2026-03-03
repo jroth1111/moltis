@@ -107,12 +107,7 @@ const PLAN_LIMIT_PATTERNS: &[&str] = &[
     "organization does not have access",
 ];
 
-const RATE_LIMIT_PATTERNS: &[&str] = &[
-    "429",
-    "rate limit",
-    "rate_limit",
-    "too many requests",
-];
+const RATE_LIMIT_PATTERNS: &[&str] = &["429", "rate limit", "rate_limit", "too many requests"];
 
 const AUTH_PATTERNS: &[&str] = &[
     "401",
@@ -291,19 +286,27 @@ mod tests {
     #[test]
     fn classifies_non_retryable_rate_limit_before_rate_limit() {
         assert_eq!(
-            classify_error_message("Your plan does not include access to this model and hit rate limit"),
+            classify_error_message(
+                "Your plan does not include access to this model and hit rate limit"
+            ),
             ProviderErrorKind::NonRetryableRateLimit
         );
     }
 
     #[test]
     fn parses_retry_after_seconds() {
-        assert_eq!(extract_retry_after_ms("Retry-After: 15", 60_000), Some(15_000));
+        assert_eq!(
+            extract_retry_after_ms("Retry-After: 15", 60_000),
+            Some(15_000)
+        );
     }
 
     #[test]
     fn parses_retry_after_decimal_seconds() {
-        assert_eq!(extract_retry_after_ms("retry after 5.5 seconds", 60_000), Some(5_500));
+        assert_eq!(
+            extract_retry_after_ms("retry after 5.5 seconds", 60_000),
+            Some(5_500)
+        );
     }
 
     #[test]

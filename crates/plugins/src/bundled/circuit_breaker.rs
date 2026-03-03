@@ -9,7 +9,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use {async_trait::async_trait, tokio::sync::RwLock, tracing::{info, warn}};
+use {
+    async_trait::async_trait,
+    tokio::sync::RwLock,
+    tracing::{info, warn},
+};
 
 use moltis_agents::classify::{ProviderErrorKind, classify_error_message};
 use moltis_common::{
@@ -465,8 +469,10 @@ mod tests {
 
     #[tokio::test]
     async fn enforce_mode_blocks_open_circuit() {
-        let hook = CircuitBreakerHook::new(1, 60)
-            .with_enforcement(ProviderErrorKind::BillingExhausted, EnforcementLevel::Enforce);
+        let hook = CircuitBreakerHook::new(1, 60).with_enforcement(
+            ProviderErrorKind::BillingExhausted,
+            EnforcementLevel::Enforce,
+        );
 
         let fail = HookPayload::AfterLLMCall {
             session_key: "s1".into(),

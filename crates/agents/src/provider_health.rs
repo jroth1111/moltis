@@ -73,13 +73,7 @@ impl ProviderHealthTracker {
         }
     }
 
-    fn record(
-        &self,
-        provider: &str,
-        model: &str,
-        duration_ms: u64,
-        error_class: Option<String>,
-    ) {
+    fn record(&self, provider: &str, model: &str, duration_ms: u64, error_class: Option<String>) {
         let now = now_ms();
         let cutoff = now.saturating_sub(self.window.as_millis() as u64);
         let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());

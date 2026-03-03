@@ -12,11 +12,14 @@ use moltis_common::hooks::{HookAction, HookPayload, HookRegistry};
 
 use crate::{
     classify::{ProviderErrorKind, classify_error_message, extract_retry_after_ms},
+    intent_tracker::IntentTracker,
     model::{
-        ChatMessage, CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage, UserContent,
-        values_to_chat_messages,
+        ChatMessage, CompletionResponse, ContentPart, LlmProvider, StreamEvent, ToolCall, Usage,
+        UserContent, values_to_chat_messages,
     },
-    response_sanitizer::{clean_response, recover_tool_calls_from_content, sanitize_with_leak_detection},
+    response_sanitizer::{
+        clean_response, recover_tool_calls_from_content, sanitize_with_leak_detection,
+    },
     tool_parsing::{
         looks_like_failed_tool_call, new_synthetic_tool_call_id, parse_tool_calls_from_text,
     },
@@ -645,55 +648,55 @@ pub async fn run_agent_loop_with_context(
         };
 
         let mut response: CompletionResponse = match completion_result {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if let Some(ref hooks) = hook_registry {
-                        let payload = HookPayload::AfterLLMCall {
-                            session_key: session_key_for_hooks.clone(),
-                            provider: provider.name().to_string(),
-                            model: provider.id().to_string(),
-                            error: Some(msg.clone()),
-                            text: None,
-                            tool_calls: vec![],
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            iteration: iterations,
-                            trace_id: trace_id.clone(),
-                        };
-                        if let Err(dispatch_err) = hooks.dispatch(&payload).await {
-                            warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
-                        }
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if let Some(ref hooks) = hook_registry {
+                    let payload = HookPayload::AfterLLMCall {
+                        session_key: session_key_for_hooks.clone(),
+                        provider: provider.name().to_string(),
+                        model: provider.id().to_string(),
+                        error: Some(msg.clone()),
+                        text: None,
+                        tool_calls: vec![],
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        iteration: iterations,
+                        trace_id: trace_id.clone(),
+                    };
+                    if let Err(dispatch_err) = hooks.dispatch(&payload).await {
+                        warn!(error = %dispatch_err, "AfterLLMCall dispatch failed for provider error");
                     }
-                    if classify_error_message(&msg) == ProviderErrorKind::ContextWindow {
-                        return Err(AgentRunError::ContextWindowExceeded(msg));
-                    }
-                    if let Some(delay_ms) = next_retry_delay_ms(
-                        &msg,
-                        &mut server_retries_remaining,
-                        &mut rate_limit_retries_remaining,
-                        &mut rate_limit_backoff_ms,
-                    ) {
-                        iterations -= 1;
-                        warn!(
-                            error = %msg,
+                }
+                if classify_error_message(&msg) == ProviderErrorKind::ContextWindow {
+                    return Err(AgentRunError::ContextWindowExceeded(msg));
+                }
+                if let Some(delay_ms) = next_retry_delay_ms(
+                    &msg,
+                    &mut server_retries_remaining,
+                    &mut rate_limit_retries_remaining,
+                    &mut rate_limit_backoff_ms,
+                ) {
+                    iterations -= 1;
+                    warn!(
+                        error = %msg,
+                        delay_ms,
+                        server_retries_remaining,
+                        rate_limit_retries_remaining,
+                        "transient LLM error, retrying after delay"
+                    );
+                    if let Some(cb) = on_event {
+                        cb(RunnerEvent::RetryingAfterError {
+                            error: msg,
                             delay_ms,
-                            server_retries_remaining,
-                            rate_limit_retries_remaining,
-                            "transient LLM error, retrying after delay"
-                        );
-                        if let Some(cb) = on_event {
-                            cb(RunnerEvent::RetryingAfterError {
-                                error: msg,
-                                delay_ms,
-                            });
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        continue;
+                        });
                     }
-                    return Err(AgentRunError::Other(e));
-                },
-            };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                return Err(AgentRunError::Other(e));
+            },
+        };
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::ThinkingDone);
@@ -1108,6 +1111,20 @@ pub async fn run_agent_loop_streaming(
         content: user_content.clone(),
     });
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
+
+    // Extract original intent for drift detection.
+    let original_intent = match user_content {
+        UserContent::Text(t) => t.clone(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let mut intent_tracker = IntentTracker::new(&original_intent);
 
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
@@ -1595,6 +1612,20 @@ pub async fn run_agent_loop_streaming(
                 raw_llm_responses,
             });
         }
+
+        // Check intent drift when tool calls are present.
+        let current_intent = format!(
+            "{} {}",
+            accumulated_text.as_str(),
+            tool_calls
+                .iter()
+                .map(|tc| tc.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // check_drift logs warnings internally when drift is detected.
+        let (_drift_score, _is_drifted) =
+            intent_tracker.check_drift(&current_intent, trace_id.as_deref());
 
         // Append assistant message with tool calls.
         //
@@ -4439,15 +4470,24 @@ mod tests {
 
             // Some(2_000) → base 4_000; jitter range [3_000, 5_000].
             let v = next_rate_limit_retry_ms(Some(2_000));
-            assert!(v >= 3_000 && v <= 5_000, "Some(2_000) case out of range: {v}");
+            assert!(
+                v >= 3_000 && v <= 5_000,
+                "Some(2_000) case out of range: {v}"
+            );
 
             // Some(30_000) → base clamped to 60_000; jitter range [45_000, 60_000].
             let v = next_rate_limit_retry_ms(Some(30_000));
-            assert!(v >= 45_000 && v <= 60_000, "Some(30_000) case out of range: {v}");
+            assert!(
+                v >= 45_000 && v <= 60_000,
+                "Some(30_000) case out of range: {v}"
+            );
 
             // Some(60_000) → base clamped to 60_000; jitter range [45_000, 60_000].
             let v = next_rate_limit_retry_ms(Some(60_000));
-            assert!(v >= 45_000 && v <= 60_000, "Some(60_000) case out of range: {v}");
+            assert!(
+                v >= 45_000 && v <= 60_000,
+                "Some(60_000) case out of range: {v}"
+            );
         }
     }
 
