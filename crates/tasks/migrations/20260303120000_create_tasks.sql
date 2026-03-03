@@ -55,3 +55,34 @@ CREATE TABLE IF NOT EXISTS task_events (
 
 CREATE INDEX IF NOT EXISTS task_events_task    ON task_events (list_id, task_id, id);
 CREATE INDEX IF NOT EXISTS task_events_recent  ON task_events (list_id, created_at DESC);
+
+-- intent_state: One row per intent task — mutable dispatch metadata.
+--
+-- Holds state that changes between shifts and must be updated atomically with
+-- task transitions. Uses CAS (version column) for optimistic concurrency.
+--
+-- active_shift_id:  ID of the currently running shift (NULL when idle).
+-- shift_count:      Total shifts dispatched so far.
+-- tokens_used:      Cumulative token spend across all shifts.
+-- tokens_budget:    Max token budget (NULL = unlimited).
+-- snapshot_json:    Serialized ObjectiveSnapshot for spin detection.
+-- spin_count:       Consecutive shifts with identical structural snapshot.
+-- spin_threshold:   Shifts with no delta before escalating (default 3).
+-- version:          CAS counter, incremented on every write.
+CREATE TABLE IF NOT EXISTS intent_state (
+    intent_id       TEXT    NOT NULL PRIMARY KEY,
+    list_id         TEXT    NOT NULL,
+    active_shift_id TEXT,
+    shift_count     INTEGER NOT NULL DEFAULT 0,
+    tokens_used     INTEGER NOT NULL DEFAULT 0,
+    tokens_budget   INTEGER,
+    snapshot_json   TEXT    NOT NULL DEFAULT '{}',
+    spin_count      INTEGER NOT NULL DEFAULT 0,
+    spin_threshold  INTEGER NOT NULL DEFAULT 3,
+    version         INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS intent_state_list
+    ON intent_state (list_id);

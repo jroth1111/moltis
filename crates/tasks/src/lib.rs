@@ -17,6 +17,7 @@
 pub mod errors;
 pub mod event_log;
 pub mod guards;
+pub mod intent_state;
 pub mod recovery;
 pub mod state;
 pub mod store;
@@ -27,6 +28,7 @@ pub mod types;
 pub use {
     errors::TransitionError,
     event_log::EventLog,
+    intent_state::{IntentState, IntentStore, ObjectiveSnapshot},
     recovery::{RecoveryPhase, classify_recovery},
     state::{RuntimeState, TerminalState},
     store::TaskStore,
