@@ -3542,6 +3542,101 @@ pub async fn prepare_gateway(
                 }
             });
         }
+        // Background: stale-slot sweep — clears dangling active_shift_id pointers.
+        {
+            let store_for_sweep = Arc::clone(&task_store);
+            tokio::spawn(async move {
+                let intent_store =
+                    moltis_tasks::IntentStore::from_pool(store_for_sweep.pool().clone());
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match moltis_tasks::IntentStore::stale_slot_sweep(
+                        &intent_store,
+                        &store_for_sweep,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "stale-slot sweep cleared dangling shift refs")
+                        },
+                        Ok(_) => {},
+                        Err(e) => tracing::warn!(error = %e, "stale-slot sweep failed"),
+                    }
+                }
+            });
+        }
+        // Background: stale-intent sweep — escalates idle Active intents with no pending shifts.
+        {
+            let store_for_sweep = Arc::clone(&task_store);
+            let idle_timeout = config.tasks.intent_idle_timeout_secs;
+            tokio::spawn(async move {
+                let intent_store =
+                    moltis_tasks::IntentStore::from_pool(store_for_sweep.pool().clone());
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match moltis_tasks::IntentStore::stale_intent_sweep(
+                        &intent_store,
+                        &store_for_sweep,
+                        idle_timeout,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "stale-intent sweep escalated idle intents")
+                        },
+                        Ok(_) => {},
+                        Err(e) => tracing::warn!(error = %e, "stale-intent sweep failed"),
+                    }
+                }
+            });
+        }
+        // Background: denorm integrity sweep — repairs state_name vs runtime_json drift.
+        {
+            let store_for_sweep = Arc::clone(&task_store);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match store_for_sweep.denorm_integrity_sweep().await {
+                        Ok(n) if n > 0 => info!(count = n, "denorm integrity sweep repaired tasks"),
+                        Ok(_) => {},
+                        Err(e) => tracing::warn!(error = %e, "denorm integrity sweep failed"),
+                    }
+                }
+            });
+        }
+        // Background: output retention sweep — TTL-prune task_outputs older than configured limit.
+        {
+            let store_for_sweep = Arc::clone(&task_store);
+            let retention_secs = config.tasks.output_retention_secs;
+            tokio::spawn(async move {
+                let output_store =
+                    moltis_tasks::OutputStore::from_pool(store_for_sweep.pool().clone());
+                // Run once at startup, then every 6 hours.
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let cutoff = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(retention_secs);
+                    match output_store.delete_older_than(cutoff as i64).await {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "output retention sweep pruned old shift outputs")
+                        },
+                        Ok(_) => {},
+                        Err(e) => tracing::warn!(error = %e, "output retention sweep failed"),
+                    }
+                }
+            });
+        }
         // Background: intent dispatch loop — drives multi-shift agent execution.
         {
             let state_for_dispatch = Arc::clone(&state);

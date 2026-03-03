@@ -305,6 +305,161 @@ impl IntentStore {
         Ok((updated, is_spinning))
     }
 
+    // ── Safety sweeps ─────────────────────────────────────────────────────────
+
+    /// Clear `active_shift_id` for any intent where the referenced shift task
+    /// is no longer in an `Active` or `AwaitingHuman` state.
+    ///
+    /// This repairs the intent slot when a shift crashes or is reclaimed by the
+    /// zombie sweep without the dispatch loop having a chance to finalize.
+    /// Returns the number of intent_state rows repaired.
+    pub async fn stale_slot_sweep(
+        &self,
+        task_store: &crate::store::TaskStore,
+    ) -> Result<usize, TransitionError> {
+        // One JOIN query: find intent_state rows where active_shift_id points at
+        // a task that is NOT Active/AwaitingHuman.
+        let rows = sqlx::query(
+            "SELECT i.intent_id, i.version \
+             FROM intent_state i \
+             LEFT JOIN tasks t ON t.id = i.active_shift_id \
+                              AND t.state_name IN ('Active', 'AwaitingHuman') \
+             WHERE i.active_shift_id IS NOT NULL \
+               AND t.id IS NULL",
+        )
+        .fetch_all(task_store.pool())
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        let mut repaired = 0usize;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        for row in rows {
+            let intent_id: String = row.get("intent_id");
+            let version: i64 = row.get("version");
+
+            let affected = sqlx::query(
+                "UPDATE intent_state \
+                 SET active_shift_id = NULL, version = version + 1, updated_at = ? \
+                 WHERE intent_id = ? AND version = ?",
+            )
+            .bind(now)
+            .bind(&intent_id)
+            .bind(version)
+            .execute(task_store.pool())
+            .await
+            .map_err(TransitionError::Storage)?
+            .rows_affected();
+
+            if affected > 0 {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    intent_id = %intent_id,
+                    "stale-slot sweep: cleared dangling active_shift_id"
+                );
+                #[cfg(feature = "metrics")]
+                moltis_metrics::counter!("tasks.stale_slot_repaired").increment(1);
+                repaired += 1;
+            }
+        }
+
+        Ok(repaired)
+    }
+
+    /// Escalate `Active` intents that have no non-terminal child shifts and
+    /// whose `intent_state.updated_at` is older than `idle_timeout_secs`.
+    ///
+    /// This handles the case where an intent becomes stuck: all shifts are
+    /// terminal but the intent itself was never completed/escalated.
+    /// Returns the number of intents escalated.
+    pub async fn stale_intent_sweep(
+        &self,
+        task_store: &crate::store::TaskStore,
+        idle_timeout_secs: u64,
+    ) -> Result<usize, TransitionError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let cutoff = now - idle_timeout_secs as i64;
+
+        // Find Active intents with no running slot that have been idle too long.
+        let rows = sqlx::query(
+            "SELECT t.id, t.list_id, t.spec_json, t.runtime_json, t.blocked_by, t.version \
+             FROM tasks t \
+             JOIN intent_state i ON i.intent_id = t.id \
+             WHERE t.is_intent = 1 \
+               AND t.state_name = 'Active' \
+               AND i.active_shift_id IS NULL \
+               AND i.updated_at < ? \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM tasks c \
+                   WHERE c.parent_task = t.id \
+                     AND c.state_name NOT IN ('Completed', 'Failed', 'Cancelled') \
+               )",
+        )
+        .bind(cutoff)
+        .fetch_all(task_store.pool())
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        let mut escalated = 0usize;
+
+        for row in rows {
+            let task = crate::store::TaskStore::row_to_task_pub(
+                row.get::<String, _>("id"),
+                row.get::<String, _>("list_id"),
+                row.get::<String, _>("spec_json"),
+                row.get::<String, _>("runtime_json"),
+                row.get::<String, _>("blocked_by"),
+                row.get::<i64, _>("version"),
+            );
+            let task = match task {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            let list_id = task.list_id.clone();
+            let task_id = task.id.0.clone();
+            let version = task.runtime.version;
+
+            match task_store
+                .apply_transition(
+                    &list_id,
+                    &task_id,
+                    Some(version),
+                    &crate::transitions::TransitionEvent::Escalate {
+                        question: "Intent idle past timeout with no active or pending shifts"
+                            .into(),
+                        handoff: crate::types::HandoffContext::default(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        intent_id = %task_id,
+                        list_id = %list_id,
+                        "stale-intent sweep: escalated idle intent"
+                    );
+                    #[cfg(feature = "metrics")]
+                    moltis_metrics::counter!("tasks.stale_intent_escalated").increment(1);
+                    escalated += 1;
+                },
+                Err(TransitionError::VersionConflict { .. }) => {},
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        intent_id = %task_id,
+                        error = %e,
+                        "stale-intent sweep: escalation failed"
+                    );
+                    let _ = e;
+                },
+            }
+        }
+
+        Ok(escalated)
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Read intent state using an existing transaction.

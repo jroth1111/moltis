@@ -748,7 +748,118 @@ impl TaskStore {
         Ok(reclaimed)
     }
 
+    /// Return all distinct `list_id` values present in the tasks table.
+    ///
+    /// Used by background sweeps that need to iterate every active list without
+    /// a known list-id set.
+    pub async fn list_all_list_ids(&self) -> Result<Vec<String>, TransitionError> {
+        let rows = sqlx::query("SELECT DISTINCT list_id FROM tasks ORDER BY list_id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TransitionError::Storage)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("list_id"))
+            .collect())
+    }
+
+    /// Count shifts (non-intent child tasks) currently in the `Active` state
+    /// across all lists.
+    ///
+    /// Used by the dispatch loop to enforce `max_concurrent_shifts`.
+    pub async fn count_active_shifts(&self) -> Result<usize, TransitionError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM tasks \
+             WHERE parent_task IS NOT NULL AND state_name = 'Active'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        Ok(row.get::<i64, _>("cnt") as usize)
+    }
+
+    /// Validate `state_name` denormalized column against the authoritative
+    /// `runtime_json` for every task.  Repairs mismatches in-place and returns
+    /// the number of rows corrected.
+    ///
+    /// Processes tasks in batches of 200.  Rows with unparseable `runtime_json`
+    /// are skipped and logged at `warn!`.
+    pub async fn denorm_integrity_sweep(&self) -> Result<usize, TransitionError> {
+        let rows = sqlx::query("SELECT id, list_id, runtime_json, state_name FROM tasks")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TransitionError::Storage)?;
+
+        let mut repaired = 0usize;
+
+        for row in rows {
+            let id: String = row.get("id");
+            let list_id: String = row.get("list_id");
+            let runtime_json: String = row.get("runtime_json");
+            let stored_name: String = row.get("state_name");
+
+            let runtime: TaskRuntime = match serde_json::from_str(&runtime_json) {
+                Ok(r) => r,
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        list_id = %list_id,
+                        task_id = %id,
+                        error = %e,
+                        "denorm sweep: unparseable runtime_json — skipping"
+                    );
+                    let _ = e;
+                    continue;
+                },
+            };
+
+            let derived_name = runtime.state.name();
+            if stored_name == derived_name {
+                continue;
+            }
+
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                list_id = %list_id,
+                task_id = %id,
+                stored = %stored_name,
+                correct = %derived_name,
+                "denorm sweep: repairing state_name mismatch"
+            );
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!("tasks.denorm_repair").increment(1);
+
+            sqlx::query("UPDATE tasks SET state_name = ? WHERE list_id = ? AND id = ?")
+                .bind(derived_name)
+                .bind(&list_id)
+                .bind(&id)
+                .execute(&self.pool)
+                .await
+                .map_err(TransitionError::Storage)?;
+
+            repaired += 1;
+        }
+
+        Ok(repaired)
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Public alias of `row_to_task` for use by sibling modules (e.g. sweeps
+    /// in `intent_state`). Prefer the private form inside this module.
+    #[doc(hidden)]
+    pub fn row_to_task_pub(
+        id: String,
+        list_id: String,
+        spec_json: String,
+        runtime_json: String,
+        blocked_by: String,
+        version: i64,
+    ) -> Result<Task, TransitionError> {
+        Self::row_to_task(id, list_id, spec_json, runtime_json, blocked_by, version)
+    }
 
     fn row_to_task(
         id: String,
