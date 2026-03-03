@@ -8,6 +8,7 @@
 
 pub mod approval;
 pub mod branch_session;
+pub mod tool_selector;
 
 pub mod error;
 pub mod params;
