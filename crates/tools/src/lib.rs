@@ -9,6 +9,7 @@
 pub mod approval;
 pub mod branch_session;
 pub mod tool_selector;
+pub mod file_io_common;
 
 pub mod error;
 pub mod params;
@@ -56,6 +57,7 @@ pub mod location;
 pub mod map;
 pub mod policy;
 pub mod process;
+pub mod read_file;
 pub mod sandbox;
 pub mod sandbox_packages;
 pub mod sandbox_pool;
@@ -76,3 +78,4 @@ pub mod wasm_limits;
 pub mod wasm_tool_runner;
 pub mod web_fetch;
 pub mod web_search;
+pub mod write_file;

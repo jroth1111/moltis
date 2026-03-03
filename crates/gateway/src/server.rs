@@ -3260,7 +3260,8 @@ pub async fn prepare_gateway(
 
     // Wire live chat service (needs state reference, so done after state creation).
     {
-        let broadcaster = Arc::new(GatewayApprovalBroadcaster::new(Arc::clone(&state)));
+        let broadcaster: Arc<dyn moltis_tools::exec::ApprovalBroadcaster> =
+            Arc::new(GatewayApprovalBroadcaster::new(Arc::clone(&state)));
         let env_provider: Arc<dyn EnvVarProvider> = credential_store.clone();
         let eq = cron_service.events_queue().clone();
         let cs = Arc::clone(&cron_service);
@@ -3274,7 +3275,7 @@ pub async fn prepare_gateway(
             });
         });
         let exec_tool = moltis_tools::exec::ExecTool::default()
-            .with_approval(Arc::clone(&approval_manager), broadcaster)
+            .with_approval(Arc::clone(&approval_manager), Arc::clone(&broadcaster))
             .with_approval_store(Arc::new(db_pool.clone()))
             .with_sandbox_router(Arc::clone(&sandbox_router))
             .with_env_provider(Arc::clone(&env_provider))
@@ -3333,6 +3334,16 @@ pub async fn prepare_gateway(
         tool_registry.register(Box::new(
             moltis_tools::send_image::SendImageTool::new()
                 .with_sandbox_router(Arc::clone(&sandbox_router)),
+        ));
+        tool_registry.register(Box::new(
+            moltis_tools::read_file::ReadFileTool::new()
+                .with_sandbox_router(Arc::clone(&sandbox_router)),
+        ));
+        tool_registry.register(Box::new(
+            moltis_tools::write_file::WriteFileTool::new()
+                .with_sandbox_router(Arc::clone(&sandbox_router))
+                .with_approval(Arc::clone(&approval_manager), Arc::clone(&broadcaster))
+                .with_approval_store(Arc::new(db_pool.clone())),
         ));
         if let Some(t) = moltis_tools::web_search::WebSearchTool::from_config_with_env_overrides(
             &config.tools.web.search,
