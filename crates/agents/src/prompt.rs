@@ -991,6 +991,7 @@ mod tests {
                 accept_language: Some("en-US,fr;q=0.9".into()),
                 remote_ip: Some("203.0.113.42".into()),
                 location: None,
+                dispatch_deny: vec![],
             },
             sandbox: Some(PromptSandboxRuntimeContext {
                 exec_sandboxed: true,
