@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::PathBuf,
 };
 
@@ -573,14 +573,15 @@ impl SessionStore {
                         .write(true)
                         .truncate(true)
                         .open(&tmp_path)?;
-                    let mut lock = RwLock::new(file);
-                    let mut guard = lock
-                        .write()
-                        .map_err(|e| Error::lock_failed(e.to_string()))?;
+                    let mut writer = BufWriter::new(file);
                     for line in &valid_lines {
-                        writeln!(*guard, "{line}")?;
+                        writeln!(writer, "{line}")?;
                     }
-                    guard.sync_data()?;
+                    writer.flush()?;
+                    writer
+                        .into_inner()
+                        .map_err(|e| e.into_error())?
+                        .sync_data()?;
                 }
                 fs::rename(&tmp_path, &path)?;
             }
