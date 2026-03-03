@@ -7235,6 +7235,8 @@ async fn run_streaming(
     let mut rate_limit_backoff_ms: Option<u64> = None;
     let mut channel_stream_dispatcher =
         ChannelStreamDispatcher::for_session(state, session_key).await;
+    #[cfg(feature = "metrics")]
+    let should_record_stream_metrics = !provider.emits_metrics();
 
     'attempts: loop {
         #[cfg(feature = "metrics")]
@@ -7290,7 +7292,7 @@ async fn run_streaming(
 
                     // Record streaming completion metrics (mirroring provider_chain.rs)
                     #[cfg(feature = "metrics")]
-                    {
+                    if should_record_stream_metrics {
                         let duration = stream_start.elapsed().as_secs_f64();
                         counter!(
                             llm_metrics::COMPLETIONS_TOTAL,

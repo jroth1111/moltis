@@ -1213,6 +1213,8 @@ pub async fn run_agent_loop_streaming(
 
         // Use streaming API.
         #[cfg(feature = "metrics")]
+        let should_record_stream_metrics = !provider.emits_metrics();
+        #[cfg(feature = "metrics")]
         let iter_start = std::time::Instant::now();
         #[cfg(feature = "metrics")]
         let mut first_token_at: Option<std::time::Instant> = None;
@@ -1239,7 +1241,7 @@ pub async fn run_agent_loop_streaming(
             match event {
                 StreamEvent::Delta(text) => {
                     #[cfg(feature = "metrics")]
-                    if first_token_at.is_none() {
+                    if should_record_stream_metrics && first_token_at.is_none() {
                         first_token_at = Some(std::time::Instant::now());
                     }
                     accumulated_text.push_str(&text);
@@ -1254,7 +1256,7 @@ pub async fn run_agent_loop_streaming(
                 },
                 StreamEvent::ReasoningDelta(text) => {
                     #[cfg(feature = "metrics")]
-                    if first_token_at.is_none() {
+                    if should_record_stream_metrics && first_token_at.is_none() {
                         first_token_at = Some(std::time::Instant::now());
                     }
                     accumulated_reasoning.push_str(&text);
@@ -1264,7 +1266,7 @@ pub async fn run_agent_loop_streaming(
                 },
                 StreamEvent::ToolCallStart { id, name, index } => {
                     #[cfg(feature = "metrics")]
-                    if first_token_at.is_none() {
+                    if should_record_stream_metrics && first_token_at.is_none() {
                         first_token_at = Some(std::time::Instant::now());
                     }
                     let vec_pos = tool_calls.len();
@@ -1279,7 +1281,7 @@ pub async fn run_agent_loop_streaming(
                 },
                 StreamEvent::ToolCallArgumentsDelta { index, delta } => {
                     #[cfg(feature = "metrics")]
-                    if first_token_at.is_none() {
+                    if should_record_stream_metrics && first_token_at.is_none() {
                         first_token_at = Some(std::time::Instant::now());
                     }
                     if let Some(args) = tool_call_args.get_mut(&index) {
@@ -1297,7 +1299,7 @@ pub async fn run_agent_loop_streaming(
                     debug!(input_tokens, output_tokens, "stream done");
 
                     #[cfg(feature = "metrics")]
-                    {
+                    if should_record_stream_metrics {
                         let provider_name = provider.name().to_string();
                         let model_id = provider.id().to_string();
                         let duration = iter_start.elapsed().as_secs_f64();
@@ -1359,7 +1361,7 @@ pub async fn run_agent_loop_streaming(
                 },
                 StreamEvent::Error(msg) => {
                     #[cfg(feature = "metrics")]
-                    {
+                    if should_record_stream_metrics {
                         let kind = classify_error_message(&msg);
                         counter!(
                             llm_metrics::COMPLETION_ERRORS_TOTAL,

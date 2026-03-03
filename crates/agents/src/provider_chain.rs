@@ -95,6 +95,10 @@ impl LlmProvider for ProviderChain {
         self.primary().provider.context_window()
     }
 
+    fn emits_metrics(&self) -> bool {
+        true
+    }
+
     async fn complete(
         &self,
         messages: &[ChatMessage],
