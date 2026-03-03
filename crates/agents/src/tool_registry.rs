@@ -167,10 +167,10 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
-        if let Some(ref rl) = entry.rate_limit {
-            if let Err(e) = rl.try_acquire() {
-                return Err(anyhow::anyhow!("{}", e));
-            }
+        if let Some(ref rl) = entry.rate_limit
+            && let Err(e) = rl.try_acquire()
+        {
+            return Err(anyhow::anyhow!("{}", e));
         }
         entry.tool.execute(params).await
     }
