@@ -1,5 +1,6 @@
 use {
     serde::{Deserialize, Serialize},
+    std::sync::Arc,
     tracing::debug,
 };
 
@@ -10,6 +11,15 @@ pub struct ToolPolicy {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+}
+
+/// Runtime resolver for obtaining the latest tool policy.
+pub type ToolPolicyResolver = Arc<dyn Fn() -> ToolPolicy + Send + Sync>;
+
+/// Build a resolver that always returns the same fixed policy.
+#[must_use]
+pub fn fixed_tool_policy_resolver(policy: ToolPolicy) -> ToolPolicyResolver {
+    Arc::new(move || policy.clone())
 }
 
 /// Context for resolving which policy layers apply.
