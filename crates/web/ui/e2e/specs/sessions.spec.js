@@ -365,6 +365,32 @@ test.describe("Session management", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
+	test("share manager lists and revokes active shares", async ({ page }) => {
+		const pageErrors = await navigateAndWait(page, "/");
+		await waitForWsConnected(page);
+
+		const created = await expectRpcOk(page, "sessions.share.create", {
+			key: "main",
+			visibility: "public",
+		});
+		const sharePath = created?.payload?.path || "";
+		expect(sharePath).toMatch(/^\/share\/.+/);
+
+		await page.locator('button[title="Manage active shares"]').click();
+		const sharePanel = page.locator(".backend-card").filter({ hasText: "Active Shares" });
+		await expect(sharePanel).toBeVisible();
+		await expect(sharePanel).toContainText(sharePath);
+
+		const row = sharePanel.locator("div").filter({ hasText: sharePath }).first();
+		await row.getByRole("button", { name: "Revoke", exact: true }).click();
+		await page.locator(".provider-modal").getByRole("button", { name: "Delete", exact: true }).click();
+
+		await expect(sharePanel).toHaveCount(1);
+		await expect(sharePanel).not.toContainText(sharePath);
+
+		expect(pageErrors).toEqual([]);
+	});
+
 	test("private share requires key and strips it from URL", async ({ page, request }) => {
 		const pageErrors = await navigateAndWait(page, "/");
 		await waitForWsConnected(page);

@@ -47,6 +47,15 @@ async function copyShareUrl(url, visibility) {
 	await shareLinkDialog(url, visibility);
 }
 
+function formatShareTimestamp(createdAtMs) {
+	if (!createdAtMs) return "Unknown time";
+	try {
+		return new Date(createdAtMs).toLocaleString();
+	} catch (_err) {
+		return "Unknown time";
+	}
+}
+
 export function SessionHeader() {
 	var session = sessionStore.activeSession.value;
 	var currentKey = sessionStore.activeSessionKey.value;
@@ -57,6 +66,9 @@ export function SessionHeader() {
 	var [switchingAgent, setSwitchingAgent] = useState(false);
 	var [agentOptions, setAgentOptions] = useState([]);
 	var [defaultAgentId, setDefaultAgentId] = useState("main");
+	var [shareEntries, setShareEntries] = useState([]);
+	var [showShares, setShowShares] = useState(false);
+	var [sharesBusy, setSharesBusy] = useState(false);
 	var inputRef = useRef(null);
 
 	var fullName = session ? session.label || session.key : currentKey;
@@ -82,6 +94,11 @@ export function SessionHeader() {
 		return () => {
 			cancelled = true;
 		};
+	}, [currentKey]);
+
+	useEffect(() => {
+		setShowShares(false);
+		setShareEntries([]);
 	}, [currentKey]);
 
 	var startRename = useCallback(() => {
@@ -202,8 +219,14 @@ export function SessionHeader() {
 			// Reload the active session so the snapshot cutoff notice appears.
 			switchSession(currentKey);
 			fetchSessions();
+			if (showShares) {
+				var listRes = await sendRpc("sessions.share.list", { key: currentKey });
+				if (listRes?.ok && Array.isArray(listRes.payload)) {
+					setShareEntries(listRes.payload);
+				}
+			}
 		},
-		[currentKey],
+		[currentKey, showShares],
 	);
 
 	var onShare = useCallback(() => {
@@ -212,6 +235,47 @@ export function SessionHeader() {
 			void shareSnapshot(visibility);
 		});
 	}, [shareSnapshot]);
+
+	var loadShares = useCallback(async () => {
+		if (sharesBusy) return;
+		setSharesBusy(true);
+		try {
+			var res = await sendRpc("sessions.share.list", { key: currentKey });
+			if (!res?.ok) {
+				showToast(res?.error?.message || "Failed to load shares", "error");
+				return;
+			}
+			setShareEntries(Array.isArray(res.payload) ? res.payload : []);
+		} finally {
+			setSharesBusy(false);
+		}
+	}, [currentKey, sharesBusy]);
+
+	var onToggleShares = useCallback(() => {
+		if (showShares) {
+			setShowShares(false);
+			return;
+		}
+		setShowShares(true);
+		void loadShares();
+	}, [loadShares, showShares]);
+
+	var onRevokeShare = useCallback(
+		(shareId) => {
+			confirmDialog("Revoke this shared link?").then((yes) => {
+				if (!yes) return;
+				sendRpc("sessions.share.revoke", { id: shareId }).then((res) => {
+					if (!res?.ok) {
+						showToast(res?.error?.message || "Failed to revoke share", "error");
+						return;
+					}
+					showToast("Share revoked", "success");
+					void loadShares();
+				});
+			});
+		},
+		[loadShares],
+	);
 
 	var onAgentChange = useCallback(
 		(event) => {
@@ -247,7 +311,8 @@ export function SessionHeader() {
 	var selectDisabled = switchingAgent || agentOptions.length === 0;
 
 	return html`
-		<div class="flex items-center gap-2">
+		<div class="flex flex-col gap-2">
+			<div class="flex items-center gap-2">
 			${
 				!isCron &&
 				html`
@@ -303,6 +368,14 @@ export function SessionHeader() {
 				<button class="chat-session-btn" onClick=${onShare} title="Share snapshot">
 					Share
 				</button>
+				<button
+					class="chat-session-btn"
+					onClick=${onToggleShares}
+					title="Manage active shares"
+					disabled=${sharesBusy}
+				>
+					${sharesBusy ? "Loading…" : showShares ? "Hide Shares" : "Shares"}
+				</button>
 			`
 			}
 			${
@@ -327,6 +400,42 @@ export function SessionHeader() {
 				<button class="chat-session-btn chat-session-btn-danger" onClick=${onDelete} title="Delete session">
 					Delete
 				</button>
+			`
+			}
+			</div>
+			${
+				showShares &&
+				!isCron &&
+				html`
+				<div class="backend-card flex flex-col gap-2">
+					<div class="text-xs font-medium text-[var(--text-strong)]">Active Shares</div>
+					${
+						shareEntries.length === 0 &&
+						html`<div class="text-xs text-[var(--muted)]">No active shares for this session.</div>`
+					}
+					${shareEntries.map((entry) => {
+						var shareUrl = `${window.location.origin}${entry.path || ""}`;
+						var visibility = entry.visibility || "public";
+						var createdAt = formatShareTimestamp(entry.createdAt);
+						return html`
+							<div key=${entry.id} class="flex items-center justify-between gap-2 text-xs">
+								<div class="min-w-0 flex-1">
+									<div class="truncate text-[var(--text-strong)]">${shareUrl}</div>
+									<div class="text-[var(--muted)]">
+										${visibility} · created ${createdAt} · views ${entry.views || 0}
+									</div>
+								</div>
+								<button
+									class="provider-btn provider-btn-danger"
+									style="font-size:0.7rem;padding:3px 8px;"
+									onClick=${() => onRevokeShare(entry.id)}
+								>
+									Revoke
+								</button>
+							</div>
+						`;
+					})}
+				</div>
 			`
 			}
 		</div>
