@@ -464,6 +464,78 @@ impl TaskStore {
         Ok(promoted)
     }
 
+    /// Sweep all lists for Active tasks with an expired lease and fail them as
+    /// [`FailureClass::TimeoutExceeded`].
+    ///
+    /// Called by the background zombie-reclamation poll. Returns the count of
+    /// tasks that were successfully transitioned. `VersionConflict` is silently
+    /// skipped (another writer already changed the task); other errors are logged
+    /// and skipped.
+    pub async fn expire_zombie_leases_all(&self) -> Result<usize, TransitionError> {
+        use crate::types::{FailureClass, HandoffContext};
+
+        let rows = sqlx::query(
+            "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
+             FROM tasks",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        let mut expired: Vec<Task> = rows
+            .into_iter()
+            .filter_map(|r| {
+                Self::row_to_task(
+                    r.get::<String, _>("id"),
+                    r.get::<String, _>("list_id"),
+                    r.get::<String, _>("spec_json"),
+                    r.get::<String, _>("runtime_json"),
+                    r.get::<String, _>("blocked_by"),
+                    r.get::<i64, _>("version"),
+                )
+                .ok()
+            })
+            .filter(|t| t.runtime.state.is_lease_expired())
+            .collect();
+
+        let mut reclaimed = 0usize;
+        for task in expired.drain(..) {
+            let list_id = task.list_id.clone();
+            let task_id = task.id.0.clone();
+            let version = task.runtime.version;
+            match self
+                .apply_transition(
+                    &list_id,
+                    &task_id,
+                    Some(version),
+                    &TransitionEvent::Fail {
+                        class: FailureClass::TimeoutExceeded,
+                        handoff: HandoffContext::default(),
+                        retry_after: None,
+                    },
+                )
+                .await
+            {
+                Ok(_) => reclaimed += 1,
+                Err(TransitionError::VersionConflict { .. }) => {
+                    // Another writer raced us; skip — will be picked up next sweep.
+                },
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        list_id = %list_id,
+                        task_id = %task_id,
+                        error = %e,
+                        "zombie lease reclamation failed"
+                    );
+                    let _ = e;
+                },
+            }
+        }
+
+        Ok(reclaimed)
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn row_to_task(
@@ -505,6 +577,7 @@ fn event_type_name(event: &TransitionEvent) -> &'static str {
         TransitionEvent::PromoteRetry => "PromoteRetry",
         TransitionEvent::HumanResolve { .. } => "HumanResolve",
         TransitionEvent::Cancel { .. } => "Cancel",
+        TransitionEvent::RenewLease { .. } => "RenewLease",
     }
 }
 
@@ -891,6 +964,74 @@ mod tests {
         let expired = store.expired_leases("list1").await.expect("expired_leases");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].id, claimed.id);
+    }
+
+    #[tokio::test]
+    async fn expire_zombie_leases_all_transitions_expired_tasks() {
+        let (store, _dir) = test_store().await;
+
+        // Task claimed with an active lease — will be patched to expired.
+        let t = store
+            .create("z", TaskSpec::new("zombie", ""), vec![])
+            .await
+            .expect("create");
+        let claimed = store
+            .apply_transition(
+                "z",
+                &t.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: Some(3600),
+                },
+            )
+            .await
+            .expect("claim");
+
+        // Task without a lease — should NOT be affected.
+        let t2 = store
+            .create("z", TaskSpec::new("no-lease", ""), vec![])
+            .await
+            .expect("create2");
+        store
+            .apply_transition(
+                "z",
+                &t2.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim2");
+
+        // Patch the first task's lease 60 seconds into the past.
+        let past = OffsetDateTime::now_utc() - time::Duration::seconds(60);
+        let mut rt = claimed.runtime.clone();
+        rt.state = RuntimeState::Active {
+            owner: "agent".into(),
+            lease_expires_at: Some(past),
+        };
+        let rt_json = serde_json::to_string(&rt).expect("serialize");
+        sqlx::query("UPDATE tasks SET runtime_json = ? WHERE list_id = ? AND id = ?")
+            .bind(&rt_json)
+            .bind("z")
+            .bind(&claimed.id.0)
+            .execute(store.pool())
+            .await
+            .expect("patch runtime");
+
+        let count = store.expire_zombie_leases_all().await.expect("sweep");
+        assert_eq!(count, 1, "only the expired-lease task should be reclaimed");
+
+        // The expired task must no longer be Active.
+        let reclaimed = store.get("z", &claimed.id.0).await.expect("get").expect("exists");
+        assert!(
+            !reclaimed.runtime.state.is_active(),
+            "reclaimed task should not be Active; got {:?}",
+            reclaimed.runtime.state
+        );
     }
 
     #[tokio::test]

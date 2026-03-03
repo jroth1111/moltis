@@ -56,6 +56,9 @@ pub enum TransitionEvent {
 
     /// Cancel a task that has not yet reached a terminal state.
     Cancel { reason: String },
+
+    /// Extend the lease on an Active task without changing any other state.
+    RenewLease { new_expires_at: OffsetDateTime },
 }
 
 // ── apply ─────────────────────────────────────────────────────────────────────
@@ -204,6 +207,15 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
                 handoff: handoff.clone(),
             })
         },
+
+        // Active → Active (lease renewal, no state change)
+        (
+            RuntimeState::Active { owner, .. },
+            TransitionEvent::RenewLease { new_expires_at },
+        ) => Ok(RuntimeState::Active {
+            owner: owner.clone(),
+            lease_expires_at: Some(*new_expires_at),
+        }),
 
         // Active → Terminal(Canceled)
         (RuntimeState::Active { .. }, TransitionEvent::Cancel { reason }) => {
@@ -723,5 +735,50 @@ mod tests {
             result.runtime.state,
             RuntimeState::Terminal(TerminalState::Failed { .. })
         ));
+    }
+
+    // ── RenewLease ────────────────────────────────────────────────────────
+
+    #[test]
+    fn active_renew_lease_extends_expiry() {
+        let task = pending_task();
+        let claimed = apply(
+            task,
+            &TransitionEvent::Claim {
+                owner: "agent".into(),
+                lease_duration_secs: Some(60),
+            },
+        )
+        .expect("claim");
+        let v_before = claimed.runtime.version;
+
+        let new_exp = OffsetDateTime::now_utc() + time::Duration::seconds(3600);
+        let renewed = apply(claimed, &TransitionEvent::RenewLease { new_expires_at: new_exp })
+            .expect("renew lease");
+
+        assert_eq!(renewed.runtime.version, v_before + 1);
+        if let RuntimeState::Active {
+            lease_expires_at: Some(exp),
+            ..
+        } = renewed.runtime.state
+        {
+            let delta = (exp - new_exp).abs();
+            assert!(delta < time::Duration::milliseconds(10), "expiry mismatch");
+        } else {
+            panic!("expected Active state with lease_expires_at");
+        }
+    }
+
+    #[test]
+    fn non_active_renew_lease_is_invalid() {
+        let task = pending_task();
+        let err = apply(
+            task,
+            &TransitionEvent::RenewLease {
+                new_expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(60),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, TransitionError::InvalidTransition { .. }));
     }
 }
