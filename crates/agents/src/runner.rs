@@ -555,6 +555,19 @@ pub async fn run_agent_loop(
 
 /// Like `run_agent_loop` but accepts optional context values that are injected
 /// into every tool call's parameters (e.g. `_session_key`).
+#[tracing::instrument(
+    skip(
+        provider,
+        tools,
+        system_prompt,
+        user_content,
+        on_event,
+        history,
+        tool_context,
+        hook_registry
+    ),
+    fields(trace_id = trace_id.as_deref().unwrap_or(""))
+)]
 pub async fn run_agent_loop_with_context(
     provider: Arc<dyn LlmProvider>,
     tools: &ToolRegistry,

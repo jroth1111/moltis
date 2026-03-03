@@ -216,6 +216,19 @@ impl SpawnAgentTool {
         })?;
         Ok((Some(preset_name), Some(preset)))
     }
+
+    fn build_tool_context(params: &serde_json::Value, depth: u64) -> serde_json::Value {
+        let mut tool_context = serde_json::json!({
+            SPAWN_DEPTH_KEY: depth + 1,
+        });
+        if let Some(session_key) = params.get("_session_key") {
+            tool_context["_session_key"] = session_key.clone();
+        }
+        if let Some(trace_id) = params.get("_trace_id") {
+            tool_context["_trace_id"] = trace_id.clone();
+        }
+        tool_context
+    }
 }
 
 #[async_trait]
@@ -410,13 +423,12 @@ impl AgentTool for SpawnAgentTool {
             }
         }
 
-        // Build tool context with incremented depth and propagated session key.
-        let mut tool_context = serde_json::json!({
-            SPAWN_DEPTH_KEY: depth + 1,
-        });
-        if let Some(session_key) = params.get("_session_key") {
-            tool_context["_session_key"] = session_key.clone();
-        }
+        // Build tool context with incremented depth and propagated session/trace IDs.
+        let tool_context = Self::build_tool_context(&params, depth);
+        let trace_id = params
+            .get("_trace_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
 
         // Set initial lease on the linked task before starting the agent loop.
         if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
@@ -476,7 +488,7 @@ impl AgentTool for SpawnAgentTool {
             None, // no history
             Some(tool_context),
             None, // no hooks for sub-agents
-            None, // no trace_id propagated to sub-agents yet
+            trace_id,
         )
         .await;
 
@@ -647,6 +659,19 @@ mod tests {
             cfg.presets.insert((*name).to_string(), preset.clone());
         }
         Arc::new(tokio::sync::RwLock::new(cfg))
+    }
+
+    #[test]
+    fn test_build_tool_context_propagates_session_and_trace_ids() {
+        let params = serde_json::json!({
+            "_session_key": "main",
+            "_trace_id": "trace-abc-123",
+        });
+
+        let context = SpawnAgentTool::build_tool_context(&params, 1);
+        assert_eq!(context[SPAWN_DEPTH_KEY], 2);
+        assert_eq!(context["_session_key"], "main");
+        assert_eq!(context["_trace_id"], "trace-abc-123");
     }
 
     #[tokio::test]
