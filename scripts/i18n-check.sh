@@ -12,6 +12,7 @@ fi
 node --input-type=module - "$locales_dir" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const localesDir = process.argv[2];
 
@@ -32,10 +33,17 @@ function flattenKeys(value, prefix = "", out = new Set()) {
 }
 
 async function loadLocaleModule(filePath) {
-	const source = fs.readFileSync(filePath, "utf8");
-	const dataUrl = `data:text/javascript;base64,${Buffer.from(source, "utf8").toString("base64")}`;
-	const mod = await import(dataUrl);
-	return mod.default ?? {};
+	// Copy to a temp .mjs file so Node.js v20 treats the locale as ESM.
+	// Node.js <22 does not auto-detect ES module syntax in .js files without
+	// a "type":"module" package.json, causing SyntaxError on export statements.
+	const tmpFile = `${filePath}.${Date.now()}.mjs`;
+	try {
+		fs.copyFileSync(filePath, tmpFile);
+		const mod = await import(pathToFileURL(tmpFile).href);
+		return mod.default ?? {};
+	} finally {
+		fs.rmSync(tmpFile, { force: true });
+	}
 }
 
 function sortedLocaleDirs(baseDir) {
