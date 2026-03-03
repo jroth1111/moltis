@@ -27,6 +27,7 @@ use {
         model::{StreamEvent, values_to_chat_messages},
         multimodal::parse_data_uri,
         prompt::{
+            FIRST_CHAT_IDENTITY_PROMPT,
             PromptHostRuntimeContext, PromptRuntimeContext, PromptSandboxRuntimeContext,
             VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime,
             build_system_prompt_with_session_runtime,
@@ -6303,6 +6304,57 @@ async fn run_explicit_shell_command(
 const MAX_AGENT_MEMORY_WRITE_BYTES: usize = 50 * 1024;
 const MEMORY_SEARCH_FETCH_MULTIPLIER: usize = 8;
 const MEMORY_SEARCH_MIN_FETCH: usize = 25;
+const FIRST_CHAT_IDENTITY_MARKER_FILE: &str = ".identity_moment_done";
+
+fn identity_moment_marker_path(agent_id: &str) -> PathBuf {
+    moltis_config::agent_workspace_dir(agent_id).join(FIRST_CHAT_IDENTITY_MARKER_FILE)
+}
+
+fn is_autonomous_turn_source(source: Option<&str>) -> bool {
+    source.is_some_and(|value| {
+        value.eq_ignore_ascii_case("cron") || value.eq_ignore_ascii_case("dispatch")
+    })
+}
+
+fn should_trigger_first_chat_identity_moment(
+    history_raw: &[Value],
+    is_onboarded: bool,
+    source: Option<&str>,
+    marker_exists: bool,
+) -> bool {
+    is_onboarded
+        && history_raw.is_empty()
+        && !marker_exists
+        && !is_autonomous_turn_source(source)
+}
+
+async fn mark_first_chat_identity_moment_done(agent_id: &str) {
+    let marker_path = identity_moment_marker_path(agent_id);
+    if let Some(parent) = marker_path.parent()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        warn!(
+            agent_id,
+            path = %marker_path.display(),
+            %error,
+            "failed to create identity moment marker parent directory"
+        );
+        return;
+    }
+    if let Err(error) = tokio::fs::write(&marker_path, "").await {
+        warn!(
+            agent_id,
+            path = %marker_path.display(),
+            %error,
+            "failed to write identity moment marker"
+        );
+    }
+}
+
+fn is_identity_profile_path(path: &str) -> bool {
+    let normalized = path.trim().to_ascii_lowercase();
+    normalized == "identity.md" || normalized == "soul.md"
+}
 
 fn is_valid_agent_memory_leaf_name(name: &str) -> bool {
     if name.is_empty() || name.contains('/') || !name.ends_with(".md") {
@@ -6325,15 +6377,21 @@ fn resolve_agent_memory_target_path(agent_id: &str, file: &str) -> anyhow::Resul
     if trimmed == "MEMORY.md" || trimmed == "memory.md" {
         return Ok(workspace.join("MEMORY.md"));
     }
+    if trimmed == "IDENTITY.md" {
+        return Ok(workspace.join("IDENTITY.md"));
+    }
+    if trimmed == "SOUL.md" {
+        return Ok(workspace.join("SOUL.md"));
+    }
 
     let Some(name) = trimmed.strip_prefix("memory/") else {
         anyhow::bail!(
-            "invalid memory path '{trimmed}': allowed targets are MEMORY.md, memory.md, or memory/<name>.md"
+            "invalid memory path '{trimmed}': allowed targets are IDENTITY.md, SOUL.md, MEMORY.md, memory.md, or memory/<name>.md"
         );
     };
     if !is_valid_agent_memory_leaf_name(name) {
         anyhow::bail!(
-            "invalid memory path '{trimmed}': allowed targets are MEMORY.md, memory.md, or memory/<name>.md"
+            "invalid memory path '{trimmed}': allowed targets are IDENTITY.md, SOUL.md, MEMORY.md, memory.md, or memory/<name>.md"
         );
     }
     Ok(workspace.join("memory").join(name))
@@ -6584,7 +6642,7 @@ impl AgentTool for AgentScopedMemorySaveTool {
     }
 
     fn description(&self) -> &str {
-        "Save content to long-term memory. Writes to MEMORY.md or memory/<name>.md. Content persists across sessions and is searchable via memory_search."
+        "Save content to long-term memory and identity files. Writes to IDENTITY.md, SOUL.md, MEMORY.md, or memory/<name>.md."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -6597,7 +6655,7 @@ impl AgentTool for AgentScopedMemorySaveTool {
                 },
                 "file": {
                     "type": "string",
-                    "description": "Target file: MEMORY.md, memory.md, or memory/<name>.md",
+                    "description": "Target file: IDENTITY.md, SOUL.md, MEMORY.md, memory.md, or memory/<name>.md",
                     "default": "MEMORY.md"
                 },
                 "append": {
@@ -6848,6 +6906,17 @@ async fn run_with_tools(
     let mut system_prompt =
         apply_voice_reply_suffix(system_prompt, desired_reply_medium, runtime_context);
 
+    let identity_moment_marker_exists = identity_moment_marker_path(agent_id).exists();
+    let identity_moment_should_trigger = should_trigger_first_chat_identity_moment(
+        history_raw,
+        persona.config.is_onboarded(),
+        source.as_deref(),
+        identity_moment_marker_exists,
+    );
+    if identity_moment_should_trigger {
+        system_prompt.push_str(FIRST_CHAT_IDENTITY_PROMPT);
+    }
+
     // Determine sandbox mode for this session.
     let session_is_sandboxed = if let Some(router) = state.sandbox_router() {
         router.is_sandboxed(session_key).await
@@ -6859,6 +6928,7 @@ async fn run_with_tools(
     let state_for_events = Arc::clone(state);
     let run_id_for_events = run_id.to_string();
     let session_key_for_events = session_key.to_string();
+    let agent_id_for_events = agent_id.to_string();
     let session_store_for_events = session_store.map(Arc::clone);
     let provider_name_for_events = provider_name.to_string();
     let (on_event, mut event_rx) = ordered_runner_event_callback();
@@ -6876,6 +6946,7 @@ async fn run_with_tools(
             let state = Arc::clone(&state_for_events);
             let run_id = run_id_for_events.clone();
             let sk = session_key_for_events.clone();
+            let agent_id = agent_id_for_events.clone();
             let store = session_store_for_events.clone();
             let seq = client_seq;
             let payload = match event {
@@ -7024,6 +7095,31 @@ async fn run_with_tools(
                             }
                         }
                         payload["result"] = capped;
+                    }
+
+                    let identity_saved_path = success
+                        .then(|| {
+                            (name == "memory_save")
+                                .then_some(())
+                                .and_then(|_| result.as_ref())
+                                .and_then(|value| value.get("path"))
+                                .and_then(Value::as_str)
+                        })
+                        .flatten();
+                    if let Some(path) =
+                        identity_saved_path.filter(|candidate| is_identity_profile_path(candidate))
+                    {
+                        broadcast(
+                            &state,
+                            "identity.updated",
+                            serde_json::json!({
+                                "sessionKey": sk,
+                                "agentId": agent_id,
+                                "path": path,
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
                     }
 
                     // Send native location pin to channels before the screenshot.
@@ -7500,6 +7596,10 @@ async fn run_with_tools(
                 let payload_val = serde_json::to_value(&error_payload).unwrap();
                 broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
                 return None;
+            }
+
+            if identity_moment_should_trigger {
+                mark_first_chat_identity_moment_done(agent_id).await;
             }
 
             // Tool results are persisted between the user message and the
@@ -12424,11 +12524,74 @@ mod tests {
     }
 
     #[test]
+    fn resolve_agent_memory_target_path_allows_identity_and_soul_files() {
+        let workspace = moltis_config::agent_workspace_dir("ops");
+        assert_eq!(
+            resolve_agent_memory_target_path("ops", "IDENTITY.md").unwrap(),
+            workspace.join("IDENTITY.md")
+        );
+        assert_eq!(
+            resolve_agent_memory_target_path("ops", "SOUL.md").unwrap(),
+            workspace.join("SOUL.md")
+        );
+    }
+
+    #[test]
     fn resolve_agent_memory_target_path_rejects_invalid_paths() {
         assert!(resolve_agent_memory_target_path("ops", "").is_err());
         assert!(resolve_agent_memory_target_path("ops", "foo.md").is_err());
         assert!(resolve_agent_memory_target_path("ops", "memory/a/b.md").is_err());
         assert!(resolve_agent_memory_target_path("ops", "memory/.hidden.md").is_err());
+    }
+
+    #[test]
+    fn should_trigger_first_chat_identity_moment_requires_expected_state() {
+        let first_turn: Vec<Value> = Vec::new();
+        assert!(should_trigger_first_chat_identity_moment(
+            &first_turn,
+            true,
+            None,
+            false
+        ));
+        assert!(!should_trigger_first_chat_identity_moment(
+            &first_turn,
+            false,
+            None,
+            false
+        ));
+        assert!(!should_trigger_first_chat_identity_moment(
+            &first_turn,
+            true,
+            Some("cron"),
+            false
+        ));
+        assert!(!should_trigger_first_chat_identity_moment(
+            &first_turn,
+            true,
+            Some("dispatch"),
+            false
+        ));
+        assert!(!should_trigger_first_chat_identity_moment(
+            &first_turn,
+            true,
+            None,
+            true
+        ));
+        assert!(!should_trigger_first_chat_identity_moment(
+            &[serde_json::json!({"role":"assistant","content":"hi"})],
+            true,
+            None,
+            false
+        ));
+    }
+
+    #[test]
+    fn is_identity_profile_path_matches_identity_and_soul() {
+        assert!(is_identity_profile_path("IDENTITY.md"));
+        assert!(is_identity_profile_path("SOUL.md"));
+        assert!(is_identity_profile_path(" identity.md "));
+        assert!(!is_identity_profile_path("MEMORY.md"));
+        assert!(!is_identity_profile_path("memory/identity.md"));
     }
 
     #[test]
