@@ -183,7 +183,9 @@ impl HandoffContext {
 ///
 /// Tools are annotated with a tier; during dispatch, tools above the intent's
 /// tier are structurally removed from the agent's tool registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AutonomyTier {
     /// Read-only tools (web_fetch, search, file read, memory read).
@@ -532,8 +534,14 @@ mod tests {
             account_id: "".into(),
         };
         let id = p.canonical_list_id();
-        assert!(!id.contains("+15551234567"), "sender must be hashed, not plaintext");
-        assert!(id.starts_with("v1:whatsapp:"), "must include version and channel prefix");
+        assert!(
+            !id.contains("+15551234567"),
+            "sender must be hashed, not plaintext"
+        );
+        assert!(
+            id.starts_with("v1:whatsapp:"),
+            "must include version and channel prefix"
+        );
     }
 
     #[test]
@@ -588,7 +596,11 @@ mod tests {
     fn task_spec_new_defaults() {
         let spec = TaskSpec::new("test", "desc");
         assert!(!spec.is_intent, "is_intent defaults false");
-        assert_eq!(spec.autonomy_tier, AutonomyTier::Auto, "autonomy_tier defaults Auto");
+        assert_eq!(
+            spec.autonomy_tier,
+            AutonomyTier::Auto,
+            "autonomy_tier defaults Auto"
+        );
         assert!(spec.principal.is_none(), "principal defaults None");
         assert!(spec.parent_task.is_none(), "parent_task defaults None");
     }

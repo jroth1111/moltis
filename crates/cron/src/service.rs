@@ -1670,8 +1670,7 @@ mod tests {
     #[tokio::test]
     async fn create_task_payload_defaults_autonomy_tier() {
         // autonomy_tier should default to "auto" when omitted.
-        let json =
-            r#"{"kind":"createTask","subject":"hello","description":""}"#;
+        let json = r#"{"kind":"createTask","subject":"hello","description":""}"#;
         let p: CronPayload = serde_json::from_str(json).unwrap();
         match p {
             CronPayload::CreateTask { autonomy_tier, .. } => {

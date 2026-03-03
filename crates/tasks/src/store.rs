@@ -83,7 +83,11 @@ impl TaskStore {
             .map_err(|e| TransitionError::Other(e.to_string()))?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let version = task.runtime.version as i64;
-        let is_intent: i64 = if task.spec.is_intent { 1 } else { 0 };
+        let is_intent: i64 = if task.spec.is_intent {
+            1
+        } else {
+            0
+        };
         let parent_task = task.spec.parent_task.as_ref().map(|id| id.0.as_str());
         let principal_json = task
             .spec
@@ -472,10 +476,7 @@ impl TaskStore {
 
     /// Check whether any child task (parent_task = intent_id) is in a
     /// non-terminal state. Used as a guard before creating new shifts.
-    pub async fn has_non_terminal_child(
-        &self,
-        intent_id: &str,
-    ) -> Result<bool, TransitionError> {
+    pub async fn has_non_terminal_child(&self, intent_id: &str) -> Result<bool, TransitionError> {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM tasks \
              WHERE parent_task = ? \
@@ -1625,7 +1626,11 @@ mod tests {
             .await
             .expect("list shifts");
         assert_eq!(shifts.len(), 2);
-        assert!(shifts.iter().all(|s| s.spec.parent_task.as_ref().unwrap() == &intent.id));
+        assert!(
+            shifts
+                .iter()
+                .all(|s| s.spec.parent_task.as_ref().unwrap() == &intent.id)
+        );
     }
 
     #[tokio::test]

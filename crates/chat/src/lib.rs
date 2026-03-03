@@ -1474,7 +1474,8 @@ fn apply_runtime_tool_filters(
     // runtime can unintentionally remove unrelated tools (for example, leaving
     // only `web_fetch` and preventing `create_skill` from being called).
     // Tool availability here is controlled by configured runtime policy.
-    base_registry.clone_allowed_by(|name| policy.is_allowed(name) && !deny_extra.iter().any(|d| d == name))
+    base_registry
+        .clone_allowed_by(|name| policy.is_allowed(name) && !deny_extra.iter().any(|d| d == name))
 }
 
 // ── Disabled Models Store ────────────────────────────────────────────────────
@@ -6789,7 +6790,13 @@ async fn run_with_tools(
     let mut filtered_registry = {
         let registry_guard = tool_registry.read().await;
         if tools_enabled {
-            apply_runtime_tool_filters(&registry_guard, &persona.config, skills, mcp_disabled, dispatch_deny)
+            apply_runtime_tool_filters(
+                &registry_guard,
+                &persona.config,
+                skills,
+                mcp_disabled,
+                dispatch_deny,
+            )
         } else {
             registry_guard.clone_without(&[])
         }
@@ -11429,9 +11436,18 @@ mod tests {
         let cfg = moltis_config::MoltisConfig::default();
         let deny_extra = vec!["exec".to_string()];
         let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false, &deny_extra);
-        assert!(filtered.get("web_fetch").is_some(), "web_fetch must survive deny_extra");
-        assert!(filtered.get("task_list").is_some(), "task_list must survive deny_extra");
-        assert!(filtered.get("exec").is_none(), "exec must be denied by deny_extra");
+        assert!(
+            filtered.get("web_fetch").is_some(),
+            "web_fetch must survive deny_extra"
+        );
+        assert!(
+            filtered.get("task_list").is_some(),
+            "task_list must survive deny_extra"
+        );
+        assert!(
+            filtered.get("exec").is_none(),
+            "exec must be denied by deny_extra"
+        );
     }
 
     #[test]
@@ -11442,7 +11458,10 @@ mod tests {
         });
         let mut host = PromptHostRuntimeContext::default();
         apply_request_runtime_context(&mut host, &params);
-        assert_eq!(host.dispatch_deny, vec!["exec".to_string(), "spawn_agent".to_string()]);
+        assert_eq!(
+            host.dispatch_deny,
+            vec!["exec".to_string(), "spawn_agent".to_string()]
+        );
     }
 
     #[test]
@@ -11452,7 +11471,10 @@ mod tests {
         });
         let mut host = PromptHostRuntimeContext::default();
         apply_request_runtime_context(&mut host, &params);
-        assert!(host.dispatch_deny.is_empty(), "deny list must be ignored when source is not dispatch");
+        assert!(
+            host.dispatch_deny.is_empty(),
+            "deny list must be ignored when source is not dispatch"
+        );
     }
 
     #[test]

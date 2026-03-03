@@ -113,10 +113,7 @@ async fn run_cycle(ctx: &DispatchContext) -> Result<usize, anyhow::Error> {
 // ── Intent processor ──────────────────────────────────────────────────────────
 
 /// Process a single intent task. Returns `true` if a shift was dispatched.
-async fn process_intent(
-    ctx: &DispatchContext,
-    intent: Task,
-) -> Result<bool, anyhow::Error> {
+async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, anyhow::Error> {
     let list_id = intent.list_id.clone();
     let intent_id = intent.id.0.clone();
 
@@ -298,7 +295,9 @@ async fn process_intent(
     )
     .await?;
 
-    tx.commit().await.map_err(|e| anyhow::anyhow!("finalize commit: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| anyhow::anyhow!("finalize commit: {e}"))?;
 
     // ── 12. Log shift result. ─────────────────────────────────────────────────
     match &shift_result {
@@ -327,7 +326,13 @@ async fn process_intent(
         )
         .await?;
     } else if final_state.is_over_budget() {
-        escalate(ctx, &list_id, &intent_id, "Token budget exhausted after shift").await?;
+        escalate(
+            ctx,
+            &list_id,
+            &intent_id,
+            "Token budget exhausted after shift",
+        )
+        .await?;
     } else if let Err(ServiceError::Message { message }) = &shift_result {
         // Permanent provider failure → escalate immediately.
         if message.contains("billing") || message.contains("invalid_api_key") {
@@ -532,10 +537,7 @@ fn extract_tokens(result: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use {
-        crate::services::ServiceResult,
-        moltis_tasks::FailureClass,
-    };
+    use {crate::services::ServiceResult, moltis_tasks::FailureClass};
 
     // ── classify_shifts ───────────────────────────────────────────────────
 
@@ -680,12 +682,7 @@ mod tests {
 
         // Promote back to Pending (simulates retry-promotion sweep).
         store
-            .apply_transition(
-                "default",
-                &shift.id.0,
-                None,
-                &TransitionEvent::PromoteRetry,
-            )
+            .apply_transition("default", &shift.id.0, None, &TransitionEvent::PromoteRetry)
             .await
             .expect("promote retry");
 
@@ -745,12 +742,7 @@ mod tests {
             .await
             .expect("claim shift");
         store
-            .apply_transition(
-                "default",
-                &shift.id.0,
-                None,
-                &TransitionEvent::Complete,
-            )
+            .apply_transition("default", &shift.id.0, None, &TransitionEvent::Complete)
             .await
             .expect("complete shift");
 
@@ -769,18 +761,39 @@ mod tests {
     fn auto_tier_denies_exec_and_send() {
         let denied = denied_tools_for_tier(AutonomyTier::Auto);
         assert!(denied.contains(&"exec"), "exec must be denied at Auto tier");
-        assert!(denied.contains(&"send_image"), "send_image must be denied at Auto tier");
-        assert!(denied.contains(&"spawn_agent"), "spawn_agent must be denied at Auto tier");
-        assert!(!denied.contains(&"task_list"), "task_list must never be denied");
+        assert!(
+            denied.contains(&"send_image"),
+            "send_image must be denied at Auto tier"
+        );
+        assert!(
+            denied.contains(&"spawn_agent"),
+            "spawn_agent must be denied at Auto tier"
+        );
+        assert!(
+            !denied.contains(&"task_list"),
+            "task_list must never be denied"
+        );
     }
 
     #[test]
     fn confirm_tier_denies_only_approve_tools() {
         let denied = denied_tools_for_tier(AutonomyTier::Confirm);
-        assert!(denied.contains(&"send_image"), "send_image must be denied at Confirm tier");
-        assert!(denied.contains(&"spawn_agent"), "spawn_agent must be denied at Confirm tier");
-        assert!(!denied.contains(&"exec"), "exec must be allowed at Confirm tier");
-        assert!(!denied.contains(&"task_list"), "task_list must never be denied");
+        assert!(
+            denied.contains(&"send_image"),
+            "send_image must be denied at Confirm tier"
+        );
+        assert!(
+            denied.contains(&"spawn_agent"),
+            "spawn_agent must be denied at Confirm tier"
+        );
+        assert!(
+            !denied.contains(&"exec"),
+            "exec must be allowed at Confirm tier"
+        );
+        assert!(
+            !denied.contains(&"task_list"),
+            "task_list must never be denied"
+        );
     }
 
     #[test]
@@ -846,64 +859,34 @@ mod tests {
 
     #[async_trait]
     impl crate::services::ChatService for OkChatService {
-        async fn send(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn send(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!({ "inputTokens": 100, "outputTokens": 50 }))
         }
-        async fn abort(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn abort(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!({}))
         }
-        async fn cancel_queued(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn cancel_queued(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!({ "cleared": 0 }))
         }
-        async fn history(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn history(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!([]))
         }
-        async fn inject(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn inject(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!({}))
         }
-        async fn clear(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn clear(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!({ "ok": true }))
         }
-        async fn compact(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn compact(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!({}))
         }
-        async fn context(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn context(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!({}))
         }
-        async fn raw_prompt(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn raw_prompt(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!({ "prompt": "" }))
         }
-        async fn full_context(
-            &self,
-            _p: Value,
-        ) -> ServiceResult {
+        async fn full_context(&self, _p: Value) -> ServiceResult {
             Ok(serde_json::json!([]))
         }
     }
@@ -1010,7 +993,10 @@ mod tests {
         };
 
         let dispatched = run_cycle(&ctx).await.expect("run_cycle");
-        assert_eq!(dispatched, 0, "should skip intent that already has an active shift");
+        assert_eq!(
+            dispatched, 0,
+            "should skip intent that already has an active shift"
+        );
     }
 
     #[tokio::test]

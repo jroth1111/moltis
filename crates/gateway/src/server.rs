@@ -1799,9 +1799,8 @@ pub async fn prepare_gateway(
 
     // Deferred task store: populated after TaskListTool is created below.
     // Used by the cron CreateTask callback, which is constructed before the store.
-    let deferred_task_store: Arc<
-        tokio::sync::OnceCell<Arc<moltis_tasks::TaskStore>>,
-    > = Arc::new(tokio::sync::OnceCell::new());
+    let deferred_task_store: Arc<tokio::sync::OnceCell<Arc<moltis_tasks::TaskStore>>> =
+        Arc::new(tokio::sync::OnceCell::new());
 
     services =
         services.with_onboarding(Arc::new(crate::onboarding::GatewayOnboardingService::new(
@@ -2079,17 +2078,14 @@ pub async fn prepare_gateway(
                     _ => moltis_tasks::AutonomyTier::Auto,
                 };
                 let list_id = req.list_id.as_deref().unwrap_or("default");
-                let mut spec =
-                    moltis_tasks::TaskSpec::new(req.subject, req.description);
+                let mut spec = moltis_tasks::TaskSpec::new(req.subject, req.description);
                 spec.is_intent = true;
                 spec.autonomy_tier = tier;
                 let task = store
                     .create(list_id, spec, vec![])
                     .await
                     .map_err(|e| moltis_cron::Error::message(e.to_string()))?;
-                Ok(moltis_cron::service::CreateTaskResult {
-                    task_id: task.id.0,
-                })
+                Ok(moltis_cron::service::CreateTaskResult { task_id: task.id.0 })
             })
         });
 

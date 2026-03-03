@@ -849,10 +849,7 @@ mod tests {
         let store = t.store();
         let task = store.get("default", &id).await.unwrap().unwrap();
         assert!(task.spec.is_intent);
-        assert_eq!(
-            task.spec.autonomy_tier,
-            AutonomyTier::Confirm
-        );
+        assert_eq!(task.spec.autonomy_tier, AutonomyTier::Confirm);
     }
 
     #[tokio::test]
@@ -868,10 +865,7 @@ mod tests {
         let store = t.store();
         let task = store.get("default", &id).await.unwrap().unwrap();
         assert!(!task.spec.is_intent);
-        assert_eq!(
-            task.spec.autonomy_tier,
-            AutonomyTier::Auto
-        );
+        assert_eq!(task.spec.autonomy_tier, AutonomyTier::Auto);
     }
 
     #[tokio::test]
@@ -886,7 +880,12 @@ mod tests {
             }))
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown autonomy_tier"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown autonomy_tier")
+        );
     }
 
     #[tokio::test]

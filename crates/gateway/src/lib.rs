@@ -20,12 +20,12 @@ pub mod broadcast;
 pub mod channel;
 pub mod channel_agent_tools;
 pub mod channel_events;
-pub mod dispatch;
 pub mod channel_outbound;
 pub mod channel_store;
 pub mod chat;
 pub mod chat_error;
 pub mod cron;
+pub mod dispatch;
 pub mod env_routes;
 #[cfg(feature = "graphql")]
 pub mod graphql_routes;
