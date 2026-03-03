@@ -1131,14 +1131,14 @@ impl AutoMemorySettings {
 
 #[derive(Debug, Clone)]
 struct AutoReconcileCandidate {
-    display_id: usize,
-    chunk_id: String,
+    id: usize,
     text: String,
     similarity: f32,
 }
 
 #[derive(Debug, Clone)]
 struct AutoReconcileInput {
+    fact_index: usize,
     fact: String,
     candidates: Vec<AutoReconcileCandidate>,
 }
@@ -1153,7 +1153,17 @@ struct AutoReconcileDecisionEnvelope {
 struct AutoReconcileDecision {
     #[serde(default)]
     fact_index: usize,
+    #[serde(default)]
+    target_id: Option<usize>,
+    #[serde(default)]
+    text: Option<String>,
     event: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoExtractOutcome {
+    Written,
+    Skipped(&'static str),
 }
 
 fn resolve_prompt_agent_id(session_entry: Option<&SessionEntry>) -> String {
@@ -2569,8 +2579,6 @@ pub struct LiveChatService {
     auto_extract_locks: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
     /// Last extraction start timestamp per session for debounce enforcement.
     auto_extract_last_started: Arc<RwLock<HashMap<String, Instant>>>,
-    /// Last reconcile timestamp per session to enforce minimum interval.
-    auto_reconcile_last_run: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl LiveChatService {
@@ -2608,7 +2616,6 @@ impl LiveChatService {
             auto_memory_settings,
             auto_extract_locks: Arc::new(RwLock::new(HashMap::new())),
             auto_extract_last_started: Arc::new(RwLock::new(HashMap::new())),
-            auto_reconcile_last_run: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -4113,7 +4120,6 @@ impl ChatService for LiveChatService {
         let auto_memory_settings = self.auto_memory_settings.clone();
         let auto_extract_last_started = Arc::clone(&self.auto_extract_last_started);
         let auto_extract_semaphore = self.auto_extract_semaphore(&session_key).await;
-        let auto_reconcile_last_run = Arc::clone(&self.auto_reconcile_last_run);
         let providers_registry = Arc::clone(&self.providers);
         let user_text_for_auto_memory = text.clone();
         let auto_memory_provider = Arc::clone(&provider);
@@ -4264,27 +4270,27 @@ impl ChatService for LiveChatService {
                     .await
                 {
                     warn!("failed to persist assistant message: {e}");
-                }
-                // Update metadata counts.
-                if let Ok(count) = session_store.count(&session_key_clone).await {
-                    session_metadata.touch(&session_key_clone, count).await;
-                }
+                } else {
+                    // Update metadata counts.
+                    if let Ok(count) = session_store.count(&session_key_clone).await {
+                        session_metadata.touch(&session_key_clone, count).await;
+                    }
 
-                maybe_schedule_auto_memory_extraction(
-                    &state,
-                    &auto_memory_settings,
-                    Arc::clone(&auto_extract_semaphore),
-                    Arc::clone(&auto_extract_last_started),
-                    Arc::clone(&auto_reconcile_last_run),
-                    Arc::clone(&providers_registry),
-                    Arc::clone(&auto_memory_provider),
-                    session_key_clone.clone(),
-                    session_agent_id_clone.clone(),
-                    run_id_clone.clone(),
-                    user_text_for_auto_memory.clone(),
-                    assistant_text_for_auto_memory,
-                )
-                .await;
+                    maybe_schedule_auto_memory_extraction(
+                        &state,
+                        &auto_memory_settings,
+                        Arc::clone(&auto_extract_semaphore),
+                        Arc::clone(&auto_extract_last_started),
+                        Arc::clone(&providers_registry),
+                        Arc::clone(&auto_memory_provider),
+                        session_key_clone.clone(),
+                        session_agent_id_clone.clone(),
+                        run_id_clone.clone(),
+                        user_text_for_auto_memory.clone(),
+                        assistant_text_for_auto_memory,
+                    )
+                    .await;
+                }
             }
             mark_self_repair_finished(state_store.as_deref(), &session_key_clone).await;
 
@@ -4483,7 +4489,6 @@ impl ChatService for LiveChatService {
         let auto_memory_settings = self.auto_memory_settings.clone();
         let auto_extract_last_started = Arc::clone(&self.auto_extract_last_started);
         let auto_extract_semaphore = self.auto_extract_semaphore(&session_key).await;
-        let auto_reconcile_last_run = Arc::clone(&self.auto_reconcile_last_run);
         let providers_registry = Arc::clone(&self.providers);
         let auto_memory_provider = Arc::clone(&provider);
 
@@ -4596,27 +4601,27 @@ impl ChatService for LiveChatService {
                 .await
             {
                 warn!("send_sync: failed to persist assistant message: {e}");
-            }
-            // Update metadata message count.
-            if let Ok(count) = self.session_store.count(&session_key).await {
-                self.session_metadata.touch(&session_key, count).await;
-            }
+            } else {
+                // Update metadata message count.
+                if let Ok(count) = self.session_store.count(&session_key).await {
+                    self.session_metadata.touch(&session_key, count).await;
+                }
 
-            maybe_schedule_auto_memory_extraction(
-                &state,
-                &auto_memory_settings,
-                Arc::clone(&auto_extract_semaphore),
-                Arc::clone(&auto_extract_last_started),
-                Arc::clone(&auto_reconcile_last_run),
-                Arc::clone(&providers_registry),
-                Arc::clone(&auto_memory_provider),
-                session_key.clone(),
-                session_agent_id.clone(),
-                run_id.clone(),
-                text.clone(),
-                assistant_output.text.clone(),
-            )
-            .await;
+                maybe_schedule_auto_memory_extraction(
+                    &state,
+                    &auto_memory_settings,
+                    Arc::clone(&auto_extract_semaphore),
+                    Arc::clone(&auto_extract_last_started),
+                    Arc::clone(&providers_registry),
+                    Arc::clone(&auto_memory_provider),
+                    session_key.clone(),
+                    session_agent_id.clone(),
+                    run_id.clone(),
+                    text.clone(),
+                    assistant_output.text.clone(),
+                )
+                .await;
+            }
         }
 
         match result {
@@ -6744,25 +6749,81 @@ fn format_auto_memory_entry(
     )
 }
 
-fn build_auto_reconcile_prompt(inputs: &[AutoReconcileInput]) -> String {
-    let input_json = inputs
+const AUTO_RECONCILE_CANONICAL_FILE: &str = "memory/auto-facts.md";
+const AUTO_RECONCILE_AUDIT_LOG_FILE: &str = "memory/reconciliation-log.md";
+
+fn parse_managed_auto_facts(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("**") {
+                return None;
+            }
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                let fact = rest.trim();
+                return (!fact.is_empty()).then(|| fact.to_string());
+            }
+            if let Some((prefix, rest)) = trimmed.split_once(". ")
+                && prefix.chars().all(|c| c.is_ascii_digit())
+            {
+                let fact = rest.trim();
+                if !fact.is_empty() {
+                    return Some(fact.to_string());
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+fn format_managed_auto_facts(facts: &[String], timestamp: OffsetDateTime) -> String {
+    let rows = if facts.is_empty() {
+        "- (none)\n".to_string()
+    } else {
+        facts
+            .iter()
+            .enumerate()
+            .map(|(idx, fact)| format!("{}. {}", idx.saturating_add(1), fact))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "# Managed Auto Facts\n\n**Updated At**: `{}`\n**Facts**: {}\n\n{}\n",
+        timestamp.unix_timestamp(),
+        facts.len(),
+        rows
+    )
+}
+
+fn build_auto_reconcile_prompt(inputs: &[AutoReconcileInput], existing_facts: &[String]) -> String {
+    let existing_json = existing_facts
         .iter()
         .enumerate()
-        .map(|(idx, input)| {
+        .map(|(id, text)| {
+            serde_json::json!({
+                "id": id,
+                "text": truncate_at_char_boundary(text.trim(), 320),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let input_json = inputs
+        .iter()
+        .map(|input| {
             let candidates = input
                 .candidates
                 .iter()
                 .map(|candidate| {
                     serde_json::json!({
-                        "id": candidate.display_id,
-                        "chunk_id": candidate.chunk_id,
+                        "id": candidate.id,
                         "text": candidate.text,
                         "similarity": candidate.similarity,
                     })
                 })
                 .collect::<Vec<_>>();
             serde_json::json!({
-                "fact_index": idx,
+                "fact_index": input.fact_index,
                 "fact": input.fact,
                 "candidates": candidates,
             })
@@ -6770,25 +6831,23 @@ fn build_auto_reconcile_prompt(inputs: &[AutoReconcileInput]) -> String {
         .collect::<Vec<_>>();
     format!(
         concat!(
-            "Decide whether each candidate fact should be saved.\n",
+            "Reconcile machine-managed memory facts.\n",
             "Return JSON only with the exact schema:\n",
             "{{\"decisions\":[{{\"fact_index\":0,\"event\":\"ADD\"}}]}}\n",
-            "Allowed events: ADD or SKIP.\n",
-            "Choose SKIP when an existing candidate already means the same thing.\n",
-            "Choose ADD when the fact contains new durable information.\n\n",
+            "Allowed events: ADD, UPDATE, DELETE, SKIP.\n",
+            "For UPDATE and DELETE include `target_id` from existing fact IDs.\n",
+            "For UPDATE optionally include replacement `text`.\n",
+            "Prefer SKIP when a fact already exists semantically.\n\n",
             "Input:\n{}\n"
         ),
-        Value::Array(input_json)
+        serde_json::json!({
+            "existing_facts": existing_json,
+            "new_facts": input_json,
+        })
     )
 }
 
-fn parse_auto_reconcile_decisions(raw: &str) -> HashSet<usize> {
-    let decisions = parse_json_string_array_response(raw, None);
-    if !decisions.is_empty() {
-        // If model returned a bare array of strings, interpret as ADD all.
-        return (0..decisions.len()).collect();
-    }
-
+fn parse_auto_reconcile_decisions(raw: &str) -> Vec<AutoReconcileDecision> {
     let candidate = raw
         .trim()
         .strip_prefix("```json")
@@ -6804,13 +6863,25 @@ fn parse_auto_reconcile_decisions(raw: &str) -> HashSet<usize> {
 
     let parsed = serde_json::from_str::<AutoReconcileDecisionEnvelope>(candidate).ok();
     parsed
-        .map(|envelope| {
-            envelope
-                .decisions
-                .into_iter()
-                .filter(|decision| decision.event.eq_ignore_ascii_case("add"))
-                .map(|decision| decision.fact_index)
-                .collect::<HashSet<_>>()
+        .map(|envelope| envelope.decisions)
+        .or_else(|| {
+            let fallback = parse_json_string_array_response(raw, None);
+            if fallback.is_empty() {
+                None
+            } else {
+                Some(
+                    fallback
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, _)| AutoReconcileDecision {
+                            fact_index: idx,
+                            target_id: None,
+                            text: None,
+                            event: "ADD".to_string(),
+                        })
+                        .collect(),
+                )
+            }
         })
         .unwrap_or_default()
 }
@@ -6820,7 +6891,6 @@ async fn maybe_schedule_auto_memory_extraction(
     settings: &AutoMemorySettings,
     auto_extract_semaphore: Arc<Semaphore>,
     auto_extract_last_started: Arc<RwLock<HashMap<String, Instant>>>,
-    auto_reconcile_last_run: Arc<RwLock<HashMap<String, Instant>>>,
     providers_registry: Arc<RwLock<ProviderRegistry>>,
     fallback_provider: Arc<dyn moltis_agents::model::LlmProvider>,
     session_key: String,
@@ -6830,11 +6900,15 @@ async fn maybe_schedule_auto_memory_extraction(
     assistant_text: String,
 ) {
     if !settings.enabled {
+        #[cfg(feature = "metrics")]
+        counter!(mem_metrics::AUTO_EXTRACT_SKIPS_TOTAL, "reason" => "disabled").increment(1);
         return;
     }
 
     let combined_chars = user_text.chars().count() + assistant_text.chars().count();
     if combined_chars < settings.min_chars {
+        #[cfg(feature = "metrics")]
+        counter!(mem_metrics::AUTO_EXTRACT_SKIPS_TOTAL, "reason" => "min_chars").increment(1);
         return;
     }
 
@@ -6842,6 +6916,8 @@ async fn maybe_schedule_auto_memory_extraction(
         Ok(permit) => permit,
         Err(_) => {
             debug!(session = %session_key, "auto-memory extract skipped: extraction already running");
+            #[cfg(feature = "metrics")]
+            counter!(mem_metrics::AUTO_EXTRACT_SKIPS_TOTAL, "reason" => "single_flight").increment(1);
             return;
         },
     };
@@ -6853,12 +6929,17 @@ async fn maybe_schedule_auto_memory_extraction(
             && now.saturating_duration_since(*last) < settings.debounce
         {
             debug!(session = %session_key, "auto-memory extract skipped: debounce window active");
+            #[cfg(feature = "metrics")]
+            counter!(mem_metrics::AUTO_EXTRACT_SKIPS_TOTAL, "reason" => "debounce").increment(1);
             return;
         }
         last_started.insert(session_key.clone(), now);
     }
 
     let Some(manager) = state.memory_manager().map(Arc::clone) else {
+        #[cfg(feature = "metrics")]
+        counter!(mem_metrics::AUTO_EXTRACT_SKIPS_TOTAL, "reason" => "memory_manager_unavailable")
+            .increment(1);
         return;
     };
 
@@ -6873,7 +6954,6 @@ async fn maybe_schedule_auto_memory_extraction(
         let run_result = run_auto_memory_extraction_task(
             settings,
             manager,
-            auto_reconcile_last_run,
             providers_registry,
             fallback_provider,
             session_key,
@@ -6885,11 +6965,18 @@ async fn maybe_schedule_auto_memory_extraction(
         .await;
 
         match run_result {
-            Ok(wrote_memory) => {
-                if wrote_memory {
+            Ok(outcome) => match outcome {
+                AutoExtractOutcome::Written => {
                     #[cfg(feature = "metrics")]
-                    counter!(mem_metrics::AUTO_EXTRACT_SUCCESSES_TOTAL).increment(1);
-                }
+                    counter!(mem_metrics::AUTO_EXTRACT_SUCCESS_TOTAL).increment(1);
+                },
+                AutoExtractOutcome::Skipped(reason) => {
+                    #[cfg(feature = "metrics")]
+                    counter!(mem_metrics::AUTO_EXTRACT_SKIPS_TOTAL, "reason" => reason)
+                        .increment(1);
+                    #[cfg(not(feature = "metrics"))]
+                    let _ = reason;
+                },
             },
             Err(error) => {
                 warn!(%error, "auto-memory extract failed");
@@ -6899,7 +6986,7 @@ async fn maybe_schedule_auto_memory_extraction(
         }
 
         #[cfg(feature = "metrics")]
-        histogram!(mem_metrics::AUTO_EXTRACT_LATENCY_SECONDS)
+        histogram!(mem_metrics::AUTO_EXTRACT_DURATION_SECONDS)
             .record(extract_started.elapsed().as_secs_f64());
     });
 }
@@ -6907,7 +6994,6 @@ async fn maybe_schedule_auto_memory_extraction(
 async fn run_auto_memory_extraction_task(
     settings: AutoMemorySettings,
     manager: Arc<moltis_memory::manager::MemoryManager>,
-    auto_reconcile_last_run: Arc<RwLock<HashMap<String, Instant>>>,
     providers_registry: Arc<RwLock<ProviderRegistry>>,
     fallback_provider: Arc<dyn moltis_agents::model::LlmProvider>,
     session_key: String,
@@ -6915,7 +7001,7 @@ async fn run_auto_memory_extraction_task(
     run_id: String,
     user_text: String,
     assistant_text: String,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<AutoExtractOutcome> {
     let extraction_provider = {
         let maybe_override_id = settings.model_id.as_deref();
         if let Some(model_id) = maybe_override_id {
@@ -6924,72 +7010,53 @@ async fn run_auto_memory_extraction_task(
             if selected.is_none() {
                 warn!(
                     model_id,
-                    "auto-memory extract skipped: configured auto_extract_model_id not found"
+                    "auto-memory extract override missing; falling back to session model"
                 );
             }
-            selected
+            selected.unwrap_or_else(|| Arc::clone(&fallback_provider))
         } else {
-            Some(Arc::clone(&fallback_provider))
+            Arc::clone(&fallback_provider)
         }
     };
-    let Some(extraction_provider) = extraction_provider else {
-        return Ok(false);
-    };
 
-    let mut facts = extract_facts_from_turn(
-        &*extraction_provider,
+    let facts = extract_facts_from_turn(
+        extraction_provider.as_ref(),
         &user_text,
         &assistant_text,
         settings.max_facts,
     )
     .await?;
     if facts.is_empty() {
-        return Ok(false);
+        return Ok(AutoExtractOutcome::Skipped("no_facts"));
     }
-    let extracted_fact_count = facts.len();
-
-    if settings.reconcile_enabled {
-        facts = reconcile_auto_extracted_facts(
-            &*extraction_provider,
-            &manager,
-            &session_key,
-            &agent_id,
-            &facts,
-            settings.reconcile_similarity_threshold,
-            settings.reconcile_min_interval,
-            auto_reconcile_last_run,
-        )
-        .await?;
-    }
-
-    if facts.is_empty() {
-        return Ok(false);
-    }
-    let retained_fact_count = facts.len();
 
     let timestamp = OffsetDateTime::now_utc().to_offset(UtcOffset::UTC);
     let target_file = auto_memory_facts_file_name(timestamp);
     let entry = format_auto_memory_entry(&session_key, &run_id, timestamp, &facts);
-    let writer = AgentScopedMemoryWriter::new(manager, agent_id);
+    let writer = AgentScopedMemoryWriter::new(Arc::clone(&manager), agent_id.clone());
     use moltis_agents::memory_writer::MemoryWriter;
+    let _result = writer.write_memory(&target_file, &entry, true).await?;
+
     if settings.reconcile_enabled {
-        let reconcile_log = format!(
-            "## Auto Reconcile {}\n\n- Session: `{}`\n- Run: `{}`\n- Extracted: {}\n- Retained: {}\n",
-            timestamp.unix_timestamp(),
-            session_key,
-            run_id,
-            extracted_fact_count,
-            retained_fact_count
-        );
-        if let Err(error) = writer
-            .write_memory("memory/auto-reconcile-log.md", &reconcile_log, true)
-            .await
+        if let Err(error) = reconcile_auto_extracted_facts(
+            extraction_provider.as_ref(),
+            &manager,
+            &writer,
+            &session_key,
+            &agent_id,
+            &run_id,
+            &facts,
+            settings.reconcile_similarity_threshold,
+            settings.reconcile_min_interval,
+            timestamp,
+        )
+        .await
         {
-            warn!(%error, "failed to append auto-reconcile audit log");
+            warn!(%error, "auto-memory reconcile failed; continuing with staged facts");
         }
     }
-    let _result = writer.write_memory(&target_file, &entry, true).await?;
-    Ok(true)
+
+    Ok(AutoExtractOutcome::Written)
 }
 
 async fn extract_facts_from_turn(
@@ -7024,75 +7091,26 @@ async fn extract_facts_from_turn(
 async fn reconcile_auto_extracted_facts(
     provider: &dyn moltis_agents::model::LlmProvider,
     manager: &Arc<moltis_memory::manager::MemoryManager>,
+    writer: &AgentScopedMemoryWriter,
     session_key: &str,
     agent_id: &str,
+    run_id: &str,
     facts: &[String],
     similarity_threshold: f32,
     min_interval: Duration,
-    auto_reconcile_last_run: Arc<RwLock<HashMap<String, Instant>>>,
-) -> anyhow::Result<Vec<String>> {
-    let mut llm_inputs = Vec::new();
-    let mut final_facts = Vec::new();
+    timestamp: OffsetDateTime,
+) -> anyhow::Result<()> {
+    use moltis_agents::memory_writer::MemoryWriter;
 
-    for fact in facts {
-        let normalized_fact = normalize_for_similarity(fact);
-        if normalized_fact.is_empty() {
-            continue;
+    let now_unix = timestamp.unix_timestamp();
+    let state_key = format!("auto_reconcile_last_ts::{agent_id}");
+    if let Some(last_success_raw) = manager.get_state(&state_key).await?
+        && let Ok(last_success_unix) = last_success_raw.parse::<i64>()
+    {
+        let elapsed_secs = now_unix.saturating_sub(last_success_unix) as u64;
+        if elapsed_secs < min_interval.as_secs() {
+            return Ok(());
         }
-
-        let search_results = manager.search(fact, 5).await.unwrap_or_default();
-        let mut candidates = Vec::new();
-        let mut max_similarity = 0.0f32;
-
-        for (idx, result) in search_results.into_iter().enumerate() {
-            if !is_path_in_agent_memory_scope(Path::new(&result.path), agent_id) {
-                continue;
-            }
-            let normalized_existing = normalize_for_similarity(&result.text);
-            let similarity = token_jaccard_similarity(&normalized_fact, &normalized_existing);
-            max_similarity = max_similarity.max(similarity);
-            candidates.push(AutoReconcileCandidate {
-                display_id: idx,
-                chunk_id: result.chunk_id,
-                text: truncate_at_char_boundary(result.text.trim(), 320).to_string(),
-                similarity,
-            });
-        }
-
-        if max_similarity >= similarity_threshold {
-            continue;
-        }
-
-        if candidates.is_empty() {
-            final_facts.push(fact.clone());
-            continue;
-        }
-
-        llm_inputs.push(AutoReconcileInput {
-            fact: fact.clone(),
-            candidates,
-        });
-    }
-
-    if llm_inputs.is_empty() {
-        return Ok(dedupe_strings_preserve_order(final_facts));
-    }
-
-    let should_run_llm = {
-        let now = Instant::now();
-        let mut last_runs = auto_reconcile_last_run.write().await;
-        let due = last_runs
-            .get(session_key)
-            .is_none_or(|last| now.saturating_duration_since(*last) >= min_interval);
-        if due {
-            last_runs.insert(session_key.to_string(), now);
-        }
-        due
-    };
-
-    if !should_run_llm {
-        final_facts.extend(llm_inputs.into_iter().map(|input| input.fact));
-        return Ok(dedupe_strings_preserve_order(final_facts));
     }
 
     #[cfg(feature = "metrics")]
@@ -7100,37 +7118,210 @@ async fn reconcile_auto_extracted_facts(
     #[cfg(feature = "metrics")]
     let reconcile_started = Instant::now();
 
-    let prompt = build_auto_reconcile_prompt(&llm_inputs);
-    let response = match provider.complete(&[ChatMessage::user(prompt)], &[]).await {
-        Ok(response) => response,
-        Err(error) => {
-            #[cfg(feature = "metrics")]
-            counter!(mem_metrics::AUTO_RECONCILE_FAILURES_TOTAL).increment(1);
-            warn!(session = %session_key, %error, "auto-memory reconcile failed; keeping extracted facts");
-            final_facts.extend(llm_inputs.into_iter().map(|input| input.fact));
-            return Ok(dedupe_strings_preserve_order(final_facts));
-        },
+    let canonical_path = resolve_agent_memory_target_path(agent_id, AUTO_RECONCILE_CANONICAL_FILE)?;
+    let existing_facts_raw = if tokio::fs::try_exists(&canonical_path).await.unwrap_or(false) {
+        tokio::fs::read_to_string(&canonical_path)
+            .await
+            .unwrap_or_default()
+    } else {
+        String::new()
     };
-    let add_fact_indices = parse_auto_reconcile_decisions(response.text.as_deref().unwrap_or(""));
+    let existing_facts = dedupe_strings_preserve_order(parse_managed_auto_facts(&existing_facts_raw));
 
-    #[cfg(feature = "metrics")]
-    histogram!(mem_metrics::AUTO_RECONCILE_LATENCY_SECONDS)
-        .record(reconcile_started.elapsed().as_secs_f64());
+    let mut fast_skip_count = 0usize;
+    let mut llm_inputs = Vec::new();
+    let mut direct_adds = Vec::new();
 
-    if add_fact_indices.is_empty() {
-        #[cfg(feature = "metrics")]
-        counter!(mem_metrics::AUTO_RECONCILE_FAILURES_TOTAL).increment(1);
-        final_facts.extend(llm_inputs.into_iter().map(|input| input.fact));
-        return Ok(dedupe_strings_preserve_order(final_facts));
+    for (idx, fact) in facts.iter().enumerate() {
+        let normalized_fact = normalize_for_similarity(fact);
+        if normalized_fact.is_empty() {
+            continue;
+        }
+
+        let mut candidates = existing_facts
+            .iter()
+            .enumerate()
+            .map(|(id, text)| {
+                let normalized_existing = normalize_for_similarity(text);
+                let similarity = token_jaccard_similarity(&normalized_fact, &normalized_existing);
+                AutoReconcileCandidate {
+                    id,
+                    text: truncate_at_char_boundary(text.trim(), 320).to_string(),
+                    similarity,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let max_similarity = candidates
+            .iter()
+            .map(|candidate| candidate.similarity)
+            .fold(0.0f32, f32::max);
+
+        if max_similarity >= similarity_threshold {
+            fast_skip_count = fast_skip_count.saturating_add(1);
+            continue;
+        }
+
+        if candidates.is_empty() {
+            direct_adds.push(fact.clone());
+            continue;
+        }
+
+        candidates.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(5);
+
+        llm_inputs.push(AutoReconcileInput {
+            fact_index: idx,
+            fact: fact.clone(),
+            candidates,
+        });
     }
 
-    final_facts.extend(
-        llm_inputs
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, input)| add_fact_indices.contains(&idx).then_some(input.fact)),
+    let mut decisions = Vec::new();
+    if !llm_inputs.is_empty() {
+        let prompt = build_auto_reconcile_prompt(&llm_inputs, &existing_facts);
+        let response = match provider.complete(&[ChatMessage::user(prompt)], &[]).await {
+            Ok(response) => response,
+            Err(error) => {
+                #[cfg(feature = "metrics")]
+                {
+                    counter!(mem_metrics::AUTO_RECONCILE_FAILURES_TOTAL).increment(1);
+                    histogram!(mem_metrics::AUTO_RECONCILE_DURATION_SECONDS)
+                        .record(reconcile_started.elapsed().as_secs_f64());
+                }
+                warn!(session = %session_key, %error, "auto-memory reconcile provider call failed");
+                return Ok(());
+            },
+        };
+        decisions = parse_auto_reconcile_decisions(response.text.as_deref().unwrap_or(""));
+        if decisions.is_empty() {
+            #[cfg(feature = "metrics")]
+            {
+                counter!(mem_metrics::AUTO_RECONCILE_FAILURES_TOTAL).increment(1);
+                histogram!(mem_metrics::AUTO_RECONCILE_DURATION_SECONDS)
+                    .record(reconcile_started.elapsed().as_secs_f64());
+            }
+            warn!(session = %session_key, "auto-memory reconcile returned empty decisions");
+            return Ok(());
+        }
+    }
+
+    let mut canonical_by_id = existing_facts
+        .iter()
+        .enumerate()
+        .map(|(id, text)| (id, text.clone()))
+        .collect::<BTreeMap<usize, String>>();
+    let facts_by_index = llm_inputs
+        .iter()
+        .map(|input| (input.fact_index, input.fact.clone()))
+        .collect::<HashMap<usize, String>>();
+
+    let mut pending_adds = direct_adds;
+    let mut added = pending_adds.len();
+    let mut updated = 0usize;
+    let mut deleted = 0usize;
+    let mut skipped = fast_skip_count;
+
+    for decision in decisions {
+        let event = decision.event.to_ascii_uppercase();
+        match event.as_str() {
+            "ADD" => {
+                if let Some(fact) = facts_by_index.get(&decision.fact_index) {
+                    pending_adds.push(fact.clone());
+                    added = added.saturating_add(1);
+                } else {
+                    skipped = skipped.saturating_add(1);
+                }
+            },
+            "UPDATE" => {
+                let Some(target_id) = decision.target_id else {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                };
+                let Some(current) = canonical_by_id.get_mut(&target_id) else {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                };
+                let replacement = decision
+                    .text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| facts_by_index.get(&decision.fact_index).cloned());
+                if let Some(replacement) = replacement {
+                    *current = replacement;
+                    updated = updated.saturating_add(1);
+                } else {
+                    skipped = skipped.saturating_add(1);
+                }
+            },
+            "DELETE" => {
+                if let Some(target_id) = decision.target_id {
+                    if canonical_by_id.remove(&target_id).is_some() {
+                        deleted = deleted.saturating_add(1);
+                    } else {
+                        skipped = skipped.saturating_add(1);
+                    }
+                } else {
+                    skipped = skipped.saturating_add(1);
+                }
+            },
+            "SKIP" => {
+                skipped = skipped.saturating_add(1);
+            },
+            _ => {
+                skipped = skipped.saturating_add(1);
+            },
+        }
+    }
+
+    let mut canonical_facts = canonical_by_id.into_values().collect::<Vec<_>>();
+    canonical_facts.extend(pending_adds);
+    canonical_facts = dedupe_strings_preserve_order(canonical_facts);
+
+    let canonical_changed = canonical_facts != existing_facts;
+    if canonical_changed {
+        let canonical_doc = format_managed_auto_facts(&canonical_facts, timestamp);
+        writer
+            .write_memory(AUTO_RECONCILE_CANONICAL_FILE, &canonical_doc, false)
+            .await?;
+    }
+
+    manager.set_state(&state_key, &now_unix.to_string()).await?;
+
+    let reconcile_log = format!(
+        "## Reconcile {}\n\n- Session: `{}`\n- Run: `{}`\n- Agent: `{}`\n- Existing Facts: {}\n- Added: {}\n- Updated: {}\n- Deleted: {}\n- Skipped: {}\n- Canonical Changed: {}\n",
+        now_unix,
+        session_key,
+        run_id,
+        agent_id,
+        existing_facts.len(),
+        added,
+        updated,
+        deleted,
+        skipped,
+        canonical_changed
     );
-    Ok(dedupe_strings_preserve_order(final_facts))
+    if let Err(error) = writer
+        .write_memory(AUTO_RECONCILE_AUDIT_LOG_FILE, &reconcile_log, true)
+        .await
+    {
+        warn!(%error, "failed to append reconcile audit log");
+    }
+
+    #[cfg(feature = "metrics")]
+    {
+        counter!(mem_metrics::AUTO_RECONCILE_SUCCESS_TOTAL).increment(1);
+        histogram!(mem_metrics::AUTO_RECONCILE_DURATION_SECONDS)
+            .record(reconcile_started.elapsed().as_secs_f64());
+    }
+
+    Ok(())
 }
 
 async fn maybe_append_research_context(
@@ -13166,15 +13357,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_auto_reconcile_decisions_extracts_add_events() {
-        let raw = r#"{"decisions":[{"fact_index":0,"event":"ADD"},{"fact_index":1,"event":"SKIP"}]}"#;
-        let selected = parse_auto_reconcile_decisions(raw);
-        assert!(selected.contains(&0));
-        assert!(!selected.contains(&1));
+    fn parse_auto_reconcile_decisions_extracts_supported_events() {
+        let raw = r#"{"decisions":[{"fact_index":0,"event":"ADD"},{"fact_index":1,"target_id":3,"event":"UPDATE","text":"updated"},{"fact_index":2,"target_id":4,"event":"DELETE"},{"fact_index":3,"event":"SKIP"}]}"#;
+        let decisions = parse_auto_reconcile_decisions(raw);
+        assert_eq!(decisions.len(), 4);
+        assert_eq!(decisions[0].fact_index, 0);
+        assert_eq!(decisions[0].event, "ADD");
+        assert_eq!(decisions[1].target_id, Some(3));
+        assert_eq!(decisions[1].text.as_deref(), Some("updated"));
+        assert_eq!(decisions[2].event, "DELETE");
+        assert_eq!(decisions[2].target_id, Some(4));
+        assert_eq!(decisions[3].event, "SKIP");
     }
 
     #[tokio::test]
-    async fn auto_memory_extraction_writes_searches_and_dedupes_subsequent_turn() {
+    async fn auto_memory_extraction_writes_searches_and_reconciles_subsequent_turn() {
         let _guard = DATA_DIR_OVERRIDE_LOCK
             .lock()
             .expect("data dir lock poisoned");
@@ -13225,13 +13422,11 @@ mod tests {
             reconcile_min_interval: Duration::from_secs(0),
             reconcile_similarity_threshold: 0.10,
         };
-        let auto_reconcile_last_run = Arc::new(RwLock::new(HashMap::new()));
         let providers_registry = Arc::new(RwLock::new(ProviderRegistry::empty()));
 
-        let first_written = run_auto_memory_extraction_task(
+        let first_outcome = run_auto_memory_extraction_task(
             settings.clone(),
             Arc::clone(&manager),
-            Arc::clone(&auto_reconcile_last_run),
             Arc::clone(&providers_registry),
             Arc::clone(&provider),
             "session-main".to_string(),
@@ -13242,7 +13437,7 @@ mod tests {
         )
         .await
         .expect("first extraction should succeed");
-        assert!(first_written);
+        assert!(matches!(first_outcome, AutoExtractOutcome::Written));
 
         let search_results = manager
             .search("TypeScript", 10)
@@ -13250,12 +13445,11 @@ mod tests {
             .expect("search should succeed");
         assert!(!search_results.is_empty(), "extracted memory should be searchable");
 
-        let second_written = run_auto_memory_extraction_task(
+        let second_outcome = run_auto_memory_extraction_task(
             settings,
             Arc::clone(&manager),
-            auto_reconcile_last_run,
-            providers_registry,
-            provider,
+            Arc::clone(&providers_registry),
+            Arc::clone(&provider),
             "session-main".to_string(),
             "main".to_string(),
             "run-2".to_string(),
@@ -13264,9 +13458,101 @@ mod tests {
         )
         .await
         .expect("second extraction should succeed");
+        assert!(matches!(second_outcome, AutoExtractOutcome::Written));
+
+        let canonical_path =
+            resolve_agent_memory_target_path("main", AUTO_RECONCILE_CANONICAL_FILE).unwrap();
+        let canonical = tokio::fs::read_to_string(&canonical_path)
+            .await
+            .expect("canonical managed facts should exist");
+        let canonical_facts = parse_managed_auto_facts(&canonical);
+        assert_eq!(
+            canonical_facts,
+            vec!["User prefers TypeScript for backend services".to_string()]
+        );
+
+        let state = manager
+            .get_state("auto_reconcile_last_ts::main")
+            .await
+            .expect("state read")
+            .expect("state should exist");
+        assert!(!state.trim().is_empty());
+
+        let staged_path = resolve_agent_memory_target_path(
+            "main",
+            &auto_memory_facts_file_name(OffsetDateTime::now_utc().to_offset(UtcOffset::UTC)),
+        )
+        .unwrap();
+        let staged = tokio::fs::read_to_string(staged_path)
+            .await
+            .expect("staged auto extract file should exist");
+        assert!(staged.contains("run-1"));
+        assert!(staged.contains("run-2"));
+
+        let reconcile_log_path =
+            resolve_agent_memory_target_path("main", AUTO_RECONCILE_AUDIT_LOG_FILE).unwrap();
+        let reconcile_log = tokio::fs::read_to_string(reconcile_log_path)
+            .await
+            .expect("reconcile log should exist");
+        assert!(reconcile_log.contains("Added: 1"));
+    }
+
+    #[tokio::test]
+    async fn auto_memory_extraction_skips_when_disabled() {
+        let _guard = DATA_DIR_OVERRIDE_LOCK
+            .lock()
+            .expect("data dir lock poisoned");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+        struct DataDirReset;
+        impl Drop for DataDirReset {
+            fn drop(&mut self) {
+                moltis_config::clear_data_dir();
+            }
+        }
+        let _reset = DataDirReset;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(QueuedResponseProvider::new(vec![
+            r#"{"facts":["Should not be written"]}"#.to_string(),
+        ]));
+        let settings = AutoMemorySettings {
+            enabled: false,
+            min_chars: 1,
+            debounce: Duration::from_secs(1),
+            max_facts: 4,
+            model_id: None,
+            reconcile_enabled: false,
+            reconcile_min_interval: Duration::from_secs(900),
+            reconcile_similarity_threshold: 0.95,
+        };
+        let providers_registry = Arc::new(RwLock::new(ProviderRegistry::empty()));
+
+        let runtime: Arc<dyn ChatRuntime> = Arc::new(MockChatRuntime::new());
+        maybe_schedule_auto_memory_extraction(
+            &runtime,
+            &settings,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(RwLock::new(HashMap::new())),
+            providers_registry,
+            provider,
+            "session-main".to_string(),
+            "main".to_string(),
+            "run-1".to_string(),
+            "please remember this".to_string(),
+            "noted".to_string(),
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let staged_path = resolve_agent_memory_target_path(
+            "main",
+            &auto_memory_facts_file_name(OffsetDateTime::now_utc().to_offset(UtcOffset::UTC)),
+        )
+        .unwrap();
         assert!(
-            !second_written,
-            "second identical extraction should be deduped"
+            !tokio::fs::try_exists(&staged_path).await.unwrap_or(false),
+            "disabled auto_extract should not write staged facts"
         );
     }
 }
