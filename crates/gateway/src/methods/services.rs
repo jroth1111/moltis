@@ -4169,6 +4169,14 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     "disable_rag": memory.disable_rag,
                     "llm_reranking": memory.llm_reranking,
                     "session_export": memory.session_export,
+                    "auto_extract": memory.auto_extract,
+                    "auto_extract_min_chars": memory.auto_extract_min_chars,
+                    "auto_extract_debounce_ms": memory.auto_extract_debounce_ms,
+                    "auto_extract_max_facts": memory.auto_extract_max_facts,
+                    "auto_extract_model_id": memory.auto_extract_model_id,
+                    "auto_reconcile": memory.auto_reconcile,
+                    "auto_reconcile_min_interval_secs": memory.auto_reconcile_min_interval_secs,
+                    "auto_reconcile_similarity_threshold": memory.auto_reconcile_similarity_threshold,
                     "qmd_feature_enabled": cfg!(feature = "qmd"),
                 }))
             })
@@ -4200,12 +4208,58 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .get("session_export")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let auto_extract = ctx.params.get("auto_extract").and_then(|v| v.as_bool());
+                let auto_extract_min_chars = ctx
+                    .params
+                    .get("auto_extract_min_chars")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let auto_extract_debounce_ms = ctx
+                    .params
+                    .get("auto_extract_debounce_ms")
+                    .and_then(|v| v.as_u64());
+                let auto_extract_max_facts = ctx
+                    .params
+                    .get("auto_extract_max_facts")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                let has_auto_extract_model_id = ctx.params.get("auto_extract_model_id").is_some();
+                let auto_extract_model_id = ctx
+                    .params
+                    .get("auto_extract_model_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned);
+                let auto_reconcile = ctx
+                    .params
+                    .get("auto_reconcile")
+                    .and_then(|v| v.as_bool());
+                let auto_reconcile_min_interval_secs = ctx
+                    .params
+                    .get("auto_reconcile_min_interval_secs")
+                    .and_then(|v| v.as_u64());
+                let auto_reconcile_similarity_threshold = ctx
+                    .params
+                    .get("auto_reconcile_similarity_threshold")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32);
 
                 // Persist to moltis.toml so the config survives restarts.
                 let backend_str = backend.to_string();
                 let citations_str = citations.to_string();
-                let mut effective_disable_rag =
-                    moltis_config::discover_and_load().memory.disable_rag;
+                let current_memory = moltis_config::discover_and_load().memory;
+                let mut effective_disable_rag = current_memory.disable_rag;
+                let mut effective_auto_extract = current_memory.auto_extract;
+                let mut effective_auto_extract_min_chars = current_memory.auto_extract_min_chars;
+                let mut effective_auto_extract_debounce_ms = current_memory.auto_extract_debounce_ms;
+                let mut effective_auto_extract_max_facts = current_memory.auto_extract_max_facts;
+                let mut effective_auto_extract_model_id = current_memory.auto_extract_model_id;
+                let mut effective_auto_reconcile = current_memory.auto_reconcile;
+                let mut effective_auto_reconcile_min_interval_secs =
+                    current_memory.auto_reconcile_min_interval_secs;
+                let mut effective_auto_reconcile_similarity_threshold =
+                    current_memory.auto_reconcile_similarity_threshold;
                 if let Err(e) = moltis_config::update_config(|cfg| {
                     cfg.memory.backend = Some(backend_str.clone());
                     cfg.memory.citations = Some(citations_str.clone());
@@ -4215,6 +4269,40 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     }
                     cfg.memory.session_export = session_export;
                     effective_disable_rag = cfg.memory.disable_rag;
+                    if let Some(value) = auto_extract {
+                        cfg.memory.auto_extract = value;
+                    }
+                    if let Some(value) = auto_extract_min_chars {
+                        cfg.memory.auto_extract_min_chars = value;
+                    }
+                    if let Some(value) = auto_extract_debounce_ms {
+                        cfg.memory.auto_extract_debounce_ms = value;
+                    }
+                    if let Some(value) = auto_extract_max_facts {
+                        cfg.memory.auto_extract_max_facts = value;
+                    }
+                    if has_auto_extract_model_id {
+                        cfg.memory.auto_extract_model_id = auto_extract_model_id.clone();
+                    }
+                    if let Some(value) = auto_reconcile {
+                        cfg.memory.auto_reconcile = value;
+                    }
+                    if let Some(value) = auto_reconcile_min_interval_secs {
+                        cfg.memory.auto_reconcile_min_interval_secs = value;
+                    }
+                    if let Some(value) = auto_reconcile_similarity_threshold {
+                        cfg.memory.auto_reconcile_similarity_threshold = value;
+                    }
+                    effective_auto_extract = cfg.memory.auto_extract;
+                    effective_auto_extract_min_chars = cfg.memory.auto_extract_min_chars;
+                    effective_auto_extract_debounce_ms = cfg.memory.auto_extract_debounce_ms;
+                    effective_auto_extract_max_facts = cfg.memory.auto_extract_max_facts;
+                    effective_auto_extract_model_id = cfg.memory.auto_extract_model_id.clone();
+                    effective_auto_reconcile = cfg.memory.auto_reconcile;
+                    effective_auto_reconcile_min_interval_secs =
+                        cfg.memory.auto_reconcile_min_interval_secs;
+                    effective_auto_reconcile_similarity_threshold =
+                        cfg.memory.auto_reconcile_similarity_threshold;
                 }) {
                     tracing::warn!(error = %e, "failed to persist memory config");
                 }
@@ -4225,6 +4313,14 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     "disable_rag": effective_disable_rag,
                     "llm_reranking": llm_reranking,
                     "session_export": session_export,
+                    "auto_extract": effective_auto_extract,
+                    "auto_extract_min_chars": effective_auto_extract_min_chars,
+                    "auto_extract_debounce_ms": effective_auto_extract_debounce_ms,
+                    "auto_extract_max_facts": effective_auto_extract_max_facts,
+                    "auto_extract_model_id": effective_auto_extract_model_id,
+                    "auto_reconcile": effective_auto_reconcile,
+                    "auto_reconcile_min_interval_secs": effective_auto_reconcile_min_interval_secs,
+                    "auto_reconcile_similarity_threshold": effective_auto_reconcile_similarity_threshold,
                 }))
             })
         }),
