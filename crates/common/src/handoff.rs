@@ -39,7 +39,11 @@ pub struct DeadEnd {
 
 impl DeadEnd {
     /// Create a new dead-end, computing its fingerprint.
-    pub fn new(tool_name: impl Into<String>, description: impl Into<String>, error: impl Into<String>) -> Self {
+    pub fn new(
+        tool_name: impl Into<String>,
+        description: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
         let tool_name = tool_name.into();
         let error = truncate_string(error.into(), 512);
         let fingerprint = compute_fingerprint(&tool_name, &error);
@@ -85,7 +89,11 @@ impl HandoffContext {
     /// and not over the cap).
     pub fn add_dead_end(&mut self, dead_end: DeadEnd) -> bool {
         // Deduplicate.
-        if self.dead_ends.iter().any(|d| d.fingerprint == dead_end.fingerprint) {
+        if self
+            .dead_ends
+            .iter()
+            .any(|d| d.fingerprint == dead_end.fingerprint)
+        {
             return false;
         }
         // Cap.
@@ -147,12 +155,14 @@ impl HandoffContext {
 
     /// Serialize to JSON string for storage in `SessionStateStore`.
     pub fn to_json(&self) -> crate::Result<String> {
-        serde_json::to_string(self).map_err(|e| crate::Error::message(format!("handoff serialization failed: {e}")))
+        serde_json::to_string(self)
+            .map_err(|e| crate::Error::message(format!("handoff serialization failed: {e}")))
     }
 
     /// Deserialize from a JSON string.
     pub fn from_json(json: &str) -> crate::Result<Self> {
-        serde_json::from_str(json).map_err(|e| crate::Error::message(format!("handoff deserialization failed: {e}")))
+        serde_json::from_str(json)
+            .map_err(|e| crate::Error::message(format!("handoff deserialization failed: {e}")))
     }
 }
 

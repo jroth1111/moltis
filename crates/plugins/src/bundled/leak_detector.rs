@@ -111,7 +111,6 @@ fn extract_scan_text(tool_name: &str, arguments: &serde_json::Value) -> Option<S
     Some(arguments.to_string())
 }
 
-
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
