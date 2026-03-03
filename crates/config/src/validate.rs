@@ -972,6 +972,29 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         });
     }
 
+    if config.tools.exec.sandbox.pool_min_warm > 0
+        && config.tools.exec.sandbox.scope.to_ascii_lowercase() != "shared"
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "tools.exec.sandbox.scope".into(),
+            message: "sandbox pool requires scope = \"shared\"; pool settings will be ignored"
+                .into(),
+        });
+    }
+
+    if config.tools.exec.sandbox.pool_max > 0
+        && config.tools.exec.sandbox.pool_max < config.tools.exec.sandbox.pool_min_warm
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "tools.exec.sandbox.pool_max".into(),
+            message: "pool_max must be greater than or equal to pool_min_warm".into(),
+        });
+    }
+
     // Loop limit must be positive to avoid immediate run failures.
     if config.tools.agent_max_iterations == 0 {
         diagnostics.push(Diagnostic {
@@ -1646,6 +1669,43 @@ mode = "off"
             .iter()
             .find(|d| d.path == "tools.exec.sandbox.mode");
         assert!(warning.is_some(), "expected warning for sandbox mode off");
+    }
+
+    #[test]
+    fn sandbox_pool_with_non_shared_scope_warned() {
+        let toml = r#"
+[tools.exec.sandbox]
+scope = "session"
+pool_min_warm = 1
+"#;
+        let result = validate_toml_str(toml);
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "tools.exec.sandbox.scope");
+        assert!(
+            warning.is_some(),
+            "expected warning for pool_min_warm with non-shared scope"
+        );
+    }
+
+    #[test]
+    fn sandbox_pool_max_less_than_min_is_error() {
+        let toml = r#"
+[tools.exec.sandbox]
+scope = "shared"
+pool_min_warm = 4
+pool_max = 2
+"#;
+        let result = validate_toml_str(toml);
+        let error = result
+            .diagnostics
+            .iter()
+            .find(|d| d.severity == Severity::Error && d.path == "tools.exec.sandbox.pool_max");
+        assert!(
+            error.is_some(),
+            "expected error for pool_max < pool_min_warm"
+        );
     }
 
     #[test]

@@ -1339,8 +1339,23 @@ pub async fn container_disk_usage() -> Result<ContainerDiskUsage> {
 /// Returns the number of containers removed.
 pub async fn clean_all_containers(container_prefix: &str) -> Result<usize> {
     let containers = list_running_containers(container_prefix).await?;
+    clean_containers_inner(&containers, false).await
+}
+
+/// Remove non-pool containers whose name starts with `container_prefix`.
+///
+/// This is intended for startup GC where pooled slots should survive.
+pub async fn clean_session_containers(container_prefix: &str) -> Result<usize> {
+    let containers = list_running_containers(container_prefix).await?;
+    clean_containers_inner(&containers, true).await
+}
+
+async fn clean_containers_inner(containers: &[RunningContainer], skip_pool: bool) -> Result<usize> {
     let mut removed = 0;
-    for c in &containers {
+    for c in containers {
+        if skip_pool && is_pool_container_name(&c.name) {
+            continue;
+        }
         // Stop running containers first.
         if c.state == ContainerRunState::Running {
             let _ = stop_container(&c.name).await;
@@ -1353,6 +1368,10 @@ pub async fn clean_all_containers(container_prefix: &str) -> Result<usize> {
         }
     }
     Ok(removed)
+}
+
+fn is_pool_container_name(name: &str) -> bool {
+    name.contains("-moltis-pool-")
 }
 
 /// Stop a container by name. Detects the backend from the available CLIs.
@@ -5294,10 +5313,13 @@ impl SandboxRouter {
     /// If the session holds a pool slot, the guard is released (returning the
     /// slot to the pool) instead of destroying the container.
     pub async fn cleanup_session(&self, session_key: &str) -> Result<()> {
-        // If this session has a pool guard, release it (RAII returns the slot).
-        let had_pool_slot = self.pool_guards.write().await.remove(session_key).is_some();
-        if had_pool_slot {
-            debug!(session = session_key, "released pool slot");
+        // If this session has a pool guard, clean the pooled sandbox first to
+        // avoid cross-session state leakage, then release the guard.
+        if let Some(guard) = self.pool_guards.write().await.remove(session_key) {
+            let sid = guard.sandbox_id();
+            self.backend.cleanup(&sid).await?;
+            drop(guard);
+            debug!(session = session_key, sandbox_id = %sid, "released and reset pool slot");
         } else {
             let id = self.sandbox_id_for(session_key);
             self.backend.cleanup(&id).await?;
@@ -5420,6 +5442,10 @@ mod tests {
         fn exec_calls(&self) -> usize {
             self.exec_calls.load(Ordering::SeqCst)
         }
+
+        fn cleanup_calls(&self) -> usize {
+            self.cleanup_calls.load(Ordering::SeqCst)
+        }
     }
 
     #[test]
@@ -5472,6 +5498,12 @@ mod tests {
         assert_eq!(SandboxMode::Off.to_string(), "off");
         assert_eq!(SandboxMode::NonMain.to_string(), "non-main");
         assert_eq!(SandboxMode::All.to_string(), "all");
+    }
+
+    #[test]
+    fn test_is_pool_container_name() {
+        assert!(is_pool_container_name("moltis-sandbox-moltis-pool-0"));
+        assert!(!is_pool_container_name("moltis-sandbox-session-main"));
     }
 
     #[test]
@@ -6105,6 +6137,26 @@ mod tests {
         assert!(!router.mark_preparing_once("main").await);
         router.clear_prepared_session("main").await;
         assert!(router.mark_preparing_once("main").await);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_session_resets_pooled_slot() {
+        let backend = Arc::new(TestSandbox::new("docker", None, None));
+        let backend_dyn: Arc<dyn Sandbox> = backend.clone();
+        let pool =
+            Arc::new(crate::sandbox_pool::SandboxPool::new(backend_dyn.clone(), 1, 1, None).await);
+        let router =
+            SandboxRouter::with_backend(SandboxConfig::default(), backend_dyn).with_pool(pool);
+
+        let sid = router
+            .try_acquire_pool_slot("session-1")
+            .await
+            .expect("pool slot");
+        assert!(sid.key.contains("moltis-pool-"));
+
+        let before = backend.cleanup_calls();
+        router.cleanup_session("session-1").await.expect("cleanup");
+        assert_eq!(backend.cleanup_calls(), before + 1);
     }
 
     #[tokio::test]

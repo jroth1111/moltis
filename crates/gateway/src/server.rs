@@ -2080,14 +2080,22 @@ pub async fn prepare_gateway(
 
     // Pre-warm sandbox pool when configured.
     if sandbox_config.pool_min_warm > 0 {
-        let pool = moltis_tools::sandbox_pool::SandboxPool::new(
-            Arc::clone(sandbox_router.backend()),
-            sandbox_config.pool_min_warm,
-            sandbox_config.pool_max,
-            sandbox_config.image.as_deref(),
-        )
-        .await;
-        sandbox_router = sandbox_router.with_pool(Arc::new(pool));
+        if sandbox_config.scope == moltis_tools::sandbox::SandboxScope::Shared {
+            let pool = moltis_tools::sandbox_pool::SandboxPool::new(
+                Arc::clone(sandbox_router.backend()),
+                sandbox_config.pool_min_warm,
+                sandbox_config.pool_max,
+                sandbox_config.image.as_deref(),
+            )
+            .await;
+            sandbox_router = sandbox_router.with_pool(Arc::new(pool));
+        } else {
+            warn!(
+                scope = ?sandbox_config.scope,
+                pool_min_warm = sandbox_config.pool_min_warm,
+                "sandbox pool is only supported with shared scope; ignoring pool settings"
+            );
+        }
     }
 
     let sandbox_router = Arc::new(sandbox_router);
@@ -2337,7 +2345,7 @@ pub async fn prepare_gateway(
         let prefix = sandbox_router.config().container_prefix.clone();
         tokio::spawn(async move {
             if let Some(prefix) = prefix {
-                match moltis_tools::sandbox::clean_all_containers(&prefix).await {
+                match moltis_tools::sandbox::clean_session_containers(&prefix).await {
                     Ok(0) => {},
                     Ok(n) => info!(
                         removed = n,
