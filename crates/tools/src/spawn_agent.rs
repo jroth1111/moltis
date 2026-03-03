@@ -145,6 +145,7 @@ impl SpawnAgentTool {
 
     fn build_sub_tools(
         &self,
+        task: &str,
         allow_tools: &[String],
         deny_tools: &[String],
         delegate_only: bool,
@@ -158,8 +159,10 @@ impl SpawnAgentTool {
             self.tool_registry
                 .clone_allowed_by(|name| name != "spawn_agent" && allowed.contains(name))
         } else {
-            // Default behavior preserves old semantics.
-            self.tool_registry.clone_without(&["spawn_agent"])
+            // Auto-select tools based on task description.
+            let selected =
+                crate::tool_selector::select_tools_for_task(task, &self.tool_registry);
+            selected.clone_without(&["spawn_agent"])
         };
 
         if !deny_tools.is_empty() {
@@ -218,7 +221,8 @@ impl AgentTool for SpawnAgentTool {
         "Spawn a sub-agent to handle a complex, multi-step task autonomously. \
          The sub-agent runs its own agent loop with access to tools and returns \
          the result when done. Use this to delegate tasks that require multiple \
-         tool calls or independent reasoning. Supports optional tool policy controls."
+         tool calls or independent reasoning. Tools are automatically selected \
+         based on the task description unless `allow_tools` is explicitly provided."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -357,7 +361,9 @@ impl AgentTool for SpawnAgentTool {
         });
 
         // Build filtered tool registry from policy knobs.
-        let sub_tools = self.build_sub_tools(&allow_tools, &deny_tools, delegate_only);
+        // When no explicit allow_tools are specified, the selector automatically
+        // scopes tools based on the task description.
+        let sub_tools = self.build_sub_tools(&task, &allow_tools, &deny_tools, delegate_only);
 
         // Build system prompt.
         let mut system_prompt = if context.is_empty() {
@@ -797,6 +803,7 @@ mod tests {
         );
 
         let filtered = spawn_tool.build_sub_tools(
+            "test task",
             &[
                 "exec".to_string(),
                 "task_list".to_string(),
@@ -830,6 +837,7 @@ mod tests {
 
         // Even though exec is in the allow list, global policy denies it.
         let filtered = spawn_tool.build_sub_tools(
+            "test task",
             &["exec".to_string(), "web_fetch".to_string()],
             &[],
             false,
@@ -858,7 +866,7 @@ mod tests {
             ]),
         );
 
-        let filtered = spawn_tool.build_sub_tools(&[], &[], true);
+        let filtered = spawn_tool.build_sub_tools("test task", &[], &[], true);
         assert!(filtered.get("spawn_agent").is_some());
         assert!(filtered.get("sessions_list").is_some());
         assert!(filtered.get("sessions_history").is_some());
