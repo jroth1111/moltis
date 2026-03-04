@@ -378,6 +378,15 @@ fn build_schema_map() -> KnownKeys {
                         ("memory_bootstrap_max_chars", Leaf),
                     ])),
                 ),
+                (
+                    "deterministic_policy",
+                    Struct(HashMap::from([
+                        ("strict_soul_routing", Leaf),
+                        ("untrusted_content_mode", Leaf),
+                        ("memory_relevance_min_score", Leaf),
+                        ("max_memory_facts_in_prompt", Leaf),
+                    ])),
+                ),
             ])),
         ),
         (
@@ -1162,6 +1171,46 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         });
     }
 
+    // Deterministic policy configuration validation.
+    let valid_untrusted_modes = ["sanitize", "drop"];
+    if !valid_untrusted_modes.contains(
+        &config
+            .chat
+            .deterministic_policy
+            .untrusted_content_mode
+            .as_str(),
+    ) {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "type-error",
+            path: "chat.deterministic_policy.untrusted_content_mode".into(),
+            message: format!(
+                "unknown mode \"{}\"; expected one of: {}",
+                config.chat.deterministic_policy.untrusted_content_mode,
+                valid_untrusted_modes.join(", ")
+            ),
+        });
+    }
+
+    let min_score = config.chat.deterministic_policy.memory_relevance_min_score;
+    if !(0.0..=1.0).contains(&min_score) {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "type-error",
+            path: "chat.deterministic_policy.memory_relevance_min_score".into(),
+            message: format!("must be within [0.0, 1.0], got {min_score}"),
+        });
+    }
+
+    if config.chat.deterministic_policy.max_memory_facts_in_prompt == 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "type-error",
+            path: "chat.deterministic_policy.max_memory_facts_in_prompt".into(),
+            message: "must be greater than 0".into(),
+        });
+    }
+
     // Unknown voice TTS providers list values
     let valid_voice_tts_providers = [
         "elevenlabs",
@@ -1793,6 +1842,43 @@ security_level = "paranoid"
             warning.is_some(),
             "expected warning for unknown security level"
         );
+    }
+
+    #[test]
+    fn invalid_untrusted_content_mode_errors() {
+        let toml = r#"
+[chat.deterministic_policy]
+untrusted_content_mode = "rewrite"
+"#;
+        let result = validate_toml_str(toml);
+        let error = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "chat.deterministic_policy.untrusted_content_mode");
+        assert!(
+            error.is_some_and(|d| d.severity == Severity::Error),
+            "expected hard error for invalid untrusted_content_mode"
+        );
+    }
+
+    #[test]
+    fn invalid_memory_policy_ranges_error() {
+        let toml = r#"
+[chat.deterministic_policy]
+memory_relevance_min_score = 1.5
+max_memory_facts_in_prompt = 0
+"#;
+        let result = validate_toml_str(toml);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.path == "chat.deterministic_policy.memory_relevance_min_score"
+                && d.severity == Severity::Error));
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.path == "chat.deterministic_policy.max_memory_facts_in_prompt"
+                && d.severity == Severity::Error));
     }
 
     #[test]

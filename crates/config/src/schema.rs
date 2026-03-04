@@ -1238,6 +1238,9 @@ pub struct ChatConfig {
     /// Character budgets for major system-prompt sections.
     #[serde(default)]
     pub prompt_budgets: PromptBudgetsConfig,
+    /// Deterministic runtime policy controls for prompt/persona/tool handling.
+    #[serde(default)]
+    pub deterministic_policy: DeterministicPolicyConfig,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1263,6 +1266,7 @@ impl Default for ChatConfig {
             context_compaction_keep_recent: default_compaction_keep_recent(),
             research: ResearchConfig::default(),
             prompt_budgets: PromptBudgetsConfig::default(),
+            deterministic_policy: DeterministicPolicyConfig::default(),
         }
     }
 }
@@ -1288,6 +1292,47 @@ impl Default for PromptBudgetsConfig {
             project_context_max_chars: 8_000,
             workspace_file_max_chars: 6_000,
             memory_bootstrap_max_chars: 8_000,
+        }
+    }
+}
+
+fn default_untrusted_content_mode() -> String {
+    "sanitize".to_string()
+}
+
+fn default_memory_relevance_min_score() -> f64 {
+    0.18
+}
+
+fn default_max_memory_facts_in_prompt() -> usize {
+    12
+}
+
+/// Deterministic runtime policy controls for persona/prompt assembly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeterministicPolicyConfig {
+    /// When true, invalid/orphan SOUL lane markers fail prompt assembly.
+    pub strict_soul_routing: bool,
+    /// How to handle untrusted tool/web payloads before reinjection.
+    /// Supported values: "sanitize", "drop".
+    #[serde(default = "default_untrusted_content_mode")]
+    pub untrusted_content_mode: String,
+    /// Minimum relevance score required for memory facts to be injected.
+    #[serde(default = "default_memory_relevance_min_score")]
+    pub memory_relevance_min_score: f64,
+    /// Maximum number of memory facts injected into prompt bootstrap.
+    #[serde(default = "default_max_memory_facts_in_prompt")]
+    pub max_memory_facts_in_prompt: usize,
+}
+
+impl Default for DeterministicPolicyConfig {
+    fn default() -> Self {
+        Self {
+            strict_soul_routing: true,
+            untrusted_content_mode: default_untrusted_content_mode(),
+            memory_relevance_min_score: default_memory_relevance_min_score(),
+            max_memory_facts_in_prompt: default_max_memory_facts_in_prompt(),
         }
     }
 }
@@ -2410,6 +2455,15 @@ system_prompt_suffix = "Focus on evidence."
     fn chat_config_toml_missing_queue_mode_defaults_to_followup() {
         let cfg: ChatConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.message_queue_mode, MessageQueueMode::Followup);
+    }
+
+    #[test]
+    fn chat_deterministic_policy_defaults_are_set() {
+        let cfg: ChatConfig = toml::from_str("").unwrap();
+        assert!(cfg.deterministic_policy.strict_soul_routing);
+        assert_eq!(cfg.deterministic_policy.untrusted_content_mode, "sanitize");
+        assert_eq!(cfg.deterministic_policy.memory_relevance_min_score, 0.18);
+        assert_eq!(cfg.deterministic_policy.max_memory_facts_in_prompt, 12);
     }
 
     #[test]
