@@ -46,7 +46,8 @@ SOUL section routing precedence:
 1. Explicit lane marker (`<!-- lane:agents|tools|heartbeat|soul -->`)
 2. Default `soul` lane
 
-Invalid or orphan lane markers are ignored and reported as warnings.
+With `chat.deterministic_policy.strict_soul_routing = true` (default), invalid
+or orphan lane markers are treated as hard errors.
 
 ## Prompt Budgets
 

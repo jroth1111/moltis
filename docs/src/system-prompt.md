@@ -121,7 +121,8 @@ a section to a workspace lane:
 Place markers immediately before a `##` section (or inline on the same line).
 The marker is stripped from prompt output. Routed content is removed from
 `## Soul` and injected once into the target workspace block (no duplication).
-Invalid/orphan markers are ignored and produce warnings.
+By default (`chat.deterministic_policy.strict_soul_routing = true`), invalid or
+orphan markers fail prompt assembly.
 
 Routing precedence is:
 
@@ -222,11 +223,27 @@ When a section exceeds its budget, prompt assembly truncates it and appends a
 truncation notice in the prompt. The runtime also logs a warning with section
 name and original size.
 
+Deterministic policy controls are configurable in `moltis.toml`:
+
+```toml
+[chat.deterministic_policy]
+strict_soul_routing = true
+untrusted_content_mode = "sanitize" # sanitize | drop
+memory_relevance_min_score = 0.18
+max_memory_facts_in_prompt = 12
+```
+
+Memory bootstrap is relevance-filtered before prompt injection using this
+policy (`Top-N + minimum score`), rather than blindly injecting the full
+`MEMORY.md` body.
+
 Debug endpoints include this as structured metadata:
 
 - `personaDiagnostics`: health-check warnings on the assembled persona
 - `truncations`: section-level budget overflow details
+- `droppedSections`: section IDs dropped by priority-based budget enforcement
 - `policyDecisions`: deterministic policy decisions for surface/privacy gating
+- `untrustedTransforms`: deterministic transform/drop events from policy pipeline
 
 ### Tool Schemas
 
