@@ -274,10 +274,20 @@ function eligibilityBadge(d) {
 	return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--surface2);color:var(--muted);font-weight:500">no deps declared</span>`;
 }
 
+function isQuarantinedSkill(d) {
+	return d?.quarantined === true || d?.status === "quarantined";
+}
+
 function trustBadge(d) {
+	if (isQuarantinedSkill(d)) return null;
 	if (d.trusted === false)
 		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">untrusted</span>`;
 	return null;
+}
+
+function quarantineBadge(d) {
+	if (!isQuarantinedSkill(d)) return null;
+	return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">quarantined</span>`;
 }
 
 function SkillMetadata(props) {
@@ -364,8 +374,10 @@ function SkillDetail(props) {
 	if (!d) return null;
 
 	var isDisc = d.source === "personal" || d.source === "project";
+	var isQuarantined = isQuarantinedSkill(d);
 	var needsTrust = !isDisc && d.trusted === false;
 	var isProtected = isDisc && d.protected === true;
+	var quarantineReason = d.quarantine_reason || "integrity checks failed";
 
 	function doToggle() {
 		actionBusy.value = true;
@@ -379,6 +391,24 @@ function SkillDetail(props) {
 			} else {
 				showToast(`Failed: ${r?.error || "unknown error"}`, "error");
 			}
+			});
+	}
+
+	function doUnquarantine() {
+		actionBusy.value = true;
+		sendRpc("skills.skill.unquarantine", {
+			source: props.repoSource,
+			skill: d.name,
+			confirm: true,
+		}).then((r) => {
+			actionBusy.value = false;
+			if (r?.ok) {
+				showToast(`Unquarantined ${d.name}. Review, trust, then enable.`, "success");
+				fetchAll();
+				props.onReload?.();
+			} else {
+				showToast(`Failed: ${r?.error || "unknown error"}`, "error");
+			}
 		});
 	}
 
@@ -387,6 +417,18 @@ function SkillDetail(props) {
 		if (actionBusy.value) return;
 		if (isProtected) {
 			showToast(`Skill ${d.name} is protected and cannot be deleted from UI`, "error");
+			return;
+		}
+		if (isQuarantined) {
+			requestConfirm(
+				`Unquarantine skill "${d.name}"?\n\nReason: ${quarantineReason}\n\nAfter unquarantine, you still need to trust and enable it separately.`,
+				{
+					confirmLabel: "Unquarantine",
+					danger: true,
+				},
+			).then((yes) => {
+				if (yes) doUnquarantine();
+			});
 			return;
 		}
 		if (!d.enabled && needsTrust) {
@@ -418,48 +460,62 @@ function SkillDetail(props) {
 		doToggle();
 	}
 
+	var actionLabel = actionBusy.value
+		? isQuarantined
+			? "Unquarantining..."
+			: isDisc && d.enabled
+				? "Deleting..."
+				: "Loading..."
+		: isProtected
+			? "Protected"
+			: isQuarantined
+				? "Unquarantine"
+				: isDisc && d.enabled
+					? "Delete"
+					: d.enabled
+						? "Disable"
+						: "Enable";
+
 	return html`<div ref=${panelRef} class="skills-detail-panel" style="display:block">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
       <div style="display:flex;align-items:center;gap:8px">
         <span style="font-family:var(--font-mono);font-size:.9rem;font-weight:600;color:var(--text-strong)">${d.display_name || d.name}</span>
         ${d.display_name && html`<span style="font-family:var(--font-mono);font-size:.72rem;color:var(--muted)">${d.name}</span>`}
-        ${d.license && d.license_url && html`<a href=${d.license_url} target="_blank" rel="noopener noreferrer" style="font-size:.65rem;padding:1px 6px;border-radius:9999px;background:var(--surface2);color:var(--muted);text-decoration:none">${d.license}</a>`}
-        ${d.license && !d.license_url && html`<span style="font-size:.65rem;padding:1px 6px;border-radius:9999px;background:var(--surface2);color:var(--muted)">${d.license}</span>`}
-        ${eligibilityBadge(d)}
-        ${trustBadge(d)}
-      </div>
-      <div style="display:flex;align-items:center;gap:6px">
-				<button onClick=${onToggle} disabled=${isProtected || actionBusy.value} class=${isDisc && d.enabled ? "provider-btn provider-btn-sm provider-btn-danger" : ""} style=${
-					isDisc && d.enabled
-						? {}
-						: {
-								background: d.enabled ? "none" : "var(--accent)",
-								border: "1px solid var(--border)",
-								borderRadius: "var(--radius-sm)",
-								fontSize: ".72rem",
-								padding: "3px 10px",
-								cursor: "pointer",
-								color: d.enabled ? "var(--muted)" : "#fff",
-								fontWeight: 500,
-							}
-				}>${
-					actionBusy.value
-						? isDisc && d.enabled
-							? "Deleting..."
-							: "Loading..."
-						: isProtected
-							? "Protected"
-							: isDisc && d.enabled
-								? "Delete"
-								: d.enabled
-									? "Disable"
-									: "Enable"
-				}</button>
+	        ${d.license && d.license_url && html`<a href=${d.license_url} target="_blank" rel="noopener noreferrer" style="font-size:.65rem;padding:1px 6px;border-radius:9999px;background:var(--surface2);color:var(--muted);text-decoration:none">${d.license}</a>`}
+	        ${d.license && !d.license_url && html`<span style="font-size:.65rem;padding:1px 6px;border-radius:9999px;background:var(--surface2);color:var(--muted)">${d.license}</span>`}
+	        ${eligibilityBadge(d)}
+					${quarantineBadge(d)}
+	        ${trustBadge(d)}
+	      </div>
+	      <div style="display:flex;align-items:center;gap:6px">
+					<button onClick=${onToggle} disabled=${isProtected || actionBusy.value} class=${
+						isDisc && d.enabled && !isQuarantined ? "provider-btn provider-btn-sm provider-btn-danger" : ""
+					} style=${
+						isDisc && d.enabled && !isQuarantined
+							? {}
+							: {
+									background: isQuarantined ? "var(--error, #e55)" : d.enabled ? "none" : "var(--accent)",
+									border: "1px solid var(--border)",
+									borderRadius: "var(--radius-sm)",
+									fontSize: ".72rem",
+									padding: "3px 10px",
+									cursor: "pointer",
+									color: d.enabled && !isQuarantined ? "var(--muted)" : "#fff",
+									fontWeight: 500,
+								}
+					}>${actionLabel}</button>
         <button onClick=${onClose} style="background:none;border:none;color:var(--muted);font-size:.9rem;cursor:pointer;padding:2px 4px">\u2715</button>
       </div>
     </div>
-    <${SkillMetadata} detail=${d} />
-    ${d.commit_age_days != null && d.commit_age_days <= 14 && html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--warning, #c77d00);background:color-mix(in srgb, var(--warning, #c77d00) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)"><strong style="color:var(--warning, #c77d00)">Recent commit warning:</strong> This skill was updated ${d.commit_age_days} day${d.commit_age_days === 1 ? "" : "s"} ago. Treat recent updates as high risk and review diffs before trusting/enabling.</div>`}
+	    <${SkillMetadata} detail=${d} />
+	    ${
+				isQuarantined &&
+				html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--error, #e55);background:color-mix(in srgb, var(--error, #e55) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)">
+	      <strong style="color:var(--error, #e55)">Quarantined:</strong> ${quarantineReason}.<br />
+	      This skill is fail-closed and cannot be enabled until you explicitly unquarantine, review, trust, and enable it.
+	    </div>`
+			}
+	    ${d.commit_age_days != null && d.commit_age_days <= 14 && html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--warning, #c77d00);background:color-mix(in srgb, var(--warning, #c77d00) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)"><strong style="color:var(--warning, #c77d00)">Recent commit warning:</strong> This skill was updated ${d.commit_age_days} day${d.commit_age_days === 1 ? "" : "s"} ago. Treat recent updates as high risk and review diffs before trusting/enabling.</div>`}
     ${d.drifted && html`<div style="margin:0 0 8px;font-size:.75rem;color:var(--warning, #c77d00)">Source changed since last trust; review updates before enabling again.</div>`}
     ${d.description && html`<p style="margin:0 0 8px;font-size:.82rem;color:var(--text)">${d.description}</p>`}
     <${MissingDepsSection} detail=${d} onReload=${props.onReload} />
@@ -497,6 +553,7 @@ function RepoCard(props) {
 	var removingRepo = useSignal(false);
 	var isOrphan = repo.orphaned === true || String(repo.source || "").startsWith("orphan:");
 	var sourceLabel = isOrphan ? repo.repo_name : repo.source;
+	var quarantinedCount = Number(repo.quarantined_count || 0);
 
 	var href = isOrphan ? null : /^https?:\/\//.test(repo.source) ? repo.source : `https://github.com/${repo.source}`;
 
@@ -571,10 +628,11 @@ function RepoCard(props) {
            style="font-family:var(--font-mono);font-size:.82rem;font-weight:500;color:var(--text-strong);text-decoration:none">${sourceLabel}</a>`
 						: html`<span style="font-family:var(--font-mono);font-size:.82rem;font-weight:500;color:var(--text-strong)">${sourceLabel}</span>`
 				}
-        <span style="font-size:.72rem;color:var(--muted)">${repo.enabled_count}/${repo.skill_count} enabled</span>
-				${repo.commit_sha && html`<span style="font-size:.68rem;color:var(--muted)">sha ${shortSha(repo.commit_sha)}</span>`}
-				${repo.drifted && html`<span style="font-size:.64rem;padding:1px 6px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">source changed</span>`}
-				${isOrphan && html`<span style="font-size:.64rem;padding:1px 6px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">orphaned on disk</span>`}
+	        <span style="font-size:.72rem;color:var(--muted)">${repo.enabled_count}/${repo.skill_count} enabled</span>
+					${quarantinedCount > 0 && html`<span style="font-size:.64rem;padding:1px 6px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">${quarantinedCount} quarantined</span>`}
+					${repo.commit_sha && html`<span style="font-size:.68rem;color:var(--muted)">sha ${shortSha(repo.commit_sha)}</span>`}
+					${repo.drifted && html`<span style="font-size:.64rem;padding:1px 6px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">source changed</span>`}
+					${isOrphan && html`<span style="font-size:.64rem;padding:1px 6px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">orphaned on disk</span>`}
       </div>
       <button class="provider-btn provider-btn-sm provider-btn-danger" disabled=${removingRepo.value} onClick=${removeRepo}>${removingRepo.value ? "Removing..." : "Remove"}</button>
     </div>
@@ -599,12 +657,13 @@ function RepoCard(props) {
                 ${skill.display_name && html`<span style="color:var(--muted);font-size:.68rem;font-family:var(--font-mono);white-space:nowrap">${skill.name}</span>`}
                 ${skill.description && html`<span style="color:var(--muted);font-size:.72rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${skill.description}</span>`}
               </div>
-              <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;margin-left:8px">
-                ${skill.enabled && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--accent);color:#fff;font-weight:500">enabled</span>`}
-                ${skill.trusted === false && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">untrusted</span>`}
-                ${skill.drifted && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">source changed</span>`}
-                ${skill.eligible === false && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">blocked</span>`}
-              </div>
+	              <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;margin-left:8px">
+	                ${skill.enabled && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--accent);color:#fff;font-weight:500">enabled</span>`}
+	                ${(skill.quarantined === true || skill.status === "quarantined") && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">quarantined</span>`}
+	                ${skill.trusted === false && skill.quarantined !== true && skill.status !== "quarantined" && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">untrusted</span>`}
+	                ${skill.drifted && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">source changed</span>`}
+	                ${skill.eligible === false && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">blocked</span>`}
+	              </div>
             </div>`,
 					)}
         </div>`
@@ -638,8 +697,9 @@ function RepoCard(props) {
 
 function ReposSection() {
 	var r = repos.value;
+	var quarantinedTotal = (r || []).reduce((sum, repo) => sum + Number(repo.quarantined_count || 0), 0);
 	return html`<div class="skills-section">
-    <h3 class="skills-section-title">Installed Repositories</h3>
+    <h3 class="skills-section-title">Installed Repositories${quarantinedTotal > 0 ? ` (${quarantinedTotal} quarantined)` : ""}</h3>
     <div class="skills-section">
       ${(!r || r.length === 0) && html`<div style="padding:12px;color:var(--muted);font-size:.82rem">No repositories installed.</div>`}
       ${r.map((repo) => html`<${RepoCard} key=${repo.source} repo=${repo} />`)}
