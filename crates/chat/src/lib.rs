@@ -34,6 +34,7 @@ use {
             collect_dropped_prompt_sections,
             collect_soul_routing_issues,
             collect_prompt_section_truncations,
+            validate_soul_routing,
         },
         runner::{RunnerEvent, run_agent_loop_streaming},
         tool_registry::{AgentTool, ToolRegistry},
@@ -1301,8 +1302,8 @@ fn validate_prompt_persona(agent_id: &str, persona: &PromptPersona) -> Vec<Perso
 
     for issue in collect_soul_routing_issues(soul) {
         issues.push(PersonaHealthIssue {
-            code: "soul_routing_issue",
-            message: issue,
+            code: issue.code.as_str(),
+            message: issue.message,
         });
     }
 
@@ -1544,19 +1545,27 @@ fn apply_private_persona_data_policy(
     }
 }
 
+fn format_soul_routing_diagnostics(diagnostics: &moltis_agents::prompt::SoulRoutingDiagnostics) -> String {
+    diagnostics
+        .issues
+        .iter()
+        .map(|issue| format!("{}: {}", issue.code.as_str(), issue.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn enforce_strict_soul_routing(agent_id: &str, persona: &PromptPersona) -> error::Result<()> {
     if !persona.config.chat.deterministic_policy.strict_soul_routing {
         return Ok(());
     }
     let soul = persona.soul_text.as_deref().unwrap_or_default();
-    let issues = collect_soul_routing_issues(soul);
-    if issues.is_empty() {
-        return Ok(());
+    if let Err(diagnostics) = validate_soul_routing(soul) {
+        let detail = format_soul_routing_diagnostics(&diagnostics);
+        return Err(error::Error::message(format!(
+            "agent '{agent_id}' failed strict SOUL routing validation: {detail}"
+        )));
     }
-    let detail = issues.join("; ");
-    Err(error::Error::message(format!(
-        "agent '{agent_id}' failed strict SOUL routing validation: {detail}"
-    )))
+    Ok(())
 }
 
 fn user_content_to_search_text(user_content: &UserContent) -> String {
@@ -5436,7 +5445,7 @@ impl ChatService for LiveChatService {
         let tool_count = filtered_registry.list_schemas().len();
 
         // Build the system prompt.
-        let system_prompt = if tools_enabled {
+        let system_prompt = (if tools_enabled {
             build_system_prompt_with_session_runtime_workspace_budgets(
                 &filtered_registry,
                 native_tools,
@@ -5465,7 +5474,13 @@ impl ChatService for LiveChatService {
                 Some(&runtime_context),
                 selected_memory.as_deref(),
             )
-        };
+        })
+        .map_err(|diagnostics| {
+            ServiceError::message(format!(
+                "agent '{prompt_agent_id}' failed strict SOUL routing validation: {}",
+                format_soul_routing_diagnostics(&diagnostics)
+            ))
+        })?;
 
         let char_count = system_prompt.len();
 
@@ -5610,7 +5625,7 @@ impl ChatService for LiveChatService {
         };
 
         // Build the system prompt.
-        let system_prompt = if tools_enabled {
+        let system_prompt = (if tools_enabled {
             build_system_prompt_with_session_runtime_workspace_budgets(
                 &filtered_registry,
                 native_tools,
@@ -5639,7 +5654,13 @@ impl ChatService for LiveChatService {
                 Some(&runtime_context),
                 selected_memory.as_deref(),
             )
-        };
+        })
+        .map_err(|diagnostics| {
+            ServiceError::message(format!(
+                "agent '{prompt_agent_id}' failed strict SOUL routing validation: {}",
+                format_soul_routing_diagnostics(&diagnostics)
+            ))
+        })?;
 
         let system_prompt_chars = system_prompt.len();
 
@@ -6787,6 +6808,30 @@ async fn run_with_tools(
             selected_memory.as_deref(),
         )
     };
+    let system_prompt = match system_prompt {
+        Ok(prompt) => prompt,
+        Err(diagnostics) => {
+            let error_obj = parse_chat_error(
+                &format!(
+                    "agent '{agent_id}' failed strict SOUL routing validation: {}",
+                    format_soul_routing_diagnostics(&diagnostics)
+                ),
+                Some(provider_name),
+            );
+            deliver_channel_error(state, session_key, &error_obj).await;
+            let error_payload = ChatErrorBroadcast {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                state: "error",
+                error: error_obj,
+                seq: client_seq,
+            };
+            #[allow(clippy::unwrap_used)] // serializing known-valid struct
+            let payload_val = serde_json::to_value(&error_payload).unwrap();
+            broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
+            return None;
+        },
+    };
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     // Keep the runtime datetime/date sentence as the final prompt line for better cache locality.
@@ -7721,6 +7766,30 @@ async fn run_streaming(
         runtime_context,
         selected_memory.as_deref(),
     );
+    let system_prompt = match system_prompt {
+        Ok(prompt) => prompt,
+        Err(diagnostics) => {
+            let error_obj = parse_chat_error(
+                &format!(
+                    "agent '{agent_id}' failed strict SOUL routing validation: {}",
+                    format_soul_routing_diagnostics(&diagnostics)
+                ),
+                Some(provider_name),
+            );
+            deliver_channel_error(state, session_key, &error_obj).await;
+            let error_payload = ChatErrorBroadcast {
+                run_id: run_id.to_string(),
+                session_key: session_key.to_string(),
+                state: "error",
+                error: error_obj,
+                seq: client_seq,
+            };
+            #[allow(clippy::unwrap_used)] // serializing known-valid struct
+            let payload_val = serde_json::to_value(&error_payload).unwrap();
+            broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
+            return None;
+        },
+    };
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     // Keep the runtime datetime/date sentence as the final prompt line for better cache locality.
@@ -9478,7 +9547,7 @@ mod tests {
             Some("# SOUL.md\n\n<!-- lane:not_valid -->\n## Identity\nTruth first.\n".to_string());
         let issues = validate_prompt_persona("main", &persona);
         assert!(issues.iter().any(|issue| issue.code == "identity_empty"));
-        assert!(issues.iter().any(|issue| issue.code == "soul_routing_issue"
+        assert!(issues.iter().any(|issue| issue.code == "invalid_soul_marker"
             && issue.message.contains("invalid SOUL lane marker")));
     }
 

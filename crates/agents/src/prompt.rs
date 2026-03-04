@@ -126,6 +126,66 @@ pub struct DroppedPromptSection {
     pub max_chars: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoulRoutingIssueCode {
+    InvalidSoulMarker,
+    OrphanSoulMarker,
+    DuplicateSoulSection,
+    SectionPlacementMismatch,
+}
+
+impl SoulRoutingIssueCode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidSoulMarker => "invalid_soul_marker",
+            Self::OrphanSoulMarker => "orphan_soul_marker",
+            Self::DuplicateSoulSection => "duplicate_soul_section",
+            Self::SectionPlacementMismatch => "section_placement_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoulRoutingIssue {
+    pub code: SoulRoutingIssueCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SoulRoutingDiagnostics {
+    pub issues: Vec<SoulRoutingIssue>,
+}
+
+impl SoulRoutingDiagnostics {
+    fn push(&mut self, code: SoulRoutingIssueCode, message: impl Into<String>) {
+        self.issues.push(SoulRoutingIssue {
+            code,
+            message: message.into(),
+        });
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.issues.is_empty()
+    }
+
+    #[must_use]
+    pub fn joined_messages(&self) -> String {
+        self.issues
+            .iter()
+            .map(|issue| issue.message.clone())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+impl std::fmt::Display for SoulRoutingDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.joined_messages())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PriorityBucket {
     SafetyBoundaries,
@@ -178,7 +238,7 @@ pub fn build_system_prompt(
     tools: &ToolRegistry,
     native_tools: bool,
     project_context: Option<&str>,
-) -> String {
+) -> Result<String, SoulRoutingDiagnostics> {
     build_system_prompt_with_session_runtime(
         tools,
         native_tools,
@@ -207,7 +267,7 @@ pub fn build_system_prompt_with_session_runtime(
     tools_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
-) -> String {
+) -> Result<String, SoulRoutingDiagnostics> {
     build_system_prompt_with_session_runtime_workspace(
         tools,
         native_tools,
@@ -239,7 +299,7 @@ pub fn build_system_prompt_with_session_runtime_workspace(
     heartbeat_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
-) -> String {
+) -> Result<String, SoulRoutingDiagnostics> {
     build_system_prompt_with_session_runtime_workspace_budgets(
         tools,
         native_tools,
@@ -273,7 +333,7 @@ pub fn build_system_prompt_with_session_runtime_workspace_budgets(
     prompt_budgets: Option<&PromptBudgetsConfig>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
-) -> String {
+) -> Result<String, SoulRoutingDiagnostics> {
     let budgets = prompt_budgets.cloned().unwrap_or_default();
     build_system_prompt_full(
         tools,
@@ -303,7 +363,7 @@ pub fn build_system_prompt_minimal_runtime(
     tools_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
-) -> String {
+) -> Result<String, SoulRoutingDiagnostics> {
     build_system_prompt_minimal_runtime_workspace(
         project_context,
         identity,
@@ -329,7 +389,7 @@ pub fn build_system_prompt_minimal_runtime_workspace(
     heartbeat_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
-) -> String {
+) -> Result<String, SoulRoutingDiagnostics> {
     build_system_prompt_minimal_runtime_workspace_budgets(
         project_context,
         identity,
@@ -357,7 +417,7 @@ pub fn build_system_prompt_minimal_runtime_workspace_budgets(
     prompt_budgets: Option<&PromptBudgetsConfig>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
-) -> String {
+) -> Result<String, SoulRoutingDiagnostics> {
     let budgets = prompt_budgets.cloned().unwrap_or_default();
     build_system_prompt_full(
         &ToolRegistry::new(),
@@ -478,6 +538,7 @@ const MINIMAL_GUIDELINES: &str = concat!(
     "- If you don't know something, say so rather than making things up.\n",
     "- For coding questions, provide clear explanations with examples.\n",
 );
+const HARD_PROMPT_MAX_CHARS: usize = 120_000;
 
 /// Internal: build system prompt with full control over what's included.
 fn build_system_prompt_full(
@@ -495,7 +556,7 @@ fn build_system_prompt_full(
     runtime_context: Option<&PromptRuntimeContext>,
     include_tools: bool,
     memory_text: Option<&str>,
-) -> String {
+) -> Result<String, SoulRoutingDiagnostics> {
     let tool_schemas = if include_tools {
         tools.list_schemas()
     } else {
@@ -507,10 +568,7 @@ fn build_system_prompt_full(
         "You are a helpful assistant. Answer questions clearly and concisely.\n\n"
     });
 
-    let prepared_soul = prepare_soul_sections(soul_text.unwrap_or(DEFAULT_SOUL));
-    for warning_text in &prepared_soul.warnings {
-        warn!(warning = %warning_text, "SOUL redistribution warning");
-    }
+    let prepared_soul = prepare_soul_sections(soul_text.unwrap_or(DEFAULT_SOUL))?;
     let effective_agents_text = merge_agents_text(
         agents_text,
         prepared_soul.redistributed_agents_text.as_deref(),
@@ -557,7 +615,10 @@ fn build_system_prompt_full(
     append_guidelines_section(&mut prompt, include_tools);
     append_runtime_datetime_tail(&mut prompt, runtime_context);
 
-    prompt
+    if prompt.chars().count() > HARD_PROMPT_MAX_CHARS {
+        prompt = truncate_prompt_text(&prompt, HARD_PROMPT_MAX_CHARS);
+    }
+    Ok(prompt)
 }
 
 #[derive(Debug)]
@@ -566,7 +627,14 @@ struct PreparedSoulSections {
     redistributed_agents_text: Option<String>,
     redistributed_tools_text: Option<String>,
     redistributed_heartbeat_text: Option<String>,
-    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedSoulSection {
+    heading: String,
+    body: String,
+    lane: SoulLane,
+    section_id: String,
 }
 
 fn merge_agents_text(primary_agents: Option<&str>, redistributed: Option<&str>) -> Option<String> {
@@ -683,14 +751,14 @@ fn build_derived_soul_section(title: &str, intro: &str, blocks: Vec<String>) -> 
 /// - `<!-- lane:heartbeat -->`
 /// - `<!-- lane:soul -->`
 /// - default `soul` lane
-fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
+fn prepare_soul_sections(soul_text: &str) -> Result<PreparedSoulSections, SoulRoutingDiagnostics> {
+    let mut diagnostics = SoulRoutingDiagnostics::default();
     let mut preamble_lines: Vec<String> = Vec::new();
-    let mut sections: Vec<(String, String, SoulLane)> = Vec::new();
+    let mut sections: Vec<ParsedSoulSection> = Vec::new();
     let mut current_heading: Option<String> = None;
     let mut current_lines: Vec<String> = Vec::new();
     let mut current_lane = SoulLane::Soul;
     let mut pending_lane: Option<SoulLane> = None;
-    let mut warnings = Vec::new();
 
     for raw_line in soul_text.lines() {
         let marker = parse_lane_marker(raw_line);
@@ -711,16 +779,25 @@ fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
                     } else {
                         value.to_string()
                     };
-                    warnings.push(format!(
-                        "invalid SOUL lane marker '{rendered}'; expected one of: soul, agents, tools, heartbeat"
-                    ));
+                    diagnostics.push(
+                        SoulRoutingIssueCode::InvalidSoulMarker,
+                        format!(
+                            "invalid SOUL lane marker '{rendered}'; expected one of: soul, agents, tools, heartbeat"
+                        ),
+                    );
                 },
             }
         }
 
         if let Some(new_heading) = line_heading {
             if let Some(previous_heading) = current_heading.take() {
-                sections.push((previous_heading, current_lines.join("\n"), current_lane));
+                let section_index = sections.len() + 1;
+                sections.push(ParsedSoulSection {
+                    section_id: format!("{}-{section_index}", slugify_heading(&previous_heading)),
+                    heading: previous_heading,
+                    body: current_lines.join("\n"),
+                    lane: current_lane,
+                });
                 current_lines.clear();
             } else if !current_lines.is_empty() {
                 preamble_lines.extend(current_lines.drain(..));
@@ -744,25 +821,34 @@ fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
     }
 
     if let Some(last_heading) = current_heading.take() {
-        sections.push((last_heading, current_lines.join("\n"), current_lane));
+        let section_index = sections.len() + 1;
+        sections.push(ParsedSoulSection {
+            section_id: format!("{}-{section_index}", slugify_heading(&last_heading)),
+            heading: last_heading,
+            body: current_lines.join("\n"),
+            lane: current_lane,
+        });
     } else if !current_lines.is_empty() {
         preamble_lines.extend(current_lines);
     }
     if pending_lane.is_some() {
-        warnings.push(
-            "orphan SOUL lane marker found with no following `##` section; marker was ignored"
-                .to_string(),
+        diagnostics.push(
+            SoulRoutingIssueCode::OrphanSoulMarker,
+            "orphan SOUL lane marker found with no following `##` section; marker was ignored",
         );
     }
 
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+
     if sections.is_empty() {
-        return PreparedSoulSections {
+        return Ok(PreparedSoulSections {
             identity_soul_text: soul_text.trim().to_string(),
             redistributed_agents_text: None,
             redistributed_tools_text: None,
             redistributed_heartbeat_text: None,
-            warnings,
-        };
+        });
     }
 
     let mut identity_blocks = Vec::new();
@@ -774,25 +860,46 @@ fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
     let mut operational_blocks = Vec::new();
     let mut tools_blocks = Vec::new();
     let mut heartbeat_blocks = Vec::new();
+    let mut input_ids = HashSet::new();
+    let mut output_ids = HashSet::new();
     let mut seen_heading_lanes: HashMap<String, SoulLane> = HashMap::new();
-    for (heading, body, lane) in sections {
-        let heading_key = heading.trim().to_ascii_lowercase();
+    for section in sections {
+        let heading_key = section.heading.trim().to_ascii_lowercase();
         if let Some(existing_lane) = seen_heading_lanes.get(&heading_key)
-            && *existing_lane != lane
+            && *existing_lane != section.lane
         {
-            warnings.push(format!(
-                "duplicate SOUL section placement for heading '{heading_key}' across lanes"
-            ));
+            diagnostics.push(
+                SoulRoutingIssueCode::DuplicateSoulSection,
+                format!("duplicate SOUL section placement for heading '{heading_key}' across lanes"),
+            );
         } else {
-            let _ = seen_heading_lanes.insert(heading_key, lane);
+            let _ = seen_heading_lanes.insert(heading_key.clone(), section.lane);
         }
-        match lane {
-            SoulLane::Soul => identity_blocks.push(body),
-            SoulLane::Agents => operational_blocks.push(body),
-            SoulLane::Tools => tools_blocks.push(body),
-            SoulLane::Heartbeat => heartbeat_blocks.push(body),
+        let _ = input_ids.insert(section.section_id.clone());
+        if !output_ids.insert(section.section_id) {
+            diagnostics.push(
+                SoulRoutingIssueCode::DuplicateSoulSection,
+                format!("duplicate SOUL section placement detected for heading '{heading_key}'"),
+            );
+        }
+        match section.lane {
+            SoulLane::Soul => identity_blocks.push(section.body),
+            SoulLane::Agents => operational_blocks.push(section.body),
+            SoulLane::Tools => tools_blocks.push(section.body),
+            SoulLane::Heartbeat => heartbeat_blocks.push(section.body),
         }
     }
+
+    if input_ids != output_ids {
+        diagnostics.push(
+            SoulRoutingIssueCode::SectionPlacementMismatch,
+            "SOUL redistribution failed one-to-one section placement validation",
+        );
+    }
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+
     let identity_soul_text = {
         let joined = join_non_empty_blocks(identity_blocks);
         if joined.is_empty() {
@@ -820,19 +927,47 @@ AGENTS/rules.",
         heartbeat_blocks,
     );
 
-    PreparedSoulSections {
+    Ok(PreparedSoulSections {
         identity_soul_text,
         redistributed_agents_text,
         redistributed_tools_text,
         redistributed_heartbeat_text,
-        warnings,
-    }
+    })
 }
 
 /// Collect SOUL routing diagnostics (invalid/orphan/duplicate lane placement).
 #[must_use]
-pub fn collect_soul_routing_issues(soul_text: &str) -> Vec<String> {
-    prepare_soul_sections(soul_text).warnings
+pub fn collect_soul_routing_issues(soul_text: &str) -> Vec<SoulRoutingIssue> {
+    match prepare_soul_sections(soul_text) {
+        Ok(_) => Vec::new(),
+        Err(diag) => diag.issues,
+    }
+}
+
+/// Validate SOUL routing and return diagnostics when invalid.
+pub fn validate_soul_routing(soul_text: &str) -> Result<(), SoulRoutingDiagnostics> {
+    prepare_soul_sections(soul_text).map(|_| ())
+}
+
+fn prepare_soul_sections_best_effort(soul_text: &str) -> PreparedSoulSections {
+    match prepare_soul_sections(soul_text) {
+        Ok(prepared) => prepared,
+        Err(diag) => {
+            for issue in diag.issues {
+                warn!(
+                    code = issue.code.as_str(),
+                    message = %issue.message,
+                    "SOUL redistribution validation issue"
+                );
+            }
+            PreparedSoulSections {
+                identity_soul_text: soul_text.trim().to_string(),
+                redistributed_agents_text: None,
+                redistributed_tools_text: None,
+                redistributed_heartbeat_text: None,
+            }
+        },
+    }
 }
 
 fn append_identity_and_user_sections(
@@ -1439,7 +1574,7 @@ pub fn collect_prompt_section_truncations(
     prompt_budgets: Option<&PromptBudgetsConfig>,
 ) -> Vec<PromptSectionTruncation> {
     let budgets = prompt_budgets.cloned().unwrap_or_default();
-    let prepared_soul = prepare_soul_sections(soul_text.unwrap_or(DEFAULT_SOUL));
+    let prepared_soul = prepare_soul_sections_best_effort(soul_text.unwrap_or(DEFAULT_SOUL));
     let effective_agents_text = merge_agents_text(
         agents_text,
         prepared_soul.redistributed_agents_text.as_deref(),
@@ -1560,7 +1695,7 @@ pub fn collect_dropped_prompt_sections(
     prompt_budgets: Option<&PromptBudgetsConfig>,
 ) -> Vec<DroppedPromptSection> {
     let budgets = prompt_budgets.cloned().unwrap_or_default();
-    let prepared_soul = prepare_soul_sections(soul_text.unwrap_or(DEFAULT_SOUL));
+    let prepared_soul = prepare_soul_sections_best_effort(soul_text.unwrap_or(DEFAULT_SOUL));
     let effective_agents_text = merge_agents_text(
         agents_text,
         prepared_soul.redistributed_agents_text.as_deref(),
@@ -1678,6 +1813,139 @@ fn format_sandbox_runtime_line(sandbox: &PromptSandboxRuntimeContext) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn must_render(prompt: Result<String, SoulRoutingDiagnostics>) -> String {
+        prompt.expect("prompt assembly should succeed for this test case")
+    }
+
+    fn build_system_prompt(
+        tools: &ToolRegistry,
+        native_tools: bool,
+        project_context: Option<&str>,
+    ) -> String {
+        must_render(super::build_system_prompt(
+            tools,
+            native_tools,
+            project_context,
+        ))
+    }
+
+    fn build_system_prompt_with_session_runtime(
+        tools: &ToolRegistry,
+        native_tools: bool,
+        project_context: Option<&str>,
+        skills: &[SkillMetadata],
+        identity: Option<&AgentIdentity>,
+        user: Option<&UserProfile>,
+        soul_text: Option<&str>,
+        agents_text: Option<&str>,
+        tools_text: Option<&str>,
+        runtime_context: Option<&PromptRuntimeContext>,
+        memory_text: Option<&str>,
+    ) -> String {
+        must_render(super::build_system_prompt_with_session_runtime(
+            tools,
+            native_tools,
+            project_context,
+            skills,
+            identity,
+            user,
+            soul_text,
+            agents_text,
+            tools_text,
+            runtime_context,
+            memory_text,
+        ))
+    }
+
+    fn build_system_prompt_with_session_runtime_workspace(
+        tools: &ToolRegistry,
+        native_tools: bool,
+        project_context: Option<&str>,
+        skills: &[SkillMetadata],
+        identity: Option<&AgentIdentity>,
+        user: Option<&UserProfile>,
+        soul_text: Option<&str>,
+        agents_text: Option<&str>,
+        tools_text: Option<&str>,
+        heartbeat_text: Option<&str>,
+        runtime_context: Option<&PromptRuntimeContext>,
+        memory_text: Option<&str>,
+    ) -> String {
+        must_render(super::build_system_prompt_with_session_runtime_workspace(
+            tools,
+            native_tools,
+            project_context,
+            skills,
+            identity,
+            user,
+            soul_text,
+            agents_text,
+            tools_text,
+            heartbeat_text,
+            runtime_context,
+            memory_text,
+        ))
+    }
+
+    fn build_system_prompt_with_session_runtime_workspace_budgets(
+        tools: &ToolRegistry,
+        native_tools: bool,
+        project_context: Option<&str>,
+        skills: &[SkillMetadata],
+        identity: Option<&AgentIdentity>,
+        user: Option<&UserProfile>,
+        soul_text: Option<&str>,
+        agents_text: Option<&str>,
+        tools_text: Option<&str>,
+        heartbeat_text: Option<&str>,
+        prompt_budgets: Option<&PromptBudgetsConfig>,
+        runtime_context: Option<&PromptRuntimeContext>,
+        memory_text: Option<&str>,
+    ) -> String {
+        must_render(super::build_system_prompt_with_session_runtime_workspace_budgets(
+            tools,
+            native_tools,
+            project_context,
+            skills,
+            identity,
+            user,
+            soul_text,
+            agents_text,
+            tools_text,
+            heartbeat_text,
+            prompt_budgets,
+            runtime_context,
+            memory_text,
+        ))
+    }
+
+    fn build_system_prompt_minimal_runtime(
+        project_context: Option<&str>,
+        identity: Option<&AgentIdentity>,
+        user: Option<&UserProfile>,
+        soul_text: Option<&str>,
+        agents_text: Option<&str>,
+        tools_text: Option<&str>,
+        runtime_context: Option<&PromptRuntimeContext>,
+        memory_text: Option<&str>,
+    ) -> String {
+        must_render(super::build_system_prompt_minimal_runtime(
+            project_context,
+            identity,
+            user,
+            soul_text,
+            agents_text,
+            tools_text,
+            runtime_context,
+            memory_text,
+        ))
+    }
+
+    fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
+        super::prepare_soul_sections(soul_text)
+            .expect("SOUL routing should succeed for this test case")
+    }
 
     #[test]
     fn test_native_prompt_does_not_include_tool_call_format() {
@@ -2555,7 +2823,6 @@ No fluff.
         assert!(redistributed.contains("## Derived From SOUL.md"));
         assert!(redistributed.contains("## Advanced Operating Principles"));
         assert!(redistributed.contains("Verify before claiming done"));
-        assert!(prepared.warnings.is_empty());
     }
 
     #[test]
@@ -2583,7 +2850,6 @@ No fluff.
 "#;
 
         let prepared = prepare_soul_sections(soul);
-        assert!(prepared.warnings.is_empty());
 
         // Non-operational sections remain in Soul.
         assert!(prepared.identity_soul_text.contains("## Identity"));
@@ -2685,7 +2951,6 @@ I am calm and direct.
 "#;
 
         let prepared = prepare_soul_sections(soul);
-        assert!(prepared.warnings.is_empty());
         assert!(prepared.identity_soul_text.contains("## Work Style"));
         assert!(prepared.identity_soul_text.contains("## Routing Defaults"));
         assert!(
@@ -2699,7 +2964,7 @@ I am calm and direct.
     }
 
     #[test]
-    fn test_prepare_soul_sections_warns_on_invalid_marker_and_keeps_section_in_soul() {
+    fn test_prepare_soul_sections_fails_on_invalid_marker() {
         let soul = r#"
 # SOUL.md
 
@@ -2707,21 +2972,18 @@ I am calm and direct.
 ## Personal Signature
 - Verify before claiming done.
 "#;
-        let prepared = prepare_soul_sections(soul);
-        assert_eq!(prepared.warnings.len(), 1);
-        assert!(prepared.warnings[0].contains("invalid SOUL lane marker"));
+        let diagnostics =
+            super::prepare_soul_sections(soul).expect_err("invalid lane marker should fail");
         assert!(
-            prepared
-                .identity_soul_text
-                .contains("## Personal Signature")
+            diagnostics
+                .issues
+                .iter()
+                .any(|issue| issue.code == SoulRoutingIssueCode::InvalidSoulMarker)
         );
-        assert!(prepared.redistributed_agents_text.is_none());
-        assert!(prepared.redistributed_tools_text.is_none());
-        assert!(prepared.redistributed_heartbeat_text.is_none());
     }
 
     #[test]
-    fn test_prepare_soul_sections_warns_on_orphan_marker() {
+    fn test_prepare_soul_sections_fails_on_orphan_marker() {
         let soul = r#"
 # SOUL.md
 
@@ -2730,14 +2992,18 @@ I am calm and direct.
 
 <!-- lane:agents -->
 "#;
-        let prepared = prepare_soul_sections(soul);
-        assert_eq!(prepared.warnings.len(), 1);
-        assert!(prepared.warnings[0].contains("orphan SOUL lane marker"));
-        assert!(prepared.identity_soul_text.contains("## Identity"));
+        let diagnostics =
+            super::prepare_soul_sections(soul).expect_err("orphan marker should fail");
+        assert!(
+            diagnostics
+                .issues
+                .iter()
+                .any(|issue| issue.code == SoulRoutingIssueCode::OrphanSoulMarker)
+        );
     }
 
     #[test]
-    fn test_prepare_soul_sections_warns_on_duplicate_heading_in_multiple_lanes() {
+    fn test_prepare_soul_sections_fails_on_duplicate_heading_in_multiple_lanes() {
         let soul = r#"
 # SOUL.md
 
@@ -2749,12 +3015,13 @@ I am calm and direct.
 ## Work Style
 - lane two
 "#;
-        let prepared = prepare_soul_sections(soul);
+        let diagnostics = super::prepare_soul_sections(soul)
+            .expect_err("duplicate cross-lane section headings should fail");
         assert!(
-            prepared
-                .warnings
+            diagnostics
+                .issues
                 .iter()
-                .any(|item| item.contains("duplicate SOUL section placement"))
+                .any(|issue| issue.code == SoulRoutingIssueCode::DuplicateSoulSection)
         );
     }
 
