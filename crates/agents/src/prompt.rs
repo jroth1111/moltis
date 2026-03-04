@@ -2,6 +2,7 @@ use {
     crate::tool_registry::ToolRegistry,
     moltis_config::{AgentIdentity, DEFAULT_SOUL, PromptBudgetsConfig, UserProfile},
     moltis_skills::types::SkillMetadata,
+    std::collections::{HashMap, HashSet},
     tracing::warn,
 };
 
@@ -112,6 +113,38 @@ pub struct PromptSectionTruncation {
     pub section: String,
     pub max_chars: usize,
     pub original_chars: usize,
+}
+
+/// Metadata for markdown sections dropped during budget enforcement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedPromptSection {
+    pub section: String,
+    pub section_id: String,
+    pub bucket: String,
+    pub reason: String,
+    pub original_chars: usize,
+    pub max_chars: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PriorityBucket {
+    SafetyBoundaries,
+    IdentityConstraints,
+    ExecutionPolicy,
+    ToolingRules,
+    StyleVibe,
+}
+
+impl PriorityBucket {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SafetyBoundaries => "safety_boundaries",
+            Self::IdentityConstraints => "identity_constraints",
+            Self::ExecutionPolicy => "execution_policy",
+            Self::ToolingRules => "tooling_rules",
+            Self::StyleVibe => "style_vibe",
+        }
+    }
 }
 
 /// Suffix appended to the system prompt when the user's reply medium is voice.
@@ -741,7 +774,18 @@ fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
     let mut operational_blocks = Vec::new();
     let mut tools_blocks = Vec::new();
     let mut heartbeat_blocks = Vec::new();
-    for (_, body, lane) in sections {
+    let mut seen_heading_lanes: HashMap<String, SoulLane> = HashMap::new();
+    for (heading, body, lane) in sections {
+        let heading_key = heading.trim().to_ascii_lowercase();
+        if let Some(existing_lane) = seen_heading_lanes.get(&heading_key)
+            && *existing_lane != lane
+        {
+            warnings.push(format!(
+                "duplicate SOUL section placement for heading '{heading_key}' across lanes"
+            ));
+        } else {
+            let _ = seen_heading_lanes.insert(heading_key, lane);
+        }
         match lane {
             SoulLane::Soul => identity_blocks.push(body),
             SoulLane::Agents => operational_blocks.push(body),
@@ -783,6 +827,12 @@ AGENTS/rules.",
         redistributed_heartbeat_text,
         warnings,
     }
+}
+
+/// Collect SOUL routing diagnostics (invalid/orphan/duplicate lane placement).
+#[must_use]
+pub fn collect_soul_routing_issues(soul_text: &str) -> Vec<String> {
+    prepare_soul_sections(soul_text).warnings
 }
 
 fn append_identity_and_user_sections(
@@ -962,17 +1012,16 @@ fn append_memory_section(
             warn_prompt_truncation("memory_bootstrap", memory_bootstrap_max_chars, text);
         }
         prompt.push_str(concat!(
-            "\n\n**The information above is what you already know about the user. ",
-            "Always include it in your answers.** ",
-            "Even if a tool search returns no additional results, ",
-            "this section still contains valid, current facts.\n",
+            "\n\n**The information above is memory bootstrap context. ",
+            "Use it when relevant and safe for the current request.** ",
+            "Do not force unrelated personalization.\n",
         ));
     }
     if has_memory_search {
         prompt.push_str(concat!(
             "\nYou also have `memory_search` to find additional details from ",
             "`memory/*.md` files and past session history beyond what is shown above. ",
-            "**Always search memory before claiming you don't know something.** ",
+            "**Search memory when relevance is non-trivial before claiming you don't know something.** ",
             "The long-term memory system holds user facts, past decisions, project context, ",
             "and anything previously stored.\n",
         ));
@@ -1162,23 +1211,111 @@ fn truncate_chars_with_ellipsis(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn split_markdown_sections(text: &str) -> Option<Vec<String>> {
-    let mut sections: Vec<String> = Vec::new();
+#[derive(Debug, Clone)]
+struct MarkdownSection {
+    index: usize,
+    body: String,
+    section_id: String,
+    bucket: PriorityBucket,
+}
+
+fn slugify_heading(heading: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in heading.to_ascii_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn classify_priority_bucket(heading: &str) -> PriorityBucket {
+    let key = heading.to_ascii_lowercase();
+    if ["security", "boundary", "risk", "privacy", "safety", "non-negotiable"]
+        .iter()
+        .any(|needle| key.contains(needle))
+    {
+        return PriorityBucket::SafetyBoundaries;
+    }
+    if ["identity", "constitutional", "role", "conflict", "precedence"]
+        .iter()
+        .any(|needle| key.contains(needle))
+    {
+        return PriorityBucket::IdentityConstraints;
+    }
+    if ["tool", "routing", "tooling"]
+        .iter()
+        .any(|needle| key.contains(needle))
+    {
+        return PriorityBucket::ToolingRules;
+    }
+    if ["style", "vibe", "tone"]
+        .iter()
+        .any(|needle| key.contains(needle))
+    {
+        return PriorityBucket::StyleVibe;
+    }
+    PriorityBucket::ExecutionPolicy
+}
+
+fn split_markdown_sections(text: &str) -> Option<Vec<MarkdownSection>> {
+    let mut sections: Vec<MarkdownSection> = Vec::new();
     let mut current: Vec<String> = Vec::new();
+    let mut current_heading = String::from("preamble");
     let mut saw_heading = false;
 
     for line in text.lines() {
         if line.trim_start().starts_with("## ") {
             saw_heading = true;
             if !current.is_empty() {
-                sections.push(current.join("\n"));
+                let body = current.join("\n");
+                let section_idx = sections.len() + 1;
+                sections.push(MarkdownSection {
+                    index: sections.len(),
+                    section_id: format!(
+                        "{}-{}",
+                        if current_heading == "preamble" {
+                            "preamble".to_string()
+                        } else {
+                            slugify_heading(&current_heading)
+                        },
+                        section_idx
+                    ),
+                    bucket: classify_priority_bucket(&current_heading),
+                    body,
+                });
                 current.clear();
             }
+            current_heading = line
+                .trim()
+                .trim_start_matches("##")
+                .trim()
+                .to_string();
         }
         current.push(line.to_string());
     }
     if !current.is_empty() {
-        sections.push(current.join("\n"));
+        let body = current.join("\n");
+        let section_idx = sections.len() + 1;
+        sections.push(MarkdownSection {
+            index: sections.len(),
+            section_id: format!(
+                "{}-{}",
+                if current_heading == "preamble" {
+                    "preamble".to_string()
+                } else {
+                    slugify_heading(&current_heading)
+                },
+                section_idx
+            ),
+            bucket: classify_priority_bucket(&current_heading),
+            body,
+        });
     }
 
     saw_heading.then_some(sections)
@@ -1186,11 +1323,14 @@ fn split_markdown_sections(text: &str) -> Option<Vec<String>> {
 
 fn truncate_markdown_sections(text: &str, max_chars: usize) -> Option<String> {
     let sections = split_markdown_sections(text)?;
+    let mut ordered = sections.clone();
+    ordered.sort_by_key(|section| (section.bucket, section.index));
+
     let mut kept: Vec<String> = Vec::new();
     let mut used = 0usize;
 
-    for section in sections {
-        let section = section.trim();
+    for section in ordered {
+        let section = section.body.trim();
         if section.is_empty() {
             continue;
         }
@@ -1227,7 +1367,25 @@ fn truncate_paragraphs(text: &str, max_chars: usize) -> String {
         let next_total = used + sep + para_chars;
         if next_total > max_chars {
             if kept.is_empty() {
-                return truncate_chars_with_ellipsis(para, max_chars);
+                let mut line_kept = Vec::new();
+                let mut line_used = 0usize;
+                for line in para.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let line_chars = line.chars().count();
+                    let line_sep = usize::from(!line_kept.is_empty());
+                    if line_used + line_sep + line_chars > max_chars {
+                        break;
+                    }
+                    line_kept.push(line.to_string());
+                    line_used += line_sep + line_chars;
+                }
+                if line_kept.is_empty() {
+                    return truncate_chars_with_ellipsis(para, max_chars);
+                }
+                return line_kept.join("\n");
             }
             break;
         }
@@ -1333,6 +1491,144 @@ pub fn collect_prompt_section_truncations(
         budgets.memory_bootstrap_max_chars,
     );
     out
+}
+
+fn default_bucket_for_section(section: &str) -> PriorityBucket {
+    match section {
+        "soul" => PriorityBucket::IdentityConstraints,
+        "tools_md" => PriorityBucket::ToolingRules,
+        "project_context" | "agents_md" | "heartbeat_md" => PriorityBucket::ExecutionPolicy,
+        "memory_bootstrap" => PriorityBucket::SafetyBoundaries,
+        _ => PriorityBucket::ExecutionPolicy,
+    }
+}
+
+fn collect_dropped_markdown_sections(
+    section_name: &str,
+    text: &str,
+    max_chars: usize,
+) -> Vec<DroppedPromptSection> {
+    let Some(sections) = split_markdown_sections(text) else {
+        return Vec::new();
+    };
+    let mut ordered = sections.clone();
+    ordered.sort_by_key(|section| (section.bucket, section.index));
+
+    let mut kept_ids: HashSet<String> = HashSet::new();
+    let mut used = 0usize;
+    for section in ordered {
+        let body = section.body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let section_chars = body.chars().count();
+        let sep = usize::from(!kept_ids.is_empty()) * 2;
+        if used + sep + section_chars > max_chars {
+            continue;
+        }
+        let _ = kept_ids.insert(section.section_id.clone());
+        used += sep + section_chars;
+    }
+
+    sections
+        .into_iter()
+        .filter_map(|section| {
+            let body = section.body.trim();
+            if body.is_empty() || kept_ids.contains(&section.section_id) {
+                return None;
+            }
+            Some(DroppedPromptSection {
+                section: section_name.to_string(),
+                section_id: section.section_id,
+                bucket: section.bucket.as_str().to_string(),
+                reason: "budget_exceeded".to_string(),
+                original_chars: body.chars().count(),
+                max_chars,
+            })
+        })
+        .collect()
+}
+
+/// Compute dropped markdown sections for budget diagnostics.
+pub fn collect_dropped_prompt_sections(
+    project_context: Option<&str>,
+    soul_text: Option<&str>,
+    agents_text: Option<&str>,
+    tools_text: Option<&str>,
+    heartbeat_text: Option<&str>,
+    memory_text: Option<&str>,
+    prompt_budgets: Option<&PromptBudgetsConfig>,
+) -> Vec<DroppedPromptSection> {
+    let budgets = prompt_budgets.cloned().unwrap_or_default();
+    let prepared_soul = prepare_soul_sections(soul_text.unwrap_or(DEFAULT_SOUL));
+    let effective_agents_text = merge_agents_text(
+        agents_text,
+        prepared_soul.redistributed_agents_text.as_deref(),
+    );
+    let effective_tools_text = merge_agents_text(
+        tools_text,
+        prepared_soul.redistributed_tools_text.as_deref(),
+    );
+    let effective_heartbeat_text = merge_agents_text(
+        heartbeat_text,
+        prepared_soul.redistributed_heartbeat_text.as_deref(),
+    );
+    let sections: [(&str, Option<&str>, usize); 6] = [
+        (
+            "soul",
+            Some(prepared_soul.identity_soul_text.as_str()),
+            budgets.soul_max_chars,
+        ),
+        (
+            "project_context",
+            project_context,
+            budgets.project_context_max_chars,
+        ),
+        (
+            "agents_md",
+            effective_agents_text.as_deref(),
+            budgets.workspace_file_max_chars,
+        ),
+        (
+            "tools_md",
+            effective_tools_text.as_deref(),
+            budgets.workspace_file_max_chars,
+        ),
+        (
+            "heartbeat_md",
+            effective_heartbeat_text.as_deref(),
+            budgets.workspace_file_max_chars,
+        ),
+        (
+            "memory_bootstrap",
+            memory_text,
+            budgets.memory_bootstrap_max_chars,
+        ),
+    ];
+
+    let mut dropped = Vec::new();
+    for (section_name, text_opt, max_chars) in sections {
+        let Some(text) = text_opt.filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let original_chars = text.chars().count();
+        if original_chars <= max_chars {
+            continue;
+        }
+        let mut markdown_dropped = collect_dropped_markdown_sections(section_name, text, max_chars);
+        if markdown_dropped.is_empty() {
+            markdown_dropped.push(DroppedPromptSection {
+                section: section_name.to_string(),
+                section_id: format!("{section_name}-overflow"),
+                bucket: default_bucket_for_section(section_name).as_str().to_string(),
+                reason: "budget_exceeded".to_string(),
+                original_chars,
+                max_chars,
+            });
+        }
+        dropped.extend(markdown_dropped);
+    }
+    dropped
 }
 
 fn append_truncated_text_block(
@@ -1841,7 +2137,7 @@ mod tests {
         assert!(prompt.contains("Speaks French"));
         // Memory content should include the "already know" hint so models
         // don't ignore it when tool searches return empty.
-        assert!(prompt.contains("information above is what you already know"));
+        assert!(prompt.contains("memory bootstrap context"));
     }
 
     #[test]
@@ -2438,6 +2734,28 @@ I am calm and direct.
         assert_eq!(prepared.warnings.len(), 1);
         assert!(prepared.warnings[0].contains("orphan SOUL lane marker"));
         assert!(prepared.identity_soul_text.contains("## Identity"));
+    }
+
+    #[test]
+    fn test_prepare_soul_sections_warns_on_duplicate_heading_in_multiple_lanes() {
+        let soul = r#"
+# SOUL.md
+
+<!-- lane:agents -->
+## Work Style
+- lane one
+
+<!-- lane:tools -->
+## Work Style
+- lane two
+"#;
+        let prepared = prepare_soul_sections(soul);
+        assert!(
+            prepared
+                .warnings
+                .iter()
+                .any(|item| item.contains("duplicate SOUL section placement"))
+        );
     }
 
     #[test]
