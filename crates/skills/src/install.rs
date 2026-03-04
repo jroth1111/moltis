@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use moltis_metrics::{counter, histogram, skills as skills_metrics};
 
 use crate::{
+    archive_audit,
     audit,
     formats::{PluginFormat, detect_format, scan_with_adapter},
     manifest::ManifestStore,
@@ -62,6 +63,7 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
                         .as_deref()
                         .map(|relative| target.join(relative))
                         .unwrap_or_else(|| entry.metadata.path.join("SKILL.md"));
+                    archive_audit::enforce_skill_markdown_size(&source_hint, &entry.body)?;
                     audit::audit_skill_markdown(&entry.metadata.path, &entry.body, &source_hint)?;
                 }
                 let relative = target
@@ -162,7 +164,10 @@ async fn install_via_http(
         anyhow::bail!("failed to fetch {}/{}: HTTP {}", owner, repo, resp.status());
     }
 
+    archive_audit::enforce_download_size_hint(resp.content_length())?;
     let bytes = resp.bytes().await?;
+    archive_audit::enforce_download_size_bytes(bytes.len())?;
+    archive_audit::audit_archive_bytes(&bytes)?;
 
     tokio::fs::create_dir_all(target).await?;
     let target_owned = target.to_path_buf();
@@ -272,6 +277,7 @@ async fn scan_repo_skills(
     let root_skill_md = repo_dir.join("SKILL.md");
     if root_skill_md.is_file() {
         let content = tokio::fs::read_to_string(&root_skill_md).await?;
+        archive_audit::enforce_skill_markdown_size(&root_skill_md, &content)?;
         audit::audit_skill_file(repo_dir, &root_skill_md, &content)?;
         let mut meta = parse::parse_metadata(&content, repo_dir)?;
         meta.source = Some(crate::types::SkillSource::Registry);
@@ -315,6 +321,10 @@ async fn scan_repo_skills(
                         continue;
                     },
                 };
+                if let Err(e) = archive_audit::enforce_skill_markdown_size(&skill_md, &content) {
+                    tracing::debug!(?skill_md, %e, "skipping oversized SKILL.md");
+                    continue;
+                }
                 audit::audit_skill_file(&subdir, &skill_md, &content)?;
                 match parse::parse_metadata(&content, &subdir) {
                     Ok(mut meta) => {
