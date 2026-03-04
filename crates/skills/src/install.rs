@@ -77,7 +77,11 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
                     .map(|e| SkillState {
                         name: e.metadata.name.clone(),
                         relative_path: relative.clone(),
-                        trusted: false,
+                        status: crate::types::SkillStatus::Untrusted,
+                        quarantine_reason: None,
+                        last_audited_ms: None,
+                        content_hash: None,
+                        trusted_hash: None,
                         enabled: false,
                     })
                     .collect();
@@ -291,7 +295,11 @@ async fn scan_repo_skills(
         let state = SkillState {
             name: meta.name.clone(),
             relative_path: relative,
-            trusted: false,
+            status: crate::types::SkillStatus::Untrusted,
+            quarantine_reason: None,
+            last_audited_ms: None,
+            content_hash: None,
+            trusted_hash: None,
             enabled: false,
         };
         return Ok((vec![meta], vec![state]));
@@ -337,7 +345,11 @@ async fn scan_repo_skills(
                         skill_states.push(SkillState {
                             name: meta.name.clone(),
                             relative_path: relative,
-                            trusted: false,
+                            status: crate::types::SkillStatus::Untrusted,
+                            quarantine_reason: None,
+                            last_audited_ms: None,
+                            content_hash: None,
+                            trusted_hash: None,
                             enabled: false,
                         });
                         skills_meta.push(meta);
@@ -488,13 +500,17 @@ mod tests {
             .map(|e| SkillState {
                 name: e.metadata.name.clone(),
                 relative_path: "test-owner-test-repo".into(),
-                trusted: false,
+                status: crate::types::SkillStatus::Untrusted,
+                quarantine_reason: None,
+                last_audited_ms: None,
+                content_hash: None,
+                trusted_hash: None,
                 enabled: false,
             })
             .collect();
         assert_eq!(states.len(), 1);
         assert!(!states[0].enabled);
-        assert!(!states[0].trusted);
+        assert!(!states[0].status.is_trusted());
     }
 
     #[tokio::test]

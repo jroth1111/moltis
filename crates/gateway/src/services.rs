@@ -439,7 +439,7 @@ impl SkillsService for NoopSkillsService {
                                 "description": entry.map(|e| e.metadata.description.as_str()).unwrap_or(""),
                                 "display_name": entry.and_then(|e| e.display_name.as_deref()),
                                 "relative_path": s.relative_path,
-                                "trusted": s.trusted,
+                                "trusted": s.status.is_trusted(),
                                 "enabled": s.enabled,
                                 "drifted": drifted_sources.contains(&repo.source),
                                 "eligible": true,
@@ -484,7 +484,7 @@ impl SkillsService for NoopSkillsService {
                                 "description": description,
                                 "display_name": display_name,
                                 "relative_path": s.relative_path,
-                                "trusted": s.trusted,
+                                "trusted": s.status.is_trusted(),
                                 "enabled": s.enabled,
                                 "drifted": drifted_sources.contains(&repo.source),
                                 "eligible": elig.as_ref().map(|e| e.eligible).unwrap_or(true),
@@ -709,7 +709,7 @@ impl SkillsService for NoopSkillsService {
                     "eligible": elig.eligible,
                     "missing_bins": elig.missing_bins,
                     "install_options": elig.install_options,
-                    "trusted": skill_state.trusted,
+                    "trusted": skill_state.status.is_trusted(),
                     "enabled": skill_state.enabled,
                     "drifted": drifted_sources.contains(source),
                     "commit_sha": commit_sha,
@@ -754,7 +754,7 @@ impl SkillsService for NoopSkillsService {
                     "eligible": true,
                     "missing_bins": empty,
                     "install_options": empty,
-                    "trusted": skill_state.trusted,
+                    "trusted": skill_state.status.is_trusted(),
                     "enabled": skill_state.enabled,
                     "drifted": drifted_sources.contains(source),
                     "commit_sha": commit_sha,
@@ -968,7 +968,7 @@ fn detect_and_mark_repo_drift(
             drifted.insert(repo.source.clone());
             repo.commit_sha = Some(current_sha);
             for skill in &mut repo.skills {
-                skill.trusted = false;
+                skill.status = moltis_skills::types::SkillStatus::Untrusted;
                 skill.enabled = false;
             }
             security_audit(
@@ -1102,7 +1102,7 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
         let trusted = manifest
             .find_repo(source)
             .and_then(|r| r.skills.iter().find(|s| s.name == skill_name))
-            .map(|s| s.trusted)
+            .map(|s| s.status.is_trusted())
             .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
         if !trusted {
             return Err(format!(
@@ -1144,7 +1144,12 @@ fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
     let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
     let mut manifest = store.load().map_err(ServiceError::message)?;
 
-    if !manifest.set_skill_trusted(source, skill_name, trusted) {
+    let status = if trusted {
+        moltis_skills::types::SkillStatus::Trusted
+    } else {
+        moltis_skills::types::SkillStatus::Untrusted
+    };
+    if !manifest.set_skill_status(source, skill_name, status) {
         return Err(format!("skill '{skill_name}' not found in repo '{source}'").into());
     }
 

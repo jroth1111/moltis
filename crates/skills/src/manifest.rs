@@ -23,6 +23,11 @@ impl ManifestStore {
             return Ok(SkillsManifest::default());
         }
         let data = std::fs::read_to_string(&self.path)?;
+        if let Some(migrated) = crate::migration::migrate_manifest_v1_to_v2(&data)? {
+            // One-time in-place upgrade to schema v2.
+            self.save(&migrated)?;
+            return Ok(migrated);
+        }
         let manifest: SkillsManifest = serde_json::from_str(&data)?;
         Ok(manifest)
     }
@@ -49,7 +54,7 @@ impl ManifestStore {
 mod tests {
     use {
         super::*,
-        crate::types::{RepoEntry, SkillState},
+        crate::types::{RepoEntry, SkillState, SkillStatus},
     };
 
     #[test]
@@ -57,7 +62,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ManifestStore::new(tmp.path().join("missing.json"));
         let m = store.load().unwrap();
-        assert_eq!(m.version, 1);
+        assert_eq!(m.version, 2);
         assert!(m.repos.is_empty());
     }
 
@@ -76,7 +81,11 @@ mod tests {
             skills: vec![SkillState {
                 name: "my-skill".into(),
                 relative_path: "skills/my-skill".into(),
-                trusted: true,
+                status: SkillStatus::Trusted,
+                quarantine_reason: None,
+                last_audited_ms: None,
+                content_hash: None,
+                trusted_hash: None,
                 enabled: true,
             }],
         });
@@ -102,13 +111,21 @@ mod tests {
                 SkillState {
                     name: "s1".into(),
                     relative_path: "s1".into(),
-                    trusted: true,
+                    status: SkillStatus::Trusted,
+                    quarantine_reason: None,
+                    last_audited_ms: None,
+                    content_hash: None,
+                    trusted_hash: None,
                     enabled: true,
                 },
                 SkillState {
                     name: "s2".into(),
                     relative_path: "s2".into(),
-                    trusted: true,
+                    status: SkillStatus::Trusted,
+                    quarantine_reason: None,
+                    last_audited_ms: None,
+                    content_hash: None,
+                    trusted_hash: None,
                     enabled: true,
                 },
             ],
@@ -125,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_set_skill_trusted() {
+    fn test_manifest_set_skill_status() {
         let mut m = SkillsManifest::default();
         m.add_repo(RepoEntry {
             source: "a/b".into(),
@@ -136,14 +153,18 @@ mod tests {
             skills: vec![SkillState {
                 name: "s1".into(),
                 relative_path: "s1".into(),
-                trusted: false,
+                status: SkillStatus::Untrusted,
+                quarantine_reason: None,
+                last_audited_ms: None,
+                content_hash: None,
+                trusted_hash: None,
                 enabled: false,
             }],
         });
 
-        assert!(m.set_skill_trusted("a/b", "s1", true));
-        assert!(m.find_repo("a/b").unwrap().skills[0].trusted);
-        assert!(!m.set_skill_trusted("a/b", "missing", true));
+        assert!(m.set_skill_status("a/b", "s1", SkillStatus::Trusted));
+        assert_eq!(m.find_repo("a/b").unwrap().skills[0].status, SkillStatus::Trusted);
+        assert!(!m.set_skill_status("a/b", "missing", SkillStatus::Trusted));
     }
 
     #[test]
@@ -169,5 +190,43 @@ mod tests {
         m.remove_repo("a/b");
         assert_eq!(m.repos.len(), 1);
         assert_eq!(m.repos[0].source, "c/d");
+    }
+
+    #[test]
+    fn test_load_migrates_v1_manifest_to_v2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skills-manifest.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "repos": [
+                {
+                  "source": "owner/repo",
+                  "repo_name": "owner-repo",
+                  "installed_at_ms": 1,
+                  "format": "skill",
+                  "skills": [
+                    {
+                      "name": "s",
+                      "relative_path": "owner-repo/s",
+                      "trusted": true,
+                      "enabled": true
+                    }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let store = ManifestStore::new(path.clone());
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.repos[0].skills[0].status, SkillStatus::Trusted);
+
+        let rewritten = std::fs::read_to_string(path).unwrap();
+        assert!(rewritten.contains("\"version\": 2"));
+        assert!(rewritten.contains("\"status\": \"trusted\""));
     }
 }

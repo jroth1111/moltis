@@ -6,7 +6,27 @@ use crate::formats::PluginFormat;
 
 // ── Skills manifest ──────────────────────────────────────────────────────────
 
-/// Top-level manifest tracking installed repos and per-skill enabled state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillStatus {
+    Trusted,
+    Untrusted,
+    Quarantined,
+}
+
+impl Default for SkillStatus {
+    fn default() -> Self {
+        Self::Untrusted
+    }
+}
+
+impl SkillStatus {
+    pub fn is_trusted(self) -> bool {
+        matches!(self, Self::Trusted)
+    }
+}
+
+/// Top-level manifest tracking installed repos and per-skill status/enabled state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillsManifest {
     pub version: u32,
@@ -17,7 +37,7 @@ pub struct SkillsManifest {
 impl Default for SkillsManifest {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             repos: Vec::new(),
         }
     }
@@ -50,11 +70,16 @@ impl SkillsManifest {
         false
     }
 
-    pub fn set_skill_trusted(&mut self, source: &str, skill_name: &str, trusted: bool) -> bool {
+    pub fn set_skill_status(
+        &mut self,
+        source: &str,
+        skill_name: &str,
+        status: SkillStatus,
+    ) -> bool {
         if let Some(repo) = self.find_repo_mut(source)
             && let Some(skill) = repo.skills.iter_mut().find(|s| s.name == skill_name)
         {
-            skill.trusted = trusted;
+            skill.status = status;
             return true;
         }
         false
@@ -74,18 +99,28 @@ pub struct RepoEntry {
     pub skills: Vec<SkillState>,
 }
 
-/// Per-skill enabled state within a repo.
+/// Per-skill state within a repo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillState {
     pub name: String,
     pub relative_path: String,
-    #[serde(default = "default_trusted")]
-    pub trusted: bool,
+    #[serde(default)]
+    pub status: SkillStatus,
+    #[serde(default)]
+    pub quarantine_reason: Option<String>,
+    #[serde(default)]
+    pub last_audited_ms: Option<u64>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub trusted_hash: Option<String>,
     pub enabled: bool,
 }
 
-fn default_trusted() -> bool {
-    false
+impl SkillState {
+    pub fn is_trusted(&self) -> bool {
+        self.status.is_trusted()
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -96,10 +131,20 @@ mod tests {
     #[test]
     fn skill_state_defaults_to_untrusted() {
         let parsed: SkillState = serde_json::from_str(
-            r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":true}"#,
+            r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":true,"status":"untrusted"}"#,
         )
         .unwrap();
-        assert!(!parsed.trusted);
+        assert_eq!(parsed.status, SkillStatus::Untrusted);
+        assert!(!parsed.is_trusted());
+    }
+
+    #[test]
+    fn skill_state_missing_status_defaults_to_untrusted() {
+        let parsed: SkillState =
+            serde_json::from_str(r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":false}"#)
+                .unwrap();
+        assert_eq!(parsed.status, SkillStatus::Untrusted);
+        assert!(!parsed.is_trusted());
     }
 
     #[test]

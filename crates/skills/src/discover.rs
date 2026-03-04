@@ -142,7 +142,7 @@ fn discover_plugins(install_dir: &Path, skills: &mut Vec<SkillMetadata>) {
 
     for repo in &manifest.repos {
         for skill_state in &repo.skills {
-            if !skill_state.enabled || !skill_state.trusted {
+            if !skill_state.enabled || !skill_state.is_trusted() {
                 continue;
             }
             let skill_dir = match audit::resolve_relative_within(
@@ -197,7 +197,7 @@ fn discover_registry(install_dir: &Path, skills: &mut Vec<SkillMetadata>) {
 
     for repo in &manifest.repos {
         for skill_state in &repo.skills {
-            if !skill_state.enabled || !skill_state.trusted {
+            if !skill_state.enabled || !skill_state.is_trusted() {
                 continue;
             }
             let skill_dir = match audit::resolve_relative_within(
@@ -275,7 +275,7 @@ fn discover_registry(install_dir: &Path, skills: &mut Vec<SkillMetadata>) {
 mod tests {
     use {
         super::*,
-        crate::types::{RepoEntry, SkillState, SkillsManifest},
+        crate::types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
     };
 
     #[tokio::test]
@@ -370,7 +370,7 @@ mod tests {
 
         // Create manifest with 'a' enabled and 'b' disabled.
         let manifest = SkillsManifest {
-            version: 1,
+            version: 2,
             repos: vec![RepoEntry {
                 source: "owner/repo".into(),
                 repo_name: "repo".into(),
@@ -381,13 +381,21 @@ mod tests {
                     SkillState {
                         name: "a".into(),
                         relative_path: "repo/skills/a".into(),
-                        trusted: true,
+                        status: SkillStatus::Trusted,
+                        quarantine_reason: None,
+                        last_audited_ms: None,
+                        content_hash: None,
+                        trusted_hash: None,
                         enabled: true,
                     },
                     SkillState {
                         name: "b".into(),
                         relative_path: "repo/skills/b".into(),
-                        trusted: false,
+                        status: SkillStatus::Untrusted,
+                        quarantine_reason: None,
+                        last_audited_ms: None,
+                        content_hash: None,
+                        trusted_hash: None,
                         enabled: false,
                     },
                 ],
@@ -432,7 +440,7 @@ mod tests {
 
         // Build manifest with both formats
         let manifest = SkillsManifest {
-            version: 1,
+            version: 2,
             repos: vec![
                 RepoEntry {
                     source: "owner/skill-repo".into(),
@@ -443,7 +451,11 @@ mod tests {
                     skills: vec![SkillState {
                         name: "my-skill".into(),
                         relative_path: "skill-repo".into(),
-                        trusted: true,
+                        status: SkillStatus::Trusted,
+                        quarantine_reason: None,
+                        last_audited_ms: None,
+                        content_hash: None,
+                        trusted_hash: None,
                         enabled: true,
                     }],
                 },
@@ -456,7 +468,11 @@ mod tests {
                     skills: vec![SkillState {
                         name: "test-plugin:helper".into(),
                         relative_path: "plugin-repo".into(),
-                        trusted: true,
+                        status: SkillStatus::Trusted,
+                        quarantine_reason: None,
+                        last_audited_ms: None,
+                        content_hash: None,
+                        trusted_hash: None,
                         enabled: true,
                     }],
                 },
@@ -471,7 +487,7 @@ mod tests {
         let mut skills = Vec::new();
         for repo in &manifest.repos {
             for skill_state in &repo.skills {
-                if !skill_state.enabled || !skill_state.trusted {
+                if !skill_state.enabled || !skill_state.is_trusted() {
                     continue;
                 }
                 let skill_dir = install_dir.join(&skill_state.relative_path);

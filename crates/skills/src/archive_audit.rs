@@ -1,7 +1,4 @@
-use std::{
-    io::Write,
-    path::{Component, Path, PathBuf},
-};
+use std::path::{Component, Path, PathBuf};
 
 /// Maximum downloaded archive size (compressed), in bytes.
 pub const MAX_ARCHIVE_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024; // 20 MB
@@ -156,6 +153,8 @@ fn sanitize_archive_path(path: &Path) -> anyhow::Result<Option<PathBuf>> {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     fn build_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
