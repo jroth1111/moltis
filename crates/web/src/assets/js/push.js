@@ -10,6 +10,18 @@ var currentSubscription = null;
 var vapidPublicKey = null;
 
 /**
+ * Resolve the active session key used to scope push subscriptions.
+ * @returns {string|null}
+ */
+function activeSessionKey() {
+	try {
+		return localStorage.getItem("moltis-session") || "main";
+	} catch (_e) {
+		return "main";
+	}
+}
+
+/**
  * Convert a base64 string to a Uint8Array (for VAPID key).
  * @param {string} base64String - Base64 URL-safe encoded string
  * @returns {Uint8Array}
@@ -124,6 +136,11 @@ export async function subscribeToPush() {
 			userVisibleOnly: true,
 			applicationServerKey: urlBase64ToUint8Array(key),
 		});
+		var p256dhKey = subscription.getKey("p256dh");
+		var authKey = subscription.getKey("auth");
+		if (!p256dhKey || !authKey) {
+			throw new Error("Missing push subscription keys");
+		}
 
 		// Send subscription to server
 		var response = await fetch("/api/push/subscribe", {
@@ -134,15 +151,16 @@ export async function subscribeToPush() {
 			body: JSON.stringify({
 				endpoint: subscription.endpoint,
 				keys: {
-					p256dh: btoa(String.fromCharCode(...new Uint8Array(subscription.getKey("p256dh"))))
+					p256dh: btoa(String.fromCharCode(...new Uint8Array(p256dhKey)))
 						.replace(/\+/g, "-")
 						.replace(/\//g, "_")
 						.replace(/=+$/, ""),
-					auth: btoa(String.fromCharCode(...new Uint8Array(subscription.getKey("auth"))))
+					auth: btoa(String.fromCharCode(...new Uint8Array(authKey)))
 						.replace(/\+/g, "-")
 						.replace(/\//g, "_")
 						.replace(/=+$/, ""),
 				},
+				session_key: activeSessionKey(),
 			}),
 		});
 

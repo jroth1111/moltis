@@ -47,6 +47,9 @@ pub struct PushSubscription {
     pub ip_address: Option<String>,
     /// When the subscription was created.
     pub created_at: DateTime<Utc>,
+    /// Optional session scope this subscription should receive notifications for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
 }
 
 /// Payload for a push notification.
@@ -192,9 +195,24 @@ impl PushService {
 
     /// Send a push notification to all subscriptions.
     pub async fn send_to_all(&self, payload: &PushPayload) -> Result<usize> {
+        self.send_to_scope(payload, None).await
+    }
+
+    /// Send a push notification to subscriptions matching a target session.
+    ///
+    /// Subscriptions without a `session_key` are treated as global and receive
+    /// all notifications.
+    pub async fn send_to_scope(
+        &self,
+        payload: &PushPayload,
+        target_session_key: Option<&str>,
+    ) -> Result<usize> {
         let (vapid, subscriptions) = {
             let store = self.store.read().await;
-            (store.vapid.clone(), store.subscriptions.clone())
+            (
+                store.vapid.clone(),
+                filter_subscriptions_for_target(&store.subscriptions, target_session_key),
+            )
         };
 
         let Some(vapid) = vapid else {
@@ -273,5 +291,73 @@ impl PushService {
         let content = serde_json::to_string_pretty(&*store)?;
         tokio::fs::write(&self.store_path, content).await?;
         Ok(())
+    }
+}
+
+fn subscription_matches_target(
+    subscription: &PushSubscription,
+    target_session_key: Option<&str>,
+) -> bool {
+    match target_session_key {
+        None => true,
+        Some(target) => {
+            subscription.session_key.is_none()
+                || subscription.session_key.as_deref() == Some(target)
+        },
+    }
+}
+
+fn filter_subscriptions_for_target(
+    subscriptions: &[PushSubscription],
+    target_session_key: Option<&str>,
+) -> Vec<PushSubscription> {
+    subscriptions
+        .iter()
+        .filter(|sub| subscription_matches_target(sub, target_session_key))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PushSubscription, filter_subscriptions_for_target};
+    use chrono::Utc;
+
+    fn subscription(endpoint: &str, session_key: Option<&str>) -> PushSubscription {
+        PushSubscription {
+            endpoint: endpoint.to_string(),
+            p256dh: "p256dh".to_string(),
+            auth: "auth".to_string(),
+            user_agent: None,
+            ip_address: None,
+            created_at: Utc::now(),
+            session_key: session_key.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn filter_subscriptions_for_target_keeps_global_and_matching() {
+        let subscriptions = vec![
+            subscription("global", None),
+            subscription("main", Some("main")),
+            subscription("project", Some("project:alpha")),
+        ];
+
+        let filtered = filter_subscriptions_for_target(&subscriptions, Some("main"));
+        let endpoints: Vec<&str> = filtered.iter().map(|s| s.endpoint.as_str()).collect();
+
+        assert_eq!(endpoints, vec!["global", "main"]);
+    }
+
+    #[test]
+    fn filter_subscriptions_for_target_returns_all_without_scope() {
+        let subscriptions = vec![
+            subscription("global", None),
+            subscription("main", Some("main")),
+            subscription("project", Some("project:alpha")),
+        ];
+
+        let filtered = filter_subscriptions_for_target(&subscriptions, None);
+        assert_eq!(filtered.len(), 3);
     }
 }
