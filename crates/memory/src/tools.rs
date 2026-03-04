@@ -341,15 +341,17 @@ impl AgentTool for MemoryRecallFailuresTool {
             .filter(|r| r.path.ends_with("memory/failures.md"))
             .take(limit)
             .map(|r| {
+                // Keep the tool output stable and avoid leaking absolute workspace paths.
+                let display_path = "memory/failures.md";
                 json!({
                     "chunk_id": r.chunk_id,
-                    "path": r.path,
+                    "path": display_path,
                     "source": r.source,
                     "start_line": r.start_line,
                     "end_line": r.end_line,
                     "score": r.score,
                     "text": r.text,
-                    "citation": format!("{}#{}", r.path, r.start_line),
+                    "citation": format!("{}#{}", display_path, r.start_line),
                 })
             })
             .collect();
