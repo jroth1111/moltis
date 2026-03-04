@@ -331,6 +331,84 @@ fn estimate_text_tokens(text: &str) -> u64 {
     bytes.div_ceil(4).max(1)
 }
 
+#[must_use]
+fn dropped_messages_for_retention(history: &[Value], retained: &[Value]) -> Vec<Value> {
+    let mut retained_counts: HashMap<String, usize> = HashMap::new();
+    for msg in retained {
+        let key = serde_json::to_string(msg).unwrap_or_else(|_| msg.to_string());
+        *retained_counts.entry(key).or_insert(0) += 1;
+    }
+
+    let mut dropped = Vec::new();
+    for msg in history {
+        let key = serde_json::to_string(msg).unwrap_or_else(|_| msg.to_string());
+        match retained_counts.get_mut(&key) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+            },
+            _ => dropped.push(msg.clone()),
+        }
+    }
+    dropped
+}
+
+fn build_archive_snapshot_body(dropped_messages: &[Value], limit: usize) -> String {
+    let mut lines = String::new();
+    for msg in dropped_messages.iter().take(limit) {
+        let role = msg
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_ascii_uppercase();
+        if let Some(preview) = extract_preview_from_value(msg) {
+            lines.push_str("- [");
+            lines.push_str(&role);
+            lines.push_str("] ");
+            lines.push_str(preview.trim());
+            lines.push('\n');
+        }
+    }
+    if lines.trim().is_empty() {
+        "- [INFO] Archived messages had no previewable text content.\n".to_string()
+    } else {
+        lines
+    }
+}
+
+async fn persist_archive_snapshot_to_memory(
+    memory_manager: Arc<moltis_memory::manager::MemoryManager>,
+    session_agent_id: String,
+    session_key: String,
+    archive_filename: String,
+    dropped_messages: Vec<Value>,
+) {
+    let memory_dir = moltis_config::agent_workspace_dir(&session_agent_id).join("memory");
+    if let Err(error) = tokio::fs::create_dir_all(&memory_dir).await {
+        warn!(%error, "archive snapshot: failed to create memory dir");
+        return;
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let safe_session_key = SessionStore::key_to_filename(&session_key);
+    let path = memory_dir.join(format!("archive-{safe_session_key}-{ts}.md"));
+    let archived_preview = build_archive_snapshot_body(&dropped_messages, 200);
+    let content = format!(
+        "# Archived Context Snapshot\n\n- **Session**: {session_key}\n- **Archive File**: {archive_filename}\n- **Archived Messages**: {}\n\n## Archived Excerpts\n\n{archived_preview}",
+        dropped_messages.len()
+    );
+    if let Err(error) = tokio::fs::write(&path, content).await {
+        warn!(%error, "archive snapshot: failed to write memory file");
+        return;
+    }
+
+    if let Err(error) = memory_manager.sync().await {
+        warn!(%error, "archive snapshot: memory sync failed");
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3878,6 +3956,8 @@ impl ChatService for LiveChatService {
                                 .await
                             {
                                 Ok(archive_filename) => {
+                                    let dropped_messages =
+                                        dropped_messages_for_retention(&history, &reduction.messages);
                                     let notice = PersistedMessage::notice(format!(
                                         "[Context Archive] {archived_count} older message(s) archived to \
                                          cold storage ({archive_filename}). Retaining {} recent \
@@ -3903,6 +3983,18 @@ impl ChatService for LiveChatService {
                                         self.session_metadata
                                             .touch(&session_key, history.len() as u32)
                                             .await;
+                                        if let Some(memory_manager) = self.state.memory_manager() {
+                                            let session_key_for_snapshot = session_key.clone();
+                                            let session_agent_for_snapshot = session_agent_id.clone();
+                                            let archive_file_for_snapshot = archive_filename.clone();
+                                            tokio::spawn(persist_archive_snapshot_to_memory(
+                                                Arc::clone(memory_manager),
+                                                session_agent_for_snapshot,
+                                                session_key_for_snapshot,
+                                                archive_file_for_snapshot,
+                                                dropped_messages,
+                                            ));
+                                        }
                                         info!(
                                             session = %session_key,
                                             estimated_next_input,
@@ -9554,6 +9646,26 @@ mod tests {
         assert_eq!(compaction::archive_keep_recent_for_reduction(1, 20), 1);
         assert_eq!(compaction::archive_keep_recent_for_reduction(3, 20), 2);
         assert_eq!(compaction::archive_keep_recent_for_reduction(10, 3), 3);
+    }
+
+    #[test]
+    fn dropped_messages_for_retention_tracks_duplicates_by_count() {
+        let history = vec![
+            serde_json::json!({ "role": "user", "content": "same" }),
+            serde_json::json!({ "role": "assistant", "content": "same" }),
+            serde_json::json!({ "role": "assistant", "content": "same" }),
+        ];
+        let retained = vec![
+            serde_json::json!({ "role": "assistant", "content": "same" }),
+            serde_json::json!({ "role": "user", "content": "same" }),
+        ];
+
+        let dropped = dropped_messages_for_retention(&history, &retained);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(
+            dropped[0].get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
     }
 
     #[test]
