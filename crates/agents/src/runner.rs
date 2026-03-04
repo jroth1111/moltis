@@ -969,11 +969,13 @@ pub async fn run_agent_loop_with_context(
                 let _tc_id = tc.id.clone();
                 let trace_id = trace_id.clone();
 
+                // SECURITY: context fields (including _session_key) must overwrite any
+                // LLM-provided values in args. Do not change merge order or direction.
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
                 {
                     for (k, v) in ctx_obj {
-                        args_obj.insert(k.clone(), v.clone());
+                        args_obj.insert(k.clone(), v.clone()); // context wins
                     }
                 }
                 async move {
@@ -1776,11 +1778,13 @@ pub async fn run_agent_loop_streaming(
                 let tc_name = tc.name.clone();
                 let trace_id = trace_id.clone();
 
+                // SECURITY: context fields (including _session_key) must overwrite any
+                // LLM-provided values in args. Do not change merge order or direction.
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
                 {
                     for (k, v) in ctx_obj {
-                        args_obj.insert(k.clone(), v.clone());
+                        args_obj.insert(k.clone(), v.clone()); // context wins
                     }
                 }
                 async move {
@@ -4845,5 +4849,27 @@ mod tests {
             assert!(v >= 1);
             assert!(v <= RATE_LIMIT_MAX_RETRY_MS);
         }
+    }
+
+    /// Verify that the tool context merge overwrites any LLM-supplied value for
+    /// security-sensitive fields like `_session_key`. If this merge order ever
+    /// changes the protection in `require_mutation_caller()` disappears silently.
+    #[test]
+    fn test_tool_context_session_key_overwrites_llm_provided() {
+        let mut args = serde_json::json!({ "_session_key": "evil", "other": 1 });
+        let ctx = serde_json::json!({ "_session_key": "real-session-abc" });
+
+        if let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object()) {
+            for (k, v) in ctx_obj {
+                args_obj.insert(k.clone(), v.clone()); // context wins
+            }
+        }
+
+        assert_eq!(
+            args["_session_key"].as_str().unwrap(),
+            "real-session-abc",
+            "context must overwrite LLM-supplied _session_key"
+        );
+        assert_eq!(args["other"], 1);
     }
 }
