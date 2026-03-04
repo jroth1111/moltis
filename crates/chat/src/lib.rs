@@ -28,8 +28,8 @@ use {
         multimodal::parse_data_uri,
         prompt::{
             PromptHostRuntimeContext, PromptRuntimeContext, PromptSandboxRuntimeContext,
-            VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime,
-            build_system_prompt_with_session_runtime,
+            VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime_workspace,
+            build_system_prompt_with_session_runtime_workspace,
         },
         runner::{RunnerEvent, run_agent_loop_streaming},
         tool_registry::{AgentTool, ToolRegistry},
@@ -1084,12 +1084,13 @@ struct PromptPersona {
     soul_text: Option<String>,
     agents_text: Option<String>,
     tools_text: Option<String>,
+    heartbeat_text: Option<String>,
     memory_text: Option<String>,
 }
 
-fn resolve_prompt_agent_id(session_entry: Option<&SessionEntry>) -> String {
+fn resolve_prompt_agent_id(session_entry: Option<&SessionEntry>) -> error::Result<String> {
     let Some(entry) = session_entry else {
-        return "main".to_string();
+        return Ok("main".to_string());
     };
     let Some(agent_id) = entry
         .agent_id
@@ -1097,20 +1098,18 @@ fn resolve_prompt_agent_id(session_entry: Option<&SessionEntry>) -> String {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return "main".to_string();
+        return Ok("main".to_string());
     };
     if agent_id == "main" {
-        return "main".to_string();
+        return Ok("main".to_string());
     }
     if moltis_config::agent_workspace_dir(agent_id).exists() {
-        return agent_id.to_string();
+        return Ok(agent_id.to_string());
     }
-    warn!(
-        session = %entry.key,
-        agent_id,
-        "session references unknown agent workspace, falling back to main prompt persona"
-    );
-    "main".to_string()
+    Err(error::Error::message(format!(
+        "session '{}' references unknown agent workspace '{}'",
+        entry.key, agent_id
+    )))
 }
 
 /// Load identity, user profile, soul, and workspace text for one agent.
@@ -1132,7 +1131,7 @@ fn load_prompt_persona_for_agent(agent_id: &str) -> PromptPersona {
         }
     }
     let mut user = config.user.clone();
-    if let Some(file_user) = moltis_config::load_user() {
+    if let Some(file_user) = moltis_config::load_user_for_agent(agent_id) {
         if file_user.name.is_some() {
             user.name = file_user.name;
         }
@@ -1147,13 +1146,87 @@ fn load_prompt_persona_for_agent(agent_id: &str) -> PromptPersona {
         soul_text: moltis_config::load_soul_for_agent(agent_id),
         agents_text: moltis_config::load_agents_md_for_agent(agent_id),
         tools_text: moltis_config::load_tools_md_for_agent(agent_id),
+        heartbeat_text: moltis_config::load_heartbeat_md_for_agent(agent_id),
         memory_text: moltis_config::load_memory_md_for_agent(agent_id),
     }
 }
 
-fn load_prompt_persona_for_session(session_entry: Option<&SessionEntry>) -> PromptPersona {
-    let agent_id = resolve_prompt_agent_id(session_entry);
-    load_prompt_persona_for_agent(&agent_id)
+fn load_prompt_persona_for_session(
+    session_entry: Option<&SessionEntry>,
+) -> error::Result<PromptPersona> {
+    let agent_id = resolve_prompt_agent_id(session_entry)?;
+    let mut persona = load_prompt_persona_for_agent(&agent_id);
+    let include_private = should_include_private_persona_data(
+        session_entry.and_then(|entry| entry.channel_binding.as_deref()),
+    );
+    apply_private_persona_data_policy(&mut persona, include_private);
+    Ok(persona)
+}
+
+fn should_include_private_persona_data(channel_binding: Option<&str>) -> bool {
+    let Some(binding_json) = channel_binding else {
+        return true;
+    };
+    let Ok(binding) = serde_json::from_str::<moltis_channels::ChannelReplyTarget>(binding_json)
+    else {
+        return false;
+    };
+
+    let channel_type = binding.channel_type.as_str().to_ascii_lowercase();
+    let chat_type = infer_channel_chat_type(&channel_type, &binding.chat_id);
+    should_include_private_persona_data_for_surface(Some(channel_type.as_str()), chat_type.as_deref())
+}
+
+fn should_include_private_persona_data_for_runtime(
+    runtime_context: Option<&PromptRuntimeContext>,
+) -> bool {
+    let Some(runtime) = runtime_context else {
+        return true;
+    };
+    should_include_private_persona_data_for_surface(
+        runtime.host.channel_type.as_deref(),
+        runtime.host.channel_chat_type.as_deref(),
+    )
+}
+
+fn should_include_private_persona_data_for_surface(
+    channel_type: Option<&str>,
+    channel_chat_type: Option<&str>,
+) -> bool {
+    let Some(channel_type) = channel_type else {
+        // Non-channel surfaces (web/local/cron) keep private persona data.
+        return true;
+    };
+    let Some(chat_type) = channel_chat_type else {
+        // Unclassified channel surfaces are treated as non-private.
+        return false;
+    };
+
+    if channel_type.eq_ignore_ascii_case("telegram") {
+        return chat_type.eq_ignore_ascii_case("private");
+    }
+    if channel_type.eq_ignore_ascii_case("whatsapp") {
+        return chat_type.eq_ignore_ascii_case("private");
+    }
+    if channel_type.eq_ignore_ascii_case("discord")
+        || channel_type.eq_ignore_ascii_case("msteams")
+    {
+        return chat_type.eq_ignore_ascii_case("private");
+    }
+
+    false
+}
+
+fn apply_private_persona_data_policy(persona: &mut PromptPersona, include_private: bool) {
+    if include_private {
+        return;
+    }
+
+    // Group/public/unknown channel surfaces should not receive private
+    // always-loaded persona context by default.
+    persona.user.name = None;
+    persona.user.location = None;
+    persona.memory_text = None;
 }
 
 #[derive(Default)]
@@ -1172,6 +1245,13 @@ fn infer_channel_chat_type(channel_type: &str, chat_id: &str) -> Option<String> 
             return Some("channel_or_supergroup".to_string());
         }
         if chat_id.starts_with('-') {
+            return Some("group".to_string());
+        }
+        return Some("private".to_string());
+    }
+    if channel_type.eq_ignore_ascii_case("whatsapp") {
+        let normalized = chat_id.to_ascii_lowercase();
+        if normalized.ends_with("@g.us") {
             return Some("group".to_string());
         }
         return Some("private".to_string());
@@ -3260,7 +3340,8 @@ impl ChatService for LiveChatService {
         // Check if MCP tools are disabled for this session and capture
         // per-session sandbox override details for prompt runtime context.
         let session_entry = self.session_metadata.get(&session_key).await;
-        let session_agent_id = resolve_prompt_agent_id(session_entry.as_ref());
+        let session_agent_id =
+            resolve_prompt_agent_id(session_entry.as_ref()).map_err(ServiceError::message)?;
         let mcp_disabled = session_entry
             .as_ref()
             .and_then(|entry| entry.mcp_disabled)
@@ -3944,7 +4025,8 @@ impl ChatService for LiveChatService {
         self.session_metadata.touch(&session_key, 1).await;
 
         let session_entry = self.session_metadata.get(&session_key).await;
-        let session_agent_id = resolve_prompt_agent_id(session_entry.as_ref());
+        let session_agent_id =
+            resolve_prompt_agent_id(session_entry.as_ref()).map_err(ServiceError::message)?;
         let mut runtime_context = build_prompt_runtime_context(
             &self.state,
             &provider,
@@ -4293,7 +4375,8 @@ impl ChatService for LiveChatService {
             self.session_key_for(conn_id.as_deref()).await
         };
         let session_entry = self.session_metadata.get(&session_key).await;
-        let session_agent_id = resolve_prompt_agent_id(session_entry.as_ref());
+        let session_agent_id =
+            resolve_prompt_agent_id(session_entry.as_ref()).map_err(ServiceError::message)?;
 
         let history = self
             .session_store
@@ -4832,7 +4915,8 @@ impl ChatService for LiveChatService {
 
         // Build runtime context.
         let session_entry = self.session_metadata.get(&session_key).await;
-        let persona = load_prompt_persona_for_session(session_entry.as_ref());
+        let persona = load_prompt_persona_for_session(session_entry.as_ref())
+            .map_err(ServiceError::message)?;
         let mut runtime_context = build_prompt_runtime_context(
             &self.state,
             &provider,
@@ -4883,7 +4967,7 @@ impl ChatService for LiveChatService {
 
         // Build the system prompt.
         let system_prompt = if tools_enabled {
-            build_system_prompt_with_session_runtime(
+            build_system_prompt_with_session_runtime_workspace(
                 &filtered_registry,
                 native_tools,
                 project_context.as_deref(),
@@ -4893,17 +4977,19 @@ impl ChatService for LiveChatService {
                 persona.soul_text.as_deref(),
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
+                persona.heartbeat_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
             )
         } else {
-            build_system_prompt_minimal_runtime(
+            build_system_prompt_minimal_runtime_workspace(
                 project_context.as_deref(),
                 Some(&persona.identity),
                 Some(&persona.user),
                 persona.soul_text.as_deref(),
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
+                persona.heartbeat_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
             )
@@ -4955,7 +5041,8 @@ impl ChatService for LiveChatService {
 
         // Build runtime context.
         let session_entry = self.session_metadata.get(&session_key).await;
-        let persona = load_prompt_persona_for_session(session_entry.as_ref());
+        let persona = load_prompt_persona_for_session(session_entry.as_ref())
+            .map_err(ServiceError::message)?;
         let mut runtime_context = build_prompt_runtime_context(
             &self.state,
             &provider,
@@ -5004,7 +5091,7 @@ impl ChatService for LiveChatService {
 
         // Build the system prompt.
         let system_prompt = if tools_enabled {
-            build_system_prompt_with_session_runtime(
+            build_system_prompt_with_session_runtime_workspace(
                 &filtered_registry,
                 native_tools,
                 project_context.as_deref(),
@@ -5014,17 +5101,19 @@ impl ChatService for LiveChatService {
                 persona.soul_text.as_deref(),
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
+                persona.heartbeat_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
             )
         } else {
-            build_system_prompt_minimal_runtime(
+            build_system_prompt_minimal_runtime_workspace(
                 project_context.as_deref(),
                 Some(&persona.identity),
                 Some(&persona.user),
                 persona.soul_text.as_deref(),
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
+                persona.heartbeat_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
             )
@@ -6088,7 +6177,9 @@ async fn run_with_tools(
     active_tool_calls: Option<Arc<RwLock<HashMap<String, Vec<ActiveToolCall>>>>>,
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
-    let persona = load_prompt_persona_for_agent(agent_id);
+    let mut persona = load_prompt_persona_for_agent(agent_id);
+    let include_private = should_include_private_persona_data_for_runtime(runtime_context);
+    apply_private_persona_data_policy(&mut persona, include_private);
 
     let tool_mode = effective_tool_mode(&*provider);
     let native_tools = matches!(tool_mode, ToolMode::Native);
@@ -6111,7 +6202,7 @@ async fn run_with_tools(
     // - Text tools: full prompt with tool schemas embedded + call guidance
     // - Off: minimal prompt without tools
     let system_prompt = if tools_enabled {
-        build_system_prompt_with_session_runtime(
+        build_system_prompt_with_session_runtime_workspace(
             &filtered_registry,
             native_tools,
             project_context,
@@ -6121,17 +6212,19 @@ async fn run_with_tools(
             persona.soul_text.as_deref(),
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
+            persona.heartbeat_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
         )
     } else {
-        build_system_prompt_minimal_runtime(
+        build_system_prompt_minimal_runtime_workspace(
             project_context,
             Some(&persona.identity),
             Some(&persona.user),
             persona.soul_text.as_deref(),
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
+            persona.heartbeat_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
         )
@@ -7028,15 +7121,18 @@ async fn run_streaming(
     client_seq: Option<u64>,
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
-    let persona = load_prompt_persona_for_agent(agent_id);
+    let mut persona = load_prompt_persona_for_agent(agent_id);
+    let include_private = should_include_private_persona_data_for_runtime(runtime_context);
+    apply_private_persona_data_policy(&mut persona, include_private);
 
-    let system_prompt = build_system_prompt_minimal_runtime(
+    let system_prompt = build_system_prompt_minimal_runtime_workspace(
         project_context,
         Some(&persona.identity),
         Some(&persona.user),
         persona.soul_text.as_deref(),
         persona.agents_text.as_deref(),
         persona.tools_text.as_deref(),
+        persona.heartbeat_text.as_deref(),
         runtime_context,
         persona.memory_text.as_deref(),
     );
@@ -8714,6 +8810,65 @@ mod tests {
     }
 
     #[test]
+    fn private_persona_data_allowed_without_channel_binding() {
+        assert!(should_include_private_persona_data(None));
+    }
+
+    #[test]
+    fn private_persona_data_blocked_for_invalid_binding_json() {
+        assert!(!should_include_private_persona_data(Some("{invalid}")));
+    }
+
+    #[test]
+    fn private_persona_data_blocked_for_telegram_group_chat() {
+        let binding = serde_json::json!({
+            "channel_type": "telegram",
+            "account_id": "bot-main",
+            "chat_id": "-100200300"
+        })
+        .to_string();
+        assert!(!should_include_private_persona_data(Some(&binding)));
+    }
+
+    #[test]
+    fn private_persona_data_allowed_for_telegram_private_chat() {
+        let binding = serde_json::json!({
+            "channel_type": "telegram",
+            "account_id": "bot-main",
+            "chat_id": "12345678"
+        })
+        .to_string();
+        assert!(should_include_private_persona_data(Some(&binding)));
+    }
+
+    #[test]
+    fn private_persona_data_blocked_for_whatsapp_group_chat() {
+        let binding = serde_json::json!({
+            "channel_type": "whatsapp",
+            "account_id": "wa-main",
+            "chat_id": "120363000000000000@g.us"
+        })
+        .to_string();
+        assert!(!should_include_private_persona_data(Some(&binding)));
+    }
+
+    #[test]
+    fn private_persona_data_blocked_for_unclassified_discord_surface() {
+        assert!(!should_include_private_persona_data_for_surface(
+            Some("discord"),
+            None
+        ));
+    }
+
+    #[test]
+    fn private_persona_data_allowed_for_discord_private_surface() {
+        assert!(should_include_private_persona_data_for_surface(
+            Some("discord"),
+            Some("private")
+        ));
+    }
+
+    #[test]
     fn truncate_at_char_boundary_handles_multibyte_boundary() {
         let text = format!("{}л{}", "a".repeat(99), "z");
         let truncated = truncate_at_char_boundary(&text, 100);
@@ -8919,6 +9074,16 @@ mod tests {
         assert_eq!(context.channel_type, None);
         assert_eq!(context.channel_account_id, None);
         assert_eq!(context.channel_chat_id, None);
+    }
+
+    #[test]
+    fn resolve_prompt_agent_id_errors_for_unknown_agent_workspace() {
+        let mut entry = make_session_entry_with_binding(None);
+        entry.agent_id = Some("missing-agent".to_string());
+        let err = resolve_prompt_agent_id(Some(&entry)).expect_err("unknown agent should error");
+        assert!(err
+            .to_string()
+            .contains("references unknown agent workspace"));
     }
 
     #[test]
@@ -11468,16 +11633,15 @@ mod tests {
         );
 
         // Pre-populate active tool calls for a session.
-        service
-            .active_tool_calls
-            .write()
-            .await
-            .insert("test-session".into(), vec![ActiveToolCall {
+        service.active_tool_calls.write().await.insert(
+            "test-session".into(),
+            vec![ActiveToolCall {
                 id: "tc_1".into(),
                 name: "bash".into(),
                 arguments: serde_json::json!({}),
                 started_at: 0,
-            }]);
+            }],
+        );
         // Pre-populate active_runs_by_session so abort can find the session.
         let run_id = "test-run".to_string();
         service

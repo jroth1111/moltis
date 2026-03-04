@@ -8,7 +8,7 @@
 use {
     serde::{Deserialize, Serialize},
     std::{
-        path::{Path, PathBuf},
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     },
 };
@@ -199,31 +199,14 @@ impl AgentPersonaStore {
         Ok(id.to_string())
     }
 
-    /// Ensure the default main workspace exists and is seeded from the root
-    /// workspace when files are present there.
+    /// Ensure the default main workspace directory exists.
+    ///
+    /// Prompt/file loading uses runtime fallback from `agents/main/*` to root
+    /// workspace files, so we intentionally avoid copying root files into the
+    /// main workspace.
     pub fn ensure_main_workspace_seeded(&self) -> Result<PathBuf> {
         let main_workspace = moltis_config::agent_workspace_dir("main");
         std::fs::create_dir_all(&main_workspace)?;
-
-        for file_name in &[
-            "IDENTITY.md",
-            "SOUL.md",
-            "MEMORY.md",
-            "AGENTS.md",
-            "TOOLS.md",
-        ] {
-            let src = moltis_config::data_dir().join(file_name);
-            let dst = main_workspace.join(file_name);
-            if src.exists() && !dst.exists() {
-                let _ = std::fs::copy(&src, &dst)?;
-            }
-        }
-
-        let src_memory_dir = moltis_config::data_dir().join("memory");
-        let dst_memory_dir = main_workspace.join("memory");
-        if src_memory_dir.exists() && src_memory_dir.is_dir() && !dst_memory_dir.exists() {
-            copy_dir_recursive(&src_memory_dir, &dst_memory_dir)?;
-        }
 
         Ok(main_workspace)
     }
@@ -417,22 +400,6 @@ fn synthesize_main_agent(is_default: bool) -> AgentPersona {
     }
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if file_type.is_file() {
-            let _ = std::fs::copy(src_path, dst_path)?;
-        }
-    }
-    Ok(())
-}
-
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
@@ -556,12 +523,15 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update("writer", UpdateAgentParams {
-                name: Some("Creative Writer".to_string()),
-                emoji: Some("✍️".to_string()),
-                theme: None,
-                description: None,
-            })
+            .update(
+                "writer",
+                UpdateAgentParams {
+                    name: Some("Creative Writer".to_string()),
+                    emoji: Some("✍️".to_string()),
+                    theme: None,
+                    description: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -574,12 +544,15 @@ mod tests {
         let pool = test_pool().await;
         let store = AgentPersonaStore::new(pool);
         let result = store
-            .update("main", UpdateAgentParams {
-                name: Some("Changed".to_string()),
-                emoji: None,
-                theme: None,
-                description: None,
-            })
+            .update(
+                "main",
+                UpdateAgentParams {
+                    name: Some("Changed".to_string()),
+                    emoji: None,
+                    theme: None,
+                    description: None,
+                },
+            )
             .await;
         assert!(result.is_err());
     }
