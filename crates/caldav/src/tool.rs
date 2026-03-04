@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use {
     anyhow::{Result, anyhow},
     async_trait::async_trait,
-    moltis_agents::tool_registry::AgentTool,
+    moltis_agents::tool_registry::{AgentTool, ToolEffectClass},
     moltis_config::CalDavConfig,
     serde_json::{Value, json},
 };
@@ -184,6 +184,10 @@ impl AgentTool for CalDavTool {
                 }
             }
         })
+    }
+
+    fn side_effect_class(&self) -> ToolEffectClass {
+        ToolEffectClass::ExternalEffect
     }
 
     async fn execute(&self, params: Value) -> Result<Value> {
@@ -391,13 +395,16 @@ mod tests {
 
     fn test_config() -> CalDavConfig {
         let mut accounts = HashMap::new();
-        accounts.insert("test".to_string(), CalDavAccountConfig {
-            url: Some("https://caldav.example.com".to_string()),
-            username: Some("user".to_string()),
-            password: Some(Secret::new("pass".to_string())),
-            provider: Some("generic".to_string()),
-            ..Default::default()
-        });
+        accounts.insert(
+            "test".to_string(),
+            CalDavAccountConfig {
+                url: Some("https://caldav.example.com".to_string()),
+                username: Some("user".to_string()),
+                password: Some(Secret::new("pass".to_string())),
+                provider: Some("generic".to_string()),
+                ..Default::default()
+            },
+        );
         CalDavConfig {
             enabled: true,
             default_account: Some("test".to_string()),

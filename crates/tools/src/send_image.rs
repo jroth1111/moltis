@@ -7,7 +7,7 @@
 use {
     async_trait::async_trait,
     base64::{Engine as _, engine::general_purpose::STANDARD as BASE64},
-    moltis_agents::tool_registry::AgentTool,
+    moltis_agents::tool_registry::{AgentTool, ToolEffectClass},
     serde_json::{Value, json},
     std::{
         path::{Path, PathBuf},
@@ -216,6 +216,10 @@ impl AgentTool for SendImageTool {
                 }
             }
         })
+    }
+
+    fn side_effect_class(&self) -> ToolEffectClass {
+        ToolEffectClass::ExternalEffect
     }
 
     async fn execute(&self, params: Value) -> anyhow::Result<Value> {

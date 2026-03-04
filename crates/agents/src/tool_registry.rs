@@ -8,6 +8,14 @@ use {
     },
 };
 
+/// Side-effect class used by deterministic execution policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEffectClass {
+    ReadOnly,
+    LocalMutation,
+    ExternalEffect,
+}
+
 struct RateLimitState {
     window_started_at: Instant,
     used: u32,
@@ -54,6 +62,9 @@ pub trait AgentTool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> serde_json::Value;
+    fn side_effect_class(&self) -> ToolEffectClass {
+        ToolEffectClass::ReadOnly
+    }
     async fn execute(&self, params: serde_json::Value) -> Result<serde_json::Value>;
 }
 
@@ -161,14 +172,34 @@ impl ToolRegistry {
         self.tools.get(name).map(|e| Arc::clone(&e.tool))
     }
 
+    /// Validate tool-call parameters against schema without executing.
+    pub fn validate_call_arguments(&self, name: &str, params: &serde_json::Value) -> Result<()> {
+        let entry = self
+            .tools
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        let schema = entry.tool.parameters_schema();
+        validate_tool_call_arguments(name, &schema, params)
+    }
+
+    /// Resolve side-effect class for deterministic policy checks.
+    #[must_use]
+    pub fn side_effect_class(&self, name: &str) -> Option<ToolEffectClass> {
+        let entry = self.tools.get(name)?;
+        if matches!(entry.source, ToolSource::Mcp { .. } | ToolSource::Wasm { .. }) {
+            // Fail closed for externally supplied tool definitions.
+            return Some(ToolEffectClass::ExternalEffect);
+        }
+        Some(entry.tool.side_effect_class())
+    }
+
     /// Dispatch a tool call by name: check rate limit, then execute.
     pub async fn call(&self, name: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let entry = self
             .tools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
-        let schema = entry.tool.parameters_schema();
-        validate_tool_call_arguments(name, &schema, &params)?;
+        self.validate_call_arguments(name, &params)?;
         if let Some(ref rl) = entry.rate_limit
             && let Err(e) = rl.try_acquire()
         {
@@ -788,5 +819,49 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "runtime metadata fields should be ignored");
+    }
+
+    #[test]
+    fn test_side_effect_class_fail_closed_for_mcp_and_wasm() {
+        struct ReadOnlyTool;
+        #[async_trait]
+        impl AgentTool for ReadOnlyTool {
+            fn name(&self) -> &str {
+                "ro"
+            }
+            fn description(&self) -> &str {
+                "read-only"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            fn side_effect_class(&self) -> ToolEffectClass {
+                ToolEffectClass::ReadOnly
+            }
+            async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({"ok":true}))
+            }
+        }
+
+        let mut builtin = ToolRegistry::new();
+        builtin.register(Box::new(ReadOnlyTool));
+        assert_eq!(
+            builtin.side_effect_class("ro"),
+            Some(ToolEffectClass::ReadOnly)
+        );
+
+        let mut mcp = ToolRegistry::new();
+        mcp.register_mcp(Box::new(ReadOnlyTool), "mcp-local".to_string());
+        assert_eq!(
+            mcp.side_effect_class("ro"),
+            Some(ToolEffectClass::ExternalEffect)
+        );
+
+        let mut wasm = ToolRegistry::new();
+        wasm.register_wasm(Box::new(ReadOnlyTool), [7u8; 32]);
+        assert_eq!(
+            wasm.side_effect_class("ro"),
+            Some(ToolEffectClass::ExternalEffect)
+        );
     }
 }

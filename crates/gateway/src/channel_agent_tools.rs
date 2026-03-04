@@ -1,7 +1,7 @@
 use {
     anyhow::Result,
     async_trait::async_trait,
-    moltis_agents::tool_registry::AgentTool,
+    moltis_agents::tool_registry::{AgentTool, ToolEffectClass},
     serde_json::{Value, json},
     std::sync::Arc,
 };
@@ -71,6 +71,10 @@ impl AgentTool for SendMessageTool {
                 }
             }
         })
+    }
+
+    fn side_effect_class(&self) -> ToolEffectClass {
+        ToolEffectClass::ExternalEffect
     }
 
     async fn execute(&self, params: Value) -> Result<Value> {

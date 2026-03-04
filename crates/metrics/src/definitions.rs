@@ -74,6 +74,13 @@ pub mod chat {
     pub const MESSAGES_RECEIVED_TOTAL: &str = "moltis_chat_messages_received_total";
     /// Chat message processing duration in seconds
     pub const PROCESSING_DURATION_SECONDS: &str = "moltis_chat_processing_duration_seconds";
+    /// Private persona injections blocked by deterministic policy.
+    pub const PRIVATE_PERSONA_BLOCKED_TOTAL: &str = "moltis_policy_private_persona_blocked_total";
+    /// Memory bootstrap injections blocked by deterministic policy.
+    pub const MEMORY_BOOTSTRAP_BLOCKED_TOTAL: &str =
+        "moltis_policy_memory_bootstrap_blocked_total";
+    /// Prompt sections dropped due deterministic budget priority handling.
+    pub const DROPPED_SECTIONS_TOTAL: &str = "moltis_policy_dropped_sections_total";
 }
 
 /// Tool execution metrics
@@ -86,6 +93,10 @@ pub mod tools {
     pub const EXECUTION_ERRORS_TOTAL: &str = "moltis_tool_execution_errors_total";
     /// Number of currently running tool executions
     pub const EXECUTIONS_IN_FLIGHT: &str = "moltis_tool_executions_in_flight";
+    /// Tool calls blocked by deterministic policy.
+    pub const POLICY_BLOCKED_TOTAL: &str = "moltis_policy_tool_calls_blocked_total";
+    /// Untrusted payload transforms applied before reinjection.
+    pub const UNTRUSTED_TRANSFORMS_TOTAL: &str = "moltis_policy_untrusted_transforms_total";
 }
 
 /// Sandbox metrics
