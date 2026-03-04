@@ -28,8 +28,8 @@ use {
         multimodal::parse_data_uri,
         prompt::{
             PromptHostRuntimeContext, PromptRuntimeContext, PromptSandboxRuntimeContext,
-            VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime_workspace,
-            build_system_prompt_with_session_runtime_workspace,
+            VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime_workspace_budgets,
+            build_system_prompt_with_session_runtime_workspace_budgets,
         },
         runner::{RunnerEvent, run_agent_loop_streaming},
         tool_registry::{AgentTool, ToolRegistry},
@@ -1088,6 +1088,142 @@ struct PromptPersona {
     memory_text: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersonaHealthIssue {
+    code: &'static str,
+    message: String,
+}
+
+static PERSONA_HEALTH_WARNED_AGENTS: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+fn extract_lane_marker_value(line: &str) -> Option<&str> {
+    let start = line.find("<!--")?;
+    let rest = &line[start + 4..];
+    let end = rest.find("-->")?;
+    let comment = rest[..end].trim();
+    let mut parts = comment.splitn(2, ':');
+    let key = parts.next()?.trim();
+    if !key.eq_ignore_ascii_case("lane") {
+        return None;
+    }
+    Some(parts.next().map(str::trim).unwrap_or_default())
+}
+
+fn collect_unknown_lane_markers(soul_text: &str) -> Vec<String> {
+    soul_text
+        .lines()
+        .filter_map(extract_lane_marker_value)
+        .filter_map(|value| {
+            let valid = matches!(
+                value.to_ascii_lowercase().as_str(),
+                "soul" | "agents" | "tools" | "heartbeat"
+            );
+            (!valid).then(|| value.to_string())
+        })
+        .collect()
+}
+
+fn validate_prompt_persona(agent_id: &str, persona: &PromptPersona) -> Vec<PersonaHealthIssue> {
+    let mut issues = Vec::new();
+    if persona.identity.name.is_none() && persona.identity.emoji.is_none() && persona.identity.theme.is_none() {
+        issues.push(PersonaHealthIssue {
+            code: "identity_empty",
+            message: "IDENTITY is empty; prompt persona may be under-specified".to_string(),
+        });
+    }
+
+    let soul = persona.soul_text.as_deref().map(str::trim).unwrap_or_default();
+    if soul.is_empty() {
+        issues.push(PersonaHealthIssue {
+            code: "soul_missing",
+            message: "SOUL.md is empty or missing; persona defaults may not match intent".to_string(),
+        });
+    } else if !soul.contains("\n## ") && !soul.starts_with("## ") {
+        issues.push(PersonaHealthIssue {
+            code: "soul_unstructured",
+            message: "SOUL.md has no level-2 sections; consider structured sections for predictable routing"
+                .to_string(),
+        });
+    }
+
+    for marker in collect_unknown_lane_markers(soul) {
+        issues.push(PersonaHealthIssue {
+            code: "soul_lane_unknown",
+            message: format!(
+                "SOUL lane marker '{marker}' is invalid; use soul|agents|tools|heartbeat"
+            ),
+        });
+    }
+
+    if persona.agents_text.is_none() && persona.tools_text.is_none() && persona.heartbeat_text.is_none() {
+        issues.push(PersonaHealthIssue {
+            code: "workspace_guidance_missing",
+            message:
+                "AGENTS.md, TOOLS.md, and HEARTBEAT.md are all empty; execution guidance lanes are missing"
+                    .to_string(),
+        });
+    }
+
+    let budgets = &persona.config.chat.prompt_budgets;
+    for (name, value) in [
+        ("chat.prompt_budgets.soul_max_chars", budgets.soul_max_chars),
+        (
+            "chat.prompt_budgets.project_context_max_chars",
+            budgets.project_context_max_chars,
+        ),
+        (
+            "chat.prompt_budgets.workspace_file_max_chars",
+            budgets.workspace_file_max_chars,
+        ),
+        (
+            "chat.prompt_budgets.memory_bootstrap_max_chars",
+            budgets.memory_bootstrap_max_chars,
+        ),
+    ] {
+        if value == 0 {
+            issues.push(PersonaHealthIssue {
+                code: "prompt_budget_zero",
+                message: format!("{name} is 0; this section will be effectively disabled"),
+            });
+        }
+    }
+
+    if !issues.is_empty() && agent_id == "main" {
+        issues.push(PersonaHealthIssue {
+            code: "persona_health_docs",
+            message:
+                "See docs/system-prompt.md for precedence matrix, lane markers, and prompt assembly rules"
+                    .to_string(),
+        });
+    }
+
+    issues
+}
+
+fn emit_prompt_persona_health_warnings(agent_id: &str, issues: &[PersonaHealthIssue]) {
+    if issues.is_empty() {
+        return;
+    }
+    let already_warned = {
+        let mut seen = PERSONA_HEALTH_WARNED_AGENTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        !seen.insert(agent_id.to_string())
+    };
+    if already_warned {
+        return;
+    }
+    for issue in issues {
+        warn!(
+            agent_id,
+            code = issue.code,
+            message = %issue.message,
+            "persona health warning"
+        );
+    }
+}
+
 fn resolve_prompt_agent_id(session_entry: Option<&SessionEntry>) -> error::Result<String> {
     let Some(entry) = session_entry else {
         return Ok("main".to_string());
@@ -1139,7 +1275,7 @@ fn load_prompt_persona_for_agent(agent_id: &str) -> PromptPersona {
             user.timezone = file_user.timezone;
         }
     }
-    PromptPersona {
+    let persona = PromptPersona {
         config,
         identity,
         user,
@@ -1148,7 +1284,10 @@ fn load_prompt_persona_for_agent(agent_id: &str) -> PromptPersona {
         tools_text: moltis_config::load_tools_md_for_agent(agent_id),
         heartbeat_text: moltis_config::load_heartbeat_md_for_agent(agent_id),
         memory_text: moltis_config::load_memory_md_for_agent(agent_id),
-    }
+    };
+    let issues = validate_prompt_persona(agent_id, &persona);
+    emit_prompt_persona_health_warnings(agent_id, &issues);
+    persona
 }
 
 fn load_prompt_persona_for_session(
@@ -4967,7 +5106,7 @@ impl ChatService for LiveChatService {
 
         // Build the system prompt.
         let system_prompt = if tools_enabled {
-            build_system_prompt_with_session_runtime_workspace(
+            build_system_prompt_with_session_runtime_workspace_budgets(
                 &filtered_registry,
                 native_tools,
                 project_context.as_deref(),
@@ -4978,11 +5117,12 @@ impl ChatService for LiveChatService {
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 persona.heartbeat_text.as_deref(),
+                Some(&persona.config.chat.prompt_budgets),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
             )
         } else {
-            build_system_prompt_minimal_runtime_workspace(
+            build_system_prompt_minimal_runtime_workspace_budgets(
                 project_context.as_deref(),
                 Some(&persona.identity),
                 Some(&persona.user),
@@ -4990,6 +5130,7 @@ impl ChatService for LiveChatService {
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 persona.heartbeat_text.as_deref(),
+                Some(&persona.config.chat.prompt_budgets),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
             )
@@ -5091,7 +5232,7 @@ impl ChatService for LiveChatService {
 
         // Build the system prompt.
         let system_prompt = if tools_enabled {
-            build_system_prompt_with_session_runtime_workspace(
+            build_system_prompt_with_session_runtime_workspace_budgets(
                 &filtered_registry,
                 native_tools,
                 project_context.as_deref(),
@@ -5102,11 +5243,12 @@ impl ChatService for LiveChatService {
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 persona.heartbeat_text.as_deref(),
+                Some(&persona.config.chat.prompt_budgets),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
             )
         } else {
-            build_system_prompt_minimal_runtime_workspace(
+            build_system_prompt_minimal_runtime_workspace_budgets(
                 project_context.as_deref(),
                 Some(&persona.identity),
                 Some(&persona.user),
@@ -5114,6 +5256,7 @@ impl ChatService for LiveChatService {
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 persona.heartbeat_text.as_deref(),
+                Some(&persona.config.chat.prompt_budgets),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
             )
@@ -6202,7 +6345,7 @@ async fn run_with_tools(
     // - Text tools: full prompt with tool schemas embedded + call guidance
     // - Off: minimal prompt without tools
     let system_prompt = if tools_enabled {
-        build_system_prompt_with_session_runtime_workspace(
+        build_system_prompt_with_session_runtime_workspace_budgets(
             &filtered_registry,
             native_tools,
             project_context,
@@ -6213,11 +6356,12 @@ async fn run_with_tools(
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
             persona.heartbeat_text.as_deref(),
+            Some(&persona.config.chat.prompt_budgets),
             runtime_context,
             persona.memory_text.as_deref(),
         )
     } else {
-        build_system_prompt_minimal_runtime_workspace(
+        build_system_prompt_minimal_runtime_workspace_budgets(
             project_context,
             Some(&persona.identity),
             Some(&persona.user),
@@ -6225,6 +6369,7 @@ async fn run_with_tools(
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
             persona.heartbeat_text.as_deref(),
+            Some(&persona.config.chat.prompt_budgets),
             runtime_context,
             persona.memory_text.as_deref(),
         )
@@ -7125,7 +7270,7 @@ async fn run_streaming(
     let include_private = should_include_private_persona_data_for_runtime(runtime_context);
     apply_private_persona_data_policy(&mut persona, include_private);
 
-    let system_prompt = build_system_prompt_minimal_runtime_workspace(
+    let system_prompt = build_system_prompt_minimal_runtime_workspace_budgets(
         project_context,
         Some(&persona.identity),
         Some(&persona.user),
@@ -7133,6 +7278,7 @@ async fn run_streaming(
         persona.agents_text.as_deref(),
         persona.tools_text.as_deref(),
         persona.heartbeat_text.as_deref(),
+        Some(&persona.config.chat.prompt_budgets),
         runtime_context,
         persona.memory_text.as_deref(),
     );
@@ -8866,6 +9012,57 @@ mod tests {
             Some("discord"),
             Some("private")
         ));
+    }
+
+    fn persona_fixture() -> PromptPersona {
+        PromptPersona {
+            config: moltis_config::MoltisConfig::default(),
+            identity: moltis_config::AgentIdentity {
+                name: Some("Momo".to_string()),
+                emoji: None,
+                theme: None,
+            },
+            user: moltis_config::UserProfile::default(),
+            soul_text: Some("# SOUL.md\n\n## Identity\nTruth first.\n".to_string()),
+            agents_text: Some("Follow execution checklist.".to_string()),
+            tools_text: Some("Prefer read-only tools.".to_string()),
+            heartbeat_text: Some("Ping every hour.".to_string()),
+            memory_text: None,
+        }
+    }
+
+    #[test]
+    fn validate_prompt_persona_reports_empty_identity_and_lane_marker_issues() {
+        let mut persona = persona_fixture();
+        persona.identity = moltis_config::AgentIdentity::default();
+        persona.soul_text = Some(
+            "# SOUL.md\n\n<!-- lane:not_valid -->\n## Identity\nTruth first.\n".to_string(),
+        );
+        let issues = validate_prompt_persona("main", &persona);
+        assert!(issues.iter().any(|issue| issue.code == "identity_empty"));
+        assert!(issues.iter().any(|issue| issue.code == "soul_lane_unknown"));
+    }
+
+    #[test]
+    fn validate_prompt_persona_reports_zero_budgets() {
+        let mut persona = persona_fixture();
+        persona.config.chat.prompt_budgets.soul_max_chars = 0;
+        let issues = validate_prompt_persona("ops", &persona);
+        assert!(issues.iter().any(|issue| issue.code == "prompt_budget_zero"));
+    }
+
+    #[test]
+    fn validate_prompt_persona_warns_when_workspace_guidance_missing() {
+        let mut persona = persona_fixture();
+        persona.agents_text = None;
+        persona.tools_text = None;
+        persona.heartbeat_text = None;
+        let issues = validate_prompt_persona("ops", &persona);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code == "workspace_guidance_missing")
+        );
     }
 
     #[test]

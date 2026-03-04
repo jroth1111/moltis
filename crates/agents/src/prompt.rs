@@ -1,7 +1,8 @@
 use {
     crate::tool_registry::ToolRegistry,
-    moltis_config::{AgentIdentity, DEFAULT_SOUL, UserProfile},
+    moltis_config::{AgentIdentity, DEFAULT_SOUL, PromptBudgetsConfig, UserProfile},
     moltis_skills::types::SkillMetadata,
+    tracing::warn,
 };
 
 // ── Model family detection ──────────────────────────────────────────────────
@@ -166,6 +167,73 @@ pub fn build_system_prompt_with_session_runtime(
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
 ) -> String {
+    build_system_prompt_with_session_runtime_workspace(
+        tools,
+        native_tools,
+        project_context,
+        skills,
+        identity,
+        user,
+        soul_text,
+        agents_text,
+        tools_text,
+        None,
+        runtime_context,
+        memory_text,
+    )
+}
+
+/// Build the system prompt with explicit runtime context and optional
+/// workspace heartbeat guidance text.
+pub fn build_system_prompt_with_session_runtime_workspace(
+    tools: &ToolRegistry,
+    native_tools: bool,
+    project_context: Option<&str>,
+    skills: &[SkillMetadata],
+    identity: Option<&AgentIdentity>,
+    user: Option<&UserProfile>,
+    soul_text: Option<&str>,
+    agents_text: Option<&str>,
+    tools_text: Option<&str>,
+    heartbeat_text: Option<&str>,
+    runtime_context: Option<&PromptRuntimeContext>,
+    memory_text: Option<&str>,
+) -> String {
+    build_system_prompt_with_session_runtime_workspace_budgets(
+        tools,
+        native_tools,
+        project_context,
+        skills,
+        identity,
+        user,
+        soul_text,
+        agents_text,
+        tools_text,
+        heartbeat_text,
+        None,
+        runtime_context,
+        memory_text,
+    )
+}
+
+/// Build the system prompt with explicit runtime context, optional workspace
+/// heartbeat guidance text, and configurable section budgets.
+pub fn build_system_prompt_with_session_runtime_workspace_budgets(
+    tools: &ToolRegistry,
+    native_tools: bool,
+    project_context: Option<&str>,
+    skills: &[SkillMetadata],
+    identity: Option<&AgentIdentity>,
+    user: Option<&UserProfile>,
+    soul_text: Option<&str>,
+    agents_text: Option<&str>,
+    tools_text: Option<&str>,
+    heartbeat_text: Option<&str>,
+    prompt_budgets: Option<&PromptBudgetsConfig>,
+    runtime_context: Option<&PromptRuntimeContext>,
+    memory_text: Option<&str>,
+) -> String {
+    let budgets = prompt_budgets.cloned().unwrap_or_default();
     build_system_prompt_full(
         tools,
         native_tools,
@@ -176,6 +244,8 @@ pub fn build_system_prompt_with_session_runtime(
         soul_text,
         agents_text,
         tools_text,
+        heartbeat_text,
+        &budgets,
         runtime_context,
         true, // include_tools
         memory_text,
@@ -193,6 +263,61 @@ pub fn build_system_prompt_minimal_runtime(
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
 ) -> String {
+    build_system_prompt_minimal_runtime_workspace(
+        project_context,
+        identity,
+        user,
+        soul_text,
+        agents_text,
+        tools_text,
+        None,
+        runtime_context,
+        memory_text,
+    )
+}
+
+/// Build a minimal system prompt with explicit runtime context and optional
+/// workspace heartbeat guidance text.
+pub fn build_system_prompt_minimal_runtime_workspace(
+    project_context: Option<&str>,
+    identity: Option<&AgentIdentity>,
+    user: Option<&UserProfile>,
+    soul_text: Option<&str>,
+    agents_text: Option<&str>,
+    tools_text: Option<&str>,
+    heartbeat_text: Option<&str>,
+    runtime_context: Option<&PromptRuntimeContext>,
+    memory_text: Option<&str>,
+) -> String {
+    build_system_prompt_minimal_runtime_workspace_budgets(
+        project_context,
+        identity,
+        user,
+        soul_text,
+        agents_text,
+        tools_text,
+        heartbeat_text,
+        None,
+        runtime_context,
+        memory_text,
+    )
+}
+
+/// Build a minimal system prompt with explicit runtime context, optional
+/// workspace heartbeat guidance text, and configurable section budgets.
+pub fn build_system_prompt_minimal_runtime_workspace_budgets(
+    project_context: Option<&str>,
+    identity: Option<&AgentIdentity>,
+    user: Option<&UserProfile>,
+    soul_text: Option<&str>,
+    agents_text: Option<&str>,
+    tools_text: Option<&str>,
+    heartbeat_text: Option<&str>,
+    prompt_budgets: Option<&PromptBudgetsConfig>,
+    runtime_context: Option<&PromptRuntimeContext>,
+    memory_text: Option<&str>,
+) -> String {
+    let budgets = prompt_budgets.cloned().unwrap_or_default();
     build_system_prompt_full(
         &ToolRegistry::new(),
         true,
@@ -203,21 +328,14 @@ pub fn build_system_prompt_minimal_runtime(
         soul_text,
         agents_text,
         tools_text,
+        heartbeat_text,
+        &budgets,
         runtime_context,
         false, // include_tools
         memory_text,
     )
 }
 
-/// Maximum number of characters from `MEMORY.md` injected into the system
-/// prompt to keep the context window manageable.
-const MEMORY_BOOTSTRAP_MAX_CHARS: usize = 8_000;
-/// Maximum number of characters from project context files (`CLAUDE.md`,
-/// project docs, etc.) injected into the prompt.
-const PROJECT_CONTEXT_MAX_CHARS: usize = 8_000;
-/// Maximum number of characters from each workspace file (`AGENTS.md`,
-/// `TOOLS.md`) injected into the prompt.
-const WORKSPACE_FILE_MAX_CHARS: usize = 6_000;
 const EXEC_ROUTING_GUIDANCE: &str = "Execution routing:\n\
 - `exec` runs inside sandbox when `Sandbox(exec): enabled=true`.\n\
 - When sandbox is disabled, `exec` runs on the host and may require approval.\n\
@@ -331,6 +449,8 @@ fn build_system_prompt_full(
     soul_text: Option<&str>,
     agents_text: Option<&str>,
     tools_text: Option<&str>,
+    heartbeat_text: Option<&str>,
+    prompt_budgets: &PromptBudgetsConfig,
     runtime_context: Option<&PromptRuntimeContext>,
     include_tools: bool,
     memory_text: Option<&str>,
@@ -346,12 +466,50 @@ fn build_system_prompt_full(
         "You are a helpful assistant. Answer questions clearly and concisely.\n\n"
     });
 
-    append_identity_and_user_sections(&mut prompt, identity, user, soul_text);
-    append_project_context(&mut prompt, project_context);
+    let prepared_soul = prepare_soul_sections(soul_text.unwrap_or(DEFAULT_SOUL));
+    for warning_text in &prepared_soul.warnings {
+        warn!(warning = %warning_text, "SOUL redistribution warning");
+    }
+    let effective_agents_text = merge_agents_text(
+        agents_text,
+        prepared_soul.redistributed_agents_text.as_deref(),
+    );
+    let effective_tools_text = merge_agents_text(
+        tools_text,
+        prepared_soul.redistributed_tools_text.as_deref(),
+    );
+    let effective_heartbeat_text = merge_agents_text(
+        heartbeat_text,
+        prepared_soul.redistributed_heartbeat_text.as_deref(),
+    );
+
+    append_identity_and_user_sections(
+        &mut prompt,
+        identity,
+        user,
+        Some(&prepared_soul.identity_soul_text),
+        prompt_budgets.soul_max_chars,
+    );
+    append_project_context(
+        &mut prompt,
+        project_context,
+        prompt_budgets.project_context_max_chars,
+    );
     append_runtime_section(&mut prompt, runtime_context, include_tools);
     append_skills_section(&mut prompt, include_tools, skills);
-    append_workspace_files_section(&mut prompt, agents_text, tools_text);
-    append_memory_section(&mut prompt, memory_text, &tool_schemas);
+    append_workspace_files_section(
+        &mut prompt,
+        effective_agents_text.as_deref(),
+        effective_tools_text.as_deref(),
+        effective_heartbeat_text.as_deref(),
+        prompt_budgets.workspace_file_max_chars,
+    );
+    append_memory_section(
+        &mut prompt,
+        memory_text,
+        &tool_schemas,
+        prompt_budgets.memory_bootstrap_max_chars,
+    );
     let model_id = runtime_context.and_then(|ctx| ctx.host.model.as_deref());
     append_available_tools_section(&mut prompt, native_tools, &tool_schemas);
     append_tool_call_guidance(&mut prompt, native_tools, &tool_schemas, model_id);
@@ -361,11 +519,269 @@ fn build_system_prompt_full(
     prompt
 }
 
+#[derive(Debug)]
+struct PreparedSoulSections {
+    identity_soul_text: String,
+    redistributed_agents_text: Option<String>,
+    redistributed_tools_text: Option<String>,
+    redistributed_heartbeat_text: Option<String>,
+    warnings: Vec<String>,
+}
+
+fn merge_agents_text(primary_agents: Option<&str>, redistributed: Option<&str>) -> Option<String> {
+    match (primary_agents, redistributed) {
+        (None, None) => None,
+        (Some(primary), None) => Some(primary.to_string()),
+        (None, Some(derived)) => Some(derived.to_string()),
+        (Some(primary), Some(derived)) => Some(format!("{primary}\n\n{derived}")),
+    }
+}
+
+fn section_heading_key(line: &str) -> Option<String> {
+    let heading = line.trim().strip_prefix("## ")?;
+    let key = heading.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_ascii_lowercase())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoulLane {
+    Soul,
+    Agents,
+    Tools,
+    Heartbeat,
+}
+
+impl SoulLane {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "soul" => Some(Self::Soul),
+            "agents" => Some(Self::Agents),
+            "tools" => Some(Self::Tools),
+            "heartbeat" => Some(Self::Heartbeat),
+            _ => None,
+        }
+    }
+}
+
+fn parse_lane_marker(line: &str) -> Option<Result<SoulLane, String>> {
+    let start = line.find("<!--")?;
+    let rest = &line[start + 4..];
+    let end = rest.find("-->")?;
+    let comment = rest[..end].trim();
+    let mut parts = comment.splitn(2, ':');
+    let Some(key) = parts.next().map(str::trim) else {
+        return None;
+    };
+    if !key.eq_ignore_ascii_case("lane") {
+        return None;
+    }
+    let value = parts.next().map(str::trim).unwrap_or_default();
+    if value.is_empty() {
+        return Some(Err("".to_string()));
+    }
+    if let Some(lane) = SoulLane::parse(value) {
+        return Some(Ok(lane));
+    }
+    Some(Err(value.to_string()))
+}
+
+fn strip_lane_marker(line: &str) -> String {
+    let Some(start) = line.find("<!--") else {
+        return line.to_string();
+    };
+    let rest = &line[start + 4..];
+    let Some(rel_end) = rest.find("-->") else {
+        return line.to_string();
+    };
+    let end = start + 4 + rel_end + 3;
+    let mut merged = String::new();
+    let prefix = line[..start].trim_end();
+    if !prefix.is_empty() {
+        merged.push_str(prefix);
+    }
+    let suffix = line[end..].trim_start();
+    if !suffix.is_empty() {
+        if !merged.is_empty() {
+            merged.push(' ');
+        }
+        merged.push_str(suffix);
+    }
+    merged
+}
+
+fn join_non_empty_blocks(blocks: Vec<String>) -> String {
+    blocks
+        .into_iter()
+        .filter_map(|block| {
+            let trimmed = block.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn build_derived_soul_section(title: &str, intro: &str, blocks: Vec<String>) -> Option<String> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut redistributed = format!("## {title}\n\n{intro}\n\n");
+    redistributed.push_str(&join_non_empty_blocks(blocks));
+    Some(redistributed)
+}
+
+/// Split SOUL.md into identity/value content and execution-heavy sections,
+/// then route derived sections into AGENTS/TOOLS/HEARTBEAT prompt contexts.
+///
+/// Routing markers are explicit:
+/// - `<!-- lane:agents -->`
+/// - `<!-- lane:tools -->`
+/// - `<!-- lane:heartbeat -->`
+/// - `<!-- lane:soul -->`
+fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
+    let mut preamble_lines: Vec<String> = Vec::new();
+    let mut sections: Vec<(String, String, SoulLane)> = Vec::new();
+    let mut current_heading: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut current_lane = SoulLane::Soul;
+    let mut pending_lane: Option<SoulLane> = None;
+    let mut warnings = Vec::new();
+
+    for raw_line in soul_text.lines() {
+        let marker = parse_lane_marker(raw_line);
+        let line = strip_lane_marker(raw_line);
+        let trimmed = line.trim();
+        let line_heading = section_heading_key(trimmed);
+
+        if let Some(marker) = marker.as_ref().map(|result| result.as_ref()) {
+            match marker {
+                Ok(lane) => {
+                    if trimmed.is_empty() || line_heading.is_none() {
+                        pending_lane = Some(*lane);
+                    }
+                },
+                Err(value) => {
+                    let rendered = if value.is_empty() {
+                        "empty".to_string()
+                    } else {
+                        value.to_string()
+                    };
+                    warnings.push(format!(
+                        "invalid SOUL lane marker '{rendered}'; expected one of: soul, agents, tools, heartbeat"
+                    ));
+                },
+            }
+        }
+
+        if let Some(new_heading) = line_heading {
+            if let Some(previous_heading) = current_heading.take() {
+                sections.push((previous_heading, current_lines.join("\n"), current_lane));
+                current_lines.clear();
+            } else if !current_lines.is_empty() {
+                preamble_lines.extend(current_lines.drain(..));
+            }
+            let lane_for_heading = match marker {
+                Some(Ok(lane)) => lane,
+                _ => pending_lane.take().unwrap_or(SoulLane::Soul),
+            };
+            current_heading = Some(new_heading);
+            current_lane = lane_for_heading;
+            if !trimmed.is_empty() {
+                current_lines.push(line);
+            }
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            continue;
+        }
+        current_lines.push(line);
+    }
+
+    if let Some(last_heading) = current_heading.take() {
+        sections.push((last_heading, current_lines.join("\n"), current_lane));
+    } else if !current_lines.is_empty() {
+        preamble_lines.extend(current_lines);
+    }
+    if pending_lane.is_some() {
+        warnings.push(
+            "orphan SOUL lane marker found with no following `##` section; marker was ignored"
+                .to_string(),
+        );
+    }
+
+    if sections.is_empty() {
+        return PreparedSoulSections {
+            identity_soul_text: soul_text.trim().to_string(),
+            redistributed_agents_text: None,
+            redistributed_tools_text: None,
+            redistributed_heartbeat_text: None,
+            warnings,
+        };
+    }
+
+    let mut identity_blocks = Vec::new();
+    let preamble = preamble_lines.join("\n");
+    if !preamble.trim().is_empty() {
+        identity_blocks.push(preamble);
+    }
+
+    let mut operational_blocks = Vec::new();
+    let mut tools_blocks = Vec::new();
+    let mut heartbeat_blocks = Vec::new();
+    for (_, body, lane) in sections {
+        match lane {
+            SoulLane::Soul => identity_blocks.push(body),
+            SoulLane::Agents => operational_blocks.push(body),
+            SoulLane::Tools => tools_blocks.push(body),
+            SoulLane::Heartbeat => heartbeat_blocks.push(body),
+        }
+    }
+    let identity_soul_text = {
+        let joined = join_non_empty_blocks(identity_blocks);
+        if joined.is_empty() {
+            soul_text.trim().to_string()
+        } else {
+            joined
+        }
+    };
+
+    let redistributed_agents_text = build_derived_soul_section(
+        "Derived From SOUL.md (Operational Rules)",
+        "These sections are redistributed from SOUL.md for execution salience. \
+Keep SOUL focused on identity/values/style and keep process execution in \
+AGENTS/rules.",
+        operational_blocks,
+    );
+    let redistributed_tools_text = build_derived_soul_section(
+        "Derived From SOUL.md (Tooling Rules)",
+        "These sections are redistributed from SOUL.md to keep tool/routing policy in TOOLS context.",
+        tools_blocks,
+    );
+    let redistributed_heartbeat_text = build_derived_soul_section(
+        "Derived From SOUL.md (Heartbeat/Proactivity Rules)",
+        "These sections are redistributed from SOUL.md for heartbeat/proactive cadence handling.",
+        heartbeat_blocks,
+    );
+
+    PreparedSoulSections {
+        identity_soul_text,
+        redistributed_agents_text,
+        redistributed_tools_text,
+        redistributed_heartbeat_text,
+        warnings,
+    }
+}
+
 fn append_identity_and_user_sections(
     prompt: &mut String,
     identity: Option<&AgentIdentity>,
     user: Option<&UserProfile>,
     soul_text: Option<&str>,
+    soul_max_chars: usize,
 ) {
     if let Some(id) = identity {
         let mut parts = Vec::new();
@@ -382,7 +798,16 @@ fn append_identity_and_user_sections(
             prompt.push('\n');
         }
         prompt.push_str("\n## Soul\n\n");
-        prompt.push_str(soul_text.unwrap_or(DEFAULT_SOUL));
+        let soul = soul_text.unwrap_or(DEFAULT_SOUL);
+        let was_truncated = append_truncated_text_block(
+            prompt,
+            soul,
+            soul_max_chars,
+            "\n*(SOUL.md truncated for prompt size.)*\n",
+        );
+        if was_truncated {
+            warn_prompt_truncation("soul", soul_max_chars, soul);
+        }
         prompt.push('\n');
     }
 
@@ -394,14 +819,21 @@ fn append_identity_and_user_sections(
     }
 }
 
-fn append_project_context(prompt: &mut String, project_context: Option<&str>) {
+fn append_project_context(
+    prompt: &mut String,
+    project_context: Option<&str>,
+    project_context_max_chars: usize,
+) {
     if let Some(context) = project_context {
-        append_truncated_text_block(
+        let was_truncated = append_truncated_text_block(
             prompt,
             context,
-            PROJECT_CONTEXT_MAX_CHARS,
+            project_context_max_chars,
             "\n*(Project context truncated for prompt size; use tools/files for full details.)*\n",
         );
+        if was_truncated {
+            warn_prompt_truncation("project_context", project_context_max_chars, context);
+        }
         prompt.push('\n');
     }
 }
@@ -447,30 +879,51 @@ fn append_workspace_files_section(
     prompt: &mut String,
     agents_text: Option<&str>,
     tools_text: Option<&str>,
+    heartbeat_text: Option<&str>,
+    workspace_file_max_chars: usize,
 ) {
-    if agents_text.is_none() && tools_text.is_none() {
+    if agents_text.is_none() && tools_text.is_none() && heartbeat_text.is_none() {
         return;
     }
 
     prompt.push_str("## Workspace Files\n\n");
     if let Some(agents_md) = agents_text {
         prompt.push_str("### AGENTS.md (workspace)\n\n");
-        append_truncated_text_block(
+        let was_truncated = append_truncated_text_block(
             prompt,
             agents_md,
-            WORKSPACE_FILE_MAX_CHARS,
+            workspace_file_max_chars,
             "\n*(AGENTS.md truncated for prompt size.)*\n",
         );
+        if was_truncated {
+            warn_prompt_truncation("agents_md", workspace_file_max_chars, agents_md);
+        }
         prompt.push_str("\n\n");
     }
     if let Some(tools_md) = tools_text {
         prompt.push_str("### TOOLS.md (workspace)\n\n");
-        append_truncated_text_block(
+        let was_truncated = append_truncated_text_block(
             prompt,
             tools_md,
-            WORKSPACE_FILE_MAX_CHARS,
+            workspace_file_max_chars,
             "\n*(TOOLS.md truncated for prompt size.)*\n",
         );
+        if was_truncated {
+            warn_prompt_truncation("tools_md", workspace_file_max_chars, tools_md);
+        }
+        prompt.push_str("\n\n");
+    }
+    if let Some(heartbeat_md) = heartbeat_text {
+        prompt.push_str("### HEARTBEAT.md (workspace)\n\n");
+        let was_truncated = append_truncated_text_block(
+            prompt,
+            heartbeat_md,
+            workspace_file_max_chars,
+            "\n*(HEARTBEAT.md truncated for prompt size.)*\n",
+        );
+        if was_truncated {
+            warn_prompt_truncation("heartbeat_md", workspace_file_max_chars, heartbeat_md);
+        }
         prompt.push_str("\n\n");
     }
 }
@@ -479,6 +932,7 @@ fn append_memory_section(
     prompt: &mut String,
     memory_text: Option<&str>,
     tool_schemas: &[serde_json::Value],
+    memory_bootstrap_max_chars: usize,
 ) {
     let has_memory_search = has_tool_schema(tool_schemas, "memory_search");
     let has_memory_save = has_tool_schema(tool_schemas, "memory_save");
@@ -489,12 +943,15 @@ fn append_memory_section(
 
     prompt.push_str("## Long-Term Memory\n\n");
     if let Some(text) = memory_content {
-        append_truncated_text_block(
+        let was_truncated = append_truncated_text_block(
             prompt,
             text,
-            MEMORY_BOOTSTRAP_MAX_CHARS,
+            memory_bootstrap_max_chars,
             "\n\n*(MEMORY.md truncated — use `memory_search` for full content)*\n",
         );
+        if was_truncated {
+            warn_prompt_truncation("memory_bootstrap", memory_bootstrap_max_chars, text);
+        }
         prompt.push_str(concat!(
             "\n\n**The information above is what you already know about the user. ",
             "Always include it in your answers.** ",
@@ -675,17 +1132,28 @@ fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn warn_prompt_truncation(section: &str, max_chars: usize, text: &str) {
+    warn!(
+        section,
+        max_chars,
+        original_chars = text.chars().count(),
+        "prompt section truncated due to budget"
+    );
+}
+
 fn append_truncated_text_block(
     prompt: &mut String,
     text: &str,
     max_chars: usize,
     truncated_notice: &str,
-) {
+) -> bool {
     let truncated = truncate_prompt_text(text, max_chars);
     prompt.push_str(&truncated);
-    if text.chars().count() > max_chars {
+    let was_truncated = text.chars().count() > max_chars;
+    if was_truncated {
         prompt.push_str(truncated_notice);
     }
+    was_truncated
 }
 
 fn format_sandbox_runtime_line(sandbox: &PromptSandboxRuntimeContext) -> String {
@@ -1185,8 +1653,9 @@ mod tests {
     #[test]
     fn test_memory_text_truncated_at_limit() {
         let tools = ToolRegistry::new();
-        // Create content larger than MEMORY_BOOTSTRAP_MAX_CHARS
-        let large_memory = "x".repeat(MEMORY_BOOTSTRAP_MAX_CHARS + 500);
+        let memory_budget = PromptBudgetsConfig::default().memory_bootstrap_max_chars;
+        // Create content larger than configured default memory budget.
+        let large_memory = "x".repeat(memory_budget + 500);
         let prompt = build_system_prompt_with_session_runtime(
             &tools,
             true,
@@ -1563,5 +2032,277 @@ mod tests {
         // Should include tool call guidance
         assert!(prompt.contains("## How to call tools"));
         assert!(prompt.contains("```tool_call"));
+    }
+
+    #[test]
+    fn test_prepare_soul_sections_redistributes_marked_sections() {
+        let soul = r#"
+# SOUL.md
+
+## Identity
+I am calm and direct.
+
+<!-- lane:agents -->
+## Advanced Operating Principles
+- Verify before claiming done.
+
+## Vibe
+No fluff.
+"#;
+
+        let prepared = prepare_soul_sections(soul);
+        assert!(prepared.identity_soul_text.contains("## Identity"));
+        assert!(prepared.identity_soul_text.contains("## Vibe"));
+        assert!(
+            !prepared
+                .identity_soul_text
+                .contains("## Advanced Operating Principles")
+        );
+
+        let redistributed = prepared
+            .redistributed_agents_text
+            .expect("operational sections should be redistributed");
+        assert!(redistributed.contains("## Derived From SOUL.md"));
+        assert!(redistributed.contains("## Advanced Operating Principles"));
+        assert!(redistributed.contains("Verify before claiming done"));
+        assert!(prepared.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_prepare_soul_sections_distributes_without_loss() {
+        let soul = r#"
+# SOUL.md
+
+## Identity
+I am calm and direct.
+
+<!-- lane:agents -->
+## Work Style
+- Understand -> Execute -> Verify -> Report.
+
+<!-- lane:tools -->
+## Routing Defaults
+- Use browser for web tasks.
+
+<!-- lane:heartbeat -->
+## Proactive Disposition
+- Run heartbeat checks hourly.
+
+## Vibe
+No fluff.
+"#;
+
+        let prepared = prepare_soul_sections(soul);
+        assert!(prepared.warnings.is_empty());
+
+        // Non-operational sections remain in Soul.
+        assert!(prepared.identity_soul_text.contains("## Identity"));
+        assert!(
+            prepared
+                .identity_soul_text
+                .contains("I am calm and direct.")
+        );
+        assert!(prepared.identity_soul_text.contains("## Vibe"));
+        assert!(prepared.identity_soul_text.contains("No fluff."));
+
+        // Execution/process sections are redistributed to workspace contexts.
+        assert!(!prepared.identity_soul_text.contains("## Work Style"));
+        assert!(!prepared.identity_soul_text.contains("## Routing Defaults"));
+        assert!(
+            !prepared
+                .identity_soul_text
+                .contains("## Proactive Disposition")
+        );
+
+        let redistributed_agents = prepared
+            .redistributed_agents_text
+            .as_deref()
+            .expect("work style should be redistributed");
+        let redistributed_tools = prepared
+            .redistributed_tools_text
+            .as_deref()
+            .expect("routing defaults should be redistributed");
+        let redistributed_heartbeat = prepared
+            .redistributed_heartbeat_text
+            .as_deref()
+            .expect("proactive disposition should be redistributed");
+
+        assert!(redistributed_agents.contains("## Work Style"));
+        assert!(redistributed_agents.contains("Understand -> Execute -> Verify -> Report"));
+        assert!(!redistributed_agents.contains("## Routing Defaults"));
+        assert!(!redistributed_agents.contains("## Proactive Disposition"));
+
+        assert!(redistributed_tools.contains("## Routing Defaults"));
+        assert!(redistributed_tools.contains("Use browser for web tasks"));
+        assert!(!redistributed_tools.contains("## Work Style"));
+        assert!(!redistributed_tools.contains("## Proactive Disposition"));
+
+        assert!(redistributed_heartbeat.contains("## Proactive Disposition"));
+        assert!(redistributed_heartbeat.contains("Run heartbeat checks hourly"));
+        assert!(!redistributed_heartbeat.contains("## Work Style"));
+        assert!(!redistributed_heartbeat.contains("## Routing Defaults"));
+
+        // Each redistributed heading appears exactly once across identity + derived blocks.
+        let work_style_count = prepared.identity_soul_text.matches("## Work Style").count()
+            + redistributed_agents.matches("## Work Style").count()
+            + redistributed_tools.matches("## Work Style").count()
+            + redistributed_heartbeat.matches("## Work Style").count();
+        assert_eq!(work_style_count, 1);
+
+        let routing_defaults_count = prepared
+            .identity_soul_text
+            .matches("## Routing Defaults")
+            .count()
+            + redistributed_agents.matches("## Routing Defaults").count()
+            + redistributed_tools.matches("## Routing Defaults").count()
+            + redistributed_heartbeat
+                .matches("## Routing Defaults")
+                .count();
+        assert_eq!(routing_defaults_count, 1);
+
+        let proactive_disposition_count = prepared
+            .identity_soul_text
+            .matches("## Proactive Disposition")
+            .count()
+            + redistributed_agents
+                .matches("## Proactive Disposition")
+                .count()
+            + redistributed_tools
+                .matches("## Proactive Disposition")
+                .count()
+            + redistributed_heartbeat
+                .matches("## Proactive Disposition")
+                .count();
+        assert_eq!(proactive_disposition_count, 1);
+    }
+
+    #[test]
+    fn test_prepare_soul_sections_warns_on_invalid_marker_and_keeps_section_in_soul() {
+        let soul = r#"
+# SOUL.md
+
+<!-- lane:invalid_lane -->
+## Work Style
+- Verify before claiming done.
+"#;
+        let prepared = prepare_soul_sections(soul);
+        assert_eq!(prepared.warnings.len(), 1);
+        assert!(prepared.warnings[0].contains("invalid SOUL lane marker"));
+        assert!(prepared.identity_soul_text.contains("## Work Style"));
+        assert!(prepared.redistributed_agents_text.is_none());
+        assert!(prepared.redistributed_tools_text.is_none());
+        assert!(prepared.redistributed_heartbeat_text.is_none());
+    }
+
+    #[test]
+    fn test_prepare_soul_sections_warns_on_orphan_marker() {
+        let soul = r#"
+# SOUL.md
+
+## Identity
+I am calm and direct.
+
+<!-- lane:agents -->
+"#;
+        let prepared = prepare_soul_sections(soul);
+        assert_eq!(prepared.warnings.len(), 1);
+        assert!(prepared.warnings[0].contains("orphan SOUL lane marker"));
+        assert!(prepared.identity_soul_text.contains("## Identity"));
+    }
+
+    #[test]
+    fn test_prompt_merges_existing_workspace_files_with_redistributed_soul_sections() {
+        let tools = ToolRegistry::new();
+        let identity = AgentIdentity {
+            name: Some("Momo".into()),
+            ..Default::default()
+        };
+        let soul = r#"
+# SOUL.md
+
+## Identity
+I value truth.
+
+<!-- lane:agents -->
+## Work Style
+- Understand -> Execute -> Verify -> Report.
+
+<!-- lane:tools -->
+## Routing Defaults
+- Use browser for web tasks.
+
+<!-- lane:heartbeat -->
+## Proactive Disposition
+- Run heartbeat checks hourly.
+"#;
+        let prompt = build_system_prompt_with_session_runtime_workspace(
+            &tools,
+            true,
+            None,
+            &[],
+            Some(&identity),
+            None,
+            Some(soul),
+            Some("### Existing AGENTS\n- Ask before destructive actions."),
+            Some("### Existing TOOLS\n- Prefer read-only tools first."),
+            Some("### Existing HEARTBEAT\n- Keep cycles tight."),
+            None,
+            None,
+        );
+
+        assert!(prompt.contains("### Existing AGENTS"));
+        assert!(prompt.contains("### Existing TOOLS"));
+        assert!(prompt.contains("### Existing HEARTBEAT"));
+        assert!(prompt.contains("## Derived From SOUL.md (Operational Rules)"));
+        assert!(prompt.contains("## Derived From SOUL.md (Tooling Rules)"));
+        assert!(prompt.contains("## Derived From SOUL.md (Heartbeat/Proactivity Rules)"));
+        assert!(prompt.contains("## Work Style"));
+        assert!(prompt.contains("## Routing Defaults"));
+        assert!(prompt.contains("## Proactive Disposition"));
+        assert!(prompt.contains("## Soul\n\n# SOUL.md"));
+        assert!(prompt.contains("Understand -> Execute -> Verify -> Report"));
+        assert!(!prompt.contains("<!-- lane:"));
+
+        // No duplicated headings after redistribution.
+        assert_eq!(prompt.matches("## Work Style").count(), 1);
+        assert_eq!(prompt.matches("## Routing Defaults").count(), 1);
+        assert_eq!(prompt.matches("## Proactive Disposition").count(), 1);
+    }
+
+    #[test]
+    fn test_custom_prompt_budgets_apply_to_soul_workspace_and_memory() {
+        let tools = ToolRegistry::new();
+        let identity = AgentIdentity {
+            name: Some("Momo".into()),
+            ..Default::default()
+        };
+        let budgets = PromptBudgetsConfig {
+            soul_max_chars: 60,
+            project_context_max_chars: 80,
+            workspace_file_max_chars: 50,
+            memory_bootstrap_max_chars: 70,
+        };
+        let prompt = build_system_prompt_with_session_runtime_workspace_budgets(
+            &tools,
+            true,
+            Some("P".repeat(300).as_str()),
+            &[],
+            Some(&identity),
+            None,
+            Some("S".repeat(300).as_str()),
+            Some("A".repeat(300).as_str()),
+            Some("T".repeat(300).as_str()),
+            Some("H".repeat(300).as_str()),
+            Some(&budgets),
+            None,
+            Some("M".repeat(300).as_str()),
+        );
+
+        assert!(prompt.contains("SOUL.md truncated for prompt size"));
+        assert!(prompt.contains("Project context truncated for prompt size"));
+        assert!(prompt.contains("AGENTS.md truncated for prompt size"));
+        assert!(prompt.contains("TOOLS.md truncated for prompt size"));
+        assert!(prompt.contains("HEARTBEAT.md truncated for prompt size"));
+        assert!(prompt.contains("MEMORY.md truncated"));
     }
 }

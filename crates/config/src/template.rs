@@ -183,6 +183,13 @@ message_queue_mode = "followup"   # Default: process queued messages one-by-one 
 # priority_models = ["claude-opus-4-5", "gpt-5.2", "gemini-3-flash"]  # Optional: models to pin first in selectors
 # allowed_models = ["gpt 5.2"]  # Legacy field (currently ignored).
 
+# Per-section system-prompt character budgets (higher values use more context window).
+[chat.prompt_budgets]
+soul_max_chars = 20000             # Max characters injected for ## Soul
+project_context_max_chars = 8000   # Max characters injected from project context files
+workspace_file_max_chars = 6000    # Max characters injected per workspace file (AGENTS/TOOLS/HEARTBEAT)
+memory_bootstrap_max_chars = 8000  # Max characters injected from MEMORY.md bootstrap text
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SPAWN PRESETS (OPTIONAL)
 # ══════════════════════════════════════════════════════════════════════════════

@@ -17,11 +17,29 @@ The prompt is built in `crates/agents/src/prompt.rs` by
    walked up the directory tree
 6. **Runtime context** — host info, sandbox config, execution routing hints
 7. **Skills listing** — available skills as XML block
-8. **Workspace files** — `AGENTS.md` and `TOOLS.md` from the data directory
+8. **Workspace files** — `AGENTS.md`, `TOOLS.md`, and `HEARTBEAT.md` from the
+   data directory (plus any SOUL sections explicitly routed there)
 9. **Long-term memory hint** — added when memory tools are registered
 10. **Tool schemas** — compact list (native) or full JSON (fallback)
 11. **Tool-calling format** — JSON block instructions (fallback providers only)
 12. **Guidelines** — tool usage guidance, silent reply protocol
+
+## Persona Precedence Matrix
+
+Prompt persona files are resolved with a consistent cascade:
+
+| File | Resolution order |
+|------|------------------|
+| `IDENTITY.md` | `agents/<id>/IDENTITY.md` -> root `IDENTITY.md` |
+| `SOUL.md` | `agents/<id>/SOUL.md` -> root `SOUL.md` -> built-in `DEFAULT_SOUL` |
+| `USER.md` | `agents/<id>/USER.md` -> root `USER.md` |
+| `AGENTS.md` | `agents/<id>/AGENTS.md` -> root `AGENTS.md` |
+| `TOOLS.md` | `agents/<id>/TOOLS.md` -> root `TOOLS.md` |
+| `HEARTBEAT.md` | `agents/<id>/HEARTBEAT.md` -> root `HEARTBEAT.md` |
+| `MEMORY.md` | `agents/<id>/MEMORY.md` -> root `MEMORY.md` |
+
+`agent_id` must map to a known workspace (`main` or existing `agents/<id>/`).
+Unknown IDs fail fast instead of silently falling back to `main`.
 
 ## Components in Detail
 
@@ -40,8 +58,7 @@ Loaded from `~/.moltis/IDENTITY.md` using YAML frontmatter. Fields:
 | Field | Prompt output |
 |-------|---------------|
 | `name` + `emoji` | "Your name is {name} {emoji}." |
-| `creature` | "You are a {creature}." |
-| `vibe` | "Your vibe: {vibe}." |
+| `theme` | "Your theme: {theme}." |
 
 All fields are optional. When identity is present, the soul section is always
 included.
@@ -92,6 +109,19 @@ built-in `DEFAULT_SOUL` is used. The default is sourced from
 
 The default soul is ~1,500 characters (~400 tokens).
 
+`SOUL.md` redistribution is marker-driven (not heading-name inferred). Use
+HTML comments to route a section to a workspace lane:
+
+- `<!-- lane:agents -->`
+- `<!-- lane:tools -->`
+- `<!-- lane:heartbeat -->`
+- `<!-- lane:soul -->`
+
+Place markers immediately before a `##` section (or inline on the same line).
+The marker is stripped from prompt output. Routed content is removed from
+`## Soul` and injected once into the target workspace block (no duplication).
+Invalid/orphan markers are ignored and produce warnings.
+
 ### User Profile (`USER.md`)
 
 Loaded from `~/.moltis/USER.md` using YAML frontmatter.
@@ -99,6 +129,10 @@ Loaded from `~/.moltis/USER.md` using YAML frontmatter.
 - `name` is injected as: *"The user's name is {name}."*
 - `timezone` is used by runtime context to localize `Host: time=...` and
   `Host: today=...` fields.
+
+For channel-bound sessions that are detected as non-private surfaces (Telegram
+groups/channels and WhatsApp groups), private persona data (`USER.md` name and
+`MEMORY.md` bootstrap text) is not injected by default.
 
 ### Project Context
 
@@ -155,9 +189,32 @@ Optional markdown files from the data directory (`~/.moltis/`):
 
 - **AGENTS.md** — workspace-level agent instructions
 - **TOOLS.md** — tool preferences and guidance
+- **HEARTBEAT.md** — proactive cadence and wake-up policy
 
 Each is rendered under `## Workspace Files` with its own `###` subheading.
 Leading HTML comments (`<!-- ... -->`) are stripped before injection.
+
+If `SOUL.md` sections are redistributed, they are moved without duplication:
+
+- `## Derived From SOUL.md (Operational Rules)` inside the AGENTS workspace block
+- `## Derived From SOUL.md (Tooling Rules)` inside the TOOLS workspace block
+- `## Derived From SOUL.md (Heartbeat/Proactivity Rules)` inside the HEARTBEAT workspace block
+
+## Prompt Budgets
+
+Per-section character budgets are configurable in `moltis.toml`:
+
+```toml
+[chat.prompt_budgets]
+soul_max_chars = 20000
+project_context_max_chars = 8000
+workspace_file_max_chars = 6000
+memory_bootstrap_max_chars = 8000
+```
+
+When a section exceeds its budget, prompt assembly truncates it and appends a
+truncation notice in the prompt. The runtime also logs a warning with section
+name and original size.
 
 ### Tool Schemas
 
@@ -186,7 +243,11 @@ The final section contains:
 |----------|----------|
 | `build_system_prompt()` | Simple: tools + optional project context |
 | `build_system_prompt_with_session_runtime()` | Full: identity, soul, user, skills, runtime, tools |
+| `build_system_prompt_with_session_runtime_workspace()` | Full + explicit workspace `HEARTBEAT.md` text |
+| `build_system_prompt_with_session_runtime_workspace_budgets()` | Full + explicit workspace text + custom budgets |
 | `build_system_prompt_minimal_runtime()` | No tools (e.g. title generation, summaries) |
+| `build_system_prompt_minimal_runtime_workspace()` | No tools + explicit workspace `HEARTBEAT.md` text |
+| `build_system_prompt_minimal_runtime_workspace_budgets()` | No tools + explicit workspace text + custom budgets |
 
 ## Size Estimates
 
@@ -211,11 +272,12 @@ concern.
 
 ```
 ~/.moltis/
-├── IDENTITY.md          # Agent identity (name, emoji, creature, vibe)
+├── IDENTITY.md          # Agent identity (name, emoji, theme)
 ├── SOUL.md              # Personality directives
 ├── USER.md              # User profile (name, timezone, location)
 ├── AGENTS.md            # Workspace agent instructions
-└── TOOLS.md             # Tool preferences
+├── TOOLS.md             # Tool preferences
+└── HEARTBEAT.md         # Proactive cadence policy
 
 <project>/
 ├── CLAUDE.md            # Project instructions
@@ -226,8 +288,8 @@ concern.
 ## Key Source Files
 
 - `crates/agents/src/prompt.rs` — prompt assembly logic and `DEFAULT_SOUL`
-- `crates/gateway/src/chat.rs` — `load_prompt_persona()`, runtime context
-  detection, project context resolution
+- `crates/chat/src/lib.rs` — `load_prompt_persona_for_*()`, runtime context
+  detection, project context resolution, persona privacy gating
 - `crates/config/src/loader.rs` — file loading (`load_soul()`,
   `load_agents_md()`, `load_identity()`, etc.)
 - `crates/projects/src/context.rs` — `CLAUDE.md` hierarchy walker

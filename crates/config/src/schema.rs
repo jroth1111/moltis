@@ -1235,6 +1235,9 @@ pub struct ChatConfig {
     /// Research phase settings.
     #[serde(default)]
     pub research: ResearchConfig,
+    /// Character budgets for major system-prompt sections.
+    #[serde(default)]
+    pub prompt_budgets: PromptBudgetsConfig,
 }
 
 fn default_message_queue_mode() -> MessageQueueMode {
@@ -1259,6 +1262,32 @@ impl Default for ChatConfig {
             context_compaction_strategy: default_compaction_strategy(),
             context_compaction_keep_recent: default_compaction_keep_recent(),
             research: ResearchConfig::default(),
+            prompt_budgets: PromptBudgetsConfig::default(),
+        }
+    }
+}
+
+/// Character budgets for major system-prompt sections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptBudgetsConfig {
+    /// Maximum characters injected for `## Soul`.
+    pub soul_max_chars: usize,
+    /// Maximum characters injected for project context files.
+    pub project_context_max_chars: usize,
+    /// Maximum characters injected for each workspace markdown file.
+    pub workspace_file_max_chars: usize,
+    /// Maximum characters injected for `MEMORY.md` bootstrap content.
+    pub memory_bootstrap_max_chars: usize,
+}
+
+impl Default for PromptBudgetsConfig {
+    fn default() -> Self {
+        Self {
+            soul_max_chars: 20_000,
+            project_context_max_chars: 8_000,
+            workspace_file_max_chars: 6_000,
+            memory_bootstrap_max_chars: 8_000,
         }
     }
 }
@@ -1692,26 +1721,41 @@ pub struct WasmToolLimitsConfig {
 fn default_wasm_tool_overrides() -> HashMap<String, ToolLimitOverrideConfig> {
     let mb = 1024_u64 * 1024_u64;
     HashMap::from([
-        ("calc".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(100_000),
-            memory: Some(2 * mb),
-        }),
-        ("web_fetch".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(10_000_000),
-            memory: Some(32 * mb),
-        }),
-        ("web_search".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(10_000_000),
-            memory: Some(32 * mb),
-        }),
-        ("show_map".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(10_000_000),
-            memory: Some(64 * mb),
-        }),
-        ("location".to_string(), ToolLimitOverrideConfig {
-            fuel: Some(5_000_000),
-            memory: Some(16 * mb),
-        }),
+        (
+            "calc".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(100_000),
+                memory: Some(2 * mb),
+            },
+        ),
+        (
+            "web_fetch".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(10_000_000),
+                memory: Some(32 * mb),
+            },
+        ),
+        (
+            "web_search".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(10_000_000),
+                memory: Some(32 * mb),
+            },
+        ),
+        (
+            "show_map".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(10_000_000),
+                memory: Some(64 * mb),
+            },
+        ),
+        (
+            "location".to_string(),
+            ToolLimitOverrideConfig {
+                fuel: Some(5_000_000),
+                memory: Some(16 * mb),
+            },
+        ),
     ])
 }
 
@@ -2371,10 +2415,13 @@ system_prompt_suffix = "Focus on evidence."
     #[test]
     fn providers_config_local_alias_maps_local_llm_to_local() {
         let mut config = ProvidersConfig::default();
-        config.providers.insert("local-llm".into(), ProviderEntry {
-            enabled: false,
-            ..ProviderEntry::default()
-        });
+        config.providers.insert(
+            "local-llm".into(),
+            ProviderEntry {
+                enabled: false,
+                ..ProviderEntry::default()
+            },
+        );
 
         assert!(!config.is_enabled("local"));
         assert!(!config.is_enabled("local-llm"));
@@ -2384,14 +2431,20 @@ system_prompt_suffix = "Focus on evidence."
     #[test]
     fn providers_config_local_alias_prefers_exact_key() {
         let mut config = ProvidersConfig::default();
-        config.providers.insert("local".into(), ProviderEntry {
-            enabled: false,
-            ..ProviderEntry::default()
-        });
-        config.providers.insert("local-llm".into(), ProviderEntry {
-            enabled: true,
-            ..ProviderEntry::default()
-        });
+        config.providers.insert(
+            "local".into(),
+            ProviderEntry {
+                enabled: false,
+                ..ProviderEntry::default()
+            },
+        );
+        config.providers.insert(
+            "local-llm".into(),
+            ProviderEntry {
+                enabled: true,
+                ..ProviderEntry::default()
+            },
+        );
 
         assert!(!config.is_enabled("local"));
         assert!(config.is_enabled("local-llm"));
@@ -2423,10 +2476,13 @@ system_prompt_suffix = "Focus on evidence."
             offered: vec!["openai".into()],
             ..ProvidersConfig::default()
         };
-        config.providers.insert("openai".into(), ProviderEntry {
-            enabled: false,
-            ..ProviderEntry::default()
-        });
+        config.providers.insert(
+            "openai".into(),
+            ProviderEntry {
+                enabled: false,
+                ..ProviderEntry::default()
+            },
+        );
         assert!(!config.is_enabled("openai"));
     }
 
@@ -2440,29 +2496,29 @@ system_prompt_suffix = "Focus on evidence."
     #[test]
     fn channels_config_defaults_to_telegram_and_discord_offered() {
         let config = ChannelsConfig::default();
-        assert_eq!(config.offered, vec![
-            "telegram".to_string(),
-            "discord".to_string()
-        ]);
+        assert_eq!(
+            config.offered,
+            vec!["telegram".to_string(), "discord".to_string()]
+        );
     }
 
     #[test]
     fn channels_config_empty_toml_defaults_offered() {
         let config: ChannelsConfig = toml::from_str("").unwrap();
-        assert_eq!(config.offered, vec![
-            "telegram".to_string(),
-            "discord".to_string()
-        ]);
+        assert_eq!(
+            config.offered,
+            vec!["telegram".to_string(), "discord".to_string()]
+        );
     }
 
     #[test]
     fn channels_config_explicit_offered() {
         let config: ChannelsConfig =
             toml::from_str(r#"offered = ["telegram", "msteams"]"#).unwrap();
-        assert_eq!(config.offered, vec![
-            "telegram".to_string(),
-            "msteams".to_string()
-        ]);
+        assert_eq!(
+            config.offered,
+            vec!["telegram".to_string(), "msteams".to_string()]
+        );
     }
 
     #[test]

@@ -30,8 +30,9 @@ pub use {
     schema::{
         AgentIdentity, AgentPresetConfig, AgentsConfig, AuthConfig, CalDavAccountConfig,
         CalDavConfig, ChatConfig, GeoLocation, MessageQueueMode, MoltisConfig, ResolvedIdentity,
-        Timezone, ToolMode, UserProfile, VoiceConfig, VoiceElevenLabsConfig, VoiceOpenAiConfig,
-        VoiceSttConfig, VoiceSttProvider, VoiceTtsConfig, VoiceWhisperConfig,
+        PromptBudgetsConfig, Timezone, ToolMode, UserProfile, VoiceConfig,
+        VoiceElevenLabsConfig, VoiceOpenAiConfig, VoiceSttConfig, VoiceSttProvider, VoiceTtsConfig,
+        VoiceWhisperConfig,
     },
     validate::{Diagnostic, Severity, ValidationResult},
 };
