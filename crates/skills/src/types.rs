@@ -85,9 +85,7 @@ pub struct SkillState {
 }
 
 fn default_trusted() -> bool {
-    // Backward compatibility: manifests created before trust-gating should
-    // continue to work without immediately disabling all installed skills.
-    true
+    false
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -96,12 +94,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skill_state_defaults_trusted_for_backward_compat() {
+    fn skill_state_defaults_to_untrusted() {
         let parsed: SkillState = serde_json::from_str(
             r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":true}"#,
         )
         .unwrap();
-        assert!(parsed.trusted);
+        assert!(!parsed.trusted);
     }
 }
 
