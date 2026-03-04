@@ -229,6 +229,7 @@ Deterministic policy controls are configurable in `moltis.toml`:
 [chat.deterministic_policy]
 strict_soul_routing = true
 untrusted_content_mode = "sanitize" # sanitize | drop
+untrusted_drop_tools = [] # e.g. ["web_fetch", "browser"] => force drop reinjection per tool
 memory_relevance_min_score = 0.18
 max_memory_facts_in_prompt = 12
 ```

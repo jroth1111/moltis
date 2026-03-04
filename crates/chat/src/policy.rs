@@ -17,6 +17,13 @@ pub enum PolicyReasonCode {
     SurfaceUnclassified,
     SurfacePrivate,
     SurfaceNonPrivate,
+    UnknownToolSideEffect,
+    MissingExplicitIntent,
+    SchemaInvalid,
+    InvalidSoulMarker,
+    OrphanSoulMarker,
+    DuplicateSoulSection,
+    MemoryIrrelevant,
 }
 
 #[derive(Debug, Clone, Serialize)]

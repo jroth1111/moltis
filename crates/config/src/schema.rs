@@ -1318,6 +1318,10 @@ pub struct DeterministicPolicyConfig {
     /// Supported values: "sanitize", "drop".
     #[serde(default = "default_untrusted_content_mode")]
     pub untrusted_content_mode: String,
+    /// Tool names that should always use drop-mode for untrusted reinjection.
+    /// Matching is case-insensitive.
+    #[serde(default)]
+    pub untrusted_drop_tools: Vec<String>,
     /// Minimum relevance score required for memory facts to be injected.
     #[serde(default = "default_memory_relevance_min_score")]
     pub memory_relevance_min_score: f64,
@@ -1331,6 +1335,7 @@ impl Default for DeterministicPolicyConfig {
         Self {
             strict_soul_routing: true,
             untrusted_content_mode: default_untrusted_content_mode(),
+            untrusted_drop_tools: Vec::new(),
             memory_relevance_min_score: default_memory_relevance_min_score(),
             max_memory_facts_in_prompt: default_max_memory_facts_in_prompt(),
         }
@@ -2462,6 +2467,7 @@ system_prompt_suffix = "Focus on evidence."
         let cfg: ChatConfig = toml::from_str("").unwrap();
         assert!(cfg.deterministic_policy.strict_soul_routing);
         assert_eq!(cfg.deterministic_policy.untrusted_content_mode, "sanitize");
+        assert!(cfg.deterministic_policy.untrusted_drop_tools.is_empty());
         assert_eq!(cfg.deterministic_policy.memory_relevance_min_score, 0.18);
         assert_eq!(cfg.deterministic_policy.max_memory_facts_in_prompt, 12);
     }

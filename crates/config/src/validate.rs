@@ -383,6 +383,7 @@ fn build_schema_map() -> KnownKeys {
                     Struct(HashMap::from([
                         ("strict_soul_routing", Leaf),
                         ("untrusted_content_mode", Leaf),
+                        ("untrusted_drop_tools", Leaf),
                         ("memory_relevance_min_score", Leaf),
                         ("max_memory_facts_in_prompt", Leaf),
                     ])),
@@ -1192,6 +1193,23 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         });
     }
 
+    for (idx, tool_name) in config
+        .chat
+        .deterministic_policy
+        .untrusted_drop_tools
+        .iter()
+        .enumerate()
+    {
+        if tool_name.trim().is_empty() {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                category: "type-error",
+                path: format!("chat.deterministic_policy.untrusted_drop_tools[{idx}]"),
+                message: "tool name must be a non-empty string".into(),
+            });
+        }
+    }
+
     let min_score = config.chat.deterministic_policy.memory_relevance_min_score;
     if !(0.0..=1.0).contains(&min_score) {
         diagnostics.push(Diagnostic {
@@ -1879,6 +1897,19 @@ max_memory_facts_in_prompt = 0
             .iter()
             .any(|d| d.path == "chat.deterministic_policy.max_memory_facts_in_prompt"
                 && d.severity == Severity::Error));
+    }
+
+    #[test]
+    fn invalid_untrusted_drop_tools_entry_errors() {
+        let toml = r#"
+[chat.deterministic_policy]
+untrusted_drop_tools = ["web_fetch", "   "]
+"#;
+        let result = validate_toml_str(toml);
+        assert!(result.diagnostics.iter().any(|d| {
+            d.path == "chat.deterministic_policy.untrusted_drop_tools[1]"
+                && d.severity == Severity::Error
+        }));
     }
 
     #[test]
