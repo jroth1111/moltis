@@ -42,7 +42,7 @@ use {
         store::SessionStore,
     },
     moltis_skills::discover::SkillDiscoverer,
-    moltis_tools::policy::effective_tool_policy,
+    moltis_tools::{policy::effective_tool_policy, tool_names::WEB_FETCH},
 };
 
 pub mod chat_error;
@@ -9019,7 +9019,7 @@ fn format_tool_status_message(tool_name: &str, arguments: &Value) -> String {
                 "💻 Executing command...".to_string()
             }
         },
-        "web_fetch" => {
+        WEB_FETCH => {
             let url = arguments.get("url").and_then(|v| v.as_str());
             if let Some(u) = url {
                 format!("🔗 Fetching {}", truncate_url(u))

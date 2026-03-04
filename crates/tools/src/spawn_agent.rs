@@ -8,6 +8,7 @@ use {
     crate::{
         error::Error,
         params::{bool_param, str_param, u64_param},
+        tool_names::WEB_FETCH,
     },
     moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent},
     time::OffsetDateTime,
@@ -810,7 +811,7 @@ mod tests {
         let spawn_tool = SpawnAgentTool::new(
             make_empty_provider_registry(),
             provider,
-            registry_with_tools(&["spawn_agent", "exec", "web_fetch", "task_list"]),
+            registry_with_tools(&["spawn_agent", "exec", WEB_FETCH, "task_list"]),
         );
 
         let filtered = spawn_tool.build_sub_tools(
@@ -826,7 +827,7 @@ mod tests {
         assert!(filtered.get("exec").is_some());
         assert!(filtered.get("task_list").is_none());
         assert!(filtered.get("spawn_agent").is_none());
-        assert!(filtered.get("web_fetch").is_none());
+        assert!(filtered.get(WEB_FETCH).is_none());
     }
 
     #[tokio::test]
@@ -842,14 +843,14 @@ mod tests {
         let spawn_tool = SpawnAgentTool::new(
             make_empty_provider_registry(),
             provider,
-            registry_with_tools(&["spawn_agent", "exec", "web_fetch", "task_list"]),
+            registry_with_tools(&["spawn_agent", "exec", WEB_FETCH, "task_list"]),
         )
         .with_tool_policy(policy);
 
         // Even though exec is in the allow list, global policy denies it.
         let filtered = spawn_tool.build_sub_tools(
             "test task",
-            &["exec".to_string(), "web_fetch".to_string()],
+            &["exec".to_string(), WEB_FETCH.to_string()],
             &[],
             false,
         );
@@ -857,7 +858,7 @@ mod tests {
             filtered.get("exec").is_none(),
             "global policy should deny exec"
         );
-        assert!(filtered.get("web_fetch").is_some());
+        assert!(filtered.get(WEB_FETCH).is_some());
         assert!(filtered.get("task_list").is_none(), "not in allow list");
     }
 
@@ -882,35 +883,35 @@ mod tests {
         let spawn_tool = SpawnAgentTool::new(
             make_empty_provider_registry(),
             provider,
-            registry_with_tools(&["spawn_agent", "exec", "web_fetch"]),
+            registry_with_tools(&["spawn_agent", "exec", WEB_FETCH]),
         )
         .with_tool_policy_resolver(resolver);
 
         let first = spawn_tool.build_sub_tools(
             "test task",
-            &["exec".to_string(), "web_fetch".to_string()],
+            &["exec".to_string(), WEB_FETCH.to_string()],
             &[],
             false,
         );
         assert!(first.get("exec").is_none());
-        assert!(first.get("web_fetch").is_some());
+        assert!(first.get(WEB_FETCH).is_some());
 
         {
             let mut guard = runtime_policy.write().unwrap_or_else(|e| e.into_inner());
             *guard = crate::policy::ToolPolicy {
                 allow: vec!["*".into()],
-                deny: vec!["web_fetch".into()],
+                deny: vec![WEB_FETCH.into()],
             };
         }
 
         let second = spawn_tool.build_sub_tools(
             "test task",
-            &["exec".to_string(), "web_fetch".to_string()],
+            &["exec".to_string(), WEB_FETCH.to_string()],
             &[],
             false,
         );
         assert!(second.get("exec").is_some());
-        assert!(second.get("web_fetch").is_none());
+        assert!(second.get(WEB_FETCH).is_none());
     }
 
     #[tokio::test]

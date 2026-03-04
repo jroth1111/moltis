@@ -10,6 +10,7 @@ use {
 };
 
 use crate::error::Error;
+use crate::tool_names::BRANCH_SESSION;
 
 /// Agent tool that forks the current session at a given message index.
 pub struct BranchSessionTool {
@@ -26,7 +27,7 @@ impl BranchSessionTool {
 #[async_trait]
 impl AgentTool for BranchSessionTool {
     fn name(&self) -> &str {
-        "branch_session"
+        BRANCH_SESSION
     }
 
     fn categories(&self) -> &'static [&'static str] {

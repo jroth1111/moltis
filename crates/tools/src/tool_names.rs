@@ -11,3 +11,6 @@ pub const SPAWN_AGENT: &str = "spawn_agent";
 pub const CRON: &str = "cron";
 pub const PROCESS: &str = "process";
 pub const TASK_LIST: &str = "task_list";
+pub const WEB_FETCH: &str = "web_fetch";
+pub const SESSION_STATE: &str = "session_state";
+pub const BRANCH_SESSION: &str = "branch_session";

@@ -20,7 +20,8 @@ use {
 use crate::{
     wasm_component::{HttpHostImpl, HttpToolResult, PureToolResult, http_tool, pure_tool},
     wasm_engine::{WasmComponentEngine, hash_component_bytes},
-    wasm_limits::WasmResourceLimiter,
+    wasm_limits::WasmResourceLimiter},
+    tool_names::WEB_FETCH,
 };
 
 // ---------------------------------------------------------------------------
@@ -949,7 +950,7 @@ mod tests {
         let result = ToolResult::from_http(HttpToolResult::Ok(HttpToolValue::Text(
             "fetched".to_string(),
         )));
-        let value = super::decode_tool_result("web_fetch", result).unwrap();
+        let value = super::decode_tool_result(WEB_FETCH, result).unwrap();
         assert_eq!(value, serde_json::json!("fetched"));
     }
 
@@ -959,10 +960,10 @@ mod tests {
             code: "network".to_string(),
             message: "connection refused".to_string(),
         }));
-        let err = super::decode_tool_result("web_fetch", result).unwrap_err();
+        let err = super::decode_tool_result(WEB_FETCH, result).unwrap_err();
         assert!(
             err.to_string()
-                .contains("wasm tool `web_fetch` failed [network]")
+                .contains(&format!("wasm tool `{WEB_FETCH}` failed [network]"))
         );
     }
 
@@ -1029,7 +1030,7 @@ mod tests {
 
         let engine = Arc::new(WasmComponentEngine::new(None).unwrap());
         let limits = WasmToolLimits::default();
-        let (fuel, memory) = limits.resolve_store_limits("web_fetch");
+        let (fuel, memory) = limits.resolve_store_limits(WEB_FETCH);
         let runner = WasmToolRunner::new_http(
             engine,
             fetch_bytes.as_ref(),
