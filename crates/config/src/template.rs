@@ -183,6 +183,16 @@ message_queue_mode = "followup"   # Default: process queued messages one-by-one 
 # priority_models = ["claude-opus-4-5", "gpt-5.2", "gemini-3-flash"]  # Optional: models to pin first in selectors
 # allowed_models = ["gpt 5.2"]  # Legacy field (currently ignored).
 
+[chat.compaction]
+enabled = true                    # Enable automatic layered compaction.
+soft_trigger_percent = 80         # Soft trigger: summarize background layer.
+hard_trigger_percent = 90         # Hard trigger: compact background + shrink working layer.
+emergency_trigger_percent = 95    # Emergency trigger: keep critical anchors + minimal working layer.
+verbatim_turns = 10               # Working-memory turns kept verbatim in normal compaction.
+min_verbatim_turns = 6            # Minimum working-memory turns during hard/emergency compaction.
+anchor_budget_tokens = 5000       # Budget for verbatim anchor preservation (tool chains, code, decisions).
+summary_budget_tokens = 2500      # Budget for generated rolling summary.
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SPAWN PRESETS (OPTIONAL)
 # ══════════════════════════════════════════════════════════════════════════════
