@@ -7,8 +7,222 @@ use std::{
 use {
     crate::{Error, Result},
     fd_lock::RwLock,
+    serde_json::{Value, Map},
     serde::{Deserialize, Serialize},
 };
+
+const REDACTED_VALUE: &str = "[REDACTED]";
+
+/// Redact sensitive data (API keys, tokens, passwords, bearer tokens) from a JSON message value.
+/// Recursively scans string content in the message and replaces sensitive patterns.
+fn redact_message(msg: &Value) -> Value {
+    match msg {
+        Value::String(s) => Value::String(redact_sensitive_text(s)),
+        Value::Array(arr) => Value::Array(arr.iter().map(redact_message).collect()),
+        Value::Object(map) => {
+            let mut redacted = Map::new();
+            for (k, v) in map {
+                // For known-sensitive keys, replace the entire value with [REDACTED]
+                if is_sensitive_key(k) {
+                    redacted.insert(k.clone(), Value::String(REDACTED_VALUE.to_string()));
+                } else {
+                    redacted.insert(k.clone(), redact_message(v));
+                }
+            }
+            Value::Object(redacted)
+        }
+        _ => msg.clone(),
+    }
+}
+
+/// Check if a key name suggests it contains sensitive data.
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    let compact: String = normalized.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    compact.ends_with("apikey")
+        || compact.ends_with("token")
+        || compact.ends_with("secret")
+        || compact.ends_with("password")
+        || compact.ends_with("passwd")
+        || compact == "authorization"
+        || compact == "proxyauthorization"
+}
+
+/// Redact sensitive patterns from text content.
+/// Matches patterns like:
+/// - `KEY=secret` and `KEY: secret` for sensitive keys
+/// - `Authorization: Bearer <token>` and `Proxy-Authorization: Bearer <token>`
+/// - Environment variable assignments with sensitive keys
+fn redact_sensitive_text(text: &str) -> String {
+    let mut redacted = text.to_string();
+    let mut idx = 0usize;
+
+    // Redact key=value and key: value patterns for sensitive keys
+    while idx < redacted.len() {
+        let next_separator = redacted.as_bytes()[idx..]
+            .iter()
+            .position(|byte| matches!(byte, b'=' | b':'))
+            .map(|offset| idx + offset);
+        let Some(separator_idx) = next_separator else {
+            break;
+        };
+
+        let Some((key_start, key_end)) = assignment_key_bounds(&redacted, separator_idx) else {
+            idx = separator_idx + 1;
+            continue;
+        };
+        let key = &redacted[key_start..key_end];
+        if !is_sensitive_key(key.trim()) {
+            idx = separator_idx + 1;
+            continue;
+        }
+
+        let Some((value_start, value_end)) = assignment_value_bounds(&redacted, separator_idx, key)
+        else {
+            idx = separator_idx + 1;
+            continue;
+        };
+        if redacted[value_start..value_end].trim().is_empty()
+            || &redacted[value_start..value_end] == REDACTED_VALUE
+        {
+            idx = separator_idx + 1;
+            continue;
+        }
+
+        redacted.replace_range(value_start..value_end, REDACTED_VALUE);
+        idx = value_start + REDACTED_VALUE.len();
+    }
+
+    // Redact Bearer tokens that weren't caught by key=value patterns
+    let mut idx = 0usize;
+    while let Some(start) = find_case_insensitive(&redacted, "bearer ", idx) {
+        let token_start = start + "bearer ".len();
+        if token_start >= redacted.len() {
+            break;
+        }
+        if start > 0 && redacted.as_bytes()[start - 1].is_ascii_alphanumeric() {
+            idx = token_start;
+            continue;
+        }
+
+        let bytes = redacted.as_bytes();
+        let mut token_end = token_start;
+        while token_end < bytes.len() && !is_value_delimiter(bytes[token_end]) {
+            token_end += 1;
+        }
+        if token_end <= token_start || &redacted[token_start..token_end] == REDACTED_VALUE {
+            idx = token_end.saturating_add(1);
+            continue;
+        }
+
+        redacted.replace_range(token_start..token_end, REDACTED_VALUE);
+        idx = token_start + REDACTED_VALUE.len();
+    }
+
+    redacted
+}
+
+/// Find the bounds of a key before an = or : separator.
+fn assignment_key_bounds(text: &str, separator_idx: usize) -> Option<(usize, usize)> {
+    if separator_idx == 0 || separator_idx >= text.len() {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut key_end = separator_idx;
+    while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
+        key_end -= 1;
+    }
+    if key_end == 0 {
+        return None;
+    }
+
+    let mut key_start = key_end;
+    while key_start > 0 && is_assignment_key_byte(bytes[key_start - 1]) {
+        key_start -= 1;
+    }
+    (key_start < key_end).then_some((key_start, key_end))
+}
+
+/// Find the bounds of a value after an = or : separator.
+fn assignment_value_bounds(
+    text: &str,
+    separator_idx: usize,
+    key: &str,
+) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    if separator_idx >= bytes.len() {
+        return None;
+    }
+
+    let mut value_start = separator_idx + 1;
+    while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+        value_start += 1;
+    }
+    if value_start >= bytes.len() {
+        return None;
+    }
+
+    let normalized_key = key.to_ascii_lowercase();
+    let normalized_key_compact: String = normalized_key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let mut quoted = None;
+    let mut redact_start = value_start;
+    if matches!(bytes[value_start], b'"' | b'\'') {
+        quoted = Some(bytes[value_start]);
+        redact_start = value_start + 1;
+    }
+    if redact_start >= bytes.len() {
+        return None;
+    }
+
+    // For Authorization headers, skip past "Bearer " prefix
+    if matches!(
+        normalized_key_compact.as_str(),
+        "authorization" | "proxyauthorization"
+    ) && starts_with_ignore_ascii_case(text, redact_start, "bearer ")
+    {
+        redact_start += "bearer ".len();
+    }
+    if redact_start >= bytes.len() {
+        return None;
+    }
+
+    let mut value_end = redact_start;
+    if let Some(quote_byte) = quoted {
+        while value_end < bytes.len() && bytes[value_end] != quote_byte {
+            value_end += 1;
+        }
+    } else {
+        while value_end < bytes.len() && !is_value_delimiter(bytes[value_end]) {
+            value_end += 1;
+        }
+    }
+    (value_end > redact_start).then_some((redact_start, value_end))
+}
+
+fn is_assignment_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
+fn is_value_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == b';' || byte == b','
+}
+
+fn starts_with_ignore_ascii_case(text: &str, start: usize, pattern: &str) -> bool {
+    let end = start.saturating_add(pattern.len());
+    text.get(start..end)
+        .is_some_and(|value| value.eq_ignore_ascii_case(pattern))
+}
+
+fn find_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    if from >= haystack.len() {
+        return None;
+    }
+    let needle_lower = needle.to_ascii_lowercase();
+    let haystack_lower = haystack[from..].to_ascii_lowercase();
+    haystack_lower
+        .find(&needle_lower)
+        .map(|offset| from + offset)
+}
 
 /// A single search hit within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,7 +316,7 @@ impl SessionStore {
     }
 
     /// Append a message (JSON value) as a single line to the session file.
-    pub async fn append(&self, key: &str, message: &serde_json::Value) -> Result<()> {
+    pub async fn append(&self, key: &str, message: &Value) -> Result<()> {
         let path = self.path_for(key);
         let line = serde_json::to_string(message)?;
 
@@ -125,11 +339,11 @@ impl SessionStore {
     }
 
     /// Read all messages from a session file and return skip statistics.
-    pub async fn read_with_stats(&self, key: &str) -> Result<ReadResult<serde_json::Value>> {
+    pub async fn read_with_stats(&self, key: &str) -> Result<ReadResult<Value>> {
         let path = self.path_for(key);
 
         let result =
-            tokio::task::spawn_blocking(move || -> Result<ReadResult<serde_json::Value>> {
+            tokio::task::spawn_blocking(move || -> Result<ReadResult<Value>> {
                 if !path.exists() {
                     return Ok(ReadResult {
                         messages: vec![],
@@ -174,7 +388,7 @@ impl SessionStore {
     }
 
     /// Read all messages from a session file.
-    pub async fn read(&self, key: &str) -> Result<Vec<serde_json::Value>> {
+    pub async fn read(&self, key: &str) -> Result<Vec<Value>> {
         let result = self.read_with_stats(key).await?;
         if result.skipped_lines > 0 {
             tracing::warn!(
@@ -188,7 +402,7 @@ impl SessionStore {
     }
 
     /// Read all messages from a session that match a given `run_id`.
-    pub async fn read_by_run_id(&self, key: &str, run_id: &str) -> Result<Vec<serde_json::Value>> {
+    pub async fn read_by_run_id(&self, key: &str, run_id: &str) -> Result<Vec<Value>> {
         let all = self.read(key).await?;
         let run_id = run_id.to_string();
         Ok(all
@@ -214,7 +428,7 @@ impl SessionStore {
             let file = File::open(&path)?;
             let reader = BufReader::new(file);
             let mut valid_lines: Vec<String> = Vec::new();
-            let mut valid_values: Vec<serde_json::Value> = Vec::new();
+            let mut valid_values: Vec<Value> = Vec::new();
             let mut removed_malformed = 0_u64;
             let mut pending_tool_calls: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
@@ -225,7 +439,7 @@ impl SessionStore {
                 if trimmed.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                match serde_json::from_str::<Value>(trimmed) {
                     Ok(value) => {
                         match value.get("role").and_then(|v| v.as_str()) {
                             Some("assistant") => {
@@ -426,7 +640,7 @@ impl SessionStore {
                 if trimmed.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                match serde_json::from_str::<Value>(trimmed) {
                     Ok(_) => valid_lines.push(trimmed.to_string()),
                     Err(_) => {
                         removed = removed.saturating_add(1);
@@ -451,16 +665,16 @@ impl SessionStore {
     }
 
     /// Read the last N messages from a session file.
-    pub async fn read_last_n(&self, key: &str, n: usize) -> Result<Vec<serde_json::Value>> {
+    pub async fn read_last_n(&self, key: &str, n: usize) -> Result<Vec<Value>> {
         let path = self.path_for(key);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>> {
+        tokio::task::spawn_blocking(move || -> Result<Vec<Value>> {
             if !path.exists() {
                 return Ok(vec![]);
             }
             let file = File::open(&path)?;
             let reader = BufReader::new(file);
-            let mut all: Vec<serde_json::Value> = Vec::new();
+            let mut all: Vec<Value> = Vec::new();
             for line in reader.lines() {
                 let line = line?;
                 let trimmed = line.trim();
@@ -506,7 +720,7 @@ impl SessionStore {
     pub async fn archive_to_cold_store(
         &self,
         key: &str,
-        messages: &[serde_json::Value],
+        messages: &[Value],
     ) -> Result<String> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -514,7 +728,8 @@ impl SessionStore {
             .as_secs();
         let safe_key = Self::key_to_filename(key);
         let archive_dir = self.base_dir.join("archive");
-        let messages = messages.to_vec();
+        // Redact sensitive data (API keys, tokens, passwords) before persisting
+        let messages: Vec<Value> = messages.iter().map(redact_message).collect();
 
         let archive_filename = tokio::task::spawn_blocking(move || -> Result<String> {
             fs::create_dir_all(&archive_dir)?;
@@ -599,7 +814,7 @@ impl SessionStore {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                    let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
                         continue;
                     };
                     let content = val.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -635,7 +850,7 @@ impl SessionStore {
     }
 
     /// Replace the entire session history with the given messages.
-    pub async fn replace_history(&self, key: &str, messages: Vec<serde_json::Value>) -> Result<()> {
+    pub async fn replace_history(&self, key: &str, messages: Vec<Value>) -> Result<()> {
         let path = self.path_for(key);
 
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -746,7 +961,7 @@ impl SessionStore {
         messages: &[crate::message::PersistedMessage],
     ) -> Result<()> {
         let path = self.path_for(key);
-        let values: Vec<serde_json::Value> = messages.iter().map(|m| m.to_value()).collect();
+        let values: Vec<Value> = messages.iter().map(|m| m.to_value()).collect();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             if let Some(parent) = path.parent() {
