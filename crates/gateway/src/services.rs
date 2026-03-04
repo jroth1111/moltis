@@ -990,6 +990,7 @@ impl SkillsService for NoopSkillsService {
                 "status": "ok",
                 "enforced_quarantines": enforcement.enforced_quarantines,
                 "affected_skills": enforcement.affected_skills,
+                "reasons": enforcement.reasons,
             }),
         );
         Ok(serde_json::json!({
@@ -998,7 +999,7 @@ impl SkillsService for NoopSkillsService {
             "results": results,
             "enforced_quarantines": enforcement.enforced_quarantines,
             "affected_skills": enforcement.affected_skills,
-            "enforcement_reasons": enforcement.reasons,
+            "reasons": enforcement.reasons,
         }))
     }
 }

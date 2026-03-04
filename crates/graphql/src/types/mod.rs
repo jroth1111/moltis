@@ -980,8 +980,14 @@ pub struct SecurityScanResult {
     #[graphql(name = "results")]
     #[serde(default)]
     pub results: Option<Json>,
-    #[serde(default)]
+    #[serde(default, alias = "installed_skills_dir")]
     pub installed_skills_dir: Option<String>,
+    #[serde(default, alias = "enforced_quarantines")]
+    pub enforced_quarantines: Option<u64>,
+    #[serde(default, alias = "affected_skills")]
+    pub affected_skills: Option<Json>,
+    #[serde(default)]
+    pub reasons: Option<Vec<String>>,
 }
 
 // ── Memory Config ───────────────────────────────────────────────────────────

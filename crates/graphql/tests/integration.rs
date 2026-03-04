@@ -1116,6 +1116,56 @@ async fn skills_detail_query_exposes_quarantine_and_integrity_fields() {
     assert_eq!(params["skill"], "demo");
 }
 
+#[tokio::test]
+async fn skills_security_scan_query_exposes_enforcement_summary_fields() {
+    let mock = MockDispatch::new();
+    mock.set_response(
+        "skills.security.scan",
+        json!({
+            "ok": true,
+            "message": "scan complete",
+            "results": {"tool": "mcp-scan"},
+            "installed_skills_dir": "/tmp/skills",
+            "enforced_quarantines": 1,
+            "affected_skills": [{
+                "source": "owner/repo",
+                "skill": "demo",
+                "severity": "high",
+                "reason": "mcp-scan high finding: destructive command signature"
+            }],
+            "reasons": ["mcp-scan high finding: destructive command signature"]
+        }),
+    );
+    let (schema, _) = build_test_schema(mock.clone());
+
+    let res = schema
+        .execute(Request::new(
+            r#"{ skills { securityScan { ok message installedSkillsDir enforcedQuarantines affectedSkills reasons } } }"#,
+        ))
+        .await;
+
+    assert!(res.errors.is_empty(), "errors: {:?}", res.errors);
+    let data = res.data.into_json().expect("json");
+    assert_eq!(data["skills"]["securityScan"]["ok"], true);
+    assert_eq!(
+        data["skills"]["securityScan"]["installedSkillsDir"],
+        "/tmp/skills"
+    );
+    assert_eq!(data["skills"]["securityScan"]["enforcedQuarantines"], 1);
+    assert_eq!(
+        data["skills"]["securityScan"]["affectedSkills"][0]["skill"],
+        "demo"
+    );
+    assert_eq!(
+        data["skills"]["securityScan"]["reasons"][0],
+        "mcp-scan high finding: destructive command signature"
+    );
+
+    let (method, params) = mock.last_call().expect("should have called");
+    assert_eq!(method, "skills.security.scan");
+    assert_eq!(params, json!({}));
+}
+
 // ── Mutation resolvers ──────────────────────────────────────────────────────
 
 #[tokio::test]
