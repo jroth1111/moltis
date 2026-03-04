@@ -4239,7 +4239,9 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            payload.get("auto_extract_min_chars").and_then(Value::as_u64),
+            payload
+                .get("auto_extract_min_chars")
+                .and_then(Value::as_u64),
             Some(160)
         );
     }

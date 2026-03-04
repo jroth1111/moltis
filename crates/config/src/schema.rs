@@ -987,7 +987,8 @@ impl Default for MemoryEmbeddingConfig {
             auto_extract_model_id: None,
             auto_reconcile: false,
             auto_reconcile_min_interval_secs: default_memory_auto_reconcile_min_interval_secs(),
-            auto_reconcile_similarity_threshold: default_memory_auto_reconcile_similarity_threshold(),
+            auto_reconcile_similarity_threshold: default_memory_auto_reconcile_similarity_threshold(
+            ),
             qmd: QmdConfig::default(),
         }
     }

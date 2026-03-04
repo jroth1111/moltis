@@ -418,11 +418,10 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     async fn get_state(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM memory_state WHERE key = ?")
-                .bind(key)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM memory_state WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|(value,)| value))
     }
 
@@ -550,11 +549,13 @@ mod tests {
     #[tokio::test]
     async fn test_memory_state_roundtrip() {
         let store = setup().await;
-        assert!(store
-            .get_state("auto_reconcile_last_ts::main")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_state("auto_reconcile_last_ts::main")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         store
             .set_state("auto_reconcile_last_ts::main", "1710000000")

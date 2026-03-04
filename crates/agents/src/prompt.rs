@@ -1283,7 +1283,8 @@ mod tests {
         );
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(
-            prompt.contains("When the user explicitly asks you to remember, save, or note something")
+            prompt
+                .contains("When the user explicitly asks you to remember, save, or note something")
         );
         assert!(prompt.contains("call `memory_save` so it persists across sessions"));
     }
@@ -1328,7 +1329,8 @@ mod tests {
         assert!(prompt.contains("Likes coffee"));
         assert!(prompt.contains("memory_search"));
         assert!(
-            prompt.contains("When the user explicitly asks you to remember, save, or note something")
+            prompt
+                .contains("When the user explicitly asks you to remember, save, or note something")
         );
         assert!(prompt.contains("call `memory_save` so it persists across sessions"));
     }
