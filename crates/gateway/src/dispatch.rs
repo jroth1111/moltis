@@ -47,6 +47,9 @@ use {
 
 use crate::{channel_agent_tools::SEND_MESSAGE_TOOL_NAME, state::GatewayState};
 
+const DISPATCH_TOOL_DENY_KEY: &str = "_dispatch_tool_deny";
+const DISPATCH_AUTONOMY_TIER_KEY: &str = "_dispatch_autonomy_tier";
+
 // ── Public entry point ─────────────────────────────────────────────────────────
 
 /// Start the intent dispatch loop as a long-running background task.
@@ -335,11 +338,11 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
     // ── 8. Run the shift — blocks until agent completes. ─────────────────────
     let deny_list = denied_tools_for_tier(intent.spec.autonomy_tier);
     let params = serde_json::json!({
-        "text":                    prompt,
-        "_session_key":            session_key,
-        "_source":                 "dispatch",
-        "_dispatch_tool_deny":     deny_list,
-        "_dispatch_autonomy_tier": autonomy_tier_label(intent.spec.autonomy_tier),
+        "text": prompt,
+        "_session_key": session_key,
+        "_source": "dispatch",
+        DISPATCH_TOOL_DENY_KEY: deny_list,
+        DISPATCH_AUTONOMY_TIER_KEY: autonomy_tier_label(intent.spec.autonomy_tier),
     });
 
     let heartbeat = spawn_shift_heartbeat(

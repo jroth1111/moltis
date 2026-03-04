@@ -1406,6 +1406,10 @@ fn default_user_prompt_timezone() -> Option<String> {
         .and_then(|timezone| normalized_iana_timezone(Some(&timezone)))
 }
 
+const DISPATCH_TOOL_DENY_KEY: &str = "_dispatch_tool_deny";
+const DISPATCH_AUTONOMY_TIER_KEY: &str = "_dispatch_autonomy_tier";
+const DISPATCH_SIDEBANDS: &[&str] = &[DISPATCH_TOOL_DENY_KEY, DISPATCH_AUTONOMY_TIER_KEY];
+
 fn apply_request_runtime_context(host: &mut PromptHostRuntimeContext, params: &Value) {
     host.accept_language = params
         .get("_accept_language")
@@ -1432,7 +1436,7 @@ fn apply_request_runtime_context(host: &mut PromptHostRuntimeContext, params: &V
         .is_some_and(|s| s == "dispatch");
     if is_dispatch {
         host.dispatch_deny = params
-            .get("_dispatch_tool_deny")
+            .get(DISPATCH_TOOL_DENY_KEY)
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
@@ -1441,7 +1445,7 @@ fn apply_request_runtime_context(host: &mut PromptHostRuntimeContext, params: &V
             })
             .unwrap_or_default();
         host.dispatch_autonomy_tier = params
-            .get("_dispatch_autonomy_tier")
+            .get(DISPATCH_AUTONOMY_TIER_KEY)
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|tier| !tier.is_empty())
@@ -3138,8 +3142,9 @@ impl ChatService for LiveChatService {
     async fn send(&self, mut params: Value) -> ServiceResult {
         // Internal-only dispatch sideband must not be accepted from external callers.
         if let Some(obj) = params.as_object_mut() {
-            obj.remove("_dispatch_tool_deny");
-            obj.remove("_dispatch_autonomy_tier");
+            for key in DISPATCH_SIDEBANDS {
+                obj.remove(*key);
+            }
         }
 
         // Support both text-only and multimodal content.
@@ -7291,7 +7296,7 @@ async fn run_with_tools(
     if let Some(tier) = runtime_context
         .and_then(|ctx| ctx.host.dispatch_autonomy_tier.as_deref())
     {
-        tool_context["_dispatch_autonomy_tier"] = serde_json::json!(tier);
+        tool_context[DISPATCH_AUTONOMY_TIER_KEY] = serde_json::json!(tier);
     }
 
     // Research phase: gather context before the main agent turn when enabled.
