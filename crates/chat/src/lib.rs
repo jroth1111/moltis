@@ -376,6 +376,8 @@ fn context_compaction_action_for_usage(
     estimated_next_input: u64,
     context_window: u64,
 ) -> ContextCompactionAction {
+    // Early memory persistence is handled by turn-level auto-extraction + debounce.
+    // This compaction ladder starts at 80% for history reduction tiers by design.
     let compact_threshold = (context_window * 80) / 100;
     let archive_threshold = (context_window * 90) / 100;
     let truncate_threshold = (context_window * 95) / 100;
@@ -1544,6 +1546,9 @@ fn apply_runtime_tool_filters(
     // runtime can unintentionally remove unrelated tools (for example, leaving
     // only `web_fetch` and preventing `create_skill` from being called).
     // Tool availability here is controlled by configured runtime policy.
+    // NOTE: Per-tool approval is enforced at execution time inside individual tool
+    // implementations (e.g. read_file, write_file); there is no registry-level
+    // approval filter here by design.
     base_registry.clone_allowed_by(|name| policy.is_allowed(name))
 }
 
@@ -5164,8 +5169,12 @@ impl ChatService for LiveChatService {
             .unwrap_or(false);
         let tools: Vec<Value> = if supports_tools {
             let registry_guard = self.tool_registry.read().await;
-            let effective_registry =
-                apply_runtime_tool_filters(&registry_guard, self.runtime_config.as_ref(), &[], mcp_disabled);
+            let effective_registry = apply_runtime_tool_filters(
+                &registry_guard,
+                self.runtime_config.as_ref(),
+                &[],
+                mcp_disabled,
+            );
             effective_registry
                 .list_schemas()
                 .iter()
@@ -6355,9 +6364,8 @@ impl AgentTool for AgentScopedMemorySearchTool {
             #[cfg(feature = "metrics")]
             let rerank_start = Instant::now();
 
-            let client: Arc<dyn moltis_memory::reranking::LlmClient> = Arc::new(
-                ProviderBackedRerankClient::new(Arc::clone(&self.provider)),
-            );
+            let client: Arc<dyn moltis_memory::reranking::LlmClient> =
+                Arc::new(ProviderBackedRerankClient::new(Arc::clone(&self.provider)));
             let reranker = moltis_memory::reranking::LlmReranker::new(client)
                 .with_max_candidates(search_limit);
             match moltis_memory::reranking::RerankerProvider::rerank(
@@ -6614,7 +6622,11 @@ fn research_text_from_user_content(user_content: &UserContent) -> &str {
     }
 }
 
-fn format_compaction_facts_document(session_key: &str, ts: u64, facts: &[String]) -> Option<String> {
+fn format_compaction_facts_document(
+    session_key: &str,
+    ts: u64,
+    facts: &[String],
+) -> Option<String> {
     if facts.is_empty() {
         return None;
     }
@@ -6917,7 +6929,8 @@ async fn maybe_schedule_auto_memory_extraction(
         Err(_) => {
             debug!(session = %session_key, "auto-memory extract skipped: extraction already running");
             #[cfg(feature = "metrics")]
-            counter!(mem_metrics::AUTO_EXTRACT_SKIPS_TOTAL, "reason" => "single_flight").increment(1);
+            counter!(mem_metrics::AUTO_EXTRACT_SKIPS_TOTAL, "reason" => "single_flight")
+                .increment(1);
             return;
         },
     };
@@ -7119,14 +7132,18 @@ async fn reconcile_auto_extracted_facts(
     let reconcile_started = Instant::now();
 
     let canonical_path = resolve_agent_memory_target_path(agent_id, AUTO_RECONCILE_CANONICAL_FILE)?;
-    let existing_facts_raw = if tokio::fs::try_exists(&canonical_path).await.unwrap_or(false) {
+    let existing_facts_raw = if tokio::fs::try_exists(&canonical_path)
+        .await
+        .unwrap_or(false)
+    {
         tokio::fs::read_to_string(&canonical_path)
             .await
             .unwrap_or_default()
     } else {
         String::new()
     };
-    let existing_facts = dedupe_strings_preserve_order(parse_managed_auto_facts(&existing_facts_raw));
+    let existing_facts =
+        dedupe_strings_preserve_order(parse_managed_auto_facts(&existing_facts_raw));
 
     let mut fast_skip_count = 0usize;
     let mut llm_inputs = Vec::new();
@@ -7805,6 +7822,17 @@ async fn run_with_tools(
                     "depth": depth,
                     "iterations": iterations,
                     "toolCallsMade": tool_calls_made,
+                    "seq": seq,
+                }),
+                RunnerEvent::IntentDrift {
+                    drift_score,
+                    iteration,
+                } => serde_json::json!({
+                    "runId": run_id,
+                    "sessionKey": sk,
+                    "state": "intent_drift",
+                    "driftScore": drift_score,
+                    "iteration": iteration,
                     "seq": seq,
                 }),
                 RunnerEvent::RetryingAfterError { error, delay_ms } => {
@@ -9795,9 +9823,8 @@ mod tests {
             collections::VecDeque,
             pin::Pin,
             sync::{
-                Arc,
+                Arc, LazyLock,
                 atomic::{AtomicUsize, Ordering},
-                LazyLock,
             },
             time::{Duration, Instant},
         },
@@ -10160,6 +10187,10 @@ mod tests {
 
     #[test]
     fn context_compaction_action_orchestrates_threshold_tiers() {
+        assert_eq!(
+            context_compaction_action_for_usage(70, 100),
+            ContextCompactionAction::None
+        );
         assert_eq!(
             context_compaction_action_for_usage(79, 100),
             ContextCompactionAction::None
@@ -13283,6 +13314,54 @@ mod tests {
         }
     }
 
+    struct ScriptedResponseProvider {
+        responses: std::sync::Mutex<VecDeque<Result<String>>>,
+    }
+
+    impl ScriptedResponseProvider {
+        fn new(responses: Vec<Result<String>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScriptedResponseProvider {
+        fn name(&self) -> &str {
+            "scripted-test"
+        }
+
+        fn id(&self) -> &str {
+            "scripted-test-model"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[Value],
+        ) -> Result<moltis_agents::model::CompletionResponse> {
+            let text = self
+                .responses
+                .lock()
+                .expect("scripted provider mutex poisoned")
+                .pop_front()
+                .unwrap_or_else(|| Ok("{\"facts\":[]}".to_string()))?;
+            Ok(moltis_agents::model::CompletionResponse {
+                text: Some(text),
+                tool_calls: vec![],
+                usage: Default::default(),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
     #[tokio::test]
     async fn provider_backed_rerank_client_returns_llm_text() {
         let provider: Arc<dyn LlmProvider> = Arc::new(RerankClientTestProvider {
@@ -13443,7 +13522,10 @@ mod tests {
             .search("TypeScript", 10)
             .await
             .expect("search should succeed");
-        assert!(!search_results.is_empty(), "extracted memory should be searchable");
+        assert!(
+            !search_results.is_empty(),
+            "extracted memory should be searchable"
+        );
 
         let second_outcome = run_auto_memory_extraction_task(
             settings,
@@ -13554,5 +13636,161 @@ mod tests {
             !tokio::fs::try_exists(&staged_path).await.unwrap_or(false),
             "disabled auto_extract should not write staged facts"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_memory_extraction_continues_when_reconcile_provider_call_fails() {
+        let _guard = DATA_DIR_OVERRIDE_LOCK
+            .lock()
+            .expect("data dir lock poisoned");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+        struct DataDirReset;
+        impl Drop for DataDirReset {
+            fn drop(&mut self) {
+                moltis_config::clear_data_dir();
+            }
+        }
+        let _reset = DataDirReset;
+
+        let pool = sqlx::SqlitePool::connect(":memory:")
+            .await
+            .expect("sqlite memory pool");
+        moltis_memory::schema::run_migrations(&pool)
+            .await
+            .expect("memory migrations");
+        let workspace_memory_dir = moltis_config::agent_workspace_dir("main").join("memory");
+        let config = moltis_memory::config::MemoryConfig {
+            db_path: ":memory:".into(),
+            data_dir: Some(tmp.path().to_path_buf()),
+            memory_dirs: vec![workspace_memory_dir],
+            chunk_size: 512,
+            chunk_overlap: 64,
+            vector_weight: 0.0,
+            keyword_weight: 1.0,
+            ..Default::default()
+        };
+        let manager = Arc::new(moltis_memory::manager::MemoryManager::keyword_only(
+            config,
+            Box::new(moltis_memory::store_sqlite::SqliteMemoryStore::new(pool)),
+        ));
+        let providers_registry = Arc::new(RwLock::new(ProviderRegistry::empty()));
+        let settings = AutoMemorySettings {
+            enabled: true,
+            min_chars: 1,
+            debounce: Duration::from_secs(1),
+            max_facts: 4,
+            model_id: None,
+            reconcile_enabled: true,
+            reconcile_min_interval: Duration::from_secs(0),
+            reconcile_similarity_threshold: 0.10,
+        };
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedResponseProvider::new(vec![
+            Ok(r#"{"facts":["User prefers Rust docs in markdown"]}"#.to_string()),
+            Err(anyhow::anyhow!("reconcile provider unavailable")),
+        ]));
+
+        let outcome = run_auto_memory_extraction_task(
+            settings,
+            Arc::clone(&manager),
+            Arc::clone(&providers_registry),
+            provider,
+            "session-main".to_string(),
+            "main".to_string(),
+            "run-1".to_string(),
+            "Please remember I prefer Rust docs in markdown.".to_string(),
+            "Noted.".to_string(),
+        )
+        .await
+        .expect("extraction should succeed despite reconcile provider failure");
+        assert!(matches!(outcome, AutoExtractOutcome::Written));
+
+        let staged_path = resolve_agent_memory_target_path(
+            "main",
+            &auto_memory_facts_file_name(OffsetDateTime::now_utc().to_offset(UtcOffset::UTC)),
+        )
+        .unwrap();
+        let staged = tokio::fs::read_to_string(&staged_path)
+            .await
+            .expect("staged facts should still be written");
+        assert!(staged.contains("run-1"));
+    }
+
+    #[tokio::test]
+    async fn auto_memory_extraction_continues_when_reconcile_returns_empty_decisions() {
+        let _guard = DATA_DIR_OVERRIDE_LOCK
+            .lock()
+            .expect("data dir lock poisoned");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+        struct DataDirReset;
+        impl Drop for DataDirReset {
+            fn drop(&mut self) {
+                moltis_config::clear_data_dir();
+            }
+        }
+        let _reset = DataDirReset;
+
+        let pool = sqlx::SqlitePool::connect(":memory:")
+            .await
+            .expect("sqlite memory pool");
+        moltis_memory::schema::run_migrations(&pool)
+            .await
+            .expect("memory migrations");
+        let workspace_memory_dir = moltis_config::agent_workspace_dir("main").join("memory");
+        let config = moltis_memory::config::MemoryConfig {
+            db_path: ":memory:".into(),
+            data_dir: Some(tmp.path().to_path_buf()),
+            memory_dirs: vec![workspace_memory_dir],
+            chunk_size: 512,
+            chunk_overlap: 64,
+            vector_weight: 0.0,
+            keyword_weight: 1.0,
+            ..Default::default()
+        };
+        let manager = Arc::new(moltis_memory::manager::MemoryManager::keyword_only(
+            config,
+            Box::new(moltis_memory::store_sqlite::SqliteMemoryStore::new(pool)),
+        ));
+        let providers_registry = Arc::new(RwLock::new(ProviderRegistry::empty()));
+        let settings = AutoMemorySettings {
+            enabled: true,
+            min_chars: 1,
+            debounce: Duration::from_secs(1),
+            max_facts: 4,
+            model_id: None,
+            reconcile_enabled: true,
+            reconcile_min_interval: Duration::from_secs(0),
+            reconcile_similarity_threshold: 0.10,
+        };
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedResponseProvider::new(vec![
+            Ok(r#"{"facts":["User prefers concise commit messages"]}"#.to_string()),
+            Ok(r#"{}"#.to_string()),
+        ]));
+
+        let outcome = run_auto_memory_extraction_task(
+            settings,
+            Arc::clone(&manager),
+            Arc::clone(&providers_registry),
+            provider,
+            "session-main".to_string(),
+            "main".to_string(),
+            "run-2".to_string(),
+            "Please remember I prefer concise commit messages.".to_string(),
+            "Saved.".to_string(),
+        )
+        .await
+        .expect("extraction should succeed despite empty reconcile decisions");
+        assert!(matches!(outcome, AutoExtractOutcome::Written));
+
+        let staged_path = resolve_agent_memory_target_path(
+            "main",
+            &auto_memory_facts_file_name(OffsetDateTime::now_utc().to_offset(UtcOffset::UTC)),
+        )
+        .unwrap();
+        let staged = tokio::fs::read_to_string(&staged_path)
+            .await
+            .expect("staged facts should still be written");
+        assert!(staged.contains("run-2"));
     }
 }
