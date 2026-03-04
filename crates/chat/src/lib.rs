@@ -60,7 +60,7 @@ use {
         parse_compaction_facts, partition_history_for_summary, retain_with_importance,
         summary_context_plan, trim_summary_to_budget, truncate_reduction_plan,
     },
-    history_context::normalize_for_context_view,
+    history_context::{normalize_for_context_view, normalize_for_model_context},
     moltis_common::handoff::{
         HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
     },
@@ -330,6 +330,8 @@ fn estimate_text_tokens(text: &str) -> u64 {
     let bytes = trimmed.len() as u64;
     bytes.div_ceil(4).max(1)
 }
+
+const MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS: usize = 4_000;
 
 #[must_use]
 fn dropped_messages_for_retention(history: &[Value], retained: &[Value]) -> Vec<Value> {
@@ -4112,7 +4114,12 @@ impl ChatService for LiveChatService {
                         && let Ok(flush_provider) =
                             self.resolve_provider(&session_key, &history).await
                     {
-                        let chat_history_for_memory = values_to_chat_messages(&history);
+                        let normalized_history_for_memory = normalize_for_model_context(
+                            &history,
+                            MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+                        );
+                        let chat_history_for_memory =
+                            values_to_chat_messages(&normalized_history_for_memory);
                         let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::new(
                             AgentScopedMemoryWriter::new(Arc::clone(mm), session_agent_id.clone()),
                         );
@@ -5015,7 +5022,11 @@ impl ChatService for LiveChatService {
         if let Some(mm) = self.state.memory_manager()
             && let Ok(provider) = self.resolve_provider(&session_key, &history).await
         {
-            let chat_history_for_memory = values_to_chat_messages(&history);
+            let normalized_history_for_memory = normalize_for_model_context(
+                &history,
+                MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+            );
+            let chat_history_for_memory = values_to_chat_messages(&normalized_history_for_memory);
             let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::new(
                 AgentScopedMemoryWriter::new(Arc::clone(mm), session_agent_id.clone()),
             );
@@ -5053,6 +5064,8 @@ impl ChatService for LiveChatService {
         if summary_source.is_empty() {
             summary_source = history.clone();
         }
+        let normalized_summary_source =
+            normalize_for_model_context(&summary_source, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
 
         info!(
             session = %session_key,
@@ -5070,7 +5083,7 @@ impl ChatService for LiveChatService {
         let mut fact_messages = vec![ChatMessage::system(
             "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
         )];
-        fact_messages.extend(values_to_chat_messages(&summary_source));
+        fact_messages.extend(values_to_chat_messages(&normalized_summary_source));
         fact_messages.push(ChatMessage::user(
             "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
         ));
@@ -5099,7 +5112,7 @@ impl ChatService for LiveChatService {
         let mut summary_messages = vec![ChatMessage::system(
             "You are a conversation summarizer. Preserve key context while compressing aggressively. Do not invent facts.",
         )];
-        summary_messages.extend(values_to_chat_messages(&summary_source));
+        summary_messages.extend(values_to_chat_messages(&normalized_summary_source));
         summary_messages.push(ChatMessage::user(format!(
             "Summarize the compressible history into at most {} tokens. Preserve decisions, status, open tasks, blockers, and identifiers. Output only the summary.",
             summary_plan.summary_budget_tokens
@@ -7248,7 +7261,9 @@ async fn run_with_tools(
     });
 
     // Convert persisted JSON history to typed ChatMessages for the LLM provider.
-    let chat_history = values_to_chat_messages(history_raw);
+    let normalized_history =
+        normalize_for_model_context(history_raw, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
+    let chat_history = values_to_chat_messages(&normalized_history);
     let hist = if chat_history.is_empty() {
         None
     } else {
@@ -7349,7 +7364,11 @@ async fn run_with_tools(
 
                     // Reload compacted history and retry.
                     let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
-                    let compacted_chat = values_to_chat_messages(&compacted_history_raw);
+                    let normalized_compacted_history = normalize_for_model_context(
+                        &compacted_history_raw,
+                        MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+                    );
+                    let compacted_chat = values_to_chat_messages(&normalized_compacted_history);
                     let retry_hist = if compacted_chat.is_empty() {
                         None
                     } else {
@@ -7666,6 +7685,8 @@ async fn compact_session(
     if summary_source.is_empty() {
         summary_source = history.clone();
     }
+    let normalized_summary_source =
+        normalize_for_model_context(&summary_source, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
 
     // Use structured ChatMessage objects so role boundaries are maintained via
     // the API's message structure, preventing prompt injection where user content
@@ -7673,7 +7694,7 @@ async fn compact_session(
     let mut summary_messages = vec![ChatMessage::system(
         "You are a conversation summarizer. Summarize only the compressible history and preserve all key facts, decisions, and context.",
     )];
-    summary_messages.extend(values_to_chat_messages(&summary_source));
+    summary_messages.extend(values_to_chat_messages(&normalized_summary_source));
     summary_messages.push(ChatMessage::user(format!(
         "Summarize the conversation above into at most {} tokens. Output only the summary, no preamble.",
         summary_plan.summary_budget_tokens
@@ -7860,7 +7881,9 @@ async fn run_streaming(
         apply_voice_reply_suffix(system_prompt, desired_reply_medium, runtime_context);
 
     // Convert persisted JSON history to typed ChatMessages for the LLM provider.
-    let chat_history = values_to_chat_messages(history_raw);
+    let normalized_history =
+        normalize_for_model_context(history_raw, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
+    let chat_history = values_to_chat_messages(&normalized_history);
     let _ = maybe_append_research_context(
         &mut system_prompt,
         provider.clone(),

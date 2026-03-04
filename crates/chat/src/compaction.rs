@@ -414,7 +414,6 @@ fn collect_anchor_groups(history: &[Value]) -> Vec<AnchorGroup> {
 
 fn collect_tool_chain_groups(history: &[Value]) -> Vec<AnchorGroup> {
     let mut assistant_by_tool_call: HashMap<String, usize> = HashMap::new();
-    let mut assistant_tool_ids: HashMap<usize, Vec<String>> = HashMap::new();
 
     for (idx, message) in history.iter().enumerate() {
         if !has_tool_calls(message) {
@@ -437,10 +436,9 @@ fn collect_tool_chain_groups(history: &[Value]) -> Vec<AnchorGroup> {
         for id in &ids {
             assistant_by_tool_call.insert(id.clone(), idx);
         }
-        assistant_tool_ids.insert(idx, ids);
     }
 
-    let mut results_by_assistant: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut results_by_tool_call: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, message) in history.iter().enumerate() {
         let role = message
             .get("role")
@@ -452,20 +450,18 @@ fn collect_tool_chain_groups(history: &[Value]) -> Vec<AnchorGroup> {
         let Some(tool_call_id) = message.get("tool_call_id").and_then(Value::as_str) else {
             continue;
         };
-        if let Some(assistant_idx) = assistant_by_tool_call.get(tool_call_id) {
-            results_by_assistant
-                .entry(*assistant_idx)
-                .or_default()
-                .push(idx);
-        }
+        results_by_tool_call
+            .entry(tool_call_id.to_string())
+            .or_default()
+            .push(idx);
     }
 
-    assistant_tool_ids
+    assistant_by_tool_call
         .into_iter()
-        .map(|(assistant_idx, _)| {
+        .map(|(tool_call_id, assistant_idx)| {
             let mut indices = vec![assistant_idx];
-            if let Some(result_indices) = results_by_assistant.get(&assistant_idx) {
-                indices.extend(result_indices.iter().copied());
+            if let Some(result_indices) = results_by_tool_call.remove(&tool_call_id) {
+                indices.extend(result_indices);
             }
             indices.sort_unstable();
             indices.dedup();
@@ -711,5 +707,45 @@ mod tests {
         let summary = "x".repeat(5_000);
         let trimmed = trim_summary_to_budget(&summary, 128);
         assert!(trimmed.len() < summary.len());
+    }
+
+    #[test]
+    fn retain_with_importance_preserves_partial_multi_tool_chain_when_budget_tight() {
+        let history = vec![
+            json!({
+                "role": "assistant",
+                "content": "running tools",
+                "tool_calls": [
+                    { "id": "tc-1", "type": "function", "function": { "name": "exec", "arguments": "{}" }},
+                    { "id": "tc-2", "type": "function", "function": { "name": "exec", "arguments": "{}" }},
+                    { "id": "tc-3", "type": "function", "function": { "name": "exec", "arguments": "{}" }}
+                ]
+            }),
+            json!({"role": "tool_result", "tool_call_id": "tc-1", "result": {"stdout": "one"}}),
+            json!({"role": "tool_result", "tool_call_id": "tc-2", "result": {"stdout": "two"}}),
+            json!({"role": "tool_result", "tool_call_id": "tc-3", "result": {"stdout": "three"}}),
+            json!({"role": "user", "content": "latest"}),
+        ];
+
+        let reduced = retain_with_importance(
+            &history,
+            ReductionPlan {
+                keep_recent: 1,
+                anchor_budget_tokens: 1_024,
+                max_anchor_messages: 2,
+            },
+        );
+
+        assert!(
+            reduced.retained_anchor_messages >= 2,
+            "at least one tool-call/result pair should survive under tight count budget"
+        );
+        assert!(
+            reduced
+                .messages
+                .iter()
+                .any(|msg| msg.get("role").and_then(Value::as_str) == Some("tool_result")),
+            "must preserve at least one tool result anchor"
+        );
     }
 }
