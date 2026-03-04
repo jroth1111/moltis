@@ -44,8 +44,7 @@ injected only on private surfaces.
 SOUL section routing precedence:
 
 1. Explicit lane marker (`<!-- lane:agents|tools|heartbeat|soul -->`)
-2. Legacy heading fallback map
-3. Default `soul` lane
+2. Default `soul` lane
 
 Invalid or orphan lane markers are ignored and reported as warnings.
 

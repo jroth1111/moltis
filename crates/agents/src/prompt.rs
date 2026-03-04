@@ -563,25 +563,6 @@ enum SoulLane {
     Heartbeat,
 }
 
-const LEGACY_HEADING_LANE_AGENTS: &[&str] = &[
-    "advanced operating principles",
-    "multi-agent behavior",
-    "work style",
-    "bootstrap order",
-    "quality bar",
-    "authoring workflow",
-];
-const LEGACY_HEADING_LANE_TOOLS: &[&str] = &[
-    "routing defaults",
-    "file role separation",
-    "what does not belong in soul",
-];
-const LEGACY_HEADING_LANE_HEARTBEAT: &[&str] = &[
-    "proactive disposition",
-    "proactivity split across files",
-    "autonomy preference",
-];
-
 impl SoulLane {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -592,28 +573,6 @@ impl SoulLane {
             _ => None,
         }
     }
-}
-
-fn infer_legacy_heading_lane(heading_key: &str) -> Option<SoulLane> {
-    if LEGACY_HEADING_LANE_AGENTS
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case(heading_key))
-    {
-        return Some(SoulLane::Agents);
-    }
-    if LEGACY_HEADING_LANE_TOOLS
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case(heading_key))
-    {
-        return Some(SoulLane::Tools);
-    }
-    if LEGACY_HEADING_LANE_HEARTBEAT
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case(heading_key))
-    {
-        return Some(SoulLane::Heartbeat);
-    }
-    None
 }
 
 fn parse_lane_marker(line: &str) -> Option<Result<SoulLane, String>> {
@@ -690,7 +649,7 @@ fn build_derived_soul_section(title: &str, intro: &str, blocks: Vec<String>) -> 
 /// - `<!-- lane:tools -->`
 /// - `<!-- lane:heartbeat -->`
 /// - `<!-- lane:soul -->`
-/// - legacy heading map fallback (for compatibility)
+/// - default `soul` lane
 fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
     let mut preamble_lines: Vec<String> = Vec::new();
     let mut sections: Vec<(String, String, SoulLane)> = Vec::new();
@@ -735,10 +694,7 @@ fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
             }
             let lane_for_heading = match marker {
                 Some(Ok(lane)) => lane,
-                _ => pending_lane
-                    .take()
-                    .or_else(|| infer_legacy_heading_lane(&new_heading))
-                    .unwrap_or(SoulLane::Soul),
+                _ => pending_lane.take().unwrap_or(SoulLane::Soul),
             };
             current_heading = Some(new_heading);
             current_lane = lane_for_heading;
@@ -1176,12 +1132,113 @@ fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     if text.is_empty() || max_chars == 0 {
         return String::new();
     }
-    let mut iter = text.chars();
-    let taken: String = iter.by_ref().take(max_chars).collect();
-    if iter.next().is_some() {
-        format!("{taken}...")
+    let original_chars = text.chars().count();
+    if original_chars <= max_chars {
+        return text.to_string();
+    }
+
+    // Prefer full markdown sections when possible so policy blocks are never
+    // cut mid-section.
+    if let Some(section_truncated) = truncate_markdown_sections(text, max_chars) {
+        return section_truncated;
+    }
+
+    truncate_paragraphs(text, max_chars)
+}
+
+fn truncate_chars_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        if max_chars > 3 {
+            out.truncate(out.chars().take(max_chars - 3).map(char::len_utf8).sum());
+            out.push_str("...");
+        } else {
+            out.truncate(out.chars().take(max_chars).map(char::len_utf8).sum());
+        }
+    }
+    out
+}
+
+fn split_markdown_sections(text: &str) -> Option<Vec<String>> {
+    let mut sections: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut saw_heading = false;
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("## ") {
+            saw_heading = true;
+            if !current.is_empty() {
+                sections.push(current.join("\n"));
+                current.clear();
+            }
+        }
+        current.push(line.to_string());
+    }
+    if !current.is_empty() {
+        sections.push(current.join("\n"));
+    }
+
+    saw_heading.then_some(sections)
+}
+
+fn truncate_markdown_sections(text: &str, max_chars: usize) -> Option<String> {
+    let sections = split_markdown_sections(text)?;
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+
+    for section in sections {
+        let section = section.trim();
+        if section.is_empty() {
+            continue;
+        }
+        let section_chars = section.chars().count();
+        let sep = usize::from(!kept.is_empty()) * 2;
+        let next_total = used + sep + section_chars;
+        if next_total > max_chars {
+            if kept.is_empty() {
+                return Some(truncate_paragraphs(section, max_chars));
+            }
+            break;
+        }
+        kept.push(section.to_string());
+        used = next_total;
+    }
+
+    if kept.is_empty() {
+        return Some(truncate_paragraphs(text, max_chars));
+    }
+    Some(kept.join("\n\n"))
+}
+
+fn truncate_paragraphs(text: &str, max_chars: usize) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+
+    for para in text.split("\n\n") {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        let para_chars = para.chars().count();
+        let sep = usize::from(!kept.is_empty()) * 2;
+        let next_total = used + sep + para_chars;
+        if next_total > max_chars {
+            if kept.is_empty() {
+                return truncate_chars_with_ellipsis(para, max_chars);
+            }
+            break;
+        }
+        kept.push(para.to_string());
+        used = next_total;
+    }
+
+    if kept.is_empty() {
+        truncate_chars_with_ellipsis(text, max_chars)
     } else {
-        taken
+        kept.join("\n\n")
     }
 }
 
@@ -2314,7 +2371,7 @@ No fluff.
     }
 
     #[test]
-    fn test_prepare_soul_sections_legacy_heading_fallback_routes_known_sections() {
+    fn test_prepare_soul_sections_without_lane_markers_stays_in_soul_lane() {
         let soul = r#"
 # SOUL.md
 
@@ -2333,31 +2390,16 @@ I am calm and direct.
 
         let prepared = prepare_soul_sections(soul);
         assert!(prepared.warnings.is_empty());
-        assert!(!prepared.identity_soul_text.contains("## Work Style"));
-        assert!(!prepared.identity_soul_text.contains("## Routing Defaults"));
+        assert!(prepared.identity_soul_text.contains("## Work Style"));
+        assert!(prepared.identity_soul_text.contains("## Routing Defaults"));
         assert!(
-            !prepared
+            prepared
                 .identity_soul_text
                 .contains("## Proactive Disposition")
         );
-        assert!(
-            prepared
-                .redistributed_agents_text
-                .as_deref()
-                .is_some_and(|text| text.contains("## Work Style"))
-        );
-        assert!(
-            prepared
-                .redistributed_tools_text
-                .as_deref()
-                .is_some_and(|text| text.contains("## Routing Defaults"))
-        );
-        assert!(
-            prepared
-                .redistributed_heartbeat_text
-                .as_deref()
-                .is_some_and(|text| text.contains("## Proactive Disposition"))
-        );
+        assert!(prepared.redistributed_agents_text.is_none());
+        assert!(prepared.redistributed_tools_text.is_none());
+        assert!(prepared.redistributed_heartbeat_text.is_none());
     }
 
     #[test]
@@ -2492,6 +2534,25 @@ I value truth.
         assert!(prompt.contains("TOOLS.md truncated for prompt size"));
         assert!(prompt.contains("HEARTBEAT.md truncated for prompt size"));
         assert!(prompt.contains("MEMORY.md truncated"));
+    }
+
+    #[test]
+    fn test_truncate_prompt_text_keeps_whole_markdown_sections() {
+        let text = r#"
+# SOUL.md
+
+## Core Truths
+- Rule A
+- Rule B
+
+## Style
+- Keep it concise.
+"#;
+        // Fits preamble + first section, but not the second section.
+        let truncated = truncate_prompt_text(text, 45);
+        assert!(truncated.contains("## Core Truths"));
+        assert!(!truncated.contains("## Style"));
+        assert!(!truncated.ends_with("..."));
     }
 
     #[test]

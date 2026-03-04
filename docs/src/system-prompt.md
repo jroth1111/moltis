@@ -107,10 +107,11 @@ built-in `DEFAULT_SOUL` is used. The default is sourced from
 > memory. Read them. Update them. They're how you persist. If you change this
 > file, tell the user — it's your soul, and they should know.
 
-The default soul is ~1,500 characters (~400 tokens).
+The default soul is currently ~18,357 characters and should be treated as a
+large baseline prompt component.
 
-`SOUL.md` redistribution supports explicit lane markers and legacy heading
-fallback. Use HTML comments to route a section to a workspace lane:
+`SOUL.md` redistribution uses explicit lane markers. Use HTML comments to route
+a section to a workspace lane:
 
 - `<!-- lane:agents -->`
 - `<!-- lane:tools -->`
@@ -125,8 +126,7 @@ Invalid/orphan markers are ignored and produce warnings.
 Routing precedence is:
 
 1. explicit marker
-2. legacy heading map fallback
-3. default `soul` lane
+2. default `soul` lane
 
 ### User Profile (`USER.md`)
 
@@ -226,6 +226,7 @@ Debug endpoints include this as structured metadata:
 
 - `personaDiagnostics`: health-check warnings on the assembled persona
 - `truncations`: section-level budget overflow details
+- `policyDecisions`: deterministic policy decisions for surface/privacy gating
 
 ### Tool Schemas
 
