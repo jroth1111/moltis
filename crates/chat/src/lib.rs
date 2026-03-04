@@ -49,6 +49,7 @@ use {
 
 pub mod chat_error;
 pub mod error;
+pub mod policy;
 pub mod runtime;
 
 pub use runtime::{ChatRuntime, TtsOverride};
@@ -1233,6 +1234,19 @@ fn persona_issues_to_json(issues: &[PersonaHealthIssue]) -> Vec<Value> {
         .collect()
 }
 
+fn policy_decisions_to_json(items: &[policy::PolicyDecision]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "code": item.code,
+                "outcome": item.outcome,
+                "detail": item.detail,
+            })
+        })
+        .collect()
+}
+
 fn truncations_to_json(items: &[PromptSectionTruncation]) -> Vec<Value> {
     items
         .iter()
@@ -1463,67 +1477,38 @@ fn load_prompt_persona_for_session(
 ) -> error::Result<PromptPersona> {
     let agent_id = resolve_prompt_agent_id(session_entry)?;
     let mut persona = load_prompt_persona_for_agent(&agent_id);
-    let include_private = should_include_private_persona_data(
+    let policy_eval = evaluate_policy_for_channel_binding(
         session_entry.and_then(|entry| entry.channel_binding.as_deref()),
     );
-    apply_private_persona_data_policy(&mut persona, include_private);
+    apply_private_persona_data_policy(&mut persona, policy_eval.include_private_persona_data);
     Ok(persona)
 }
 
-fn should_include_private_persona_data(channel_binding: Option<&str>) -> bool {
+fn evaluate_policy_for_channel_binding(
+    channel_binding: Option<&str>,
+) -> policy::PromptPolicyEvaluation {
     let Some(binding_json) = channel_binding else {
-        return true;
+        return policy::evaluate_surface_policy(None, None);
     };
     let Ok(binding) = serde_json::from_str::<moltis_channels::ChannelReplyTarget>(binding_json)
     else {
-        return false;
+        return policy::evaluate_surface_policy(Some("channel"), None);
     };
 
     let channel_type = binding.channel_type.as_str().to_ascii_lowercase();
     let chat_type = infer_channel_chat_type(&channel_type, &binding.chat_id);
-    should_include_private_persona_data_for_surface(
-        Some(channel_type.as_str()),
-        chat_type.as_deref(),
-    )
+    policy::evaluate_surface_policy(Some(channel_type.as_str()), chat_type.as_deref())
 }
 
-fn should_include_private_persona_data_for_runtime(
-    runtime_context: Option<&PromptRuntimeContext>,
-) -> bool {
-    let Some(runtime) = runtime_context else {
-        return true;
-    };
-    should_include_private_persona_data_for_surface(
-        runtime.host.channel_type.as_deref(),
-        runtime.host.channel_chat_type.as_deref(),
-    )
+fn should_include_private_persona_data(channel_binding: Option<&str>) -> bool {
+    evaluate_policy_for_channel_binding(channel_binding).include_private_persona_data
 }
 
 fn should_include_private_persona_data_for_surface(
     channel_type: Option<&str>,
     channel_chat_type: Option<&str>,
 ) -> bool {
-    let Some(channel_type) = channel_type else {
-        // Non-channel surfaces (web/local/cron) keep private persona data.
-        return true;
-    };
-    let Some(chat_type) = channel_chat_type else {
-        // Unclassified channel surfaces are treated as non-private.
-        return false;
-    };
-
-    if channel_type.eq_ignore_ascii_case("telegram") {
-        return chat_type.eq_ignore_ascii_case("private");
-    }
-    if channel_type.eq_ignore_ascii_case("whatsapp") {
-        return chat_type.eq_ignore_ascii_case("private");
-    }
-    if channel_type.eq_ignore_ascii_case("discord") || channel_type.eq_ignore_ascii_case("msteams")
-    {
-        return chat_type.eq_ignore_ascii_case("private");
-    }
-
-    false
+    policy::evaluate_surface_policy(channel_type, channel_chat_type).include_private_persona_data
 }
 
 fn apply_private_persona_data_policy(persona: &mut PromptPersona, include_private: bool) {
@@ -5237,6 +5222,7 @@ impl ChatService for LiveChatService {
         )
         .await;
         apply_request_runtime_context(&mut runtime_context.host, &params);
+        let runtime_policy = policy::evaluate_runtime_policy(Some(&runtime_context));
 
         // Resolve project context.
         let project_context = self
@@ -5330,6 +5316,10 @@ impl ChatService for LiveChatService {
             "promptAgentId": prompt_agent_id,
             "personaDiagnostics": persona_issues_to_json(&persona_diagnostics),
             "truncations": truncations_to_json(&truncations),
+            "includePrivatePersonaData": runtime_policy.include_private_persona_data,
+            "includeMemoryBootstrap": runtime_policy.include_memory_bootstrap,
+            "allowExternalEffects": runtime_policy.allow_external_effects,
+            "policyDecisions": policy_decisions_to_json(&runtime_policy.decisions),
         }))
     }
 
@@ -5380,6 +5370,7 @@ impl ChatService for LiveChatService {
         )
         .await;
         apply_request_runtime_context(&mut runtime_context.host, &params);
+        let runtime_policy = policy::evaluate_runtime_policy(Some(&runtime_context));
 
         // Resolve project context.
         let project_context = self
@@ -5518,6 +5509,10 @@ impl ChatService for LiveChatService {
             "promptAgentId": prompt_agent_id,
             "personaDiagnostics": persona_issues_to_json(&persona_diagnostics),
             "truncations": truncations_to_json(&truncations),
+            "includePrivatePersonaData": runtime_policy.include_private_persona_data,
+            "includeMemoryBootstrap": runtime_policy.include_memory_bootstrap,
+            "allowExternalEffects": runtime_policy.allow_external_effects,
+            "policyDecisions": policy_decisions_to_json(&runtime_policy.decisions),
         }))
     }
 
@@ -6521,8 +6516,8 @@ async fn run_with_tools(
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
     let mut persona = load_prompt_persona_for_agent(agent_id);
-    let include_private = should_include_private_persona_data_for_runtime(runtime_context);
-    apply_private_persona_data_policy(&mut persona, include_private);
+    let runtime_policy = policy::evaluate_runtime_policy(runtime_context);
+    apply_private_persona_data_policy(&mut persona, runtime_policy.include_private_persona_data);
 
     let tool_mode = effective_tool_mode(&*provider);
     let native_tools = matches!(tool_mode, ToolMode::Native);
@@ -6986,6 +6981,7 @@ async fn run_with_tools(
     // resolve per-session state and forward the user's locale to web requests.
     let mut tool_context = serde_json::json!({
         "_session_key": session_key,
+        "_allow_external_effects": runtime_policy.allow_external_effects,
     });
     if let Some(lang) = accept_language.as_deref() {
         tool_context["_accept_language"] = serde_json::json!(lang);
@@ -7467,8 +7463,8 @@ async fn run_streaming(
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
     let mut persona = load_prompt_persona_for_agent(agent_id);
-    let include_private = should_include_private_persona_data_for_runtime(runtime_context);
-    apply_private_persona_data_policy(&mut persona, include_private);
+    let runtime_policy = policy::evaluate_runtime_policy(runtime_context);
+    apply_private_persona_data_policy(&mut persona, runtime_policy.include_private_persona_data);
 
     let system_prompt = build_system_prompt_minimal_runtime_workspace_budgets(
         project_context,
