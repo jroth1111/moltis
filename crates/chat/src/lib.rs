@@ -1339,6 +1339,24 @@ fn validate_prompt_persona(agent_id: &str, persona: &PromptPersona) -> Vec<Perso
         }
     }
 
+    for truncation in collect_prompt_section_truncations(
+        None,
+        persona.soul_text.as_deref(),
+        persona.agents_text.as_deref(),
+        persona.tools_text.as_deref(),
+        persona.heartbeat_text.as_deref(),
+        persona.memory_text.as_deref(),
+        Some(budgets),
+    ) {
+        issues.push(PersonaHealthIssue {
+            code: "prompt_section_truncated",
+            message: format!(
+                "{} exceeds budget ({} > {})",
+                truncation.section, truncation.original_chars, truncation.max_chars
+            ),
+        });
+    }
+
     if !issues.is_empty() && agent_id == "main" {
         issues.push(PersonaHealthIssue {
             code: "persona_health_docs",
@@ -9233,6 +9251,18 @@ mod tests {
             issues
                 .iter()
                 .any(|issue| issue.code == "prompt_budget_zero")
+        );
+    }
+
+    #[test]
+    fn validate_prompt_persona_reports_expected_truncation() {
+        let mut persona = persona_fixture();
+        persona.config.chat.prompt_budgets.soul_max_chars = 10;
+        let issues = validate_prompt_persona("ops", &persona);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code == "prompt_section_truncated")
         );
     }
 
