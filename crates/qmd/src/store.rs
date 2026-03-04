@@ -202,6 +202,24 @@ impl MemoryStore for QmdStore {
         }
     }
 
+    // ── Scheduler state (delegated to fallback) ──
+
+    async fn get_state(&self, key: &str) -> anyhow::Result<Option<String>> {
+        if let Some(ref fallback) = self.fallback {
+            fallback.get_state(key).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn set_state(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        if let Some(ref fallback) = self.fallback {
+            fallback.set_state(key, value).await
+        } else {
+            Ok(())
+        }
+    }
+
     // ── Search operations (use QMD with optional fallback) ──
 
     async fn vector_search(
