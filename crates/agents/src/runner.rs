@@ -223,6 +223,27 @@ pub enum RunnerEvent {
         error: String,
         delay_ms: u64,
     },
+    /// Agent response has drifted significantly from the original user intent.
+    IntentDrift {
+        drift_score: f64,
+        iteration: usize,
+    },
+}
+
+fn emit_intent_drift_event(
+    intent_tracker: &mut IntentTracker,
+    current_intent: &str,
+    trace_id: Option<&str>,
+    iteration: usize,
+    on_event: Option<&OnEvent>,
+) {
+    let (drift_score, is_drifted) = intent_tracker.check_drift(current_intent, trace_id);
+    if is_drifted && let Some(cb) = on_event {
+        cb(RunnerEvent::IntentDrift {
+            drift_score,
+            iteration,
+        });
+    }
 }
 
 /// Detect an explicit shell command in the latest user turn.
@@ -574,6 +595,18 @@ pub async fn run_agent_loop_with_context(
         content: user_content.clone(),
     });
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
+    let original_intent = match user_content {
+        UserContent::Text(t) => t.clone(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let mut intent_tracker = IntentTracker::new(&original_intent);
 
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
@@ -924,6 +957,16 @@ pub async fn run_agent_loop_with_context(
                 raw_llm_responses: Vec::new(),
             });
         }
+
+        // Check intent drift when the agent is iterating with tool calls.
+        let current_intent = response.text.as_deref().unwrap_or("");
+        emit_intent_drift_event(
+            &mut intent_tracker,
+            current_intent,
+            trace_id.as_deref(),
+            iterations,
+            on_event,
+        );
 
         // Append assistant message with tool calls.
         // Save any answer text for fallback — when the final iteration returns
@@ -1720,9 +1763,13 @@ pub async fn run_agent_loop_streaming(
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        // check_drift logs warnings internally when drift is detected.
-        let (_drift_score, _is_drifted) =
-            intent_tracker.check_drift(&current_intent, trace_id.as_deref());
+        emit_intent_drift_event(
+            &mut intent_tracker,
+            &current_intent,
+            trace_id.as_deref(),
+            iterations,
+            on_event,
+        );
 
         // Append assistant message with tool calls.
         //
@@ -4849,6 +4896,58 @@ mod tests {
             assert!(v >= 1);
             assert!(v <= RATE_LIMIT_MAX_RETRY_MS);
         }
+    }
+
+    #[test]
+    fn emit_intent_drift_event_emits_when_drift_detected() {
+        let mut tracker = IntentTracker::new("Write a Rust function to parse JSON");
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        emit_intent_drift_event(
+            &mut tracker,
+            "Delete all files in the directory",
+            None,
+            3,
+            Some(&on_event),
+        );
+
+        let evts = events.lock().unwrap();
+        assert!(evts.iter().any(|event| matches!(
+            event,
+            RunnerEvent::IntentDrift {
+                drift_score,
+                iteration
+            } if *drift_score > 0.7 && *iteration == 3
+        )));
+    }
+
+    #[test]
+    fn emit_intent_drift_event_skips_when_intent_is_aligned() {
+        let mut tracker = IntentTracker::new("Write a Rust function to parse JSON");
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        emit_intent_drift_event(
+            &mut tracker,
+            "Create a Rust function that can parse JSON data",
+            None,
+            2,
+            Some(&on_event),
+        );
+
+        let evts = events.lock().unwrap();
+        assert!(!evts
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::IntentDrift { .. })));
     }
 
     /// Verify that the tool context merge overwrites any LLM-supplied value for
