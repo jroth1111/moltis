@@ -3,25 +3,16 @@ use std::collections::{BTreeSet, HashMap};
 use moltis_config::ChatConfig;
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextCompactionStrategy {
-    Truncate,
-    MoveToWorkspace,
-}
-
-impl ContextCompactionStrategy {
-    pub(crate) fn as_config_value(self) -> &'static str {
-        match self {
-            Self::Truncate => "truncate",
-            Self::MoveToWorkspace => "move_to_workspace",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ContextCompactionConfig {
-    pub(crate) strategy: ContextCompactionStrategy,
-    pub(crate) keep_recent: usize,
+    pub(crate) enabled: bool,
+    pub(crate) soft_trigger_percent: u8,
+    pub(crate) hard_trigger_percent: u8,
+    pub(crate) emergency_trigger_percent: u8,
+    pub(crate) verbatim_turns: usize,
+    pub(crate) min_verbatim_turns: usize,
+    pub(crate) anchor_budget_tokens: u64,
+    pub(crate) summary_budget_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,25 +21,34 @@ pub(crate) enum ContextCompactionAction {
     /// Early memory flush at ~70% occupancy — no summarization, only persists
     /// important memories before they might be lost to compaction.
     PreCompact,
-    Compact,
-    ArchiveTier,
-    TruncateTier,
+    SoftCompact,
+    HardCompact,
+    EmergencyCompact,
 }
 
 #[must_use]
 pub(crate) fn context_compaction_config_from_chat(chat: &ChatConfig) -> ContextCompactionConfig {
-    let strategy = match chat
-        .context_compaction_strategy
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "move_to_workspace" => ContextCompactionStrategy::MoveToWorkspace,
-        _ => ContextCompactionStrategy::Truncate,
-    };
+    let compaction = &chat.compaction;
+    let soft_trigger_percent = compaction.soft_trigger_percent.clamp(1, 98);
+    let hard_trigger_percent = compaction
+        .hard_trigger_percent
+        .clamp(soft_trigger_percent.saturating_add(1), 99);
+    let emergency_trigger_percent = compaction
+        .emergency_trigger_percent
+        .max(hard_trigger_percent.saturating_add(1))
+        .min(100);
+    let min_verbatim_turns = compaction.min_verbatim_turns.max(1);
+    let verbatim_turns = compaction.verbatim_turns.max(min_verbatim_turns);
+
     ContextCompactionConfig {
-        strategy,
-        keep_recent: chat.context_compaction_keep_recent.max(1),
+        enabled: compaction.enabled,
+        soft_trigger_percent,
+        hard_trigger_percent,
+        emergency_trigger_percent,
+        verbatim_turns,
+        min_verbatim_turns,
+        anchor_budget_tokens: compaction.anchor_budget_tokens.max(1),
+        summary_budget_tokens: compaction.summary_budget_tokens.max(64),
     }
 }
 
@@ -56,17 +56,24 @@ pub(crate) fn context_compaction_config_from_chat(chat: &ChatConfig) -> ContextC
 pub(crate) fn context_compaction_action_for_usage(
     estimated_next_input: u64,
     context_window: u64,
+    config: ContextCompactionConfig,
 ) -> ContextCompactionAction {
-    let pre_compact_threshold = (context_window * 70) / 100;
-    let compact_threshold = (context_window * 80) / 100;
-    let archive_threshold = (context_window * 90) / 100;
-    let truncate_threshold = (context_window * 95) / 100;
-    if estimated_next_input >= truncate_threshold {
-        ContextCompactionAction::TruncateTier
-    } else if estimated_next_input >= archive_threshold {
-        ContextCompactionAction::ArchiveTier
-    } else if estimated_next_input >= compact_threshold {
-        ContextCompactionAction::Compact
+    if !config.enabled || context_window == 0 {
+        return ContextCompactionAction::None;
+    }
+
+    let emergency_threshold = usage_threshold(context_window, config.emergency_trigger_percent);
+    let hard_threshold = usage_threshold(context_window, config.hard_trigger_percent);
+    let soft_threshold = usage_threshold(context_window, config.soft_trigger_percent);
+    let pre_compact_percent = config.soft_trigger_percent.saturating_sub(10).max(1);
+    let pre_compact_threshold = usage_threshold(context_window, pre_compact_percent);
+
+    if estimated_next_input >= emergency_threshold {
+        ContextCompactionAction::EmergencyCompact
+    } else if estimated_next_input >= hard_threshold {
+        ContextCompactionAction::HardCompact
+    } else if estimated_next_input >= soft_threshold {
+        ContextCompactionAction::SoftCompact
     } else if estimated_next_input >= pre_compact_threshold {
         ContextCompactionAction::PreCompact
     } else {
@@ -75,7 +82,12 @@ pub(crate) fn context_compaction_action_for_usage(
 }
 
 #[must_use]
-pub(crate) fn archive_keep_recent_for_reduction(
+fn usage_threshold(context_window: u64, percent: u8) -> u64 {
+    context_window.saturating_mul(percent as u64) / 100
+}
+
+#[must_use]
+pub(crate) fn keep_recent_for_reduction(
     history_len: usize,
     configured_keep_recent: usize,
 ) -> usize {
@@ -114,8 +126,10 @@ pub(crate) struct SummaryContextPlan {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReductionPlan {
     pub(crate) keep_recent: usize,
+    pub(crate) min_recent_to_keep: usize,
     pub(crate) anchor_budget_tokens: u64,
     pub(crate) max_anchor_messages: usize,
+    pub(crate) target_total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +137,13 @@ pub(crate) struct SummaryCompactionSections {
     pub(crate) summary_source: Vec<Value>,
     pub(crate) anchors: Vec<Value>,
     pub(crate) recent: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LayerStats {
+    pub(crate) critical_anchor_messages: usize,
+    pub(crate) working_messages: usize,
+    pub(crate) background_messages: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -134,42 +155,41 @@ pub(crate) struct ImportanceRetentionResult {
 }
 
 const SUMMARY_MIN_RECENT_TURNS: usize = 4;
-const SUMMARY_MAX_RECENT_TURNS: usize = 12;
-const SUMMARY_DEFAULT_RECENT_TURNS: usize = 10;
-const SUMMARY_DEFAULT_ANCHOR_BUDGET_TOKENS: u64 = 2_048;
-const SUMMARY_DEFAULT_BUDGET_TOKENS: u64 = 1_200;
-const ARCHIVE_DEFAULT_ANCHOR_BUDGET_TOKENS: u64 = 1_024;
-const ARCHIVE_DEFAULT_MAX_ANCHOR_MESSAGES: usize = 12;
-const TRUNCATE_DEFAULT_ANCHOR_BUDGET_TOKENS: u64 = 384;
-const TRUNCATE_DEFAULT_MAX_ANCHOR_MESSAGES: usize = 4;
+const REDUCTION_MAX_ANCHOR_MESSAGES: usize = 48;
+const EMERGENCY_MAX_ANCHOR_MESSAGES: usize = 24;
 
 #[must_use]
-pub(crate) fn summary_context_plan(configured_keep_recent: usize) -> SummaryContextPlan {
-    let verbatim_turns = configured_keep_recent
-        .max(SUMMARY_DEFAULT_RECENT_TURNS)
-        .clamp(SUMMARY_MIN_RECENT_TURNS, SUMMARY_MAX_RECENT_TURNS);
+pub(crate) fn summary_context_plan(config: ContextCompactionConfig) -> SummaryContextPlan {
+    let verbatim_turns = config.verbatim_turns.max(SUMMARY_MIN_RECENT_TURNS);
     SummaryContextPlan {
         verbatim_turns,
-        anchor_budget_tokens: SUMMARY_DEFAULT_ANCHOR_BUDGET_TOKENS,
-        summary_budget_tokens: SUMMARY_DEFAULT_BUDGET_TOKENS,
+        anchor_budget_tokens: config.anchor_budget_tokens,
+        summary_budget_tokens: config.summary_budget_tokens,
     }
 }
 
 #[must_use]
-pub(crate) fn archive_reduction_plan(configured_keep_recent: usize) -> ReductionPlan {
+pub(crate) fn hard_reduction_plan(config: ContextCompactionConfig) -> ReductionPlan {
     ReductionPlan {
-        keep_recent: configured_keep_recent,
-        anchor_budget_tokens: ARCHIVE_DEFAULT_ANCHOR_BUDGET_TOKENS,
-        max_anchor_messages: ARCHIVE_DEFAULT_MAX_ANCHOR_MESSAGES,
+        keep_recent: config.min_verbatim_turns,
+        min_recent_to_keep: config.min_verbatim_turns,
+        anchor_budget_tokens: config.anchor_budget_tokens,
+        max_anchor_messages: REDUCTION_MAX_ANCHOR_MESSAGES,
+        target_total_tokens: None,
     }
 }
 
 #[must_use]
-pub(crate) fn truncate_reduction_plan(keep_recent: usize) -> ReductionPlan {
+pub(crate) fn emergency_reduction_plan(
+    config: ContextCompactionConfig,
+    context_window: u64,
+) -> ReductionPlan {
     ReductionPlan {
-        keep_recent,
-        anchor_budget_tokens: TRUNCATE_DEFAULT_ANCHOR_BUDGET_TOKENS,
-        max_anchor_messages: TRUNCATE_DEFAULT_MAX_ANCHOR_MESSAGES,
+        keep_recent: config.min_verbatim_turns,
+        min_recent_to_keep: config.min_verbatim_turns,
+        anchor_budget_tokens: config.anchor_budget_tokens,
+        max_anchor_messages: EMERGENCY_MAX_ANCHOR_MESSAGES,
+        target_total_tokens: Some(usage_threshold(context_window, config.hard_trigger_percent)),
     }
 }
 
@@ -204,7 +224,7 @@ pub(crate) fn partition_history_for_summary(
     let selected_anchor_indices = select_anchor_indices(
         older,
         plan.anchor_budget_tokens,
-        ARCHIVE_DEFAULT_MAX_ANCHOR_MESSAGES,
+        REDUCTION_MAX_ANCHOR_MESSAGES,
     );
 
     let mut summary_source = Vec::with_capacity(older.len());
@@ -225,6 +245,34 @@ pub(crate) fn partition_history_for_summary(
 }
 
 #[must_use]
+pub(crate) fn layer_stats_for_history(history: &[Value], plan: SummaryContextPlan) -> LayerStats {
+    if history.is_empty() {
+        return LayerStats {
+            critical_anchor_messages: 0,
+            working_messages: 0,
+            background_messages: 0,
+        };
+    }
+
+    let keep_recent = keep_recent_for_reduction(history.len(), plan.verbatim_turns);
+    let split_at = history.len().saturating_sub(keep_recent);
+    let (older, recent) = history.split_at(split_at);
+    let selected_anchor_indices = select_anchor_indices(
+        older,
+        plan.anchor_budget_tokens,
+        REDUCTION_MAX_ANCHOR_MESSAGES,
+    );
+    let critical_anchor_messages = selected_anchor_indices.len();
+    let background_messages = older.len().saturating_sub(critical_anchor_messages);
+
+    LayerStats {
+        critical_anchor_messages,
+        working_messages: recent.len(),
+        background_messages,
+    }
+}
+
+#[must_use]
 pub(crate) fn retain_with_importance(
     history: &[Value],
     plan: ReductionPlan,
@@ -238,7 +286,7 @@ pub(crate) fn retain_with_importance(
         };
     }
 
-    let keep_recent = archive_keep_recent_for_reduction(history.len(), plan.keep_recent);
+    let keep_recent = keep_recent_for_reduction(history.len(), plan.keep_recent);
     let split_at = history.len().saturating_sub(keep_recent);
     let (older, recent) = history.split_at(split_at);
 
@@ -253,18 +301,80 @@ pub(crate) fn retain_with_importance(
         .filter(|(idx, _)| selected_anchor_indices.contains(idx))
         .map(|(_, msg)| msg.clone())
         .collect();
+    let mut merged: Vec<(Value, bool)> = Vec::with_capacity(anchors.len() + recent.len());
+    merged.extend(anchors.iter().cloned().map(|msg| (msg, true)));
+    merged.extend(recent.iter().cloned().map(|msg| (msg, false)));
 
-    let mut merged = Vec::with_capacity(anchors.len() + recent.len());
-    merged.extend(anchors.clone());
-    merged.extend(recent.iter().cloned());
-
-    let removed_messages = history.len().saturating_sub(merged.len());
-    ImportanceRetentionResult {
-        messages: merged,
-        removed_messages,
-        retained_anchor_messages: anchors.len(),
-        kept_recent_messages: recent.len(),
+    if let Some(target_total_tokens) = plan.target_total_tokens {
+        drop_low_importance_non_anchors_first(
+            &mut merged,
+            target_total_tokens,
+            plan.min_recent_to_keep,
+        );
     }
+
+    let retained_anchor_messages = merged.iter().filter(|(_, is_anchor)| *is_anchor).count();
+    let kept_recent_messages = merged.len().saturating_sub(retained_anchor_messages);
+    let messages: Vec<Value> = merged.into_iter().map(|(msg, _)| msg).collect();
+    let removed_messages = history.len().saturating_sub(messages.len());
+    ImportanceRetentionResult {
+        messages,
+        removed_messages,
+        retained_anchor_messages,
+        kept_recent_messages,
+    }
+}
+
+fn drop_low_importance_non_anchors_first(
+    merged: &mut Vec<(Value, bool)>,
+    target_total_tokens: u64,
+    min_recent_to_keep: usize,
+) {
+    let mut total_tokens: u64 = merged
+        .iter()
+        .map(|(msg, _)| estimate_message_tokens(msg))
+        .sum();
+    if total_tokens <= target_total_tokens {
+        return;
+    }
+
+    let mut candidates: Vec<(usize, Importance, u64)> = merged
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, is_anchor))| !*is_anchor)
+        .map(|(idx, (msg, _))| (idx, classify_importance(msg), estimate_message_tokens(msg)))
+        .collect();
+    candidates.sort_by(|left, right| {
+        left.1
+            .rank()
+            .cmp(&right.1.rank())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    let mut drop_indices = BTreeSet::new();
+    let mut remaining_recent = merged.iter().filter(|(_, is_anchor)| !*is_anchor).count();
+    for (idx, _, tokens) in candidates {
+        if total_tokens <= target_total_tokens {
+            break;
+        }
+        if remaining_recent <= min_recent_to_keep {
+            break;
+        }
+        drop_indices.insert(idx);
+        total_tokens = total_tokens.saturating_sub(tokens);
+        remaining_recent = remaining_recent.saturating_sub(1);
+    }
+
+    if drop_indices.is_empty() {
+        return;
+    }
+
+    *merged = merged
+        .drain(..)
+        .enumerate()
+        .filter(|(idx, _)| !drop_indices.contains(idx))
+        .map(|(_, item)| item)
+        .collect();
 }
 
 #[must_use]
@@ -680,8 +790,10 @@ mod tests {
             &history,
             ReductionPlan {
                 keep_recent: 2,
+                min_recent_to_keep: 2,
                 anchor_budget_tokens: 512,
                 max_anchor_messages: 2,
+                target_total_tokens: None,
             },
         );
 
@@ -731,8 +843,10 @@ mod tests {
             &history,
             ReductionPlan {
                 keep_recent: 1,
+                min_recent_to_keep: 1,
                 anchor_budget_tokens: 1_024,
                 max_anchor_messages: 2,
+                target_total_tokens: None,
             },
         );
 
@@ -746,6 +860,44 @@ mod tests {
                 .iter()
                 .any(|msg| msg.get("role").and_then(Value::as_str) == Some("tool_result")),
             "must preserve at least one tool result anchor"
+        );
+    }
+
+    #[test]
+    fn emergency_reduction_drops_low_importance_before_higher_importance() {
+        let history = vec![
+            json!({"role": "assistant", "content": "Decision: ship build 42 to staging."}),
+            json!({"role": "user", "content": "ok"}),
+            json!({"role": "user", "content": "Need rollback checklist and release owner."}),
+            json!({"role": "assistant", "content": "Owner is Alex, checklist is in runbook."}),
+        ];
+        let total_tokens: u64 = history.iter().map(estimate_message_tokens).sum();
+        let low_tokens = estimate_message_tokens(&history[1]);
+        let target = total_tokens.saturating_sub(low_tokens.max(1));
+
+        let reduced = retain_with_importance(
+            &history,
+            ReductionPlan {
+                keep_recent: 3,
+                min_recent_to_keep: 2,
+                anchor_budget_tokens: 512,
+                max_anchor_messages: 4,
+                target_total_tokens: Some(target),
+            },
+        );
+
+        assert!(
+            !reduced
+                .messages
+                .iter()
+                .any(|msg| msg.get("content").and_then(Value::as_str) == Some("ok"))
+        );
+        assert!(
+            reduced.messages.iter().any(|msg| {
+                msg.get("content").and_then(Value::as_str)
+                    == Some("Need rollback checklist and release owner.")
+            }),
+            "higher-importance recent content should remain"
         );
     }
 }
