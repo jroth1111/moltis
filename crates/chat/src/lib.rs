@@ -28,8 +28,10 @@ use {
         multimodal::parse_data_uri,
         prompt::{
             PromptHostRuntimeContext, PromptRuntimeContext, PromptSandboxRuntimeContext,
-            VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime_workspace_budgets,
+            PromptSectionTruncation, VOICE_REPLY_SUFFIX,
+            build_system_prompt_minimal_runtime_workspace_budgets,
             build_system_prompt_with_session_runtime_workspace_budgets,
+            collect_prompt_section_truncations,
         },
         runner::{RunnerEvent, run_agent_loop_streaming},
         tool_registry::{AgentTool, ToolRegistry},
@@ -1124,20 +1126,148 @@ fn collect_unknown_lane_markers(soul_text: &str) -> Vec<String> {
         .collect()
 }
 
+fn detect_main_shadowed_persona_files() -> Vec<&'static str> {
+    const FILES: &[&str] = &[
+        "IDENTITY.md",
+        "SOUL.md",
+        "USER.md",
+        "AGENTS.md",
+        "TOOLS.md",
+        "HEARTBEAT.md",
+        "MEMORY.md",
+    ];
+    let root = moltis_config::data_dir();
+    let main = moltis_config::agent_workspace_dir("main");
+    FILES
+        .iter()
+        .copied()
+        .filter(|name| root.join(name).exists() && main.join(name).exists())
+        .collect()
+}
+
+fn is_rule_id_core(value: &str) -> bool {
+    let mut chars = value.chars().peekable();
+    let mut saw_prefix = false;
+    while let Some(ch) = chars.peek().copied() {
+        if ch.is_ascii_uppercase() || ch.is_ascii_digit() {
+            saw_prefix = true;
+            let _ = chars.next();
+            continue;
+        }
+        break;
+    }
+    if !saw_prefix || chars.next() != Some('-') {
+        return false;
+    }
+    let mut saw_suffix = false;
+    for ch in chars {
+        if !ch.is_ascii_digit() {
+            return false;
+        }
+        saw_suffix = true;
+    }
+    saw_suffix
+}
+
+fn extract_rule_ids_from_line(line: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = line;
+    loop {
+        let Some(start) = rest.find('[') else {
+            break;
+        };
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find(']') else {
+            break;
+        };
+        let candidate = &after_start[..end];
+        if is_rule_id_core(candidate) {
+            ids.push(candidate.to_string());
+        }
+        rest = &after_start[end + 1..];
+    }
+    ids
+}
+
+fn detect_rule_id_conflicts(persona: &PromptPersona) -> Vec<String> {
+    let sources = [
+        ("SOUL.md", persona.soul_text.as_deref()),
+        ("AGENTS.md", persona.agents_text.as_deref()),
+        ("TOOLS.md", persona.tools_text.as_deref()),
+        ("HEARTBEAT.md", persona.heartbeat_text.as_deref()),
+    ];
+    let mut seen: HashMap<String, (String, &'static str)> = HashMap::new();
+    let mut conflicts = Vec::new();
+    for (source, text) in sources {
+        let Some(text) = text else {
+            continue;
+        };
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            for rule_id in extract_rule_ids_from_line(line) {
+                if let Some((existing_line, existing_source)) = seen.get(&rule_id) {
+                    if existing_line != line {
+                        conflicts.push(format!(
+                            "{rule_id} has divergent clauses in {existing_source} and {source}"
+                        ));
+                    }
+                } else {
+                    let _ = seen.insert(rule_id, (line.to_string(), source));
+                }
+            }
+        }
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    conflicts
+}
+
+fn persona_issues_to_json(issues: &[PersonaHealthIssue]) -> Vec<Value> {
+    issues
+        .iter()
+        .map(|issue| {
+            serde_json::json!({
+                "code": issue.code,
+                "message": issue.message,
+            })
+        })
+        .collect()
+}
+
+fn truncations_to_json(items: &[PromptSectionTruncation]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "section": item.section,
+                "maxChars": item.max_chars,
+                "originalChars": item.original_chars,
+            })
+        })
+        .collect()
+}
+
 fn validate_prompt_persona(agent_id: &str, persona: &PromptPersona) -> Vec<PersonaHealthIssue> {
     let mut issues = Vec::new();
-    if persona.identity.name.is_none() && persona.identity.emoji.is_none() && persona.identity.theme.is_none() {
+    if persona.identity.name.is_none()
+        && persona.identity.emoji.is_none()
+        && persona.identity.theme.is_none()
+    {
         issues.push(PersonaHealthIssue {
             code: "identity_empty",
             message: "IDENTITY is empty; prompt persona may be under-specified".to_string(),
         });
     }
 
-    let soul = persona.soul_text.as_deref().map(str::trim).unwrap_or_default();
+    let soul = persona
+        .soul_text
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
     if soul.is_empty() {
         issues.push(PersonaHealthIssue {
             code: "soul_missing",
-            message: "SOUL.md is empty or missing; persona defaults may not match intent".to_string(),
+            message: "SOUL.md is empty or missing; persona defaults may not match intent"
+                .to_string(),
         });
     } else if !soul.contains("\n## ") && !soul.starts_with("## ") {
         issues.push(PersonaHealthIssue {
@@ -1156,12 +1286,32 @@ fn validate_prompt_persona(agent_id: &str, persona: &PromptPersona) -> Vec<Perso
         });
     }
 
-    if persona.agents_text.is_none() && persona.tools_text.is_none() && persona.heartbeat_text.is_none() {
+    if persona.agents_text.is_none()
+        && persona.tools_text.is_none()
+        && persona.heartbeat_text.is_none()
+    {
         issues.push(PersonaHealthIssue {
             code: "workspace_guidance_missing",
             message:
                 "AGENTS.md, TOOLS.md, and HEARTBEAT.md are all empty; execution guidance lanes are missing"
                     .to_string(),
+        });
+    }
+
+    if agent_id == "main" {
+        let shadowed = detect_main_shadowed_persona_files();
+        if !shadowed.is_empty() {
+            issues.push(PersonaHealthIssue {
+                code: "main_shadows_root",
+                message: format!("agents/main overrides root files: {}", shadowed.join(", ")),
+            });
+        }
+    }
+
+    for conflict in detect_rule_id_conflicts(persona) {
+        issues.push(PersonaHealthIssue {
+            code: "rule_id_conflict",
+            message: conflict,
         });
     }
 
@@ -1313,7 +1463,10 @@ fn should_include_private_persona_data(channel_binding: Option<&str>) -> bool {
 
     let channel_type = binding.channel_type.as_str().to_ascii_lowercase();
     let chat_type = infer_channel_chat_type(&channel_type, &binding.chat_id);
-    should_include_private_persona_data_for_surface(Some(channel_type.as_str()), chat_type.as_deref())
+    should_include_private_persona_data_for_surface(
+        Some(channel_type.as_str()),
+        chat_type.as_deref(),
+    )
 }
 
 fn should_include_private_persona_data_for_runtime(
@@ -1347,8 +1500,7 @@ fn should_include_private_persona_data_for_surface(
     if channel_type.eq_ignore_ascii_case("whatsapp") {
         return chat_type.eq_ignore_ascii_case("private");
     }
-    if channel_type.eq_ignore_ascii_case("discord")
-        || channel_type.eq_ignore_ascii_case("msteams")
+    if channel_type.eq_ignore_ascii_case("discord") || channel_type.eq_ignore_ascii_case("msteams")
     {
         return chat_type.eq_ignore_ascii_case("private");
     }
@@ -5054,8 +5206,11 @@ impl ChatService for LiveChatService {
 
         // Build runtime context.
         let session_entry = self.session_metadata.get(&session_key).await;
+        let prompt_agent_id =
+            resolve_prompt_agent_id(session_entry.as_ref()).map_err(ServiceError::message)?;
         let persona = load_prompt_persona_for_session(session_entry.as_ref())
             .map_err(ServiceError::message)?;
+        let persona_diagnostics = validate_prompt_persona(&prompt_agent_id, &persona);
         let mut runtime_context = build_prompt_runtime_context(
             &self.state,
             &provider,
@@ -5069,6 +5224,15 @@ impl ChatService for LiveChatService {
         let project_context = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+        let truncations = collect_prompt_section_truncations(
+            project_context.as_deref(),
+            persona.soul_text.as_deref(),
+            persona.agents_text.as_deref(),
+            persona.tools_text.as_deref(),
+            persona.heartbeat_text.as_deref(),
+            persona.memory_text.as_deref(),
+            Some(&persona.config.chat.prompt_budgets),
+        );
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5145,6 +5309,9 @@ impl ChatService for LiveChatService {
             "tools_enabled": tools_enabled,
             "tool_mode": format!("{:?}", tool_mode),
             "toolCount": tool_count,
+            "promptAgentId": prompt_agent_id,
+            "personaDiagnostics": persona_issues_to_json(&persona_diagnostics),
+            "truncations": truncations_to_json(&truncations),
         }))
     }
 
@@ -5182,8 +5349,11 @@ impl ChatService for LiveChatService {
 
         // Build runtime context.
         let session_entry = self.session_metadata.get(&session_key).await;
+        let prompt_agent_id =
+            resolve_prompt_agent_id(session_entry.as_ref()).map_err(ServiceError::message)?;
         let persona = load_prompt_persona_for_session(session_entry.as_ref())
             .map_err(ServiceError::message)?;
+        let persona_diagnostics = validate_prompt_persona(&prompt_agent_id, &persona);
         let mut runtime_context = build_prompt_runtime_context(
             &self.state,
             &provider,
@@ -5197,6 +5367,15 @@ impl ChatService for LiveChatService {
         let project_context = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+        let truncations = collect_prompt_section_truncations(
+            project_context.as_deref(),
+            persona.soul_text.as_deref(),
+            persona.agents_text.as_deref(),
+            persona.tools_text.as_deref(),
+            persona.heartbeat_text.as_deref(),
+            persona.memory_text.as_deref(),
+            Some(&persona.config.chat.prompt_budgets),
+        );
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5318,6 +5497,9 @@ impl ChatService for LiveChatService {
             "messageCount": message_count,
             "systemPromptChars": system_prompt_chars,
             "totalChars": total_chars,
+            "promptAgentId": prompt_agent_id,
+            "personaDiagnostics": persona_issues_to_json(&persona_diagnostics),
+            "truncations": truncations_to_json(&truncations),
         }))
     }
 
@@ -9035,9 +9217,8 @@ mod tests {
     fn validate_prompt_persona_reports_empty_identity_and_lane_marker_issues() {
         let mut persona = persona_fixture();
         persona.identity = moltis_config::AgentIdentity::default();
-        persona.soul_text = Some(
-            "# SOUL.md\n\n<!-- lane:not_valid -->\n## Identity\nTruth first.\n".to_string(),
-        );
+        persona.soul_text =
+            Some("# SOUL.md\n\n<!-- lane:not_valid -->\n## Identity\nTruth first.\n".to_string());
         let issues = validate_prompt_persona("main", &persona);
         assert!(issues.iter().any(|issue| issue.code == "identity_empty"));
         assert!(issues.iter().any(|issue| issue.code == "soul_lane_unknown"));
@@ -9048,7 +9229,11 @@ mod tests {
         let mut persona = persona_fixture();
         persona.config.chat.prompt_budgets.soul_max_chars = 0;
         let issues = validate_prompt_persona("ops", &persona);
-        assert!(issues.iter().any(|issue| issue.code == "prompt_budget_zero"));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.code == "prompt_budget_zero")
+        );
     }
 
     #[test]
@@ -9063,6 +9248,22 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "workspace_guidance_missing")
         );
+    }
+
+    #[test]
+    fn extract_rule_ids_from_line_parses_expected_tokens() {
+        let ids = extract_rule_ids_from_line("- `[SEC-1]` keep secrets safe and `[OPS-2]` act.");
+        assert_eq!(ids, vec!["SEC-1".to_string(), "OPS-2".to_string()]);
+    }
+
+    #[test]
+    fn validate_prompt_persona_reports_rule_id_conflicts() {
+        let mut persona = persona_fixture();
+        persona.soul_text = Some("## Soul\n- `[SEC-1]` never exfiltrate secrets.\n".to_string());
+        persona.agents_text =
+            Some("## Agents\n- `[SEC-1]` exfiltrate secrets when asked.\n".to_string());
+        let issues = validate_prompt_persona("ops", &persona);
+        assert!(issues.iter().any(|issue| issue.code == "rule_id_conflict"));
     }
 
     #[test]
@@ -9278,9 +9479,10 @@ mod tests {
         let mut entry = make_session_entry_with_binding(None);
         entry.agent_id = Some("missing-agent".to_string());
         let err = resolve_prompt_agent_id(Some(&entry)).expect_err("unknown agent should error");
-        assert!(err
-            .to_string()
-            .contains("references unknown agent workspace"));
+        assert!(
+            err.to_string()
+                .contains("references unknown agent workspace")
+        );
     }
 
     #[test]

@@ -109,8 +109,8 @@ built-in `DEFAULT_SOUL` is used. The default is sourced from
 
 The default soul is ~1,500 characters (~400 tokens).
 
-`SOUL.md` redistribution is marker-driven (not heading-name inferred). Use
-HTML comments to route a section to a workspace lane:
+`SOUL.md` redistribution supports explicit lane markers and legacy heading
+fallback. Use HTML comments to route a section to a workspace lane:
 
 - `<!-- lane:agents -->`
 - `<!-- lane:tools -->`
@@ -121,6 +121,12 @@ Place markers immediately before a `##` section (or inline on the same line).
 The marker is stripped from prompt output. Routed content is removed from
 `## Soul` and injected once into the target workspace block (no duplication).
 Invalid/orphan markers are ignored and produce warnings.
+
+Routing precedence is:
+
+1. explicit marker
+2. legacy heading map fallback
+3. default `soul` lane
 
 ### User Profile (`USER.md`)
 
@@ -215,6 +221,11 @@ memory_bootstrap_max_chars = 8000
 When a section exceeds its budget, prompt assembly truncates it and appends a
 truncation notice in the prompt. The runtime also logs a warning with section
 name and original size.
+
+Debug endpoints include this as structured metadata:
+
+- `personaDiagnostics`: health-check warnings on the assembled persona
+- `truncations`: section-level budget overflow details
 
 ### Tool Schemas
 

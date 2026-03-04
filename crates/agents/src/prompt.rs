@@ -106,6 +106,14 @@ pub struct PromptRuntimeContext {
     pub sandbox: Option<PromptSandboxRuntimeContext>,
 }
 
+/// Section-level truncation metadata for system-prompt assembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSectionTruncation {
+    pub section: String,
+    pub max_chars: usize,
+    pub original_chars: usize,
+}
+
 /// Suffix appended to the system prompt when the user's reply medium is voice.
 ///
 /// Instructs the LLM to produce speech-friendly output: no raw URLs, no markdown
@@ -555,6 +563,25 @@ enum SoulLane {
     Heartbeat,
 }
 
+const LEGACY_HEADING_LANE_AGENTS: &[&str] = &[
+    "advanced operating principles",
+    "multi-agent behavior",
+    "work style",
+    "bootstrap order",
+    "quality bar",
+    "authoring workflow",
+];
+const LEGACY_HEADING_LANE_TOOLS: &[&str] = &[
+    "routing defaults",
+    "file role separation",
+    "what does not belong in soul",
+];
+const LEGACY_HEADING_LANE_HEARTBEAT: &[&str] = &[
+    "proactive disposition",
+    "proactivity split across files",
+    "autonomy preference",
+];
+
 impl SoulLane {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -565,6 +592,28 @@ impl SoulLane {
             _ => None,
         }
     }
+}
+
+fn infer_legacy_heading_lane(heading_key: &str) -> Option<SoulLane> {
+    if LEGACY_HEADING_LANE_AGENTS
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(heading_key))
+    {
+        return Some(SoulLane::Agents);
+    }
+    if LEGACY_HEADING_LANE_TOOLS
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(heading_key))
+    {
+        return Some(SoulLane::Tools);
+    }
+    if LEGACY_HEADING_LANE_HEARTBEAT
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(heading_key))
+    {
+        return Some(SoulLane::Heartbeat);
+    }
+    None
 }
 
 fn parse_lane_marker(line: &str) -> Option<Result<SoulLane, String>> {
@@ -636,11 +685,12 @@ fn build_derived_soul_section(title: &str, intro: &str, blocks: Vec<String>) -> 
 /// Split SOUL.md into identity/value content and execution-heavy sections,
 /// then route derived sections into AGENTS/TOOLS/HEARTBEAT prompt contexts.
 ///
-/// Routing markers are explicit:
+/// Routing precedence:
 /// - `<!-- lane:agents -->`
 /// - `<!-- lane:tools -->`
 /// - `<!-- lane:heartbeat -->`
 /// - `<!-- lane:soul -->`
+/// - legacy heading map fallback (for compatibility)
 fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
     let mut preamble_lines: Vec<String> = Vec::new();
     let mut sections: Vec<(String, String, SoulLane)> = Vec::new();
@@ -685,7 +735,10 @@ fn prepare_soul_sections(soul_text: &str) -> PreparedSoulSections {
             }
             let lane_for_heading = match marker {
                 Some(Ok(lane)) => lane,
-                _ => pending_lane.take().unwrap_or(SoulLane::Soul),
+                _ => pending_lane
+                    .take()
+                    .or_else(|| infer_legacy_heading_lane(&new_heading))
+                    .unwrap_or(SoulLane::Soul),
             };
             current_heading = Some(new_heading);
             current_lane = lane_for_heading;
@@ -1139,6 +1192,90 @@ fn warn_prompt_truncation(section: &str, max_chars: usize, text: &str) {
         original_chars = text.chars().count(),
         "prompt section truncated due to budget"
     );
+}
+
+fn push_truncation_if_needed(
+    out: &mut Vec<PromptSectionTruncation>,
+    section: &str,
+    text: Option<&str>,
+    max_chars: usize,
+) {
+    let Some(text) = text.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    let original_chars = text.chars().count();
+    if original_chars > max_chars {
+        out.push(PromptSectionTruncation {
+            section: section.to_string(),
+            max_chars,
+            original_chars,
+        });
+    }
+}
+
+/// Compute section-level truncation metadata for the current persona/context.
+pub fn collect_prompt_section_truncations(
+    project_context: Option<&str>,
+    soul_text: Option<&str>,
+    agents_text: Option<&str>,
+    tools_text: Option<&str>,
+    heartbeat_text: Option<&str>,
+    memory_text: Option<&str>,
+    prompt_budgets: Option<&PromptBudgetsConfig>,
+) -> Vec<PromptSectionTruncation> {
+    let budgets = prompt_budgets.cloned().unwrap_or_default();
+    let prepared_soul = prepare_soul_sections(soul_text.unwrap_or(DEFAULT_SOUL));
+    let effective_agents_text = merge_agents_text(
+        agents_text,
+        prepared_soul.redistributed_agents_text.as_deref(),
+    );
+    let effective_tools_text = merge_agents_text(
+        tools_text,
+        prepared_soul.redistributed_tools_text.as_deref(),
+    );
+    let effective_heartbeat_text = merge_agents_text(
+        heartbeat_text,
+        prepared_soul.redistributed_heartbeat_text.as_deref(),
+    );
+
+    let mut out = Vec::new();
+    push_truncation_if_needed(
+        &mut out,
+        "soul",
+        Some(prepared_soul.identity_soul_text.as_str()),
+        budgets.soul_max_chars,
+    );
+    push_truncation_if_needed(
+        &mut out,
+        "project_context",
+        project_context,
+        budgets.project_context_max_chars,
+    );
+    push_truncation_if_needed(
+        &mut out,
+        "agents_md",
+        effective_agents_text.as_deref(),
+        budgets.workspace_file_max_chars,
+    );
+    push_truncation_if_needed(
+        &mut out,
+        "tools_md",
+        effective_tools_text.as_deref(),
+        budgets.workspace_file_max_chars,
+    );
+    push_truncation_if_needed(
+        &mut out,
+        "heartbeat_md",
+        effective_heartbeat_text.as_deref(),
+        budgets.workspace_file_max_chars,
+    );
+    push_truncation_if_needed(
+        &mut out,
+        "memory_bootstrap",
+        memory_text,
+        budgets.memory_bootstrap_max_chars,
+    );
+    out
 }
 
 fn append_truncated_text_block(
@@ -2177,18 +2314,69 @@ No fluff.
     }
 
     #[test]
+    fn test_prepare_soul_sections_legacy_heading_fallback_routes_known_sections() {
+        let soul = r#"
+# SOUL.md
+
+## Identity
+I am calm and direct.
+
+## Work Style
+- Understand -> Execute -> Verify -> Report.
+
+## Routing Defaults
+- Use browser for web tasks.
+
+## Proactive Disposition
+- Run heartbeat checks hourly.
+"#;
+
+        let prepared = prepare_soul_sections(soul);
+        assert!(prepared.warnings.is_empty());
+        assert!(!prepared.identity_soul_text.contains("## Work Style"));
+        assert!(!prepared.identity_soul_text.contains("## Routing Defaults"));
+        assert!(
+            !prepared
+                .identity_soul_text
+                .contains("## Proactive Disposition")
+        );
+        assert!(
+            prepared
+                .redistributed_agents_text
+                .as_deref()
+                .is_some_and(|text| text.contains("## Work Style"))
+        );
+        assert!(
+            prepared
+                .redistributed_tools_text
+                .as_deref()
+                .is_some_and(|text| text.contains("## Routing Defaults"))
+        );
+        assert!(
+            prepared
+                .redistributed_heartbeat_text
+                .as_deref()
+                .is_some_and(|text| text.contains("## Proactive Disposition"))
+        );
+    }
+
+    #[test]
     fn test_prepare_soul_sections_warns_on_invalid_marker_and_keeps_section_in_soul() {
         let soul = r#"
 # SOUL.md
 
 <!-- lane:invalid_lane -->
-## Work Style
+## Personal Signature
 - Verify before claiming done.
 "#;
         let prepared = prepare_soul_sections(soul);
         assert_eq!(prepared.warnings.len(), 1);
         assert!(prepared.warnings[0].contains("invalid SOUL lane marker"));
-        assert!(prepared.identity_soul_text.contains("## Work Style"));
+        assert!(
+            prepared
+                .identity_soul_text
+                .contains("## Personal Signature")
+        );
         assert!(prepared.redistributed_agents_text.is_none());
         assert!(prepared.redistributed_tools_text.is_none());
         assert!(prepared.redistributed_heartbeat_text.is_none());
@@ -2304,5 +2492,45 @@ I value truth.
         assert!(prompt.contains("TOOLS.md truncated for prompt size"));
         assert!(prompt.contains("HEARTBEAT.md truncated for prompt size"));
         assert!(prompt.contains("MEMORY.md truncated"));
+    }
+
+    #[test]
+    fn test_collect_prompt_section_truncations_reports_all_over_budget_sections() {
+        let budgets = PromptBudgetsConfig {
+            soul_max_chars: 40,
+            project_context_max_chars: 30,
+            workspace_file_max_chars: 20,
+            memory_bootstrap_max_chars: 25,
+        };
+        let truncations = collect_prompt_section_truncations(
+            Some("P".repeat(100).as_str()),
+            Some(
+                r#"
+# SOUL.md
+
+## Identity
+I am calm and direct.
+
+<!-- lane:agents -->
+## Work Style
+- Understand -> Execute -> Verify -> Report.
+"#,
+            ),
+            Some("A".repeat(100).as_str()),
+            Some("T".repeat(100).as_str()),
+            Some("H".repeat(100).as_str()),
+            Some("M".repeat(100).as_str()),
+            Some(&budgets),
+        );
+        let sections: Vec<&str> = truncations
+            .iter()
+            .map(|item| item.section.as_str())
+            .collect();
+        assert!(sections.contains(&"soul"));
+        assert!(sections.contains(&"project_context"));
+        assert!(sections.contains(&"agents_md"));
+        assert!(sections.contains(&"tools_md"));
+        assert!(sections.contains(&"heartbeat_md"));
+        assert!(sections.contains(&"memory_bootstrap"));
     }
 }

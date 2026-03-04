@@ -61,6 +61,7 @@
 # Architecture
 
 - [System Prompt](system-prompt.md)
+- [Persona Precedence](persona-precedence.md)
 - [Streaming](streaming.md)
 - [SQLite Migrations](sqlite-migration.md)
 - [Metrics & Tracing](metrics-and-tracing.md)
