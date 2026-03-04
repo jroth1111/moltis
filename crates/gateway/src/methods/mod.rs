@@ -196,6 +196,7 @@ const WRITE_METHODS: &[&str] = &[
     "skills.repos.remove",
     "skills.emergency_disable",
     "skills.skill.trust",
+    "skills.skill.unquarantine",
     "skills.skill.enable",
     "skills.skill.disable",
     "skills.install_dep",
@@ -655,6 +656,26 @@ mod tests {
                 "UNAUTHORIZED",
             );
         }
+    }
+
+    #[test]
+    fn skills_unquarantine_requires_write() {
+        assert!(
+            authorize_method(
+                "skills.skill.unquarantine",
+                "operator",
+                &scopes(&["operator.write"])
+            )
+            .is_none()
+        );
+        assert_error_code(
+            authorize_method(
+                "skills.skill.unquarantine",
+                "operator",
+                &scopes(&["operator.read"]),
+            ),
+            "UNAUTHORIZED",
+        );
     }
 
     #[test]

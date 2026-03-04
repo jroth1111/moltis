@@ -572,11 +572,11 @@ impl SkillsQuery {
     }
 
     /// Get skill details.
-    async fn detail(&self, ctx: &Context<'_>, name: String) -> Result<SkillInfo> {
+    async fn detail(&self, ctx: &Context<'_>, source: String, skill: String) -> Result<SkillInfo> {
         let s = services!(ctx);
         from_service(
             s.skills
-                .skill_detail(serde_json::json!({ "name": name }))
+                .skill_detail(serde_json::json!({ "source": source, "skill": skill }))
                 .await,
         )
     }

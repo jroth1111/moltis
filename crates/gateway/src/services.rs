@@ -153,6 +153,14 @@ fn commit_age_days(commit_ts_ms: Option<u64>) -> Option<u64> {
     Some(now_ms.saturating_sub(ts) / 86_400_000)
 }
 
+fn skill_status_label(status: moltis_skills::types::SkillStatus) -> &'static str {
+    match status {
+        moltis_skills::types::SkillStatus::Trusted => "trusted",
+        moltis_skills::types::SkillStatus::Untrusted => "untrusted",
+        moltis_skills::types::SkillStatus::Quarantined => "quarantined",
+    }
+}
+
 fn risky_install_pattern(command: &str) -> Option<&'static str> {
     if is_download_and_execute_chain(command) {
         return Some("piped shell execution");
@@ -355,6 +363,11 @@ impl SkillsService for NoopSkillsService {
             .iter()
             .map(|repo| {
                 let enabled = repo.skills.iter().filter(|s| s.enabled).count();
+                let quarantined = repo
+                    .skills
+                    .iter()
+                    .filter(|s| s.status == moltis_skills::types::SkillStatus::Quarantined)
+                    .count();
                 // Re-detect format for repos that predate the formats module
                 let format = if repo.format == moltis_skills::formats::PluginFormat::Skill {
                     let repo_dir = install_dir.join(&repo.repo_name);
@@ -371,6 +384,7 @@ impl SkillsService for NoopSkillsService {
                     "format": format,
                     "skill_count": repo.skills.len(),
                     "enabled_count": enabled,
+                    "quarantined_count": quarantined,
                 })
             })
             .collect();
@@ -397,6 +411,7 @@ impl SkillsService for NoopSkillsService {
                     "format": format,
                     "skill_count": 0,
                     "enabled_count": 0,
+                    "quarantined_count": 0,
                 }));
             }
         }
@@ -451,6 +466,11 @@ impl SkillsService for NoopSkillsService {
                                 "display_name": entry.and_then(|e| e.display_name.as_deref()),
                                 "relative_path": s.relative_path,
                                 "trusted": s.status.is_trusted(),
+                                "status": skill_status_label(s.status),
+                                "quarantined": s.status == moltis_skills::types::SkillStatus::Quarantined,
+                                "quarantine_reason": s.quarantine_reason,
+                                "last_audited_ms": s.last_audited_ms,
+                                "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(s),
                                 "enabled": s.enabled,
                                 "drifted": drifted_sources.contains(&repo.source),
                                 "eligible": true,
@@ -496,6 +516,11 @@ impl SkillsService for NoopSkillsService {
                                 "display_name": display_name,
                                 "relative_path": s.relative_path,
                                 "trusted": s.status.is_trusted(),
+                                "status": skill_status_label(s.status),
+                                "quarantined": s.status == moltis_skills::types::SkillStatus::Quarantined,
+                                "quarantine_reason": s.quarantine_reason,
+                                "last_audited_ms": s.last_audited_ms,
+                                "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(s),
                                 "enabled": s.enabled,
                                 "drifted": drifted_sources.contains(&repo.source),
                                 "eligible": elig.as_ref().map(|e| e.eligible).unwrap_or(true),
@@ -512,6 +537,7 @@ impl SkillsService for NoopSkillsService {
                     "commit_sha": repo.commit_sha,
                     "drifted": drifted_sources.contains(&repo.source),
                     "format": format,
+                    "quarantined_count": repo.skills.iter().filter(|s| s.status == moltis_skills::types::SkillStatus::Quarantined).count(),
                     "skills": skills,
                 })
             })
@@ -537,6 +563,7 @@ impl SkillsService for NoopSkillsService {
                     "drifted": false,
                     "orphaned": true,
                     "format": format,
+                    "quarantined_count": 0,
                     "skills": [],
                 }));
             }
@@ -621,6 +648,10 @@ impl SkillsService for NoopSkillsService {
 
     async fn skill_trust(&self, params: Value) -> ServiceResult {
         set_skill_trusted(&params, true)
+    }
+
+    async fn skill_unquarantine(&self, params: Value) -> ServiceResult {
+        unquarantine_skill(&params)
     }
 
     async fn skill_detail(&self, params: Value) -> ServiceResult {
@@ -721,6 +752,11 @@ impl SkillsService for NoopSkillsService {
                     "missing_bins": elig.missing_bins,
                     "install_options": elig.install_options,
                     "trusted": skill_state.status.is_trusted(),
+                    "status": skill_status_label(skill_state.status),
+                    "quarantined": skill_state.status == moltis_skills::types::SkillStatus::Quarantined,
+                    "quarantine_reason": skill_state.quarantine_reason,
+                    "last_audited_ms": skill_state.last_audited_ms,
+                    "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(skill_state),
                     "enabled": skill_state.enabled,
                     "drifted": drifted_sources.contains(source),
                     "commit_sha": commit_sha,
@@ -766,6 +802,11 @@ impl SkillsService for NoopSkillsService {
                     "missing_bins": empty,
                     "install_options": empty,
                     "trusted": skill_state.status.is_trusted(),
+                    "status": skill_status_label(skill_state.status),
+                    "quarantined": skill_state.status == moltis_skills::types::SkillStatus::Quarantined,
+                    "quarantine_reason": skill_state.quarantine_reason,
+                    "last_audited_ms": skill_state.last_audited_ms,
+                    "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(skill_state),
                     "enabled": skill_state.enabled,
                     "drifted": drifted_sources.contains(source),
                     "commit_sha": commit_sha,
@@ -973,11 +1014,16 @@ fn compute_repo_skill_hashes(
         moltis_skills::formats::PluginFormat::Skill => {
             let mut hashes = HashMap::new();
             for skill in &repo.skills {
-                let skill_dir =
-                    moltis_skills::audit::resolve_relative_within(install_dir, &skill.relative_path)?;
+                let skill_dir = moltis_skills::audit::resolve_relative_within(
+                    install_dir,
+                    &skill.relative_path,
+                )?;
                 let skill_md = skill_dir.join("SKILL.md");
                 let raw = std::fs::read_to_string(&skill_md)?;
-                hashes.insert(skill.name.clone(), moltis_skills::integrity::hash_skill_markdown(&raw));
+                hashes.insert(
+                    skill.name.clone(),
+                    moltis_skills::integrity::hash_skill_markdown(&raw),
+                );
             }
             Ok(hashes)
         },
@@ -1174,6 +1220,11 @@ fn skill_detail_discovered(source_type: &str, skill_name: &str) -> ServiceResult
         "missing_bins": elig.missing_bins,
         "install_options": elig.install_options,
         "trusted": true,
+        "status": "trusted",
+        "quarantined": false,
+        "quarantine_reason": null,
+        "last_audited_ms": null,
+        "integrity_ok": true,
         "enabled": true,
         "protected": is_protected_discovered_skill(skill_name),
         "body": content.body,
@@ -1247,7 +1298,7 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
         }),
     );
 
-    Ok(serde_json::json!({ "source": source, "skill": skill_name, "enabled": enabled }))
+    Ok(serde_json::json!({ "ok": true, "source": source, "skill": skill_name, "enabled": enabled }))
 }
 
 fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
@@ -1303,7 +1354,74 @@ fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
             "content_hash": audited_content_hash,
         }),
     );
-    Ok(serde_json::json!({ "source": source, "skill": skill_name, "trusted": trusted }))
+    Ok(serde_json::json!({ "ok": true, "source": source, "skill": skill_name, "trusted": trusted }))
+}
+
+fn apply_skill_unquarantine(
+    manifest: &mut moltis_skills::types::SkillsManifest,
+    source: &str,
+    skill_name: &str,
+    audited_ms: u64,
+) -> ServiceResult {
+    let skill = manifest
+        .find_repo_mut(source)
+        .and_then(|repo| repo.skills.iter_mut().find(|s| s.name == skill_name))
+        .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
+    if skill.status != moltis_skills::types::SkillStatus::Quarantined {
+        return Err(format!("skill '{skill_name}' is not quarantined").into());
+    }
+    moltis_skills::integrity::untrust_skill(skill, audited_ms);
+    Ok(serde_json::json!({
+        "ok": true,
+        "source": source,
+        "skill": skill_name,
+        "status": "untrusted",
+        "enabled": false,
+        "quarantined": false,
+    }))
+}
+
+fn unquarantine_skill(params: &Value) -> ServiceResult {
+    let confirm = params
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !confirm {
+        return Err("unquarantine requires explicit confirmation. Re-run with confirm=true".into());
+    }
+    let source = params
+        .get("source")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing 'source' parameter".to_string())?;
+    let skill_name = params
+        .get("skill")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing 'skill' parameter".to_string())?;
+
+    let manifest_path =
+        moltis_skills::manifest::ManifestStore::default_path().map_err(ServiceError::message)?;
+    let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
+    let mut manifest = store.load().map_err(ServiceError::message)?;
+
+    let install_dir =
+        moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
+    let (integrity_changed, _) = detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
+    if integrity_changed {
+        store.save(&manifest).map_err(ServiceError::message)?;
+    }
+
+    let payload = apply_skill_unquarantine(&mut manifest, source, skill_name, current_time_ms())?;
+    store.save(&manifest).map_err(ServiceError::message)?;
+    security_audit(
+        "skills.skill.unquarantine",
+        serde_json::json!({
+            "source": source,
+            "skill": skill_name,
+            "status": "untrusted",
+            "enabled": false,
+        }),
+    );
+    Ok(payload)
 }
 
 // ── Browser (Real implementation — depends on moltis-browser) ───────────────
@@ -1740,7 +1858,8 @@ mod tests {
         write_skill_file(install_dir, "owner-repo", "owner-repo/skills/demo", changed);
         let changed_hash = moltis_skills::integrity::hash_skill_markdown(changed);
 
-        let (changed_manifest, drifted) = detect_and_enforce_repo_integrity(&mut manifest, install_dir);
+        let (changed_manifest, drifted) =
+            detect_and_enforce_repo_integrity(&mut manifest, install_dir);
         assert!(changed_manifest);
         assert!(drifted.is_empty());
 
@@ -1748,10 +1867,12 @@ mod tests {
         assert_eq!(skill.status, SkillStatus::Quarantined);
         assert!(!skill.enabled);
         assert_eq!(skill.content_hash.as_deref(), Some(changed_hash.as_str()));
-        assert!(skill
-            .quarantine_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("trusted content hash mismatch")));
+        assert!(
+            skill
+                .quarantine_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("trusted content hash mismatch"))
+        );
     }
 
     #[test]
@@ -1770,7 +1891,11 @@ mod tests {
         run_git(&repo_dir, &["commit", "-m", "initial"]);
         let first_sha = run_git(&repo_dir, &["rev-parse", "HEAD"]);
 
-        std::fs::write(repo_dir.join("skills/demo/SKILL.md"), format!("{body}# drift\n")).unwrap();
+        std::fs::write(
+            repo_dir.join("skills/demo/SKILL.md"),
+            format!("{body}# drift\n"),
+        )
+        .unwrap();
         run_git(&repo_dir, &["add", "."]);
         run_git(&repo_dir, &["commit", "-m", "drift"]);
         let second_sha = run_git(&repo_dir, &["rev-parse", "HEAD"]);
@@ -1787,15 +1912,21 @@ mod tests {
             Some(content_hash),
         );
 
-        let (changed_manifest, drifted) = detect_and_enforce_repo_integrity(&mut manifest, install_dir);
+        let (changed_manifest, drifted) =
+            detect_and_enforce_repo_integrity(&mut manifest, install_dir);
         assert!(changed_manifest);
         assert!(drifted.contains("owner/repo"));
-        assert_eq!(manifest.repos[0].commit_sha.as_deref(), Some(second_sha.as_str()));
+        assert_eq!(
+            manifest.repos[0].commit_sha.as_deref(),
+            Some(second_sha.as_str())
+        );
         assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Quarantined);
-        assert!(manifest.repos[0].skills[0]
-            .quarantine_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("source drift")));
+        assert!(
+            manifest.repos[0].skills[0]
+                .quarantine_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("source drift"))
+        );
     }
 
     #[test]
@@ -1830,10 +1961,73 @@ mod tests {
         assert_eq!(skill.trusted_hash, skill.content_hash);
         assert_eq!(skill.quarantine_reason, None);
 
-        let (changed_again, drifted_again) = detect_and_enforce_repo_integrity(&mut manifest, install_dir);
+        let (changed_again, drifted_again) =
+            detect_and_enforce_repo_integrity(&mut manifest, install_dir);
         assert!(!changed_again);
         assert!(drifted_again.is_empty());
         assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Trusted);
+    }
+
+    #[test]
+    fn unquarantine_requires_explicit_confirmation() {
+        let err = unquarantine_skill(&serde_json::json!({
+            "source": "owner/repo",
+            "skill": "demo",
+        }))
+        .expect_err("confirm=false should fail");
+        assert!(
+            err.to_string().contains("confirm=true"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unquarantine_transitions_to_untrusted_and_disabled() {
+        let mut manifest = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            "owner-repo/skills/demo",
+            None,
+            SkillStatus::Quarantined,
+            true,
+            Some("content".to_string()),
+            Some("trusted".to_string()),
+        );
+        manifest.repos[0].skills[0].quarantine_reason =
+            Some("trusted content hash mismatch".into());
+
+        let payload = apply_skill_unquarantine(&mut manifest, "owner/repo", "demo", 123)
+            .expect("unquarantine should succeed");
+
+        let skill = &manifest.repos[0].skills[0];
+        assert_eq!(skill.status, SkillStatus::Untrusted);
+        assert!(!skill.enabled);
+        assert!(skill.quarantine_reason.is_none());
+        assert!(skill.trusted_hash.is_none());
+        assert_eq!(skill.last_audited_ms, Some(123));
+        assert_eq!(payload["status"], "untrusted");
+        assert_eq!(payload["enabled"], false);
+        assert_eq!(payload["quarantined"], false);
+    }
+
+    #[test]
+    fn unquarantine_rejects_non_quarantined_skills() {
+        let mut manifest = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            "owner-repo/skills/demo",
+            None,
+            SkillStatus::Untrusted,
+            false,
+            Some("content".to_string()),
+            None,
+        );
+        let err = apply_skill_unquarantine(&mut manifest, "owner/repo", "demo", 123)
+            .expect_err("non-quarantined skill should fail");
+        assert!(
+            err.to_string().contains("not quarantined"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

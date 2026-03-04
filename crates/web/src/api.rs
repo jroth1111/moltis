@@ -186,6 +186,14 @@ fn enabled_from_manifest<E>(path_result: Result<PathBuf, E>) -> Vec<serde_json::
 where
     E: std::fmt::Display,
 {
+    fn status_label(status: moltis_skills::types::SkillStatus) -> &'static str {
+        match status {
+            moltis_skills::types::SkillStatus::Trusted => "trusted",
+            moltis_skills::types::SkillStatus::Untrusted => "untrusted",
+            moltis_skills::types::SkillStatus::Quarantined => "quarantined",
+        }
+    }
+
     let Ok(path) = path_result else {
         return Vec::new();
     };
@@ -201,6 +209,12 @@ where
                         serde_json::json!({
                             "name": s.name,
                             "source": source,
+                            "trusted": s.status.is_trusted(),
+                            "status": status_label(s.status),
+                            "quarantined": s.status == moltis_skills::types::SkillStatus::Quarantined,
+                            "quarantine_reason": s.quarantine_reason,
+                            "last_audited_ms": s.last_audited_ms,
+                            "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(s),
                             "enabled": true,
                         })
                     })

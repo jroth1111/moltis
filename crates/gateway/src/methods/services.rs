@@ -2582,6 +2582,19 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         }),
     );
     reg.register(
+        "skills.skill.unquarantine",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .skills
+                    .skill_unquarantine(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
         "skills.skill.enable",
         Box::new(|ctx| {
             Box::pin(async move {

@@ -437,6 +437,10 @@ impl moltis_service_traits::SkillsService for MockSkills {
         self.0.call("skills.skill.trust", p)
     }
 
+    async fn skill_unquarantine(&self, p: Value) -> ServiceResult {
+        self.0.call("skills.skill.unquarantine", p)
+    }
+
     async fn skill_detail(&self, p: Value) -> ServiceResult {
         self.0.call("skills.skill.detail", p)
     }
@@ -1046,6 +1050,72 @@ async fn logs_status_query_returns_typed_shape() {
     assert_eq!(data["logs"]["status"]["enabledLevels"]["debug"], true);
 }
 
+#[tokio::test]
+async fn skills_repos_query_includes_quarantine_counts() {
+    let mock = MockDispatch::new();
+    mock.set_response(
+        "skills.repos.list",
+        json!([{
+            "source": "owner/repo",
+            "repoName": "owner-repo",
+            "skillCount": 2,
+            "enabledCount": 1,
+            "quarantinedCount": 1,
+            "format": "skill"
+        }]),
+    );
+    let (schema, _) = build_test_schema(mock);
+
+    let res = schema
+        .execute(Request::new(
+            r#"{ skills { repos { source repoName skillCount enabledCount quarantinedCount format } } }"#,
+        ))
+        .await;
+
+    assert!(res.errors.is_empty(), "errors: {:?}", res.errors);
+    let data = res.data.into_json().expect("json");
+    assert_eq!(data["skills"]["repos"][0]["source"], "owner/repo");
+    assert_eq!(data["skills"]["repos"][0]["quarantinedCount"], 1);
+}
+
+#[tokio::test]
+async fn skills_detail_query_exposes_quarantine_and_integrity_fields() {
+    let mock = MockDispatch::new();
+    mock.set_response(
+        "skills.skill.detail",
+        json!({
+            "name": "demo",
+            "status": "quarantined",
+            "quarantined": true,
+            "quarantineReason": "trusted content hash mismatch",
+            "lastAuditedMs": 123,
+            "integrityOk": false
+        }),
+    );
+    let (schema, _) = build_test_schema(mock.clone());
+
+    let res = schema
+        .execute(Request::new(
+            r#"{ skills { detail(source: "owner/repo", skill: "demo") { name status quarantined quarantineReason lastAuditedMs integrityOk } } }"#,
+        ))
+        .await;
+
+    assert!(res.errors.is_empty(), "errors: {:?}", res.errors);
+    let data = res.data.into_json().expect("json");
+    assert_eq!(data["skills"]["detail"]["status"], "quarantined");
+    assert_eq!(data["skills"]["detail"]["quarantined"], true);
+    assert_eq!(
+        data["skills"]["detail"]["quarantineReason"],
+        "trusted content hash mismatch"
+    );
+    assert_eq!(data["skills"]["detail"]["integrityOk"], false);
+
+    let (method, params) = mock.last_call().expect("should have called");
+    assert_eq!(method, "skills.skill.detail");
+    assert_eq!(params["source"], "owner/repo");
+    assert_eq!(params["skill"], "demo");
+}
+
 // ── Mutation resolvers ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1174,6 +1244,32 @@ async fn cron_add_mutation() {
     let (method, params) = mock.last_call().expect("should have called");
     assert_eq!(method, "cron.add");
     assert_eq!(params["name"], "backup");
+}
+
+#[tokio::test]
+async fn skills_unquarantine_mutation_forwards_confirmed_params() {
+    let mock = MockDispatch::new();
+    mock.set_response(
+        "skills.skill.unquarantine",
+        json!({"ok": true, "source": "owner/repo", "skill": "demo"}),
+    );
+    let (schema, _) = build_test_schema(mock.clone());
+
+    let res = schema
+        .execute(Request::new(
+            r#"mutation { skills { unquarantine(source: "owner/repo", skill: "demo", confirm: true) { ok } } }"#,
+        ))
+        .await;
+
+    assert!(res.errors.is_empty(), "errors: {:?}", res.errors);
+    let data = res.data.into_json().expect("json");
+    assert_eq!(data["skills"]["unquarantine"]["ok"], true);
+
+    let (method, params) = mock.last_call().expect("should have called");
+    assert_eq!(method, "skills.skill.unquarantine");
+    assert_eq!(params["source"], "owner/repo");
+    assert_eq!(params["skill"], "demo");
+    assert_eq!(params["confirm"], true);
 }
 
 // ── Error propagation ───────────────────────────────────────────────────────
