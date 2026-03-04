@@ -231,11 +231,9 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
 
                 // Cooldown: don't start a new shift too soon after the last one.
                 if ctx.config.shift_cooldown_secs > 0 && intent_state.shift_count > 0 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    let elapsed = (now - intent_state.updated_at.unix_timestamp()).max(0) as u64;
+                    let elapsed = (time::OffsetDateTime::now_utc().unix_timestamp()
+                        - intent_state.updated_at.unix_timestamp())
+                    .max(0) as u64;
                     if elapsed < ctx.config.shift_cooldown_secs {
                         debug!(
                             intent_id = %intent_id,
