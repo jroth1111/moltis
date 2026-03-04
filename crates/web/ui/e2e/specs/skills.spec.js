@@ -212,7 +212,7 @@ test.describe("Skills page", () => {
 			.toBe(false);
 	});
 
-	test("untrusted non-quarantined skill trusts before enabling", async ({ page }) => {
+	test("untrusted non-quarantined skill requires separate trust then enable", async ({ page }) => {
 		await mockSkillsApi(page, {
 			repos: [
 				{
@@ -267,9 +267,9 @@ test.describe("Skills page", () => {
 		await expandRepo(page, "owner/repo");
 		await openSkillDetail(page, "Safe Skill");
 
-		await page.getByRole("button", { name: "Enable", exact: true }).first().click();
+		await page.getByRole("button", { name: "Trust", exact: true }).first().click();
 		await expect(page.locator(".modal-overlay")).toContainText('Trust skill "safe-skill" from owner/repo?');
-		await page.locator(".modal-overlay").getByRole("button", { name: "Trust & Enable", exact: true }).click();
+		await page.locator(".modal-overlay").getByRole("button", { name: "Trust", exact: true }).click();
 
 		await expect
 			.poll(() =>
@@ -277,8 +277,26 @@ test.describe("Skills page", () => {
 					var methods = (window.__skillsRpcCalls || []).map((c) => c.method);
 					var trustIndex = methods.indexOf("skills.skill.trust");
 					var enableIndex = methods.indexOf("skills.skill.enable");
-					return trustIndex >= 0 && enableIndex > trustIndex;
+					return trustIndex >= 0 && enableIndex === -1;
 				}),
+			)
+			.toBe(true);
+
+		// Refresh detail after trust mock and enable explicitly as a second action.
+		await page
+			.evaluate(() => {
+				window.__skillsRpcCalls = [];
+			})
+			.catch(() => null);
+		await page.reload();
+		await expandRepo(page, "owner/repo");
+		await openSkillDetail(page, "Safe Skill");
+		await page.getByRole("button", { name: "Enable", exact: true }).first().click();
+		await expect
+			.poll(() =>
+				page.evaluate(() =>
+					(window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.enable"),
+				),
 			)
 			.toBe(true);
 		await expect

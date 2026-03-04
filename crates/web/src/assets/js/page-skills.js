@@ -412,6 +412,20 @@ function SkillDetail(props) {
 		});
 	}
 
+	function doTrustOnly() {
+		actionBusy.value = true;
+		sendRpc("skills.skill.trust", { source: props.repoSource, skill: d.name }).then((res) => {
+			actionBusy.value = false;
+			if (res?.ok) {
+				showToast(`Trusted ${d.name}. Enable it when ready.`, "success");
+				fetchAll();
+				props.onReload?.();
+			} else {
+				showToast(`Trust failed: ${res?.error || "unknown error"}`, "error");
+			}
+		});
+	}
+
 	function onToggle() {
 		if (!S.connected) return;
 		if (actionBusy.value) return;
@@ -433,18 +447,9 @@ function SkillDetail(props) {
 		}
 		if (!d.enabled && needsTrust) {
 			requestConfirm(`Trust skill "${d.name}" from ${props.repoSource}?`, {
-				confirmLabel: "Trust & Enable",
+				confirmLabel: "Trust",
 			}).then((yes) => {
-				if (!yes) return;
-				actionBusy.value = true;
-				sendRpc("skills.skill.trust", { source: props.repoSource, skill: d.name }).then((res) => {
-					if (!res?.ok) {
-						actionBusy.value = false;
-						showToast(`Trust failed: ${res?.error || "unknown error"}`, "error");
-						return;
-					}
-					doToggle();
-				});
+				if (yes) doTrustOnly();
 			});
 			return;
 		}
@@ -463,6 +468,8 @@ function SkillDetail(props) {
 	var actionLabel = actionBusy.value
 		? isQuarantined
 			? "Unquarantining..."
+			: needsTrust && !d.enabled
+				? "Trusting..."
 			: isDisc && d.enabled
 				? "Deleting..."
 				: "Loading..."
@@ -470,6 +477,8 @@ function SkillDetail(props) {
 			? "Protected"
 			: isQuarantined
 				? "Unquarantine"
+				: needsTrust && !d.enabled
+					? "Trust"
 				: isDisc && d.enabled
 					? "Delete"
 					: d.enabled
