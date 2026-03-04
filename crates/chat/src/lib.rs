@@ -1464,15 +1464,11 @@ fn apply_runtime_tool_filters(
         skills
             .iter()
             .map(|skill| {
-                let trust = match skill.source.as_ref() {
-                    Some(moltis_skills::types::SkillSource::Project)
-                    | Some(moltis_skills::types::SkillSource::Personal) => {
-                        moltis_skills::types::SkillTrust::Trusted
-                    },
-                    Some(moltis_skills::types::SkillSource::Registry)
-                    | Some(moltis_skills::types::SkillSource::Plugin)
-                    | None => moltis_skills::types::SkillTrust::Installed,
-                };
+                let trust = skill
+                    .source
+                    .as_ref()
+                    .map(moltis_skills::types::SkillSource::default_trust)
+                    .unwrap_or(moltis_skills::types::SkillTrust::Installed);
                 (skill, trust)
             })
             .collect();

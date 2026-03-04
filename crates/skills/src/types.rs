@@ -101,6 +101,14 @@ mod tests {
         .unwrap();
         assert!(!parsed.trusted);
     }
+
+    #[test]
+    fn skill_source_default_trust_mapping() {
+        assert_eq!(SkillSource::Project.default_trust(), SkillTrust::Trusted);
+        assert_eq!(SkillSource::Personal.default_trust(), SkillTrust::Trusted);
+        assert_eq!(SkillSource::Plugin.default_trust(), SkillTrust::Installed);
+        assert_eq!(SkillSource::Registry.default_trust(), SkillTrust::Installed);
+    }
 }
 
 // ── Skill metadata ───────────────────────────────────────────────────────────
@@ -117,6 +125,16 @@ pub enum SkillSource {
     Plugin,
     /// Installed from a registry (e.g. skills.sh).
     Registry,
+}
+
+impl SkillSource {
+    /// Returns the default trust level for skills from this source.
+    pub fn default_trust(&self) -> SkillTrust {
+        match self {
+            Self::Project | Self::Personal => SkillTrust::Trusted,
+            Self::Plugin | Self::Registry => SkillTrust::Installed,
+        }
+    }
 }
 
 /// Lightweight metadata parsed from SKILL.md frontmatter.
