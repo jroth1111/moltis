@@ -981,14 +981,24 @@ impl SkillsService for NoopSkillsService {
         let results = run_mcp_scan(&installed_dir)
             .await
             .map_err(ServiceError::message)?;
+        let enforcement =
+            enforce_mcp_scan_findings(&results, &installed_dir).map_err(ServiceError::message)?;
         security_audit(
             "skills.security.scan",
-            serde_json::json!({ "installed_dir": installed_dir, "status": "ok" }),
+            serde_json::json!({
+                "installed_dir": installed_dir,
+                "status": "ok",
+                "enforced_quarantines": enforcement.enforced_quarantines,
+                "affected_skills": enforcement.affected_skills,
+            }),
         );
         Ok(serde_json::json!({
             "ok": true,
             "installed_skills_dir": installed_dir,
             "results": results,
+            "enforced_quarantines": enforcement.enforced_quarantines,
+            "affected_skills": enforcement.affected_skills,
+            "enforcement_reasons": enforcement.reasons,
         }))
     }
 }
@@ -1143,6 +1153,256 @@ fn detect_and_enforce_repo_integrity(
     }
 
     (changed, drifted)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanFinding {
+    severity: String,
+    reason: String,
+    path_hints: Vec<String>,
+    skill_hints: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ScanEnforcementSummary {
+    enforced_quarantines: u64,
+    affected_skills: Vec<Value>,
+    reasons: Vec<String>,
+}
+
+fn normalize_scan_severity(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("critical") || normalized == "crit" {
+        return Some("critical");
+    }
+    if normalized.contains("high") {
+        return Some("high");
+    }
+    if normalized.contains("medium") || normalized.contains("moderate") {
+        return Some("medium");
+    }
+    if normalized.contains("low") {
+        return Some("low");
+    }
+    None
+}
+
+fn severity_enforces_quarantine(severity: &str) -> bool {
+    matches!(severity, "critical" | "high")
+}
+
+fn collect_json_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        },
+        Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, out);
+            }
+        },
+        Value::Object(map) => {
+            for item in map.values() {
+                collect_json_strings(item, out);
+            }
+        },
+        _ => {},
+    }
+}
+
+fn strings_from_keys(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in keys {
+        if let Some(value) = obj.get(*key) {
+            collect_json_strings(value, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_scan_findings(value: &Value, out: &mut Vec<ScanFinding>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_scan_findings(item, out);
+            }
+        },
+        Value::Object(obj) => {
+            let severity = obj
+                .get("severity")
+                .and_then(Value::as_str)
+                .or_else(|| obj.get("level").and_then(Value::as_str))
+                .or_else(|| obj.get("risk").and_then(Value::as_str))
+                .and_then(normalize_scan_severity);
+
+            if let Some(severity) = severity {
+                let reason = strings_from_keys(
+                    obj,
+                    &[
+                        "message",
+                        "description",
+                        "summary",
+                        "title",
+                        "rule",
+                        "check",
+                        "id",
+                    ],
+                )
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{severity} severity mcp-scan finding"));
+                let path_hints = strings_from_keys(
+                    obj,
+                    &[
+                        "path",
+                        "paths",
+                        "file",
+                        "file_path",
+                        "filename",
+                        "location",
+                        "target",
+                        "resource",
+                        "source_file",
+                    ],
+                );
+                let skill_hints =
+                    strings_from_keys(obj, &["skill", "skill_name", "skillId", "skill_id", "name"]);
+
+                out.push(ScanFinding {
+                    severity: severity.to_string(),
+                    reason,
+                    path_hints,
+                    skill_hints,
+                });
+            }
+
+            for child in obj.values() {
+                collect_scan_findings(child, out);
+            }
+        },
+        _ => {},
+    }
+}
+
+fn normalize_scan_hint(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('\\', "/")
+}
+
+fn scan_finding_matches_skill(
+    finding: &ScanFinding,
+    repo_source: &str,
+    repo_name: &str,
+    skill: &moltis_skills::types::SkillState,
+    install_dir: &Path,
+) -> bool {
+    let relative_path = normalize_scan_hint(&skill.relative_path);
+    let skill_name = normalize_scan_hint(&skill.name);
+    let repo_name = normalize_scan_hint(repo_name);
+    let repo_source = normalize_scan_hint(repo_source);
+    let absolute_path =
+        normalize_scan_hint(&install_dir.join(&skill.relative_path).to_string_lossy());
+
+    finding
+        .path_hints
+        .iter()
+        .chain(finding.skill_hints.iter())
+        .map(|hint| normalize_scan_hint(hint))
+        .filter(|hint| !hint.is_empty())
+        .any(|hint| {
+            hint == skill_name
+                || hint.ends_with(&format!("/{skill_name}"))
+                || hint.contains(&format!("/{skill_name}/"))
+                || hint.contains(&relative_path)
+                || hint.contains(&absolute_path)
+                || (hint.contains(&repo_name) && hint.contains(&skill_name))
+                || (hint.contains(&repo_source) && hint.contains(&skill_name))
+        })
+}
+
+fn enforce_scan_findings_on_manifest(
+    manifest: &mut moltis_skills::types::SkillsManifest,
+    findings: &[ScanFinding],
+    install_dir: &Path,
+    now_ms: u64,
+) -> ScanEnforcementSummary {
+    let mut summary = ScanEnforcementSummary::default();
+    let mut unique_reasons = HashSet::new();
+
+    for repo in &mut manifest.repos {
+        let repo_source = repo.source.clone();
+        let repo_name = repo.repo_name.clone();
+
+        for skill in &mut repo.skills {
+            for finding in findings {
+                if !severity_enforces_quarantine(&finding.severity) {
+                    continue;
+                }
+                if !scan_finding_matches_skill(
+                    finding,
+                    &repo_source,
+                    &repo_name,
+                    skill,
+                    install_dir,
+                ) {
+                    continue;
+                }
+
+                let reason = format!("mcp-scan {} finding: {}", finding.severity, finding.reason);
+                if moltis_skills::integrity::quarantine_skill(skill, &reason, now_ms) {
+                    summary.enforced_quarantines += 1;
+                    summary.affected_skills.push(serde_json::json!({
+                        "source": repo_source.clone(),
+                        "skill": skill.name.clone(),
+                        "severity": finding.severity.clone(),
+                        "reason": reason.clone(),
+                    }));
+                    unique_reasons.insert(reason.clone());
+                    security_audit(
+                        "skills.scan.quarantine",
+                        serde_json::json!({
+                            "source": repo_source.clone(),
+                            "repo_name": repo_name.clone(),
+                            "skill": skill.name.clone(),
+                            "severity": finding.severity.clone(),
+                            "reason": reason,
+                        }),
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    summary.reasons = unique_reasons.into_iter().collect();
+    summary.reasons.sort_unstable();
+    summary
+}
+
+fn enforce_mcp_scan_findings(
+    results: &Value,
+    install_dir: &Path,
+) -> anyhow::Result<ScanEnforcementSummary> {
+    let mut findings = Vec::new();
+    collect_scan_findings(results, &mut findings);
+    if findings.is_empty() {
+        return Ok(ScanEnforcementSummary::default());
+    }
+
+    let manifest_path = moltis_skills::manifest::ManifestStore::default_path()?;
+    let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
+    let mut manifest = store.load()?;
+    let summary =
+        enforce_scan_findings_on_manifest(&mut manifest, &findings, install_dir, current_time_ms());
+    if summary.enforced_quarantines > 0 {
+        store.save(&manifest)?;
+    }
+    Ok(summary)
 }
 
 /// Delete a personal or project skill directory to disable it.
@@ -1770,6 +2030,15 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    fn make_scan_finding(severity: &str, reason: &str, path_hint: &str) -> ScanFinding {
+        ScanFinding {
+            severity: severity.to_string(),
+            reason: reason.to_string(),
+            path_hints: vec![path_hint.to_string()],
+            skill_hints: vec![],
+        }
+    }
+
     #[test]
     fn risky_install_pattern_detects_piped_shell() {
         assert_eq!(
@@ -2028,6 +2297,164 @@ mod tests {
             err.to_string().contains("not quarantined"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn scan_parser_extracts_nested_severity_findings() {
+        let results = serde_json::json!({
+            "results": [
+                {
+                    "findings": [
+                        {
+                            "severity": "HIGH",
+                            "message": "download-and-exec chain",
+                            "location": { "path": "owner-repo/skills/demo/SKILL.md" }
+                        },
+                        {
+                            "severity": "low",
+                            "title": "informational note",
+                            "file": "owner-repo/skills/demo/SKILL.md"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let mut findings = Vec::new();
+        collect_scan_findings(&results, &mut findings);
+
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().any(|f| {
+            f.severity == "high"
+                && f.reason.contains("download-and-exec")
+                && f.path_hints
+                    .iter()
+                    .any(|p| p.contains("owner-repo/skills/demo/SKILL.md"))
+        }));
+        assert!(findings.iter().any(|f| f.severity == "low"));
+    }
+
+    #[test]
+    fn scan_enforcement_quarantines_high_and_critical_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let mut manifest = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            "owner-repo/skills/demo",
+            None,
+            SkillStatus::Untrusted,
+            true,
+            None,
+            None,
+        );
+
+        let findings = vec![
+            make_scan_finding(
+                "medium",
+                "potential risky pattern",
+                "owner-repo/skills/demo/SKILL.md",
+            ),
+            make_scan_finding(
+                "high",
+                "credential exfiltration language",
+                "owner-repo/skills/demo/SKILL.md",
+            ),
+        ];
+
+        let summary = enforce_scan_findings_on_manifest(&mut manifest, &findings, install_dir, 77);
+        assert_eq!(summary.enforced_quarantines, 1);
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Quarantined);
+        assert!(!manifest.repos[0].skills[0].enabled);
+
+        let mut manifest_low_only = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            "owner-repo/skills/demo",
+            None,
+            SkillStatus::Untrusted,
+            true,
+            None,
+            None,
+        );
+        let low_findings = vec![make_scan_finding(
+            "low",
+            "cosmetic issue",
+            "owner-repo/skills/demo/SKILL.md",
+        )];
+        let low_summary = enforce_scan_findings_on_manifest(
+            &mut manifest_low_only,
+            &low_findings,
+            install_dir,
+            77,
+        );
+        assert_eq!(low_summary.enforced_quarantines, 0);
+        assert_eq!(
+            manifest_low_only.repos[0].skills[0].status,
+            SkillStatus::Untrusted
+        );
+        assert!(manifest_low_only.repos[0].skills[0].enabled);
+    }
+
+    #[test]
+    fn scan_enforcement_matches_skill_name_hints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let mut manifest = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            "owner-repo/skills/demo",
+            None,
+            SkillStatus::Untrusted,
+            true,
+            None,
+            None,
+        );
+        let findings = vec![ScanFinding {
+            severity: "critical".to_string(),
+            reason: "destructive command signature".to_string(),
+            path_hints: vec![],
+            skill_hints: vec!["demo".to_string()],
+        }];
+
+        let summary = enforce_scan_findings_on_manifest(&mut manifest, &findings, install_dir, 88);
+        assert_eq!(summary.enforced_quarantines, 1);
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Quarantined);
+    }
+
+    #[test]
+    fn scan_quarantine_lifecycle_allows_unquarantine_then_retrust() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let hash = "trusted-hash".to_string();
+        let mut manifest = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            "owner-repo/skills/demo",
+            None,
+            SkillStatus::Trusted,
+            true,
+            Some(hash.clone()),
+            Some(hash),
+        );
+        let findings = vec![make_scan_finding(
+            "critical",
+            "secret exfiltration pattern",
+            "owner-repo/skills/demo/SKILL.md",
+        )];
+
+        let summary = enforce_scan_findings_on_manifest(&mut manifest, &findings, install_dir, 99);
+        assert_eq!(summary.enforced_quarantines, 1);
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Quarantined);
+        assert!(!manifest.repos[0].skills[0].enabled);
+
+        let payload = apply_skill_unquarantine(&mut manifest, "owner/repo", "demo", 100)
+            .expect("unquarantine should succeed after scanner quarantine");
+        assert_eq!(payload["status"], "untrusted");
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Untrusted);
+
+        moltis_skills::integrity::trust_skill(&mut manifest.repos[0].skills[0], 101);
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Trusted);
     }
 
     #[tokio::test]
