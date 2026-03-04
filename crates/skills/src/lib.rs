@@ -9,6 +9,7 @@ pub mod audit;
 pub mod discover;
 pub mod formats;
 pub mod install;
+pub mod integrity;
 pub mod manifest;
 pub mod migration;
 pub mod parse;

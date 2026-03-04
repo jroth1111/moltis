@@ -7,6 +7,7 @@ use crate::{
     archive_audit,
     audit,
     formats::{PluginFormat, detect_format, scan_with_adapter},
+    integrity,
     manifest::ManifestStore,
     parse,
     types::{RepoEntry, SkillMetadata, SkillState},
@@ -80,7 +81,10 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
                         status: crate::types::SkillStatus::Untrusted,
                         quarantine_reason: None,
                         last_audited_ms: None,
-                        content_hash: None,
+                        content_hash: Some(integrity::hash_adapter_skill(
+                            e.source_file.as_deref(),
+                            &e.body,
+                        )),
                         trusted_hash: None,
                         enabled: false,
                     })
@@ -298,7 +302,7 @@ async fn scan_repo_skills(
             status: crate::types::SkillStatus::Untrusted,
             quarantine_reason: None,
             last_audited_ms: None,
-            content_hash: None,
+            content_hash: Some(integrity::hash_skill_markdown(&content)),
             trusted_hash: None,
             enabled: false,
         };
@@ -348,7 +352,7 @@ async fn scan_repo_skills(
                             status: crate::types::SkillStatus::Untrusted,
                             quarantine_reason: None,
                             last_audited_ms: None,
-                            content_hash: None,
+                            content_hash: Some(integrity::hash_skill_markdown(&content)),
                             trusted_hash: None,
                             enabled: false,
                         });
@@ -503,7 +507,10 @@ mod tests {
                 status: crate::types::SkillStatus::Untrusted,
                 quarantine_reason: None,
                 last_audited_ms: None,
-                content_hash: None,
+                content_hash: Some(integrity::hash_adapter_skill(
+                    e.source_file.as_deref(),
+                    &e.body,
+                )),
                 trusted_hash: None,
                 enabled: false,
             })

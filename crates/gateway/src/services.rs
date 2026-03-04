@@ -11,7 +11,11 @@ pub use moltis_service_traits::*;
 use {
     async_trait::async_trait,
     serde_json::Value,
-    std::{collections::HashSet, path::Path, sync::Arc},
+    std::{
+        collections::{HashMap, HashSet},
+        path::Path,
+        sync::Arc,
+    },
 };
 
 fn security_audit(event: &str, details: Value) {
@@ -38,6 +42,13 @@ fn security_audit(event: &str, details: Value) {
         writeln!(file, "{line}")?;
         Ok(())
     })();
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn command_available(command: &str) -> bool {
@@ -334,7 +345,7 @@ impl SkillsService for NoopSkillsService {
         let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
         let mut manifest = store.load().map_err(ServiceError::message)?;
         let (drift_changed, drifted_sources) =
-            detect_and_mark_repo_drift(&mut manifest, &install_dir);
+            detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
         if drift_changed {
             store.save(&manifest).map_err(ServiceError::message)?;
         }
@@ -403,7 +414,7 @@ impl SkillsService for NoopSkillsService {
         let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
         let mut manifest = store.load().map_err(ServiceError::message)?;
         let (drift_changed, drifted_sources) =
-            detect_and_mark_repo_drift(&mut manifest, &install_dir);
+            detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
         if drift_changed {
             store.save(&manifest).map_err(ServiceError::message)?;
         }
@@ -636,7 +647,7 @@ impl SkillsService for NoopSkillsService {
         let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
         let mut manifest = store.load().map_err(ServiceError::message)?;
         let (drift_changed, drifted_sources) =
-            detect_and_mark_repo_drift(&mut manifest, &install_dir);
+            detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
         if drift_changed {
             store.save(&manifest).map_err(ServiceError::message)?;
         }
@@ -947,30 +958,65 @@ fn local_repo_head_sha(repo_dir: &Path) -> Option<String> {
     Some(obj.detach().to_hex().to_string())
 }
 
-fn detect_and_mark_repo_drift(
+fn compute_repo_skill_hashes(
+    repo: &moltis_skills::types::RepoEntry,
+    install_dir: &Path,
+) -> anyhow::Result<HashMap<String, String>> {
+    let repo_dir = install_dir.join(&repo.repo_name);
+    let format = if repo.format == moltis_skills::formats::PluginFormat::Skill {
+        moltis_skills::formats::detect_format(&repo_dir)
+    } else {
+        repo.format
+    };
+
+    match format {
+        moltis_skills::formats::PluginFormat::Skill => {
+            let mut hashes = HashMap::new();
+            for skill in &repo.skills {
+                let skill_dir =
+                    moltis_skills::audit::resolve_relative_within(install_dir, &skill.relative_path)?;
+                let skill_md = skill_dir.join("SKILL.md");
+                let raw = std::fs::read_to_string(&skill_md)?;
+                hashes.insert(skill.name.clone(), moltis_skills::integrity::hash_skill_markdown(&raw));
+            }
+            Ok(hashes)
+        },
+        _ => {
+            let entries = moltis_skills::formats::scan_with_adapter(&repo_dir, format)
+                .ok_or_else(|| anyhow::anyhow!("no adapter for format '{format}'"))??;
+            let hashes = entries
+                .into_iter()
+                .map(|entry| {
+                    let hash = moltis_skills::integrity::hash_adapter_skill(
+                        entry.source_file.as_deref(),
+                        &entry.body,
+                    );
+                    (entry.metadata.name, hash)
+                })
+                .collect();
+            Ok(hashes)
+        },
+    }
+}
+
+fn detect_and_enforce_repo_integrity(
     manifest: &mut moltis_skills::types::SkillsManifest,
     install_dir: &Path,
 ) -> (bool, HashSet<String>) {
+    let now_ms = current_time_ms();
     let mut changed = false;
     let mut drifted = HashSet::new();
 
     for repo in &mut manifest.repos {
-        let Some(expected_sha) = repo.commit_sha.clone() else {
-            continue;
-        };
-
         let repo_dir = install_dir.join(&repo.repo_name);
-        let Some(current_sha) = local_repo_head_sha(&repo_dir) else {
-            continue;
-        };
-
-        if current_sha != expected_sha {
+        let mut repo_drifted = false;
+        if let Some(expected_sha) = repo.commit_sha.clone()
+            && let Some(current_sha) = local_repo_head_sha(&repo_dir)
+            && current_sha != expected_sha
+        {
             drifted.insert(repo.source.clone());
             repo.commit_sha = Some(current_sha);
-            for skill in &mut repo.skills {
-                skill.status = moltis_skills::types::SkillStatus::Untrusted;
-                skill.enabled = false;
-            }
+            repo_drifted = true;
             security_audit(
                 "skills.source_drift_detected",
                 serde_json::json!({
@@ -979,6 +1025,74 @@ fn detect_and_mark_repo_drift(
                 }),
             );
             changed = true;
+        }
+
+        let hashes = match compute_repo_skill_hashes(repo, install_dir) {
+            Ok(hashes) => hashes,
+            Err(e) => {
+                let reason = format!("integrity scan failed: {e}");
+                for skill in &mut repo.skills {
+                    if moltis_skills::integrity::quarantine_skill(skill, &reason, now_ms) {
+                        changed = true;
+                        security_audit(
+                            "skills.integrity.quarantine",
+                            serde_json::json!({
+                                "source": repo.source,
+                                "skill": skill.name,
+                                "reason": reason,
+                            }),
+                        );
+                    }
+                }
+                continue;
+            },
+        };
+
+        for skill in &mut repo.skills {
+            let Some(content_hash) = hashes.get(&skill.name).cloned() else {
+                let reason = "skill content missing from source";
+                if moltis_skills::integrity::quarantine_skill(skill, reason, now_ms) {
+                    changed = true;
+                    security_audit(
+                        "skills.integrity.quarantine",
+                        serde_json::json!({
+                            "source": repo.source,
+                            "skill": skill.name,
+                            "reason": reason,
+                        }),
+                    );
+                }
+                continue;
+            };
+
+            if skill.content_hash.as_deref() != Some(content_hash.as_str()) {
+                skill.content_hash = Some(content_hash.clone());
+                changed = true;
+            }
+
+            let quarantine_reason = if repo_drifted {
+                Some("source drift detected")
+            } else if !moltis_skills::integrity::integrity_matches_trusted_hash(skill) {
+                Some("trusted content hash mismatch")
+            } else {
+                None
+            };
+
+            if let Some(reason) = quarantine_reason
+                && moltis_skills::integrity::quarantine_skill(skill, reason, now_ms)
+            {
+                changed = true;
+                security_audit(
+                    "skills.integrity.quarantine",
+                    serde_json::json!({
+                        "source": repo.source,
+                        "skill": skill.name,
+                        "reason": reason,
+                        "content_hash": skill.content_hash,
+                        "trusted_hash": skill.trusted_hash,
+                    }),
+                );
+            }
         }
     }
 
@@ -1086,7 +1200,8 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
 
     let install_dir =
         moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
-    let (drift_changed, drifted_sources) = detect_and_mark_repo_drift(&mut manifest, &install_dir);
+    let (drift_changed, drifted_sources) =
+        detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
     if drift_changed {
         store.save(&manifest).map_err(ServiceError::message)?;
     }
@@ -1099,12 +1214,18 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
             .into());
         }
 
-        let trusted = manifest
+        let status = manifest
             .find_repo(source)
             .and_then(|r| r.skills.iter().find(|s| s.name == skill_name))
-            .map(|s| s.status.is_trusted())
+            .map(|s| s.status)
             .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
-        if !trusted {
+        if status == moltis_skills::types::SkillStatus::Quarantined {
+            return Err(format!(
+                "skill '{skill_name}' is quarantined due to integrity checks. Review and re-trust before enabling"
+            )
+            .into());
+        }
+        if !status.is_trusted() {
             return Err(format!(
                 "skill '{skill_name}' is not trusted. Review it and run skills.skill.trust before enabling"
             )
@@ -1144,19 +1265,33 @@ fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
     let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
     let mut manifest = store.load().map_err(ServiceError::message)?;
 
-    let status = if trusted {
-        moltis_skills::types::SkillStatus::Trusted
+    let install_dir =
+        moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
+    let (integrity_changed, _) = detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
+    if integrity_changed {
+        store.save(&manifest).map_err(ServiceError::message)?;
+    }
+
+    let now_ms = current_time_ms();
+    let skill = manifest
+        .find_repo_mut(source)
+        .and_then(|repo| repo.skills.iter_mut().find(|s| s.name == skill_name))
+        .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
+
+    if trusted {
+        if skill.content_hash.is_none() {
+            return Err(format!(
+                "skill '{skill_name}' could not be trusted because its content hash is unavailable"
+            )
+            .into());
+        }
+        moltis_skills::integrity::trust_skill(skill, now_ms);
     } else {
-        moltis_skills::types::SkillStatus::Untrusted
-    };
-    if !manifest.set_skill_status(source, skill_name, status) {
-        return Err(format!("skill '{skill_name}' not found in repo '{source}'").into());
+        moltis_skills::integrity::untrust_skill(skill, now_ms);
     }
 
-    if !trusted {
-        let _ = manifest.set_skill_enabled(source, skill_name, false);
-    }
-
+    let audited_content_hash = skill.content_hash.clone();
+    let audited_trusted_hash = skill.trusted_hash.clone();
     store.save(&manifest).map_err(ServiceError::message)?;
     security_audit(
         "skills.skill.trust",
@@ -1164,6 +1299,8 @@ fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
             "source": source,
             "skill": skill_name,
             "trusted": trusted,
+            "trusted_hash": audited_trusted_hash,
+            "content_hash": audited_content_hash,
         }),
     );
     Ok(serde_json::json!({ "source": source, "skill": skill_name, "trusted": trusted }))
@@ -1453,6 +1590,67 @@ impl GatewayServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use {
+        moltis_skills::{
+            formats::PluginFormat,
+            types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
+        },
+        std::{path::Path, process::Command},
+    };
+
+    fn write_skill_file(install_dir: &Path, repo_name: &str, relative_path: &str, body: &str) {
+        let skill_dir = install_dir.join(relative_path);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), body).unwrap();
+        std::fs::create_dir_all(install_dir.join(repo_name)).unwrap();
+    }
+
+    fn single_skill_manifest(
+        source: &str,
+        repo_name: &str,
+        relative_path: &str,
+        commit_sha: Option<String>,
+        status: SkillStatus,
+        enabled: bool,
+        content_hash: Option<String>,
+        trusted_hash: Option<String>,
+    ) -> SkillsManifest {
+        SkillsManifest {
+            version: 2,
+            repos: vec![RepoEntry {
+                source: source.to_string(),
+                repo_name: repo_name.to_string(),
+                installed_at_ms: 0,
+                commit_sha,
+                format: PluginFormat::Skill,
+                skills: vec![SkillState {
+                    name: "demo".to_string(),
+                    relative_path: relative_path.to_string(),
+                    status,
+                    quarantine_reason: None,
+                    last_audited_ms: None,
+                    content_hash,
+                    trusted_hash,
+                    enabled,
+                }],
+            }],
+        }
+    }
+
+    fn run_git(repo_dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
 
     #[test]
     fn risky_install_pattern_detects_piped_shell() {
@@ -1511,6 +1709,131 @@ mod tests {
     fn markdown_to_html_blocks_javascript_links() {
         let rendered = markdown_to_html("[click me](javascript:alert(1))");
         assert!(!rendered.contains("javascript:"));
+    }
+
+    #[test]
+    fn integrity_tamper_after_trust_quarantines_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let original = "---\nname: demo\ndescription: test\n---\nOriginal body\n";
+        let changed = "---\nname: demo\ndescription: test\n---\nTampered body\n";
+
+        write_skill_file(
+            install_dir,
+            "owner-repo",
+            "owner-repo/skills/demo",
+            original,
+        );
+
+        let original_hash = moltis_skills::integrity::hash_skill_markdown(original);
+        let mut manifest = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            "owner-repo/skills/demo",
+            None,
+            SkillStatus::Trusted,
+            true,
+            Some(original_hash.clone()),
+            Some(original_hash),
+        );
+
+        write_skill_file(install_dir, "owner-repo", "owner-repo/skills/demo", changed);
+        let changed_hash = moltis_skills::integrity::hash_skill_markdown(changed);
+
+        let (changed_manifest, drifted) = detect_and_enforce_repo_integrity(&mut manifest, install_dir);
+        assert!(changed_manifest);
+        assert!(drifted.is_empty());
+
+        let skill = &manifest.repos[0].skills[0];
+        assert_eq!(skill.status, SkillStatus::Quarantined);
+        assert!(!skill.enabled);
+        assert_eq!(skill.content_hash.as_deref(), Some(changed_hash.as_str()));
+        assert!(skill
+            .quarantine_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("trusted content hash mismatch")));
+    }
+
+    #[test]
+    fn integrity_source_drift_quarantines_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let repo_dir = install_dir.join("owner-repo");
+        let skill_rel = "owner-repo/skills/demo";
+        let body = "---\nname: demo\ndescription: test\n---\nBody\n";
+
+        write_skill_file(install_dir, "owner-repo", skill_rel, body);
+        run_git(&repo_dir, &["init"]);
+        run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_dir, &["config", "user.name", "Test User"]);
+        run_git(&repo_dir, &["add", "."]);
+        run_git(&repo_dir, &["commit", "-m", "initial"]);
+        let first_sha = run_git(&repo_dir, &["rev-parse", "HEAD"]);
+
+        std::fs::write(repo_dir.join("skills/demo/SKILL.md"), format!("{body}# drift\n")).unwrap();
+        run_git(&repo_dir, &["add", "."]);
+        run_git(&repo_dir, &["commit", "-m", "drift"]);
+        let second_sha = run_git(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let content_hash = moltis_skills::integrity::hash_skill_markdown(body);
+        let mut manifest = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            skill_rel,
+            Some(first_sha),
+            SkillStatus::Trusted,
+            true,
+            Some(content_hash.clone()),
+            Some(content_hash),
+        );
+
+        let (changed_manifest, drifted) = detect_and_enforce_repo_integrity(&mut manifest, install_dir);
+        assert!(changed_manifest);
+        assert!(drifted.contains("owner/repo"));
+        assert_eq!(manifest.repos[0].commit_sha.as_deref(), Some(second_sha.as_str()));
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Quarantined);
+        assert!(manifest.repos[0].skills[0]
+            .quarantine_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("source drift")));
+    }
+
+    #[test]
+    fn integrity_retrust_flow_allows_reviewed_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path();
+        let original = "---\nname: demo\ndescription: test\n---\nOriginal body\n";
+        let changed = "---\nname: demo\ndescription: test\n---\nUpdated body\n";
+        let skill_rel = "owner-repo/skills/demo";
+
+        write_skill_file(install_dir, "owner-repo", skill_rel, original);
+        let original_hash = moltis_skills::integrity::hash_skill_markdown(original);
+        let mut manifest = single_skill_manifest(
+            "owner/repo",
+            "owner-repo",
+            skill_rel,
+            None,
+            SkillStatus::Trusted,
+            true,
+            Some(original_hash.clone()),
+            Some(original_hash),
+        );
+
+        write_skill_file(install_dir, "owner-repo", skill_rel, changed);
+        let (changed_manifest, _) = detect_and_enforce_repo_integrity(&mut manifest, install_dir);
+        assert!(changed_manifest);
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Quarantined);
+
+        let skill = &mut manifest.repos[0].skills[0];
+        moltis_skills::integrity::trust_skill(skill, 99);
+        assert_eq!(skill.status, SkillStatus::Trusted);
+        assert_eq!(skill.trusted_hash, skill.content_hash);
+        assert_eq!(skill.quarantine_reason, None);
+
+        let (changed_again, drifted_again) = detect_and_enforce_repo_integrity(&mut manifest, install_dir);
+        assert!(!changed_again);
+        assert!(drifted_again.is_empty());
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Trusted);
     }
 
     #[tokio::test]
