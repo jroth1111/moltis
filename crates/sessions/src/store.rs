@@ -1516,6 +1516,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_archive_to_cold_store_redacts_sensitive_values() {
+        let (store, dir) = temp_store();
+
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": "OPENAI_API_KEY=sk-secret Authorization: Bearer bearer-secret",
+            "metadata": {
+                "api_key": "raw-key",
+                "nested": {
+                    "token": "raw-token"
+                }
+            }
+        })];
+
+        let filename = store
+            .archive_to_cold_store("session:secure", &messages)
+            .await
+            .unwrap();
+        let archive_path = dir.path().join("archive").join(&filename);
+        let archived = fs::read_to_string(archive_path).unwrap();
+
+        assert!(!archived.contains("sk-secret"));
+        assert!(!archived.contains("bearer-secret"));
+        assert!(!archived.contains("raw-key"));
+        assert!(!archived.contains("raw-token"));
+        assert!(archived.contains(REDACTED_VALUE));
+    }
+
+    #[test]
+    fn redact_sensitive_text_keeps_non_sensitive_content() {
+        let original = "Build status: green, duration_ms: 1234";
+        let redacted = redact_sensitive_text(original);
+        assert_eq!(redacted, original);
+    }
+
+    #[tokio::test]
     async fn test_archive_to_cold_store_colon_key_sanitized() {
         let (store, dir) = temp_store();
 
