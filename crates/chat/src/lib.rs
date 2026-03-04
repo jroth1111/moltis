@@ -55,8 +55,10 @@ pub use runtime::{ChatRuntime, TtsOverride};
 use {
     chat_error::parse_chat_error,
     compaction::{
-        ContextCompactionAction, ContextCompactionStrategy, archive_keep_recent_for_reduction,
+        ContextCompactionAction, ContextCompactionStrategy, archive_reduction_plan,
         context_compaction_action_for_usage, context_compaction_config_from_chat,
+        parse_compaction_facts, partition_history_for_summary, retain_with_importance,
+        summary_context_plan, trim_summary_to_budget, truncate_reduction_plan,
     },
     history_context::normalize_for_context_view,
     moltis_common::handoff::{
@@ -3784,9 +3786,11 @@ impl ChatService for LiveChatService {
         //   70% (pre-compact) — silent memory flush only; no summarization. Runs once
         //                       per compaction window to capture memories before the
         //                       compact window is reached.
-        //   80% (compact)     — LLM fact-extraction + narrative summary replaces history.
-        //   90% (archive tier)— strategy-driven truncate/archive while preserving recency.
-        //   95% (truncate)    — emergency: keep last 6 messages, no LLM call needed.
+        //   80% (compact)     — summarize background history while preserving
+        //                       anchor+recent layers verbatim.
+        //   90% (archive tier)— strategy-driven archive/truncate with importance-aware
+        //                       retention (anchors before recency-only dropping).
+        //   95% (truncate)    — emergency retention: keep critical anchors plus last 6.
         let context_window = provider.context_window() as u64;
         let token_usage = session_token_usage_from_messages(&history);
         let compaction_config =
@@ -3796,61 +3800,76 @@ impl ChatService for LiveChatService {
             .saturating_add(estimate_text_tokens(&text));
         match context_compaction_action_for_usage(estimated_next_input, context_window) {
             ContextCompactionAction::TruncateTier => {
-                let keep_messages = 6usize;
-                let start = history.len().saturating_sub(keep_messages);
-                let truncated = history[start..].to_vec();
+                // Emergency reduction still preserves critical anchors (tool chains,
+                // code decisions) before falling back to recency.
+                let reduction = retain_with_importance(&history, truncate_reduction_plan(6));
 
-                if let Err(error) = self
-                    .session_store
-                    .replace_history(&session_key, truncated.clone())
-                    .await
-                {
-                    warn!(
+                if reduction.removed_messages == 0 {
+                    debug!(
                         session = %session_key,
-                        %error,
-                        "emergency truncate failed, continuing with full history"
+                        "emergency truncate skipped: not enough history to reduce"
                     );
                 } else {
-                    history = truncated;
-                    self.session_metadata
-                        .touch(&session_key, history.len() as u32)
+                    if let Err(error) = self
+                        .session_store
+                        .replace_history(&session_key, reduction.messages.clone())
+                        .await
+                    {
+                        warn!(
+                            session = %session_key,
+                            %error,
+                            "emergency truncate failed, continuing with full history"
+                        );
+                    } else {
+                        history = reduction.messages;
+                        self.session_metadata
+                            .touch(&session_key, history.len() as u32)
+                            .await;
+                        warn!(
+                            session = %session_key,
+                            estimated_next_input,
+                            context_window,
+                            removed_messages = reduction.removed_messages,
+                            retained_anchors = reduction.retained_anchor_messages,
+                            "emergency history truncate applied at 95% context threshold"
+                        );
+                        broadcast(
+                            &self.state,
+                            "chat",
+                            serde_json::json!({
+                                "sessionKey": session_key,
+                                "state": "auto_compact",
+                                "phase": "truncate",
+                                "estimatedNextInputTokens": estimated_next_input,
+                                "contextWindow": context_window,
+                                "removedMessages": reduction.removed_messages,
+                                "keptMessages": history.len(),
+                                "retainedAnchors": reduction.retained_anchor_messages,
+                            }),
+                            BroadcastOpts::default(),
+                        )
                         .await;
-                    warn!(
-                        session = %session_key,
-                        estimated_next_input,
-                        context_window,
-                        "emergency history truncate applied at 95% context threshold"
-                    );
-                    broadcast(
-                        &self.state,
-                        "chat",
-                        serde_json::json!({
-                            "sessionKey": session_key,
-                            "state": "auto_compact",
-                            "phase": "truncate",
-                            "estimatedNextInputTokens": estimated_next_input,
-                            "contextWindow": context_window,
-                            "keptMessages": keep_messages,
-                        }),
-                        BroadcastOpts::default(),
-                    )
-                    .await;
+                    }
                 }
             },
             ContextCompactionAction::ArchiveTier => {
-                let keep_recent =
-                    archive_keep_recent_for_reduction(history.len(), compaction_config.keep_recent);
-                let archived_count = history.len().saturating_sub(keep_recent);
+                // Layered retention:
+                // Layer 0 (critical anchors): tool chains / code / explicit decisions.
+                // Layer 1 (working memory): recent turns.
+                // Layer 2 (background): dropped or archived first.
+                let reduction = retain_with_importance(
+                    &history,
+                    archive_reduction_plan(compaction_config.keep_recent),
+                );
+                let archived_count = reduction.removed_messages;
 
                 if archived_count == 0 {
                     debug!(
                         session = %session_key,
                         strategy = compaction_config.strategy.as_config_value(),
-                        "archive tier skipped: not enough history to reduce"
+                        "archive tier skipped: no compressible background history"
                     );
                 } else {
-                    let recent_messages =
-                        history[history.len().saturating_sub(keep_recent)..].to_vec();
                     match compaction_config.strategy {
                         ContextCompactionStrategy::MoveToWorkspace => {
                             match self
@@ -3861,11 +3880,13 @@ impl ChatService for LiveChatService {
                                 Ok(archive_filename) => {
                                     let notice = PersistedMessage::notice(format!(
                                         "[Context Archive] {archived_count} older message(s) archived to \
-                                         cold storage ({archive_filename}). Retaining {keep_recent} most \
-                                         recent messages."
+                                         cold storage ({archive_filename}). Retaining {} recent \
+                                         message(s) and {} anchor message(s).",
+                                        reduction.kept_recent_messages,
+                                        reduction.retained_anchor_messages
                                     ));
                                     let mut new_history = vec![notice.to_value()];
-                                    new_history.extend(recent_messages);
+                                    new_history.extend(reduction.messages.clone());
 
                                     if let Err(error) = self
                                         .session_store
@@ -3902,7 +3923,8 @@ impl ChatService for LiveChatService {
                                                 "estimatedNextInputTokens": estimated_next_input,
                                                 "contextWindow": context_window,
                                                 "archivedMessages": archived_count,
-                                                "keptMessages": keep_recent,
+                                                "keptMessages": history.len(),
+                                                "retainedAnchors": reduction.retained_anchor_messages,
                                                 "archiveFile": archive_filename,
                                             }),
                                             BroadcastOpts::default(),
@@ -3922,7 +3944,7 @@ impl ChatService for LiveChatService {
                         ContextCompactionStrategy::Truncate => {
                             if let Err(error) = self
                                 .session_store
-                                .replace_history(&session_key, recent_messages.clone())
+                                .replace_history(&session_key, reduction.messages.clone())
                                 .await
                             {
                                 warn!(
@@ -3931,7 +3953,7 @@ impl ChatService for LiveChatService {
                                     "context archive-tier truncate failed, continuing with full history"
                                 );
                             } else {
-                                history = recent_messages;
+                                history = reduction.messages;
                                 self.session_metadata
                                     .touch(&session_key, history.len() as u32)
                                     .await;
@@ -3940,7 +3962,8 @@ impl ChatService for LiveChatService {
                                     estimated_next_input,
                                     context_window,
                                     removed_messages = archived_count,
-                                    kept_messages = keep_recent,
+                                    kept_messages = history.len(),
+                                    retained_anchors = reduction.retained_anchor_messages,
                                     strategy = compaction_config.strategy.as_config_value(),
                                     "context archive tier applied at 90% threshold"
                                 );
@@ -3955,7 +3978,8 @@ impl ChatService for LiveChatService {
                                         "estimatedNextInputTokens": estimated_next_input,
                                         "contextWindow": context_window,
                                         "removedMessages": archived_count,
-                                        "keptMessages": keep_recent,
+                                        "keptMessages": history.len(),
+                                        "retainedAnchors": reduction.retained_anchor_messages,
                                     }),
                                     BroadcastOpts::default(),
                                 )
@@ -4922,42 +4946,27 @@ impl ChatService for LiveChatService {
             }
         }
 
-        fn parse_compaction_facts(raw: &str) -> Vec<String> {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Vec::new();
-            }
-
-            let candidate = trimmed
-                .strip_prefix("```json")
-                .and_then(|s| s.strip_suffix("```"))
-                .map(str::trim)
-                .or_else(|| {
-                    trimmed
-                        .strip_prefix("```")
-                        .and_then(|s| s.strip_suffix("```"))
-                })
-                .map(str::trim)
-                .unwrap_or(trimmed);
-
-            serde_json::from_str::<Vec<String>>(candidate)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|fact| fact.trim().to_string())
-                .filter(|fact| !fact.is_empty())
-                .collect()
-        }
-
         // Use the session's model if available, otherwise fall back to the model
         // from the last assistant message, then to the first registered provider.
         let provider = self
             .resolve_provider(&session_key, &history)
             .await
             .map_err(ServiceError::message)?;
+        let summary_plan = summary_context_plan(self.chat_config.context_compaction_keep_recent);
+        let sections = partition_history_for_summary(&history, summary_plan);
+        let mut summary_source = sections.summary_source.clone();
+        if summary_source.is_empty() {
+            summary_source = sections.anchors.clone();
+        }
+        if summary_source.is_empty() {
+            summary_source = history.clone();
+        }
 
         info!(
             session = %session_key,
-            messages = history.len(),
+            messages = summary_source.len(),
+            retained_anchors = sections.anchors.len(),
+            retained_recent = sections.recent.len(),
             "chat.compact: extracting facts"
         );
 
@@ -4969,7 +4978,7 @@ impl ChatService for LiveChatService {
         let mut fact_messages = vec![ChatMessage::system(
             "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
         )];
-        fact_messages.extend(values_to_chat_messages(&history));
+        fact_messages.extend(values_to_chat_messages(&summary_source));
         fact_messages.push(ChatMessage::user(
             "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
         ));
@@ -4993,16 +5002,23 @@ impl ChatService for LiveChatService {
         }
         let facts = parse_compaction_facts(&facts_raw);
 
-        // Pass 2: concise narrative summary for conversation replacement.
+        // Pass 2: summarize only the compressible gap; anchors and recent turns are
+        // preserved verbatim.
         let mut summary_messages = vec![ChatMessage::system(
-            "You are a conversation summarizer. Preserve key context while compressing aggressively.",
+            "You are a conversation summarizer. Preserve key context while compressing aggressively. Do not invent facts.",
         )];
-        summary_messages.extend(values_to_chat_messages(&history));
-        summary_messages.push(ChatMessage::user(
-            "Summarize the conversation into a short narrative that preserves decisions, status, and actionable context. Output only the summary.",
-        ));
+        summary_messages.extend(values_to_chat_messages(&summary_source));
+        summary_messages.push(ChatMessage::user(format!(
+            "Summarize the compressible history into at most {} tokens. Preserve decisions, status, open tasks, blockers, and identifiers. Output only the summary.",
+            summary_plan.summary_budget_tokens
+        )));
 
-        info!(session = %session_key, messages = history.len(), "chat.compact: summarizing");
+        info!(
+            session = %session_key,
+            messages = summary_source.len(),
+            summary_budget_tokens = summary_plan.summary_budget_tokens,
+            "chat.compact: summarizing"
+        );
 
         let mut summary_stream = provider.stream(summary_messages);
         let mut summary = String::new();
@@ -5025,11 +5041,15 @@ impl ChatService for LiveChatService {
             }
         }
 
+        summary = trim_summary_to_budget(&summary, summary_plan.summary_budget_tokens);
         if summary.trim().is_empty() {
             return Err("compact produced empty summary".into());
         }
 
-        // Replace history with a single assistant message containing the summary.
+        // Layered compacted history:
+        // - Narrative summary for compressible background
+        // - Verbatim anchors (critical/high-value turns)
+        // - Verbatim recent working memory turns
         let compacted_msg = PersistedMessage::Assistant {
             content: format!("[Conversation Summary]\n\n{summary}"),
             created_at: Some(now_ms()),
@@ -5047,14 +5067,28 @@ impl ChatService for LiveChatService {
             seq: None,
             run_id: None,
         };
-        let compacted = vec![compacted_msg.to_value()];
+        let mut compacted = Vec::with_capacity(1 + sections.anchors.len() + sections.recent.len());
+        compacted.push(compacted_msg.to_value());
+        if !sections.anchors.is_empty() {
+            compacted.push(
+                PersistedMessage::notice(format!(
+                    "[Compaction Anchors] Preserved {} high-value message(s) verbatim.",
+                    sections.anchors.len()
+                ))
+                .to_value(),
+            );
+        }
+        compacted.extend(sections.anchors.clone());
+        compacted.extend(sections.recent.clone());
 
         self.session_store
             .replace_history(&session_key, compacted.clone())
             .await
             .map_err(ServiceError::message)?;
 
-        self.session_metadata.touch(&session_key, 1).await;
+        self.session_metadata
+            .touch(&session_key, compacted.len() as u32)
+            .await;
 
         // Save compaction summary and extracted facts as memory files, then sync.
         if let Some(mm) = self.state.memory_manager() {
@@ -7531,16 +7565,27 @@ async fn compact_session(
         return Err(error::Error::message("nothing to compact"));
     }
 
+    let summary_plan = summary_context_plan(10);
+    let sections = partition_history_for_summary(&history, summary_plan);
+    let mut summary_source = sections.summary_source.clone();
+    if summary_source.is_empty() {
+        summary_source = sections.anchors.clone();
+    }
+    if summary_source.is_empty() {
+        summary_source = history.clone();
+    }
+
     // Use structured ChatMessage objects so role boundaries are maintained via
     // the API's message structure, preventing prompt injection where user content
     // could mimic role prefixes in concatenated text.
     let mut summary_messages = vec![ChatMessage::system(
-        "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
+        "You are a conversation summarizer. Summarize only the compressible history and preserve all key facts, decisions, and context.",
     )];
-    summary_messages.extend(values_to_chat_messages(&history));
-    summary_messages.push(ChatMessage::user(
-        "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
-    ));
+    summary_messages.extend(values_to_chat_messages(&summary_source));
+    summary_messages.push(ChatMessage::user(format!(
+        "Summarize the conversation above into at most {} tokens. Output only the summary, no preamble.",
+        summary_plan.summary_budget_tokens
+    )));
 
     let mut stream = provider.stream(summary_messages);
     let mut summary = String::new();
@@ -7565,6 +7610,7 @@ async fn compact_session(
         }
     }
 
+    summary = trim_summary_to_budget(&summary, summary_plan.summary_budget_tokens);
     if summary.is_empty() {
         return Err(error::Error::message("compact produced empty summary"));
     }
@@ -7586,7 +7632,19 @@ async fn compact_session(
         seq: None,
         run_id: None,
     };
-    let compacted = vec![compacted_msg.to_value()];
+    let mut compacted = Vec::with_capacity(1 + sections.anchors.len() + sections.recent.len());
+    compacted.push(compacted_msg.to_value());
+    if !sections.anchors.is_empty() {
+        compacted.push(
+            PersistedMessage::notice(format!(
+                "[Compaction Anchors] Preserved {} high-value message(s) verbatim.",
+                sections.anchors.len()
+            ))
+            .to_value(),
+        );
+    }
+    compacted.extend(sections.anchors);
+    compacted.extend(sections.recent);
 
     store
         .replace_history(session_key, compacted)
@@ -9492,10 +9550,10 @@ mod tests {
 
     #[test]
     fn archive_keep_recent_for_reduction_avoids_noop_when_history_is_short() {
-        assert_eq!(archive_keep_recent_for_reduction(0, 20), 0);
-        assert_eq!(archive_keep_recent_for_reduction(1, 20), 1);
-        assert_eq!(archive_keep_recent_for_reduction(3, 20), 2);
-        assert_eq!(archive_keep_recent_for_reduction(10, 3), 3);
+        assert_eq!(compaction::archive_keep_recent_for_reduction(0, 20), 0);
+        assert_eq!(compaction::archive_keep_recent_for_reduction(1, 20), 1);
+        assert_eq!(compaction::archive_keep_recent_for_reduction(3, 20), 2);
+        assert_eq!(compaction::archive_keep_recent_for_reduction(10, 3), 3);
     }
 
     #[test]
