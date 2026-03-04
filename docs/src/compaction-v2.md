@@ -32,6 +32,16 @@ Behavior by threshold:
 - **Hard**: reduce Layer 2 and shrink Layer 1 toward `min_verbatim_turns`.
 - **Emergency**: preserve critical anchors and minimal Layer 1, drop low-importance non-anchors first.
 
+Soft/overflow summaries are structured into fixed sections for deterministic shape:
+
+- `Decisions`
+- `State`
+- `Open Items`
+- `Constraints`
+- `Artifacts`
+
+If there is no compressible background gap, V2 does not summarize anchors as fallback; it keeps anchors/working context verbatim.
+
 ## Overflow Retry
 
 Context-overflow retry compaction uses the same anchor-preserving summary engine as normal compaction, so tool/result continuity and anchor rules are consistent across both paths.
