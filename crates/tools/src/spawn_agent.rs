@@ -221,7 +221,7 @@ impl SpawnAgentTool {
 #[async_trait]
 impl AgentTool for SpawnAgentTool {
     fn name(&self) -> &str {
-        "spawn_agent"
+        crate::tool_names::SPAWN_AGENT
     }
 
     fn categories(&self) -> &'static [&'static str] {

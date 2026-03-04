@@ -17,6 +17,8 @@ pub struct SendMessageTool {
     channel_service: Arc<dyn ChannelService>,
 }
 
+pub const SEND_MESSAGE_TOOL_NAME: &str = "send_message";
+
 impl SendMessageTool {
     pub fn new(channel_service: Arc<dyn ChannelService>) -> Self {
         Self { channel_service }
@@ -26,7 +28,7 @@ impl SendMessageTool {
 #[async_trait]
 impl AgentTool for SendMessageTool {
     fn name(&self) -> &str {
-        "send_message"
+        SEND_MESSAGE_TOOL_NAME
     }
 
     fn description(&self) -> &str {

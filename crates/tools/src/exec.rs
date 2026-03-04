@@ -261,7 +261,7 @@ impl ExecTool {
 #[async_trait]
 impl AgentTool for ExecTool {
     fn name(&self) -> &str {
-        "exec"
+        crate::tool_names::EXEC
     }
 
     fn categories(&self) -> &'static [&'static str] {

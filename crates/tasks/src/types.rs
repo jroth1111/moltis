@@ -187,6 +187,7 @@ impl HandoffContext {
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
 )]
 #[serde(rename_all = "snake_case")]
+// Variants are ordered: Auto(0) < Confirm(1) < Approve(2).
 pub enum AutonomyTier {
     /// Read-only tools (web_fetch, search, file read, memory read).
     #[default]

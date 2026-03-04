@@ -29,7 +29,7 @@ impl CreateSkillTool {
 #[async_trait]
 impl AgentTool for CreateSkillTool {
     fn name(&self) -> &str {
-        "create_skill"
+        crate::tool_names::CREATE_SKILL
     }
 
     fn categories(&self) -> &'static [&'static str] {
@@ -134,7 +134,7 @@ impl UpdateSkillTool {
 #[async_trait]
 impl AgentTool for UpdateSkillTool {
     fn name(&self) -> &str {
-        "update_skill"
+        crate::tool_names::UPDATE_SKILL
     }
 
     fn categories(&self) -> &'static [&'static str] {
@@ -237,7 +237,7 @@ impl DeleteSkillTool {
 #[async_trait]
 impl AgentTool for DeleteSkillTool {
     fn name(&self) -> &str {
-        "delete_skill"
+        crate::tool_names::DELETE_SKILL
     }
 
     fn categories(&self) -> &'static [&'static str] {

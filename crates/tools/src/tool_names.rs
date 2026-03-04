@@ -1,0 +1,13 @@
+pub const EXEC: &str = "exec";
+pub const CREATE_SKILL: &str = "create_skill";
+pub const UPDATE_SKILL: &str = "update_skill";
+pub const DELETE_SKILL: &str = "delete_skill";
+pub const SESSIONS_CREATE: &str = "sessions_create";
+pub const SESSIONS_DELETE: &str = "sessions_delete";
+pub const SESSIONS_SEND: &str = "sessions_send";
+pub const SANDBOX_PACKAGES: &str = "sandbox_packages";
+pub const SEND_IMAGE: &str = "send_image";
+pub const SPAWN_AGENT: &str = "spawn_agent";
+pub const CRON: &str = "cron";
+pub const PROCESS: &str = "process";
+pub const TASK_LIST: &str = "task_list";

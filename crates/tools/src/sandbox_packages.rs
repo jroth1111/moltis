@@ -364,7 +364,7 @@ impl Default for SandboxPackagesTool {
 #[async_trait]
 impl AgentTool for SandboxPackagesTool {
     fn name(&self) -> &str {
-        "sandbox_packages"
+        crate::tool_names::SANDBOX_PACKAGES
     }
 
     fn categories(&self) -> &'static [&'static str] {

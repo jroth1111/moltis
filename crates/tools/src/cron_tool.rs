@@ -773,7 +773,7 @@ fn normalize_patch_value(patch: &Value) -> Result<Value> {
 #[async_trait]
 impl AgentTool for CronTool {
     fn name(&self) -> &str {
-        "cron"
+        crate::tool_names::CRON
     }
 
     fn categories(&self) -> &'static [&'static str] {

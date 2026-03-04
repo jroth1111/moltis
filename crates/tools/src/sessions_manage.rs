@@ -73,7 +73,7 @@ impl SessionsDeleteTool {
 #[async_trait]
 impl AgentTool for SessionsCreateTool {
     fn name(&self) -> &str {
-        "sessions_create"
+        crate::tool_names::SESSIONS_CREATE
     }
 
     fn categories(&self) -> &'static [&'static str] {
@@ -146,7 +146,7 @@ impl AgentTool for SessionsCreateTool {
 #[async_trait]
 impl AgentTool for SessionsDeleteTool {
     fn name(&self) -> &str {
-        "sessions_delete"
+        crate::tool_names::SESSIONS_DELETE
     }
 
     fn categories(&self) -> &'static [&'static str] {

@@ -355,7 +355,7 @@ impl ProcessTool {
 #[async_trait]
 impl AgentTool for ProcessTool {
     fn name(&self) -> &str {
-        "process"
+        crate::tool_names::PROCESS
     }
 
     fn categories(&self) -> &'static [&'static str] {

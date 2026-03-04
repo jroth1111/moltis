@@ -232,7 +232,7 @@ impl AgentTool for SessionsHistoryTool {
 #[async_trait]
 impl AgentTool for SessionsSendTool {
     fn name(&self) -> &str {
-        "sessions_send"
+        crate::tool_names::SESSIONS_SEND
     }
 
     fn categories(&self) -> &'static [&'static str] {

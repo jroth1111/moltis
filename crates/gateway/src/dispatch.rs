@@ -40,11 +40,12 @@ use {
         RuntimeState, ShiftOutput, Task, TaskId, TaskSpec, TaskStore, TerminalState,
         TransitionError, TransitionEvent,
     },
+    moltis_tools::tool_names,
     serde_json::Value,
     tracing::{debug, info, warn},
 };
 
-use crate::state::GatewayState;
+use crate::{channel_agent_tools::SEND_MESSAGE_TOOL_NAME, state::GatewayState};
 
 // ── Public entry point ─────────────────────────────────────────────────────────
 
@@ -578,29 +579,29 @@ fn denied_tools_for_tier(tier: AutonomyTier) -> Vec<&'static str> {
     match tier {
         AutonomyTier::Auto => vec![
             // Confirm-tier (local-write)
-            "exec",
-            "create_skill",
-            "update_skill",
-            "delete_skill",
-            "sessions_create",
-            "sessions_delete",
-            "sandbox_packages",
+            tool_names::EXEC,
+            tool_names::CREATE_SKILL,
+            tool_names::UPDATE_SKILL,
+            tool_names::DELETE_SKILL,
+            tool_names::SESSIONS_CREATE,
+            tool_names::SESSIONS_DELETE,
+            tool_names::SANDBOX_PACKAGES,
             // Approve-tier (external-write)
-            "send_image",
-            "send_message",
-            "sessions_send",
-            "spawn_agent",
-            "cron",
-            "process",
+            tool_names::SEND_IMAGE,
+            SEND_MESSAGE_TOOL_NAME,
+            tool_names::SESSIONS_SEND,
+            tool_names::SPAWN_AGENT,
+            tool_names::CRON,
+            tool_names::PROCESS,
         ],
         AutonomyTier::Confirm => vec![
             // Approve-tier only (external-write)
-            "send_image",
-            "send_message",
-            "sessions_send",
-            "spawn_agent",
-            "cron",
-            "process",
+            tool_names::SEND_IMAGE,
+            SEND_MESSAGE_TOOL_NAME,
+            tool_names::SESSIONS_SEND,
+            tool_names::SPAWN_AGENT,
+            tool_names::CRON,
+            tool_names::PROCESS,
         ],
         AutonomyTier::Approve => vec![],
     }
@@ -1083,21 +1084,24 @@ mod tests {
     #[test]
     fn auto_tier_denies_exec_and_send() {
         let denied = denied_tools_for_tier(AutonomyTier::Auto);
-        assert!(denied.contains(&"exec"), "exec must be denied at Auto tier");
         assert!(
-            denied.contains(&"send_image"),
+            denied.contains(&tool_names::EXEC),
+            "exec must be denied at Auto tier"
+        );
+        assert!(
+            denied.contains(&tool_names::SEND_IMAGE),
             "send_image must be denied at Auto tier"
         );
         assert!(
-            denied.contains(&"send_message"),
+            denied.contains(&SEND_MESSAGE_TOOL_NAME),
             "send_message must be denied at Auto tier"
         );
         assert!(
-            denied.contains(&"spawn_agent"),
+            denied.contains(&tool_names::SPAWN_AGENT),
             "spawn_agent must be denied at Auto tier"
         );
         assert!(
-            !denied.contains(&"task_list"),
+            !denied.contains(&tool_names::TASK_LIST),
             "task_list must never be denied"
         );
     }
@@ -1106,23 +1110,23 @@ mod tests {
     fn confirm_tier_denies_only_approve_tools() {
         let denied = denied_tools_for_tier(AutonomyTier::Confirm);
         assert!(
-            denied.contains(&"send_image"),
+            denied.contains(&tool_names::SEND_IMAGE),
             "send_image must be denied at Confirm tier"
         );
         assert!(
-            denied.contains(&"send_message"),
+            denied.contains(&SEND_MESSAGE_TOOL_NAME),
             "send_message must be denied at Confirm tier"
         );
         assert!(
-            denied.contains(&"spawn_agent"),
+            denied.contains(&tool_names::SPAWN_AGENT),
             "spawn_agent must be denied at Confirm tier"
         );
         assert!(
-            !denied.contains(&"exec"),
+            !denied.contains(&tool_names::EXEC),
             "exec must be allowed at Confirm tier"
         );
         assert!(
-            !denied.contains(&"task_list"),
+            !denied.contains(&tool_names::TASK_LIST),
             "task_list must never be denied"
         );
     }

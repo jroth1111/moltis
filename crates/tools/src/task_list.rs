@@ -202,7 +202,7 @@ fn parse_handoff(params: &serde_json::Value) -> HandoffContext {
 #[async_trait]
 impl AgentTool for TaskListTool {
     fn name(&self) -> &str {
-        "task_list"
+        crate::tool_names::TASK_LIST
     }
 
     fn categories(&self) -> &'static [&'static str] {
