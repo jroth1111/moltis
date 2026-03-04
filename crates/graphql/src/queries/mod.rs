@@ -785,17 +785,45 @@ pub struct MemoryQuery;
 impl MemoryQuery {
     /// Get memory system status.
     async fn status(&self, _ctx: &Context<'_>) -> Result<MemoryStatus> {
-        from_service(Ok(serde_json::json!({ "enabled": false })))
+        let config = moltis_config::discover_and_load();
+        let memory = config.memory;
+        Ok(MemoryStatus {
+            enabled: Some(!memory.disable_rag),
+            file_count: None,
+            chunk_count: None,
+            backend: Some(memory.backend.unwrap_or_else(|| "builtin".to_string())),
+        })
     }
 
     /// Get memory configuration.
     async fn config(&self, _ctx: &Context<'_>) -> Result<MemoryConfig> {
-        from_service(Ok(serde_json::json!({})))
+        let config = moltis_config::discover_and_load();
+        let memory = config.memory;
+        Ok(MemoryConfig {
+            backend: Some(memory.backend.unwrap_or_else(|| "builtin".to_string())),
+            citations: Some(memory.citations.unwrap_or_else(|| "auto".to_string())),
+            disable_rag: Some(memory.disable_rag),
+            llm_reranking: Some(memory.llm_reranking),
+            session_export: Some(memory.session_export),
+            auto_extract: Some(memory.auto_extract),
+            auto_extract_min_chars: Some(memory.auto_extract_min_chars as u64),
+            auto_extract_debounce_ms: Some(memory.auto_extract_debounce_ms),
+            auto_extract_max_facts: Some(memory.auto_extract_max_facts as u64),
+            auto_extract_model_id: memory.auto_extract_model_id,
+            auto_reconcile: Some(memory.auto_reconcile),
+            auto_reconcile_min_interval_secs: Some(memory.auto_reconcile_min_interval_secs),
+            auto_reconcile_similarity_threshold: Some(
+                memory.auto_reconcile_similarity_threshold as f64,
+            ),
+            qmd_feature_enabled: Some(cfg!(feature = "qmd")),
+        })
     }
 
     /// Get QMD status.
     async fn qmd_status(&self, _ctx: &Context<'_>) -> Result<BoolResult> {
-        from_service(Ok(serde_json::json!({ "available": false })))
+        Ok(BoolResult {
+            ok: cfg!(feature = "qmd"),
+        })
     }
 }
 

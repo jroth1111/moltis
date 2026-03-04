@@ -1046,6 +1046,30 @@ async fn logs_status_query_returns_typed_shape() {
     assert_eq!(data["logs"]["status"]["enabledLevels"]["debug"], true);
 }
 
+#[tokio::test]
+async fn memory_queries_return_live_typed_values() {
+    let mock = MockDispatch::new();
+    let (schema, _) = build_test_schema(mock);
+
+    let res = schema
+        .execute(Request::new(
+            r#"{ memory { status { enabled backend } config { backend citations autoExtractMinChars autoExtractDebounceMs autoExtractMaxFacts qmdFeatureEnabled } qmdStatus { ok } } }"#,
+        ))
+        .await;
+
+    assert!(res.errors.is_empty(), "errors: {:?}", res.errors);
+    let data = res.data.into_json().expect("json");
+    assert!(data["memory"]["status"]["enabled"].is_boolean());
+    assert!(data["memory"]["status"]["backend"].is_string());
+    assert!(data["memory"]["config"]["backend"].is_string());
+    assert!(data["memory"]["config"]["citations"].is_string());
+    assert!(data["memory"]["config"]["autoExtractMinChars"].is_number());
+    assert!(data["memory"]["config"]["autoExtractDebounceMs"].is_number());
+    assert!(data["memory"]["config"]["autoExtractMaxFacts"].is_number());
+    assert!(data["memory"]["config"]["qmdFeatureEnabled"].is_boolean());
+    assert!(data["memory"]["qmdStatus"]["ok"].is_boolean());
+}
+
 // ── Mutation resolvers ──────────────────────────────────────────────────────
 
 #[tokio::test]

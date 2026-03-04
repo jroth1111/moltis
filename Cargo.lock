@@ -6095,6 +6095,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bytes",
+ "moltis-config",
  "moltis-service-traits",
  "serde",
  "serde_json",
