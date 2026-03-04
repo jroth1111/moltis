@@ -171,7 +171,7 @@ pub(crate) fn markdown_to_html(md: &str) -> String {
     let parser = Parser::new_ext(md, opts);
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
-    html_output
+    ammonia::clean(&html_output)
 }
 
 // ── Skills (Noop — complex impl that depends on gateway-specific crates) ────
@@ -1407,6 +1407,18 @@ mod tests {
     #[test]
     fn risky_install_pattern_allows_plain_package_install() {
         assert_eq!(risky_install_pattern("cargo install ripgrep"), None);
+    }
+
+    #[test]
+    fn markdown_to_html_strips_raw_script_tags() {
+        let rendered = markdown_to_html("hello<script>alert('xss')</script>world");
+        assert!(!rendered.contains("<script"));
+    }
+
+    #[test]
+    fn markdown_to_html_blocks_javascript_links() {
+        let rendered = markdown_to_html("[click me](javascript:alert(1))");
+        assert!(!rendered.contains("javascript:"));
     }
 
     #[tokio::test]
