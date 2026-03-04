@@ -104,31 +104,40 @@ impl ToolRegistry {
     /// Register a built-in tool with an optional per-tool rate limit.
     pub fn register_with_limit(&mut self, tool: Box<dyn AgentTool>, limit: Option<RateLimit>) {
         let name = tool.name().to_string();
-        self.tools.insert(name, ToolEntry {
-            tool: Arc::from(tool),
-            source: ToolSource::Builtin,
-            rate_limit: limit,
-        });
+        self.tools.insert(
+            name,
+            ToolEntry {
+                tool: Arc::from(tool),
+                source: ToolSource::Builtin,
+                rate_limit: limit,
+            },
+        );
     }
 
     /// Register a tool from an MCP server.
     pub fn register_mcp(&mut self, tool: Box<dyn AgentTool>, server: String) {
         let name = tool.name().to_string();
-        self.tools.insert(name, ToolEntry {
-            tool: Arc::from(tool),
-            source: ToolSource::Mcp { server },
-            rate_limit: None,
-        });
+        self.tools.insert(
+            name,
+            ToolEntry {
+                tool: Arc::from(tool),
+                source: ToolSource::Mcp { server },
+                rate_limit: None,
+            },
+        );
     }
 
     /// Register a tool from a WASM component.
     pub fn register_wasm(&mut self, tool: Box<dyn AgentTool>, component_hash: [u8; 32]) {
         let name = tool.name().to_string();
-        self.tools.insert(name, ToolEntry {
-            tool: Arc::from(tool),
-            source: ToolSource::Wasm { component_hash },
-            rate_limit: None,
-        });
+        self.tools.insert(
+            name,
+            ToolEntry {
+                tool: Arc::from(tool),
+                source: ToolSource::Wasm { component_hash },
+                rate_limit: None,
+            },
+        );
     }
 
     pub fn unregister(&mut self, name: &str) -> bool {
@@ -158,6 +167,8 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        let schema = entry.tool.parameters_schema();
+        validate_tool_call_arguments(name, &schema, &params)?;
         if let Some(ref rl) = entry.rate_limit
             && let Err(e) = rl.try_acquire()
         {
@@ -206,11 +217,14 @@ impl ToolRegistry {
             .iter()
             .filter(|(name, _)| !name.starts_with(prefix))
             .map(|(name, entry)| {
-                (name.clone(), ToolEntry {
-                    tool: Arc::clone(&entry.tool),
-                    source: entry.source.clone(),
-                    rate_limit: entry.rate_limit.clone(),
-                })
+                (
+                    name.clone(),
+                    ToolEntry {
+                        tool: Arc::clone(&entry.tool),
+                        source: entry.source.clone(),
+                        rate_limit: entry.rate_limit.clone(),
+                    },
+                )
             })
             .collect();
         ToolRegistry { tools }
@@ -223,11 +237,14 @@ impl ToolRegistry {
             .iter()
             .filter(|(_, entry)| !matches!(entry.source, ToolSource::Mcp { .. }))
             .map(|(name, entry)| {
-                (name.clone(), ToolEntry {
-                    tool: Arc::clone(&entry.tool),
-                    source: entry.source.clone(),
-                    rate_limit: entry.rate_limit.clone(),
-                })
+                (
+                    name.clone(),
+                    ToolEntry {
+                        tool: Arc::clone(&entry.tool),
+                        source: entry.source.clone(),
+                        rate_limit: entry.rate_limit.clone(),
+                    },
+                )
             })
             .collect();
         ToolRegistry { tools }
@@ -240,11 +257,14 @@ impl ToolRegistry {
             .iter()
             .filter(|(name, _)| !exclude.contains(&name.as_str()))
             .map(|(name, entry)| {
-                (name.clone(), ToolEntry {
-                    tool: Arc::clone(&entry.tool),
-                    source: entry.source.clone(),
-                    rate_limit: entry.rate_limit.clone(),
-                })
+                (
+                    name.clone(),
+                    ToolEntry {
+                        tool: Arc::clone(&entry.tool),
+                        source: entry.source.clone(),
+                        rate_limit: entry.rate_limit.clone(),
+                    },
+                )
             })
             .collect();
         ToolRegistry { tools }
@@ -260,11 +280,14 @@ impl ToolRegistry {
             .iter()
             .filter(|(name, _)| predicate(name))
             .map(|(name, entry)| {
-                (name.clone(), ToolEntry {
-                    tool: Arc::clone(&entry.tool),
-                    source: entry.source.clone(),
-                    rate_limit: entry.rate_limit.clone(),
-                })
+                (
+                    name.clone(),
+                    ToolEntry {
+                        tool: Arc::clone(&entry.tool),
+                        source: entry.source.clone(),
+                        rate_limit: entry.rate_limit.clone(),
+                    },
+                )
             })
             .collect();
         ToolRegistry { tools }
@@ -278,6 +301,182 @@ fn hex_component_hash(component_hash: [u8; 32]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+fn value_type_name(value: &serde_json::Value) -> &'static str {
+    if value.is_string() {
+        "string"
+    } else if value.is_boolean() {
+        "boolean"
+    } else if value.is_number() {
+        "number"
+    } else if value.is_array() {
+        "array"
+    } else if value.is_object() {
+        "object"
+    } else if value.is_null() {
+        "null"
+    } else {
+        "unknown"
+    }
+}
+
+fn type_matches(expected: &str, value: &serde_json::Value) -> bool {
+    match expected {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+fn validate_value_constraints(
+    tool_name: &str,
+    arg_name: &str,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<()> {
+    if let Some(expected_type) = schema.get("type").and_then(serde_json::Value::as_str)
+        && !type_matches(expected_type, value)
+    {
+        return Err(anyhow::anyhow!(
+            "invalid parameter '{arg_name}' for tool '{tool_name}': expected {expected_type}, got {}",
+            value_type_name(value)
+        ));
+    }
+
+    if let Some(options) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !options.iter().any(|candidate| candidate == value)
+    {
+        return Err(anyhow::anyhow!(
+            "invalid parameter '{arg_name}' for tool '{tool_name}': value {value} not in enum"
+        ));
+    }
+
+    if let Some(as_f64) = value.as_f64() {
+        if let Some(min) = schema.get("minimum").and_then(serde_json::Value::as_f64)
+            && as_f64 < min
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': {as_f64} < minimum {min}"
+            ));
+        }
+        if let Some(max) = schema.get("maximum").and_then(serde_json::Value::as_f64)
+            && as_f64 > max
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': {as_f64} > maximum {max}"
+            ));
+        }
+    }
+
+    if let Some(as_str) = value.as_str() {
+        let len = as_str.chars().count();
+        if let Some(min_len) = schema.get("minLength").and_then(serde_json::Value::as_u64)
+            && len < min_len as usize
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': length {len} < minLength {min_len}"
+            ));
+        }
+        if let Some(max_len) = schema.get("maxLength").and_then(serde_json::Value::as_u64)
+            && len > max_len as usize
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': length {len} > maxLength {max_len}"
+            ));
+        }
+    }
+
+    if let Some(items) = value.as_array() {
+        let len = items.len();
+        if let Some(min_items) = schema.get("minItems").and_then(serde_json::Value::as_u64)
+            && len < min_items as usize
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': item count {len} < minItems {min_items}"
+            ));
+        }
+        if let Some(max_items) = schema.get("maxItems").and_then(serde_json::Value::as_u64)
+            && len > max_items as usize
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': item count {len} > maxItems {max_items}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_tool_call_arguments(
+    tool_name: &str,
+    schema: &serde_json::Value,
+    params: &serde_json::Value,
+) -> Result<()> {
+    if schema.is_null() {
+        return Ok(());
+    }
+    let Some(object_schema) = schema.as_object() else {
+        return Ok(());
+    };
+    if object_schema
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind != "object")
+    {
+        return Ok(());
+    }
+
+    let Some(args_obj) = params.as_object() else {
+        return Err(anyhow::anyhow!(
+            "invalid arguments for tool '{tool_name}': expected object, got {}",
+            value_type_name(params)
+        ));
+    };
+
+    let properties = object_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    if let Some(required) = object_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+    {
+        for req in required.iter().filter_map(serde_json::Value::as_str) {
+            if !args_obj.contains_key(req) {
+                return Err(anyhow::anyhow!(
+                    "missing required parameter '{req}' for tool '{tool_name}'"
+                ));
+            }
+        }
+    }
+
+    let additional_allowed = object_schema
+        .get("additionalProperties")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    for (arg_name, arg_value) in args_obj {
+        if arg_name.starts_with('_') {
+            // Runtime/session metadata injected by the chat runtime.
+            continue;
+        }
+        let Some(prop_schema) = properties.and_then(|props| props.get(arg_name)) else {
+            if !additional_allowed {
+                return Err(anyhow::anyhow!(
+                    "unknown parameter '{arg_name}' for tool '{tool_name}'"
+                ));
+            }
+            continue;
+        };
+        validate_value_constraints(tool_name, arg_name, prop_schema, arg_value)?;
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -305,6 +504,35 @@ mod tests {
 
         async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
             Ok(serde_json::json!({}))
+        }
+    }
+
+    struct StrictArgsTool;
+
+    #[async_trait]
+    impl AgentTool for StrictArgsTool {
+        fn name(&self) -> &str {
+            "strict"
+        }
+
+        fn description(&self) -> &str {
+            "strict schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "minLength": 1 },
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": 300 }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({ "ok": true }))
         }
     }
 
@@ -518,5 +746,47 @@ mod tests {
         let err = cloned.call("limited", serde_json::json!({})).await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_call_rejects_missing_required_argument() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StrictArgsTool));
+        let err = registry
+            .call("strict", serde_json::json!({ "timeout": 30 }))
+            .await
+            .expect_err("missing required parameter should fail");
+        assert!(
+            err.to_string()
+                .contains("missing required parameter 'command'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_rejects_wrong_argument_type() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StrictArgsTool));
+        let err = registry
+            .call("strict", serde_json::json!({ "command": 42 }))
+            .await
+            .expect_err("wrong type should fail");
+        assert!(err.to_string().contains("expected string"));
+    }
+
+    #[tokio::test]
+    async fn test_call_allows_runtime_metadata_fields() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StrictArgsTool));
+        let result = registry
+            .call(
+                "strict",
+                serde_json::json!({
+                    "command": "ls -la",
+                    "_session_key": "main",
+                    "_accept_language": "en-US",
+                }),
+            )
+            .await;
+        assert!(result.is_ok(), "runtime metadata fields should be ignored");
     }
 }
