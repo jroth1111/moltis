@@ -6244,8 +6244,7 @@ mod tests {
         let session_store = Arc::new(SessionStore::new(sessions_dir));
 
         let (registry, info) =
-            discover_and_build_hooks(&HashSet::new(), Some(&session_store), None, None, true)
-                .await;
+            discover_and_build_hooks(&HashSet::new(), Some(&session_store), None, None, true).await;
         let registry = registry.expect("expected hook registry to be created");
         let handler_names = registry.handler_names();
 
