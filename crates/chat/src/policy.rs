@@ -2,12 +2,37 @@ use serde::Serialize;
 
 use moltis_agents::prompt::PromptRuntimeContext;
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyOutcome {
+    Allow,
+    Deny,
+    AllowWithTransforms,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyReasonCode {
+    SurfaceNonChannel,
+    SurfaceUnclassified,
+    SurfacePrivate,
+    SurfaceNonPrivate,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyTransform {
+    pub kind: &'static str,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyDecision {
-    pub code: &'static str,
-    pub outcome: &'static str,
+    pub code: PolicyReasonCode,
+    pub outcome: PolicyOutcome,
     pub detail: String,
+    pub transforms: Vec<PolicyTransform>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,9 +51,10 @@ impl PromptPolicyEvaluation {
             include_memory_bootstrap: true,
             allow_external_effects: true,
             decisions: vec![PolicyDecision {
-                code: "surface_non_channel",
-                outcome: "allow",
+                code: PolicyReasonCode::SurfaceNonChannel,
+                outcome: PolicyOutcome::Allow,
                 detail: "non-channel runtime surface keeps private persona data".to_string(),
+                transforms: Vec::new(),
             }],
         }
     }
@@ -49,11 +75,12 @@ pub fn evaluate_surface_policy(
             include_memory_bootstrap: false,
             allow_external_effects: false,
             decisions: vec![PolicyDecision {
-                code: "surface_unclassified",
-                outcome: "deny",
+                code: PolicyReasonCode::SurfaceUnclassified,
+                outcome: PolicyOutcome::Deny,
                 detail: format!(
                     "channel surface '{channel_type}' has unknown chat type; fail-closed policy applied"
                 ),
+                transforms: Vec::new(),
             }],
         };
     };
@@ -71,11 +98,12 @@ pub fn evaluate_surface_policy(
             include_memory_bootstrap: true,
             allow_external_effects: true,
             decisions: vec![PolicyDecision {
-                code: "surface_private",
-                outcome: "allow",
+                code: PolicyReasonCode::SurfacePrivate,
+                outcome: PolicyOutcome::Allow,
                 detail: format!(
                     "channel surface '{channel_type}' is explicitly private; private persona data allowed"
                 ),
+                transforms: Vec::new(),
             }],
         };
     }
@@ -85,11 +113,12 @@ pub fn evaluate_surface_policy(
         include_memory_bootstrap: false,
         allow_external_effects: false,
         decisions: vec![PolicyDecision {
-            code: "surface_non_private",
-            outcome: "deny",
+            code: PolicyReasonCode::SurfaceNonPrivate,
+            outcome: PolicyOutcome::Deny,
             detail: format!(
                 "channel surface '{channel_type}' with chat type '{chat_type}' is non-private"
             ),
+            transforms: Vec::new(),
         }],
     }
 }

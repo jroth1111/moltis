@@ -27,10 +27,12 @@ use {
         model::{StreamEvent, values_to_chat_messages},
         multimodal::parse_data_uri,
         prompt::{
-            PromptHostRuntimeContext, PromptRuntimeContext, PromptSandboxRuntimeContext,
-            PromptSectionTruncation, VOICE_REPLY_SUFFIX,
+            DroppedPromptSection, PromptHostRuntimeContext, PromptRuntimeContext,
+            PromptSandboxRuntimeContext, PromptSectionTruncation, VOICE_REPLY_SUFFIX,
             build_system_prompt_minimal_runtime_workspace_budgets,
             build_system_prompt_with_session_runtime_workspace_budgets,
+            collect_dropped_prompt_sections,
+            collect_soul_routing_issues,
             collect_prompt_section_truncations,
         },
         runner::{RunnerEvent, run_agent_loop_streaming},
@@ -1100,33 +1102,6 @@ struct PersonaHealthIssue {
 static PERSONA_HEALTH_WARNED_AGENTS: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
-fn extract_lane_marker_value(line: &str) -> Option<&str> {
-    let start = line.find("<!--")?;
-    let rest = &line[start + 4..];
-    let end = rest.find("-->")?;
-    let comment = rest[..end].trim();
-    let mut parts = comment.splitn(2, ':');
-    let key = parts.next()?.trim();
-    if !key.eq_ignore_ascii_case("lane") {
-        return None;
-    }
-    Some(parts.next().map(str::trim).unwrap_or_default())
-}
-
-fn collect_unknown_lane_markers(soul_text: &str) -> Vec<String> {
-    soul_text
-        .lines()
-        .filter_map(extract_lane_marker_value)
-        .filter_map(|value| {
-            let valid = matches!(
-                value.to_ascii_lowercase().as_str(),
-                "soul" | "agents" | "tools" | "heartbeat"
-            );
-            (!valid).then(|| value.to_string())
-        })
-        .collect()
-}
-
 fn detect_main_shadowed_persona_files() -> Vec<&'static str> {
     const FILES: &[&str] = &[
         "IDENTITY.md",
@@ -1242,6 +1217,23 @@ fn policy_decisions_to_json(items: &[policy::PolicyDecision]) -> Vec<Value> {
                 "code": item.code,
                 "outcome": item.outcome,
                 "detail": item.detail,
+                "transforms": item.transforms,
+            })
+        })
+        .collect()
+}
+
+fn policy_transforms_to_json(items: &[policy::PolicyDecision]) -> Vec<Value> {
+    items
+        .iter()
+        .flat_map(|decision| {
+            decision.transforms.iter().map(move |transform| {
+                serde_json::json!({
+                    "code": decision.code,
+                    "outcome": decision.outcome,
+                    "kind": transform.kind,
+                    "detail": transform.detail,
+                })
             })
         })
         .collect()
@@ -1253,6 +1245,22 @@ fn truncations_to_json(items: &[PromptSectionTruncation]) -> Vec<Value> {
         .map(|item| {
             serde_json::json!({
                 "section": item.section,
+                "maxChars": item.max_chars,
+                "originalChars": item.original_chars,
+            })
+        })
+        .collect()
+}
+
+fn dropped_sections_to_json(items: &[DroppedPromptSection]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "section": item.section,
+                "sectionId": item.section_id,
+                "bucket": item.bucket,
+                "reason": item.reason,
                 "maxChars": item.max_chars,
                 "originalChars": item.original_chars,
             })
@@ -1291,12 +1299,10 @@ fn validate_prompt_persona(agent_id: &str, persona: &PromptPersona) -> Vec<Perso
         });
     }
 
-    for marker in collect_unknown_lane_markers(soul) {
+    for issue in collect_soul_routing_issues(soul) {
         issues.push(PersonaHealthIssue {
-            code: "soul_lane_unknown",
-            message: format!(
-                "SOUL lane marker '{marker}' is invalid; use soul|agents|tools|heartbeat"
-            ),
+            code: "soul_routing_issue",
+            message: issue,
         });
     }
 
@@ -1477,10 +1483,15 @@ fn load_prompt_persona_for_session(
 ) -> error::Result<PromptPersona> {
     let agent_id = resolve_prompt_agent_id(session_entry)?;
     let mut persona = load_prompt_persona_for_agent(&agent_id);
+    enforce_strict_soul_routing(&agent_id, &persona)?;
     let policy_eval = evaluate_policy_for_channel_binding(
         session_entry.and_then(|entry| entry.channel_binding.as_deref()),
     );
-    apply_private_persona_data_policy(&mut persona, policy_eval.include_private_persona_data);
+    apply_private_persona_data_policy(
+        &mut persona,
+        policy_eval.include_private_persona_data,
+        policy_eval.include_memory_bootstrap,
+    );
     Ok(persona)
 }
 
@@ -1500,10 +1511,12 @@ fn evaluate_policy_for_channel_binding(
     policy::evaluate_surface_policy(Some(channel_type.as_str()), chat_type.as_deref())
 }
 
+#[cfg(test)]
 fn should_include_private_persona_data(channel_binding: Option<&str>) -> bool {
     evaluate_policy_for_channel_binding(channel_binding).include_private_persona_data
 }
 
+#[cfg(test)]
 fn should_include_private_persona_data_for_surface(
     channel_type: Option<&str>,
     channel_chat_type: Option<&str>,
@@ -1511,16 +1524,140 @@ fn should_include_private_persona_data_for_surface(
     policy::evaluate_surface_policy(channel_type, channel_chat_type).include_private_persona_data
 }
 
-fn apply_private_persona_data_policy(persona: &mut PromptPersona, include_private: bool) {
-    if include_private {
-        return;
+fn apply_private_persona_data_policy(
+    persona: &mut PromptPersona,
+    include_private: bool,
+    include_memory_bootstrap: bool,
+) {
+    if !include_private {
+        #[cfg(feature = "metrics")]
+        counter!("moltis_policy_private_persona_blocked_total").increment(1);
+        // Group/public/unknown channel surfaces should not receive private
+        // always-loaded persona context by default.
+        persona.user.name = None;
+        persona.user.location = None;
+    }
+    if !include_memory_bootstrap {
+        #[cfg(feature = "metrics")]
+        counter!("moltis_policy_memory_bootstrap_blocked_total").increment(1);
+        persona.memory_text = None;
+    }
+}
+
+fn enforce_strict_soul_routing(agent_id: &str, persona: &PromptPersona) -> error::Result<()> {
+    if !persona.config.chat.deterministic_policy.strict_soul_routing {
+        return Ok(());
+    }
+    let soul = persona.soul_text.as_deref().unwrap_or_default();
+    let issues = collect_soul_routing_issues(soul);
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let detail = issues.join("; ");
+    Err(error::Error::message(format!(
+        "agent '{agent_id}' failed strict SOUL routing validation: {detail}"
+    )))
+}
+
+fn user_content_to_search_text(user_content: &UserContent) -> String {
+    match user_content {
+        UserContent::Text(text) => text.to_ascii_lowercase(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text(text) => Some(text.as_str()),
+                ContentPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase(),
+    }
+}
+
+fn tokenize_lower(text: &str) -> HashSet<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| token.len() >= 3)
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn extract_memory_fact_units(memory_text: &str) -> Vec<String> {
+    let mut facts = Vec::new();
+    for raw in memory_text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let normalized = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .unwrap_or(trimmed)
+            .trim();
+        if !normalized.is_empty() {
+            facts.push(normalized.to_string());
+        }
+    }
+    facts
+}
+
+fn score_memory_fact(fact: &str, query_tokens: &HashSet<String>) -> f64 {
+    let fact_lower = fact.to_ascii_lowercase();
+    let fact_tokens = tokenize_lower(&fact_lower);
+    if fact_tokens.is_empty() {
+        return 0.0;
+    }
+    let overlap = query_tokens.intersection(&fact_tokens).count();
+    let overlap_score = if query_tokens.is_empty() {
+        0.0
+    } else {
+        overlap as f64 / query_tokens.len() as f64
+    };
+    let pinned_boost = if fact_lower.contains("[pinned]") || fact_lower.contains("[core]") {
+        0.35
+    } else {
+        0.0
+    };
+    (overlap_score + pinned_boost).min(1.0)
+}
+
+fn select_memory_bootstrap(
+    memory_text: Option<&str>,
+    query_text: &str,
+    policy_cfg: &moltis_config::DeterministicPolicyConfig,
+) -> Option<String> {
+    let Some(memory_text) = memory_text else {
+        return None;
+    };
+    let facts = extract_memory_fact_units(memory_text);
+    if facts.is_empty() {
+        return None;
+    }
+    let query_tokens = tokenize_lower(query_text);
+    let mut scored: Vec<(f64, String)> = facts
+        .into_iter()
+        .map(|fact| {
+            let score = score_memory_fact(&fact, &query_tokens);
+            (score, fact)
+        })
+        .filter(|(score, fact)| {
+            *score >= policy_cfg.memory_relevance_min_score
+                || fact.to_ascii_lowercase().contains("[pinned]")
+                || (query_tokens.is_empty() && fact.to_ascii_lowercase().contains("[core]"))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(policy_cfg.max_memory_facts_in_prompt);
+    if scored.is_empty() {
+        return None;
     }
 
-    // Group/public/unknown channel surfaces should not receive private
-    // always-loaded persona context by default.
-    persona.user.name = None;
-    persona.user.location = None;
-    persona.memory_text = None;
+    let mut out = String::from("## Selected Memory Facts\n");
+    for (_, fact) in scored {
+        out.push_str("- ");
+        out.push_str(fact.trim());
+        out.push('\n');
+    }
+    Some(out.trim().to_string())
 }
 
 #[derive(Default)]
@@ -5228,15 +5365,41 @@ impl ChatService for LiveChatService {
         let project_context = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+        let memory_query = params
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let selected_memory = select_memory_bootstrap(
+            persona.memory_text.as_deref(),
+            memory_query,
+            &persona.config.chat.deterministic_policy,
+        );
         let truncations = collect_prompt_section_truncations(
             project_context.as_deref(),
             persona.soul_text.as_deref(),
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
             persona.heartbeat_text.as_deref(),
-            persona.memory_text.as_deref(),
+            selected_memory.as_deref(),
             Some(&persona.config.chat.prompt_budgets),
         );
+        let dropped_sections = collect_dropped_prompt_sections(
+            project_context.as_deref(),
+            persona.soul_text.as_deref(),
+            persona.agents_text.as_deref(),
+            persona.tools_text.as_deref(),
+            persona.heartbeat_text.as_deref(),
+            selected_memory.as_deref(),
+            Some(&persona.config.chat.prompt_budgets),
+        );
+        #[cfg(feature = "metrics")]
+        for item in &dropped_sections {
+            counter!(
+                "moltis_policy_dropped_sections_total",
+                labels::MODE => item.bucket.as_str().to_string()
+            )
+            .increment(1);
+        }
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5287,7 +5450,7 @@ impl ChatService for LiveChatService {
                 persona.heartbeat_text.as_deref(),
                 Some(&persona.config.chat.prompt_budgets),
                 Some(&runtime_context),
-                persona.memory_text.as_deref(),
+                selected_memory.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime_workspace_budgets(
@@ -5300,7 +5463,7 @@ impl ChatService for LiveChatService {
                 persona.heartbeat_text.as_deref(),
                 Some(&persona.config.chat.prompt_budgets),
                 Some(&runtime_context),
-                persona.memory_text.as_deref(),
+                selected_memory.as_deref(),
             )
         };
 
@@ -5316,10 +5479,12 @@ impl ChatService for LiveChatService {
             "promptAgentId": prompt_agent_id,
             "personaDiagnostics": persona_issues_to_json(&persona_diagnostics),
             "truncations": truncations_to_json(&truncations),
+            "droppedSections": dropped_sections_to_json(&dropped_sections),
             "includePrivatePersonaData": runtime_policy.include_private_persona_data,
             "includeMemoryBootstrap": runtime_policy.include_memory_bootstrap,
             "allowExternalEffects": runtime_policy.allow_external_effects,
             "policyDecisions": policy_decisions_to_json(&runtime_policy.decisions),
+            "untrustedTransforms": policy_transforms_to_json(&runtime_policy.decisions),
         }))
     }
 
@@ -5376,15 +5541,41 @@ impl ChatService for LiveChatService {
         let project_context = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
+        let memory_query = params
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let selected_memory = select_memory_bootstrap(
+            persona.memory_text.as_deref(),
+            memory_query,
+            &persona.config.chat.deterministic_policy,
+        );
         let truncations = collect_prompt_section_truncations(
             project_context.as_deref(),
             persona.soul_text.as_deref(),
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
             persona.heartbeat_text.as_deref(),
-            persona.memory_text.as_deref(),
+            selected_memory.as_deref(),
             Some(&persona.config.chat.prompt_budgets),
         );
+        let dropped_sections = collect_dropped_prompt_sections(
+            project_context.as_deref(),
+            persona.soul_text.as_deref(),
+            persona.agents_text.as_deref(),
+            persona.tools_text.as_deref(),
+            persona.heartbeat_text.as_deref(),
+            selected_memory.as_deref(),
+            Some(&persona.config.chat.prompt_budgets),
+        );
+        #[cfg(feature = "metrics")]
+        for item in &dropped_sections {
+            counter!(
+                "moltis_policy_dropped_sections_total",
+                labels::MODE => item.bucket.as_str().to_string()
+            )
+            .increment(1);
+        }
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5433,7 +5624,7 @@ impl ChatService for LiveChatService {
                 persona.heartbeat_text.as_deref(),
                 Some(&persona.config.chat.prompt_budgets),
                 Some(&runtime_context),
-                persona.memory_text.as_deref(),
+                selected_memory.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime_workspace_budgets(
@@ -5446,7 +5637,7 @@ impl ChatService for LiveChatService {
                 persona.heartbeat_text.as_deref(),
                 Some(&persona.config.chat.prompt_budgets),
                 Some(&runtime_context),
-                persona.memory_text.as_deref(),
+                selected_memory.as_deref(),
             )
         };
 
@@ -5509,10 +5700,12 @@ impl ChatService for LiveChatService {
             "promptAgentId": prompt_agent_id,
             "personaDiagnostics": persona_issues_to_json(&persona_diagnostics),
             "truncations": truncations_to_json(&truncations),
+            "droppedSections": dropped_sections_to_json(&dropped_sections),
             "includePrivatePersonaData": runtime_policy.include_private_persona_data,
             "includeMemoryBootstrap": runtime_policy.include_memory_bootstrap,
             "allowExternalEffects": runtime_policy.allow_external_effects,
             "policyDecisions": policy_decisions_to_json(&runtime_policy.decisions),
+            "untrustedTransforms": policy_transforms_to_json(&runtime_policy.decisions),
         }))
     }
 
@@ -6516,8 +6709,33 @@ async fn run_with_tools(
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
     let mut persona = load_prompt_persona_for_agent(agent_id);
+    if let Err(err) = enforce_strict_soul_routing(agent_id, &persona) {
+        let error_obj = parse_chat_error(&err.to_string(), Some(provider_name));
+        deliver_channel_error(state, session_key, &error_obj).await;
+        let error_payload = ChatErrorBroadcast {
+            run_id: run_id.to_string(),
+            session_key: session_key.to_string(),
+            state: "error",
+            error: error_obj,
+            seq: client_seq,
+        };
+        #[allow(clippy::unwrap_used)] // serializing known-valid struct
+        let payload_val = serde_json::to_value(&error_payload).unwrap();
+        broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
+        return None;
+    }
     let runtime_policy = policy::evaluate_runtime_policy(runtime_context);
-    apply_private_persona_data_policy(&mut persona, runtime_policy.include_private_persona_data);
+    apply_private_persona_data_policy(
+        &mut persona,
+        runtime_policy.include_private_persona_data,
+        runtime_policy.include_memory_bootstrap,
+    );
+    let memory_query = user_content_to_search_text(user_content);
+    let selected_memory = select_memory_bootstrap(
+        persona.memory_text.as_deref(),
+        &memory_query,
+        &persona.config.chat.deterministic_policy,
+    );
 
     let tool_mode = effective_tool_mode(&*provider);
     let native_tools = matches!(tool_mode, ToolMode::Native);
@@ -6553,7 +6771,7 @@ async fn run_with_tools(
             persona.heartbeat_text.as_deref(),
             Some(&persona.config.chat.prompt_budgets),
             runtime_context,
-            persona.memory_text.as_deref(),
+            selected_memory.as_deref(),
         )
     } else {
         build_system_prompt_minimal_runtime_workspace_budgets(
@@ -6566,7 +6784,7 @@ async fn run_with_tools(
             persona.heartbeat_text.as_deref(),
             Some(&persona.config.chat.prompt_budgets),
             runtime_context,
-            persona.memory_text.as_deref(),
+            selected_memory.as_deref(),
         )
     };
 
@@ -7463,8 +7681,33 @@ async fn run_streaming(
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
     let mut persona = load_prompt_persona_for_agent(agent_id);
+    if let Err(err) = enforce_strict_soul_routing(agent_id, &persona) {
+        let error_obj = parse_chat_error(&err.to_string(), Some(provider_name));
+        deliver_channel_error(state, session_key, &error_obj).await;
+        let error_payload = ChatErrorBroadcast {
+            run_id: run_id.to_string(),
+            session_key: session_key.to_string(),
+            state: "error",
+            error: error_obj,
+            seq: client_seq,
+        };
+        #[allow(clippy::unwrap_used)] // serializing known-valid struct
+        let payload_val = serde_json::to_value(&error_payload).unwrap();
+        broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
+        return None;
+    }
     let runtime_policy = policy::evaluate_runtime_policy(runtime_context);
-    apply_private_persona_data_policy(&mut persona, runtime_policy.include_private_persona_data);
+    apply_private_persona_data_policy(
+        &mut persona,
+        runtime_policy.include_private_persona_data,
+        runtime_policy.include_memory_bootstrap,
+    );
+    let memory_query = user_content_to_search_text(user_content);
+    let selected_memory = select_memory_bootstrap(
+        persona.memory_text.as_deref(),
+        &memory_query,
+        &persona.config.chat.deterministic_policy,
+    );
 
     let system_prompt = build_system_prompt_minimal_runtime_workspace_budgets(
         project_context,
@@ -7476,7 +7719,7 @@ async fn run_streaming(
         persona.heartbeat_text.as_deref(),
         Some(&persona.config.chat.prompt_budgets),
         runtime_context,
-        persona.memory_text.as_deref(),
+        selected_memory.as_deref(),
     );
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
@@ -9235,7 +9478,8 @@ mod tests {
             Some("# SOUL.md\n\n<!-- lane:not_valid -->\n## Identity\nTruth first.\n".to_string());
         let issues = validate_prompt_persona("main", &persona);
         assert!(issues.iter().any(|issue| issue.code == "identity_empty"));
-        assert!(issues.iter().any(|issue| issue.code == "soul_lane_unknown"));
+        assert!(issues.iter().any(|issue| issue.code == "soul_routing_issue"
+            && issue.message.contains("invalid SOUL lane marker")));
     }
 
     #[test]
@@ -10213,10 +10457,16 @@ mod tests {
                 .any(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant")),
             "explicit /sh should persist an assistant turn for history coherence"
         );
-        assert!(
-            !moltis_agents::self_repair::is_session_running(&state_store, "main").await,
-            "self-repair running marker should be cleared when /sh run completes"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !moltis_agents::self_repair::is_session_running(&state_store, "main").await {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("self-repair running marker should be cleared when /sh run completes");
     }
 
     #[tokio::test]
