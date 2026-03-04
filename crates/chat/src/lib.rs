@@ -1462,6 +1462,31 @@ fn apply_runtime_tool_filters(
     base_registry.clone_allowed_by(|name| policy.is_allowed(name))
 }
 
+const DEFAULT_SKILL_SELECTION_TOKEN_BUDGET: usize = 4_000;
+
+fn latest_user_message_text(history: &[Value]) -> Option<String> {
+    history.iter().rev().find_map(|entry| {
+        if entry.get("role").and_then(Value::as_str) != Some("user") {
+            return None;
+        }
+        extract_preview_from_value(entry)
+    })
+}
+
+fn select_relevant_skills(
+    skills: &[moltis_skills::types::SkillMetadata],
+    message: &str,
+) -> Vec<moltis_skills::types::SkillMetadata> {
+    let query = message.trim();
+    if skills.is_empty() || query.is_empty() {
+        return Vec::new();
+    }
+    moltis_skills::selector::select_skills(skills, query, DEFAULT_SKILL_SELECTION_TOKEN_BUDGET)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 // ── Disabled Models Store ────────────────────────────────────────────────────
 
 /// Persistent store for disabled model IDs.
@@ -3256,6 +3281,17 @@ impl ChatService for LiveChatService {
                 Vec::new()
             },
         };
+        let selected_skills = select_relevant_skills(&discovered_skills, &text);
+        if !selected_skills.is_empty() {
+            debug!(
+                selected = selected_skills
+                    .iter()
+                    .map(|skill| skill.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "selected relevant skills for prompt injection"
+            );
+        }
 
         // Check if MCP tools are disabled for this session and capture
         // per-session sandbox override details for prompt runtime context.
@@ -3693,7 +3729,7 @@ impl ChatService for LiveChatService {
                         desired_reply_medium,
                         ctx_ref,
                         user_message_index,
-                        &discovered_skills,
+                        &selected_skills,
                         Some(&runtime_context),
                         Some(&session_store),
                         client_seq,
@@ -3716,7 +3752,7 @@ impl ChatService for LiveChatService {
                         ctx_ref,
                         Some(&runtime_context),
                         user_message_index,
-                        &discovered_skills,
+                        &selected_skills,
                         hook_registry,
                         accept_language.clone(),
                         conn_id.clone(),
@@ -4857,6 +4893,14 @@ impl ChatService for LiveChatService {
                 Vec::new()
             },
         };
+        let selection_query = params
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(String::from)
+            .or_else(|| latest_user_message_text(&history))
+            .unwrap_or_default();
+        let selected_skills = select_relevant_skills(&discovered_skills, &selection_query);
 
         // Check MCP disabled.
         let mcp_disabled = session_entry
@@ -4871,7 +4915,7 @@ impl ChatService for LiveChatService {
                 apply_runtime_tool_filters(
                     &registry_guard,
                     &persona.config,
-                    &discovered_skills,
+                    &selected_skills,
                     mcp_disabled,
                 )
             } else {
@@ -4887,7 +4931,7 @@ impl ChatService for LiveChatService {
                 &filtered_registry,
                 native_tools,
                 project_context.as_deref(),
-                &discovered_skills,
+                &selected_skills,
                 Some(&persona.identity),
                 Some(&persona.user),
                 persona.soul_text.as_deref(),
@@ -4980,6 +5024,14 @@ impl ChatService for LiveChatService {
                 Vec::new()
             },
         };
+        let selection_query = params
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(String::from)
+            .or_else(|| latest_user_message_text(&history))
+            .unwrap_or_default();
+        let selected_skills = select_relevant_skills(&discovered_skills, &selection_query);
 
         // Check MCP disabled.
         let mcp_disabled = session_entry
@@ -4994,7 +5046,7 @@ impl ChatService for LiveChatService {
                 apply_runtime_tool_filters(
                     &registry_guard,
                     &persona.config,
-                    &discovered_skills,
+                    &selected_skills,
                     mcp_disabled,
                 )
             } else {
@@ -5008,7 +5060,7 @@ impl ChatService for LiveChatService {
                 &filtered_registry,
                 native_tools,
                 project_context.as_deref(),
-                &discovered_skills,
+                &selected_skills,
                 Some(&persona.identity),
                 Some(&persona.user),
                 persona.soul_text.as_deref(),
@@ -10411,6 +10463,58 @@ mod tests {
         let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
         assert!(filtered.get("create_skill").is_some());
         assert!(filtered.get("web_fetch").is_some());
+    }
+
+    #[test]
+    fn skill_selection_prefilters_to_relevant_skills() {
+        let skills = vec![
+            moltis_skills::types::SkillMetadata {
+                name: "git-commit".into(),
+                description: "Create and amend git commits".into(),
+                license: None,
+                compatibility: None,
+                allowed_tools: vec![],
+                homepage: None,
+                dockerfile: None,
+                requires: Default::default(),
+                path: PathBuf::new(),
+                source: Some(moltis_skills::types::SkillSource::Project),
+            },
+            moltis_skills::types::SkillMetadata {
+                name: "weather".into(),
+                description: "Forecast lookup".into(),
+                license: None,
+                compatibility: None,
+                allowed_tools: vec![],
+                homepage: None,
+                dockerfile: None,
+                requires: Default::default(),
+                path: PathBuf::new(),
+                source: Some(moltis_skills::types::SkillSource::Registry),
+            },
+        ];
+
+        let selected = select_relevant_skills(&skills, "please help me amend this commit");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "git-commit");
+    }
+
+    #[test]
+    fn latest_user_message_text_reads_last_user_message() {
+        let history = vec![
+            serde_json::json!({ "role": "user", "content": "first question" }),
+            serde_json::json!({ "role": "assistant", "content": "answer" }),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "latest" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } }
+                ]
+            }),
+        ];
+
+        let latest = latest_user_message_text(&history).expect("latest user message");
+        assert_eq!(latest, "latest");
     }
 
     #[test]
