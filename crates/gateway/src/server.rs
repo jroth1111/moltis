@@ -1215,6 +1215,7 @@ pub async fn prepare_gateway(
     }
 
     // Initialize OTLP tracing exporter when configured.
+    #[cfg(feature = "metrics")]
     if let Some(endpoint) = &config.metrics.otlp_endpoint
         && let Err(e) = moltis_metrics::init_otlp(endpoint, "moltis")
     {
