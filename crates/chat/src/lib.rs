@@ -337,7 +337,51 @@ fn estimate_text_tokens(text: &str) -> u64 {
     bytes.div_ceil(4).max(1)
 }
 
+#[must_use]
+fn estimate_history_tokens(history: &[Value]) -> u64 {
+    history
+        .iter()
+        .map(|msg| estimate_text_tokens(&msg.to_string()))
+        .sum()
+}
+
 const MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS: usize = 4_000;
+const COMPACTION_STRUCTURED_SUMMARY_SYSTEM_PROMPT: &str =
+    "You are a conversation summarizer. Summarize only the compressible history and preserve key context. Do not invent facts. Do not include raw tool payload dumps.";
+const COMPACTION_EMPTY_GAP_SUMMARY: &str =
+    "No compressible background turns required summarization. Anchors and recent turns were preserved verbatim.";
+
+#[must_use]
+fn compaction_structured_summary_user_prompt(summary_budget_tokens: u64) -> String {
+    format!(
+        "Summarize the compressible history into at most {summary_budget_tokens} tokens. \
+Use exactly these sections in order and output only these sections:\n\
+Decisions\n\
+State\n\
+Open Items\n\
+Constraints\n\
+Artifacts\n\
+For empty sections write '- none'."
+    )
+}
+
+#[must_use]
+fn build_compaction_summary_messages(
+    normalized_summary_source: &[Value],
+    summary_budget_tokens: u64,
+) -> Vec<ChatMessage> {
+    let mut summary_messages = vec![ChatMessage::system(COMPACTION_STRUCTURED_SUMMARY_SYSTEM_PROMPT)];
+    summary_messages.extend(values_to_chat_messages(normalized_summary_source));
+    summary_messages.push(ChatMessage::user(compaction_structured_summary_user_prompt(
+        summary_budget_tokens,
+    )));
+    summary_messages
+}
+
+#[must_use]
+fn default_compaction_summary(summary_budget_tokens: u64) -> String {
+    trim_summary_to_budget(COMPACTION_EMPTY_GAP_SUMMARY, summary_budget_tokens)
+}
 
 #[must_use]
 fn dropped_messages_for_retention(history: &[Value], retained: &[Value]) -> Vec<Value> {
@@ -5343,13 +5387,7 @@ impl ChatService for LiveChatService {
             let compaction_config = context_compaction_config_from_chat(&self.chat_config);
             let summary_plan = summary_context_plan(compaction_config);
             let sections = partition_history_for_summary(&history, summary_plan);
-            let mut summary_source = sections.summary_source.clone();
-            if summary_source.is_empty() {
-                summary_source = sections.anchors.clone();
-            }
-            if summary_source.is_empty() {
-                summary_source = history.clone();
-            }
+            let summary_source = sections.summary_source.clone();
             let normalized_summary_source =
                 normalize_for_model_context(&summary_source, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
             (summary_plan, sections, summary_source, normalized_summary_source)
@@ -5357,6 +5395,7 @@ impl ChatService for LiveChatService {
         let planning_elapsed = planning_started.elapsed();
         #[cfg(feature = "metrics")]
         record_compaction_stage("manual", "plan", planning_elapsed);
+        let has_compressible_gap = !summary_source.is_empty();
 
         info!(
             session = %session_key,
@@ -5369,90 +5408,100 @@ impl ChatService for LiveChatService {
 
         // TODO(compaction): expose a dedicated config toggle for optional fact extraction.
 
-        // Pass 1: extract discrete facts as JSON for higher-quality memory retrieval.
-        let mut fact_messages = vec![ChatMessage::system(
-            "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
-        )];
-        fact_messages.extend(values_to_chat_messages(&normalized_summary_source));
-        fact_messages.push(ChatMessage::user(
-            "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
-        ));
-
         let summarization_started = Instant::now();
         let summarization_span = tracing::info_span!(
             "chat.compaction.summarize",
             session = %session_key
         );
-        let mut fact_stream = provider.stream(fact_messages);
-        let mut facts_raw = String::new();
-        while let Some(event) = fact_stream.next().instrument(summarization_span.clone()).await {
-            match event {
-                StreamEvent::Delta(delta) => facts_raw.push_str(&delta),
-                StreamEvent::Done(_) => break,
-                StreamEvent::Error(e) => {
-                    warn!(session = %session_key, error = %e, "compact fact extraction failed");
-                    break;
-                },
-                StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. }
-                | StreamEvent::ProviderRaw(_)
-                | StreamEvent::ReasoningDelta(_) => {},
+        let facts = if !has_compressible_gap {
+            Vec::new()
+        } else {
+            // Pass 1: extract discrete facts as JSON for higher-quality memory retrieval.
+            let mut fact_messages = vec![ChatMessage::system(
+                "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
+            )];
+            fact_messages.extend(values_to_chat_messages(&normalized_summary_source));
+            fact_messages.push(ChatMessage::user(
+                "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
+            ));
+
+            let mut fact_stream = provider.stream(fact_messages);
+            let mut facts_raw = String::new();
+            while let Some(event) = fact_stream.next().instrument(summarization_span.clone()).await {
+                match event {
+                    StreamEvent::Delta(delta) => facts_raw.push_str(&delta),
+                    StreamEvent::Done(_) => break,
+                    StreamEvent::Error(e) => {
+                        warn!(session = %session_key, error = %e, "compact fact extraction failed");
+                        break;
+                    },
+                    StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallArgumentsDelta { .. }
+                    | StreamEvent::ToolCallComplete { .. }
+                    | StreamEvent::ProviderRaw(_)
+                    | StreamEvent::ReasoningDelta(_) => {},
+                }
             }
-        }
-        let facts = parse_compaction_facts(&facts_raw);
+            parse_compaction_facts(&facts_raw)
+        };
 
         // Pass 2: summarize only the compressible gap; anchors and recent turns are
         // preserved verbatim.
-        let mut summary_messages = vec![ChatMessage::system(
-            "You are a conversation summarizer. Preserve key context while compressing aggressively. Do not invent facts.",
-        )];
-        summary_messages.extend(values_to_chat_messages(&normalized_summary_source));
-        summary_messages.push(ChatMessage::user(format!(
-            "Summarize the compressible history into at most {} tokens. Preserve decisions, status, open tasks, blockers, and identifiers. Output only the summary.",
-            summary_plan.summary_budget_tokens
-        )));
+        let summary = if !has_compressible_gap {
+            info!(
+                session = %session_key,
+                retained_anchors = sections.anchors.len(),
+                retained_recent = sections.recent.len(),
+                "chat.compact: no compressible gap, using deterministic summary"
+            );
+            default_compaction_summary(summary_plan.summary_budget_tokens)
+        } else {
+            let summary_messages = build_compaction_summary_messages(
+                &normalized_summary_source,
+                summary_plan.summary_budget_tokens,
+            );
+            info!(
+                session = %session_key,
+                messages = summary_source.len(),
+                summary_budget_tokens = summary_plan.summary_budget_tokens,
+                "chat.compact: summarizing"
+            );
 
-        info!(
-            session = %session_key,
-            messages = summary_source.len(),
-            summary_budget_tokens = summary_plan.summary_budget_tokens,
-            "chat.compact: summarizing"
-        );
-
-        let mut summary_stream = provider.stream(summary_messages);
-        let mut summary = String::new();
-        while let Some(event) = summary_stream
-            .next()
-            .instrument(summarization_span.clone())
-            .await
-        {
-            match event {
-                StreamEvent::Delta(delta) => summary.push_str(&delta),
-                StreamEvent::Done(_) => break,
-                StreamEvent::Error(e) => {
-                    #[cfg(feature = "metrics")]
-                    record_compaction_result("manual", "error", compact_started.elapsed());
-                    return Err(format!("compact summarization failed: {e}").into());
-                },
-                // Tool events not expected in summarization stream.
-                StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. }
-                // Provider raw payloads are debug metadata, not summary text.
-                | StreamEvent::ProviderRaw(_)
-                // Ignore provider reasoning blocks; summary body should only
-                // include final answer text.
-                | StreamEvent::ReasoningDelta(_) => {},
+            let mut summary_stream = provider.stream(summary_messages);
+            let mut summary = String::new();
+            while let Some(event) = summary_stream
+                .next()
+                .instrument(summarization_span.clone())
+                .await
+            {
+                match event {
+                    StreamEvent::Delta(delta) => summary.push_str(&delta),
+                    StreamEvent::Done(_) => break,
+                    StreamEvent::Error(e) => {
+                        #[cfg(feature = "metrics")]
+                        record_compaction_result("manual", "error", compact_started.elapsed());
+                        return Err(format!("compact summarization failed: {e}").into());
+                    },
+                    // Tool events not expected in summarization stream.
+                    StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallArgumentsDelta { .. }
+                    | StreamEvent::ToolCallComplete { .. }
+                    // Provider raw payloads are debug metadata, not summary text.
+                    | StreamEvent::ProviderRaw(_)
+                    // Ignore provider reasoning blocks; summary body should only
+                    // include final answer text.
+                    | StreamEvent::ReasoningDelta(_) => {},
+                }
             }
-        }
 
-        summary = trim_summary_to_budget(&summary, summary_plan.summary_budget_tokens);
-        if summary.trim().is_empty() {
-            #[cfg(feature = "metrics")]
-            record_compaction_result("manual", "error", compact_started.elapsed());
-            return Err("compact produced empty summary".into());
-        }
+            let summary = trim_summary_to_budget(&summary, summary_plan.summary_budget_tokens);
+            if summary.trim().is_empty() {
+                #[cfg(feature = "metrics")]
+                record_compaction_result("manual", "error", compact_started.elapsed());
+                return Err("compact produced empty summary".into());
+            }
+            summary
+        };
         let summarization_elapsed = summarization_started.elapsed();
         #[cfg(feature = "metrics")]
         record_compaction_stage("manual", "summarize", summarization_elapsed);
@@ -5469,25 +5518,31 @@ impl ChatService for LiveChatService {
         // - Narrative summary for compressible background
         // - Verbatim anchors (critical/high-value turns)
         // - Verbatim recent working memory turns
-        let compacted_msg = PersistedMessage::Assistant {
-            content: format!("[Conversation Summary]\n\n{summary}"),
-            created_at: Some(now_ms()),
-            model: None,
-            provider: None,
-            input_tokens: None,
-            output_tokens: None,
-            duration_ms: None,
-            request_input_tokens: None,
-            request_output_tokens: None,
-            tool_calls: None,
-            reasoning: None,
-            llm_api_response: None,
-            audio: None,
-            seq: None,
-            run_id: None,
-        };
-        let mut compacted = Vec::with_capacity(1 + sections.anchors.len() + sections.recent.len());
-        compacted.push(compacted_msg.to_value());
+        let summary_message = has_compressible_gap.then(|| {
+            PersistedMessage::Assistant {
+                content: format!("[Conversation Summary]\n\n{summary}"),
+                created_at: Some(now_ms()),
+                model: None,
+                provider: None,
+                input_tokens: None,
+                output_tokens: None,
+                duration_ms: None,
+                request_input_tokens: None,
+                request_output_tokens: None,
+                tool_calls: None,
+                reasoning: None,
+                llm_api_response: None,
+                audio: None,
+                seq: None,
+                run_id: None,
+            }
+            .to_value()
+        });
+        let mut compacted =
+            Vec::with_capacity(summary_message.is_some() as usize + 1 + sections.anchors.len() + sections.recent.len());
+        if let Some(message) = summary_message {
+            compacted.push(message);
+        }
         if !sections.anchors.is_empty() {
             compacted.push(
                 PersistedMessage::notice(format!(
@@ -6655,8 +6710,10 @@ async fn run_explicit_shell_command(
         reasoning: None,
         seq: client_seq,
     };
-    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-    let payload = serde_json::to_value(&final_payload).unwrap();
+    let payload = serde_json::to_value(&final_payload).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to serialize final broadcast payload");
+        serde_json::json!({})
+    });
     broadcast(state, "chat", payload, BroadcastOpts::default()).await;
 
     AssistantTurnOutput {
@@ -7888,8 +7945,10 @@ async fn run_with_tools(
                     error: error_obj,
                     seq: client_seq,
                 };
-                #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let payload_val = serde_json::to_value(&error_payload).unwrap();
+                let payload_val = serde_json::to_value(&error_payload).unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "failed to serialize error broadcast payload");
+                    serde_json::json!({})
+                });
                 broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
                 return None;
             }
@@ -7955,8 +8014,10 @@ async fn run_with_tools(
                 reasoning: reasoning.clone(),
                 seq: client_seq,
             };
-            #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let payload_val = serde_json::to_value(&final_payload).unwrap();
+            let payload_val = serde_json::to_value(&final_payload).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "failed to serialize final broadcast payload");
+                serde_json::json!({})
+            });
             broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
 
             if !is_silent {
@@ -8027,8 +8088,10 @@ async fn run_with_tools(
                 error: error_obj,
                 seq: client_seq,
             };
-            #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let payload_val = serde_json::to_value(&error_payload).unwrap();
+            let payload_val = serde_json::to_value(&error_payload).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "failed to serialize error broadcast payload");
+                serde_json::json!({})
+            });
             broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
             None
         },
@@ -8060,7 +8123,7 @@ async fn compact_session(
 
     #[cfg(feature = "metrics")]
     let planning_started = Instant::now();
-    let (summary_plan, sections, normalized_summary_source) = tracing::info_span!(
+    let (summary_plan, sections, summary_source, normalized_summary_source) = tracing::info_span!(
         "chat.compaction.plan",
         session = %session_key,
         path = COMPACTION_PATH
@@ -8068,33 +8131,16 @@ async fn compact_session(
     .in_scope(|| {
         let summary_plan = summary_context_plan(compaction_config);
         let sections = partition_history_for_summary(&history, summary_plan);
-        let mut summary_source = sections.summary_source.clone();
-        if summary_source.is_empty() {
-            summary_source = sections.anchors.clone();
-        }
-        if summary_source.is_empty() {
-            summary_source = history.clone();
-        }
+        let summary_source = sections.summary_source.clone();
         let normalized_summary_source =
             normalize_for_model_context(&summary_source, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
-        (summary_plan, sections, normalized_summary_source)
+        (summary_plan, sections, summary_source, normalized_summary_source)
     });
     #[cfg(feature = "metrics")]
     let planning_elapsed = planning_started.elapsed();
     #[cfg(feature = "metrics")]
     record_compaction_stage(COMPACTION_PATH, "plan", planning_elapsed);
-
-    // Use structured ChatMessage objects so role boundaries are maintained via
-    // the API's message structure, preventing prompt injection where user content
-    // could mimic role prefixes in concatenated text.
-    let mut summary_messages = vec![ChatMessage::system(
-        "You are a conversation summarizer. Summarize only the compressible history and preserve all key facts, decisions, and context.",
-    )];
-    summary_messages.extend(values_to_chat_messages(&normalized_summary_source));
-    summary_messages.push(ChatMessage::user(format!(
-        "Summarize the conversation above into at most {} tokens. Output only the summary, no preamble.",
-        summary_plan.summary_budget_tokens
-    )));
+    let has_compressible_gap = !summary_source.is_empty();
 
     #[cfg(feature = "metrics")]
     let summarization_started = Instant::now();
@@ -8103,61 +8149,79 @@ async fn compact_session(
         session = %session_key,
         path = COMPACTION_PATH
     );
-    let mut stream = provider.stream(summary_messages);
-    let mut summary = String::new();
-    while let Some(event) = stream.next().instrument(summarization_span.clone()).await {
-        match event {
-            StreamEvent::Delta(delta) => summary.push_str(&delta),
-            StreamEvent::Done(_) => break,
-            StreamEvent::Error(e) => {
-                #[cfg(feature = "metrics")]
-                record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
-                return Err(error::Error::message(format!(
-                    "compact summarization failed: {e}"
-                )));
-            },
-            // Tool events not expected in summarization stream.
-            StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolCallArgumentsDelta { .. }
-            | StreamEvent::ToolCallComplete { .. }
-            // Provider raw payloads are debug metadata, not summary text.
-            | StreamEvent::ProviderRaw(_)
-            // Ignore provider reasoning blocks; summary body should only
-            // include final answer text.
-            | StreamEvent::ReasoningDelta(_) => {},
+    let summary = if !has_compressible_gap {
+        default_compaction_summary(summary_plan.summary_budget_tokens)
+    } else {
+        // Use structured ChatMessage objects so role boundaries are maintained via
+        // the API's message structure, preventing prompt injection where user content
+        // could mimic role prefixes in concatenated text.
+        let summary_messages = build_compaction_summary_messages(
+            &normalized_summary_source,
+            summary_plan.summary_budget_tokens,
+        );
+        let mut stream = provider.stream(summary_messages);
+        let mut summary = String::new();
+        while let Some(event) = stream.next().instrument(summarization_span.clone()).await {
+            match event {
+                StreamEvent::Delta(delta) => summary.push_str(&delta),
+                StreamEvent::Done(_) => break,
+                StreamEvent::Error(e) => {
+                    #[cfg(feature = "metrics")]
+                    record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
+                    return Err(error::Error::message(format!(
+                        "compact summarization failed: {e}"
+                    )));
+                },
+                // Tool events not expected in summarization stream.
+                StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgumentsDelta { .. }
+                | StreamEvent::ToolCallComplete { .. }
+                // Provider raw payloads are debug metadata, not summary text.
+                | StreamEvent::ProviderRaw(_)
+                // Ignore provider reasoning blocks; summary body should only
+                // include final answer text.
+                | StreamEvent::ReasoningDelta(_) => {},
+            }
         }
-    }
 
-    summary = trim_summary_to_budget(&summary, summary_plan.summary_budget_tokens);
-    if summary.is_empty() {
-        #[cfg(feature = "metrics")]
-        record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
-        return Err(error::Error::message("compact produced empty summary"));
-    }
+        let summary = trim_summary_to_budget(&summary, summary_plan.summary_budget_tokens);
+        if summary.is_empty() {
+            #[cfg(feature = "metrics")]
+            record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
+            return Err(error::Error::message("compact produced empty summary"));
+        }
+        summary
+    };
     #[cfg(feature = "metrics")]
     let summarization_elapsed = summarization_started.elapsed();
     #[cfg(feature = "metrics")]
     record_compaction_stage(COMPACTION_PATH, "summarize", summarization_elapsed);
 
-    let compacted_msg = PersistedMessage::Assistant {
-        content: format!("[Conversation Summary]\n\n{summary}"),
-        created_at: Some(now_ms()),
-        model: None,
-        provider: None,
-        input_tokens: None,
-        output_tokens: None,
-        duration_ms: None,
-        request_input_tokens: None,
-        request_output_tokens: None,
-        tool_calls: None,
-        reasoning: None,
-        llm_api_response: None,
-        audio: None,
-        seq: None,
-        run_id: None,
-    };
-    let mut compacted = Vec::with_capacity(1 + sections.anchors.len() + sections.recent.len());
-    compacted.push(compacted_msg.to_value());
+    let summary_message = has_compressible_gap.then(|| {
+        PersistedMessage::Assistant {
+            content: format!("[Conversation Summary]\n\n{summary}"),
+            created_at: Some(now_ms()),
+            model: None,
+            provider: None,
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+            request_input_tokens: None,
+            request_output_tokens: None,
+            tool_calls: None,
+            reasoning: None,
+            llm_api_response: None,
+            audio: None,
+            seq: None,
+            run_id: None,
+        }
+        .to_value()
+    });
+    let mut compacted =
+        Vec::with_capacity(summary_message.is_some() as usize + 1 + sections.anchors.len() + sections.recent.len());
+    if let Some(message) = summary_message {
+        compacted.push(message);
+    }
     if !sections.anchors.is_empty() {
         compacted.push(
             PersistedMessage::notice(format!(
@@ -8169,6 +8233,24 @@ async fn compact_session(
     }
     compacted.extend(sections.anchors);
     compacted.extend(sections.recent);
+
+    let original_estimated_tokens = estimate_history_tokens(&history);
+    let mut compacted_estimated_tokens = estimate_history_tokens(&compacted);
+    if compacted_estimated_tokens >= original_estimated_tokens {
+        let reduction = retain_with_importance(
+            &history,
+            emergency_reduction_plan(compaction_config, provider.context_window() as u64),
+        );
+        if reduction.removed_messages > 0 {
+            compacted = reduction.messages;
+            compacted_estimated_tokens = estimate_history_tokens(&compacted);
+        }
+        if compacted_estimated_tokens >= original_estimated_tokens {
+            #[cfg(feature = "metrics")]
+            record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
+            return Err(error::Error::message("compact produced no effective reduction"));
+        }
+    }
 
     #[cfg(feature = "metrics")]
     let apply_started = Instant::now();
@@ -8475,8 +8557,10 @@ async fn run_streaming(
                             error: error_obj,
                             seq: client_seq,
                         };
-                        #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                        let payload_val = serde_json::to_value(&error_payload).unwrap();
+                        let payload_val = serde_json::to_value(&error_payload).unwrap_or_else(|e| {
+                            tracing::error!(error = %e, "failed to serialize error broadcast payload");
+                            serde_json::json!({})
+                        });
                         broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
                         return None;
                     }
@@ -8541,8 +8625,10 @@ async fn run_streaming(
                         reasoning: reasoning.clone(),
                         seq: client_seq,
                     };
-                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                    let payload_val = serde_json::to_value(&final_payload).unwrap();
+                    let payload_val = serde_json::to_value(&final_payload).unwrap_or_else(|e| {
+                        tracing::error!(error = %e, "failed to serialize final broadcast payload");
+                        serde_json::json!({})
+                    });
                     broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
 
                     if !is_silent {
@@ -8641,8 +8727,10 @@ async fn run_streaming(
                         error: error_obj,
                         seq: client_seq,
                     };
-                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                    let payload_val = serde_json::to_value(&error_payload).unwrap();
+                    let payload_val = serde_json::to_value(&error_payload).unwrap_or_else(|e| {
+                        tracing::error!(error = %e, "failed to serialize error broadcast payload");
+                        serde_json::json!({})
+                    });
                     broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
                     return None;
                 },
@@ -10032,6 +10120,34 @@ mod tests {
         assert_eq!(estimate_text_tokens("a"), 1);
         assert_eq!(estimate_text_tokens("abcd"), 1);
         assert_eq!(estimate_text_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn compaction_summary_messages_use_structured_sections() {
+        let messages = build_compaction_summary_messages(&[], 512);
+        let Some(ChatMessage::System { content }) = messages.first() else {
+            panic!("first message should be system");
+        };
+        assert!(content.contains("Do not include raw tool payload dumps"));
+
+        let Some(ChatMessage::User { content }) = messages.last() else {
+            panic!("last message should be user");
+        };
+        let UserContent::Text(prompt) = content else {
+            panic!("summary prompt should be text");
+        };
+        assert!(prompt.contains("Decisions"));
+        assert!(prompt.contains("State"));
+        assert!(prompt.contains("Open Items"));
+        assert!(prompt.contains("Constraints"));
+        assert!(prompt.contains("Artifacts"));
+    }
+
+    #[test]
+    fn default_compaction_summary_honors_budget() {
+        let summary = default_compaction_summary(8);
+        assert!(!summary.is_empty());
+        assert!(summary.contains("Anchors and recent turns") || summary.ends_with('…'));
     }
 
     #[test]

@@ -427,11 +427,15 @@ pub(crate) fn classify_importance(message: &Value) -> Importance {
     let text = message_text(message);
     let lower = text.to_ascii_lowercase();
 
-    if has_tool_calls(message) || matches!(role, "tool" | "tool_result") || text.contains("```") {
+    if has_tool_calls(message) || matches!(role, "tool" | "tool_result") {
         return Importance::Critical;
     }
 
-    if has_decision_markers(&lower) {
+    if has_decision_markers(&lower) || has_constraint_markers(&lower) {
+        return Importance::Critical;
+    }
+
+    if text.contains("```") || has_error_or_command_markers(&lower) {
         return Importance::High;
     }
 
@@ -493,8 +497,15 @@ fn select_anchor_indices(
 
 fn collect_anchor_groups(history: &[Value]) -> Vec<AnchorGroup> {
     let mut groups = collect_tool_chain_groups(history);
+    let tool_chain_indices: BTreeSet<usize> = groups
+        .iter()
+        .flat_map(|group| group.indices.iter().copied())
+        .collect();
 
     for (idx, message) in history.iter().enumerate() {
+        if tool_chain_indices.contains(&idx) {
+            continue;
+        }
         let importance = classify_importance(message);
         if importance < Importance::High {
             continue;
@@ -606,6 +617,35 @@ fn has_decision_markers(lower: &str) -> bool {
     DECISION_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+fn has_constraint_markers(lower: &str) -> bool {
+    const CONSTRAINT_MARKERS: &[&str] = &[
+        "hard constraint",
+        "must",
+        "must not",
+        "do not",
+        "never",
+        "required",
+        "cannot",
+    ];
+    CONSTRAINT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn has_error_or_command_markers(lower: &str) -> bool {
+    const ERROR_MARKERS: &[&str] = &[
+        "error:",
+        "failed",
+        "stderr",
+        "traceback",
+        "exception",
+        "exit code",
+        "command output",
+        "stdout",
+    ];
+    ERROR_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 fn looks_like_acknowledgement(lower: &str) -> bool {
     let normalized = lower
         .trim()
@@ -710,7 +750,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_importance_prioritizes_tool_and_code_context() {
+    fn classify_importance_follows_v2_tiers() {
         let tool_msg = json!({
             "role": "assistant",
             "content": "calling tool",
@@ -718,11 +758,29 @@ mod tests {
         });
         assert_eq!(classify_importance(&tool_msg), Importance::Critical);
 
+        let decision_msg = json!({
+            "role": "assistant",
+            "content": "Decision: ship this on Friday."
+        });
+        assert_eq!(classify_importance(&decision_msg), Importance::Critical);
+
+        let constraint_msg = json!({
+            "role": "system",
+            "content": "Hard constraint: do not expose private keys."
+        });
+        assert_eq!(classify_importance(&constraint_msg), Importance::Critical);
+
         let code_msg = json!({
             "role": "assistant",
             "content": "```rs\nfn main() {}\n```"
         });
-        assert_eq!(classify_importance(&code_msg), Importance::Critical);
+        assert_eq!(classify_importance(&code_msg), Importance::High);
+
+        let diagnostics_msg = json!({
+            "role": "assistant",
+            "content": "stderr: command failed with exit code 1"
+        });
+        assert_eq!(classify_importance(&diagnostics_msg), Importance::High);
 
         let ack_msg = json!({"role": "user", "content": "thanks"});
         assert_eq!(classify_importance(&ack_msg), Importance::Low);
@@ -774,6 +832,64 @@ mod tests {
                 .any(|msg| msg.get("tool_calls").is_some()),
             "assistant tool call anchor should be retained"
         );
+    }
+
+    #[test]
+    fn partition_history_for_summary_never_keeps_tool_result_without_call() {
+        let history = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({
+                "role": "assistant",
+                "content": "running",
+                "tool_calls": [{ "id": "tc-1", "type": "function", "function": { "name": "exec", "arguments": "{}" }}]
+            }),
+            json!({
+                "role": "tool_result",
+                "tool_call_id": "tc-1",
+                "tool_name": "exec",
+                "success": true,
+                "result": {"stdout": "ok"}
+            }),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+
+        let sections = partition_history_for_summary(
+            &history,
+            SummaryContextPlan {
+                verbatim_turns: 1,
+                anchor_budget_tokens: 2_048,
+                summary_budget_tokens: 1_024,
+            },
+        );
+        let anchored_tool_call_ids: BTreeSet<String> = sections
+            .anchors
+            .iter()
+            .flat_map(|msg| {
+                msg.get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flat_map(|calls| {
+                        calls
+                            .iter()
+                            .filter_map(|call| call.get("id").and_then(Value::as_str))
+                            .map(ToString::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let anchored_result_ids: Vec<String> = sections
+            .anchors
+            .iter()
+            .filter_map(|msg| msg.get("tool_call_id").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect();
+
+        for result_id in anchored_result_ids {
+            assert!(
+                anchored_tool_call_ids.contains(&result_id),
+                "tool_result {result_id} was anchored without matching initiating tool call"
+            );
+        }
     }
 
     #[test]
@@ -860,6 +976,24 @@ mod tests {
                 .iter()
                 .any(|msg| msg.get("role").and_then(Value::as_str) == Some("tool_result")),
             "must preserve at least one tool result anchor"
+        );
+    }
+
+    #[test]
+    fn anchor_selection_never_truncates_tool_chain_group_mid_span() {
+        let history = vec![
+            json!({
+                "role": "assistant",
+                "content": "running",
+                "tool_calls": [{ "id": "tc-1", "type": "function", "function": { "name": "exec", "arguments": "{}" }}]
+            }),
+            json!({"role": "tool_result", "tool_call_id": "tc-1", "result": {"stdout": "very long output"}}),
+        ];
+        let required_tokens: u64 = history.iter().map(estimate_message_tokens).sum();
+        let selected = select_anchor_indices(&history, required_tokens.saturating_sub(1), 8);
+        assert!(
+            selected.is_empty(),
+            "selection must skip the entire chain when budget cannot fit the full span"
         );
     }
 
