@@ -1490,8 +1490,8 @@ fn load_prompt_persona_for_session(
     );
     apply_private_persona_data_policy(
         &mut persona,
-        policy_eval.include_private_persona_data,
-        policy_eval.include_memory_bootstrap,
+        policy_eval.include_private_persona_data(),
+        policy_eval.include_memory_bootstrap(),
     );
     Ok(persona)
 }
@@ -1514,7 +1514,7 @@ fn evaluate_policy_for_channel_binding(
 
 #[cfg(test)]
 fn should_include_private_persona_data(channel_binding: Option<&str>) -> bool {
-    evaluate_policy_for_channel_binding(channel_binding).include_private_persona_data
+    evaluate_policy_for_channel_binding(channel_binding).include_private_persona_data()
 }
 
 #[cfg(test)]
@@ -1522,7 +1522,7 @@ fn should_include_private_persona_data_for_surface(
     channel_type: Option<&str>,
     channel_chat_type: Option<&str>,
 ) -> bool {
-    policy::evaluate_surface_policy(channel_type, channel_chat_type).include_private_persona_data
+    policy::evaluate_surface_policy(channel_type, channel_chat_type).include_private_persona_data()
 }
 
 fn apply_private_persona_data_policy(
@@ -5495,9 +5495,9 @@ impl ChatService for LiveChatService {
             "personaDiagnostics": persona_issues_to_json(&persona_diagnostics),
             "truncations": truncations_to_json(&truncations),
             "droppedSections": dropped_sections_to_json(&dropped_sections),
-            "includePrivatePersonaData": runtime_policy.include_private_persona_data,
-            "includeMemoryBootstrap": runtime_policy.include_memory_bootstrap,
-            "allowExternalEffects": runtime_policy.allow_external_effects,
+            "includePrivatePersonaData": runtime_policy.include_private_persona_data(),
+            "includeMemoryBootstrap": runtime_policy.include_memory_bootstrap(),
+            "allowExternalEffects": runtime_policy.allow_external_effects(),
             "policyDecisions": policy_decisions_to_json(&runtime_policy.decisions),
             "untrustedTransforms": policy_transforms_to_json(&runtime_policy.decisions),
         }))
@@ -5722,9 +5722,9 @@ impl ChatService for LiveChatService {
             "personaDiagnostics": persona_issues_to_json(&persona_diagnostics),
             "truncations": truncations_to_json(&truncations),
             "droppedSections": dropped_sections_to_json(&dropped_sections),
-            "includePrivatePersonaData": runtime_policy.include_private_persona_data,
-            "includeMemoryBootstrap": runtime_policy.include_memory_bootstrap,
-            "allowExternalEffects": runtime_policy.allow_external_effects,
+            "includePrivatePersonaData": runtime_policy.include_private_persona_data(),
+            "includeMemoryBootstrap": runtime_policy.include_memory_bootstrap(),
+            "allowExternalEffects": runtime_policy.allow_external_effects(),
             "policyDecisions": policy_decisions_to_json(&runtime_policy.decisions),
             "untrustedTransforms": policy_transforms_to_json(&runtime_policy.decisions),
         }))
@@ -6748,8 +6748,8 @@ async fn run_with_tools(
     let runtime_policy = policy::evaluate_runtime_policy(runtime_context);
     apply_private_persona_data_policy(
         &mut persona,
-        runtime_policy.include_private_persona_data,
-        runtime_policy.include_memory_bootstrap,
+        runtime_policy.include_private_persona_data(),
+        runtime_policy.include_memory_bootstrap(),
     );
     let memory_query = user_content_to_search_text(user_content);
     let selected_memory = select_memory_bootstrap(
@@ -7244,7 +7244,7 @@ async fn run_with_tools(
     // resolve per-session state and forward the user's locale to web requests.
     let mut tool_context = serde_json::json!({
         "_session_key": session_key,
-        "_allow_external_effects": runtime_policy.allow_external_effects,
+        "_allow_external_effects": runtime_policy.allow_external_effects(),
     });
     if let Some(lang) = accept_language.as_deref() {
         tool_context["_accept_language"] = serde_json::json!(lang);
@@ -7744,8 +7744,8 @@ async fn run_streaming(
     let runtime_policy = policy::evaluate_runtime_policy(runtime_context);
     apply_private_persona_data_policy(
         &mut persona,
-        runtime_policy.include_private_persona_data,
-        runtime_policy.include_memory_bootstrap,
+        runtime_policy.include_private_persona_data(),
+        runtime_policy.include_memory_bootstrap(),
     );
     let memory_query = user_content_to_search_text(user_content);
     let selected_memory = select_memory_bootstrap(

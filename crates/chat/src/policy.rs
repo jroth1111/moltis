@@ -45,18 +45,40 @@ pub struct PolicyDecision {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptPolicyEvaluation {
-    pub include_private_persona_data: bool,
-    pub include_memory_bootstrap: bool,
-    pub allow_external_effects: bool,
     pub decisions: Vec<PolicyDecision>,
 }
 
 impl PromptPolicyEvaluation {
+    fn surface_allows_private(&self) -> bool {
+        self.decisions
+            .iter()
+            .find_map(|decision| match decision.code {
+                PolicyReasonCode::SurfacePrivate | PolicyReasonCode::SurfaceNonChannel => Some(true),
+                PolicyReasonCode::SurfaceNonPrivate | PolicyReasonCode::SurfaceUnclassified => {
+                    Some(false)
+                },
+                _ => None,
+            })
+            .unwrap_or(true)
+    }
+
+    #[must_use]
+    pub fn include_private_persona_data(&self) -> bool {
+        self.surface_allows_private()
+    }
+
+    #[must_use]
+    pub fn include_memory_bootstrap(&self) -> bool {
+        self.surface_allows_private()
+    }
+
+    #[must_use]
+    pub fn allow_external_effects(&self) -> bool {
+        self.surface_allows_private()
+    }
+
     fn private_default() -> Self {
         Self {
-            include_private_persona_data: true,
-            include_memory_bootstrap: true,
-            allow_external_effects: true,
             decisions: vec![PolicyDecision {
                 code: PolicyReasonCode::SurfaceNonChannel,
                 outcome: PolicyOutcome::Allow,
@@ -78,9 +100,6 @@ pub fn evaluate_surface_policy(
     let channel_type = channel_type.to_ascii_lowercase();
     let Some(chat_type) = channel_chat_type else {
         return PromptPolicyEvaluation {
-            include_private_persona_data: false,
-            include_memory_bootstrap: false,
-            allow_external_effects: false,
             decisions: vec![PolicyDecision {
                 code: PolicyReasonCode::SurfaceUnclassified,
                 outcome: PolicyOutcome::Deny,
@@ -101,9 +120,6 @@ pub fn evaluate_surface_policy(
 
     if is_private {
         return PromptPolicyEvaluation {
-            include_private_persona_data: true,
-            include_memory_bootstrap: true,
-            allow_external_effects: true,
             decisions: vec![PolicyDecision {
                 code: PolicyReasonCode::SurfacePrivate,
                 outcome: PolicyOutcome::Allow,
@@ -116,9 +132,6 @@ pub fn evaluate_surface_policy(
     }
 
     PromptPolicyEvaluation {
-        include_private_persona_data: false,
-        include_memory_bootstrap: false,
-        allow_external_effects: false,
         decisions: vec![PolicyDecision {
             code: PolicyReasonCode::SurfaceNonPrivate,
             outcome: PolicyOutcome::Deny,
@@ -149,32 +162,32 @@ mod tests {
     #[test]
     fn non_channel_surface_keeps_private_persona_data() {
         let eval = evaluate_surface_policy(None, None);
-        assert!(eval.include_private_persona_data);
-        assert!(eval.include_memory_bootstrap);
-        assert!(eval.allow_external_effects);
+        assert!(eval.include_private_persona_data());
+        assert!(eval.include_memory_bootstrap());
+        assert!(eval.allow_external_effects());
     }
 
     #[test]
     fn unclassified_channel_surface_is_fail_closed() {
         let eval = evaluate_surface_policy(Some("discord"), None);
-        assert!(!eval.include_private_persona_data);
-        assert!(!eval.include_memory_bootstrap);
-        assert!(!eval.allow_external_effects);
+        assert!(!eval.include_private_persona_data());
+        assert!(!eval.include_memory_bootstrap());
+        assert!(!eval.allow_external_effects());
     }
 
     #[test]
     fn private_channel_surface_allows_private_persona_data() {
         let eval = evaluate_surface_policy(Some("telegram"), Some("private"));
-        assert!(eval.include_private_persona_data);
-        assert!(eval.include_memory_bootstrap);
-        assert!(eval.allow_external_effects);
+        assert!(eval.include_private_persona_data());
+        assert!(eval.include_memory_bootstrap());
+        assert!(eval.allow_external_effects());
     }
 
     #[test]
     fn non_private_channel_surface_blocks_private_persona_data() {
         let eval = evaluate_surface_policy(Some("whatsapp"), Some("group"));
-        assert!(!eval.include_private_persona_data);
-        assert!(!eval.include_memory_bootstrap);
-        assert!(!eval.allow_external_effects);
+        assert!(!eval.include_private_persona_data());
+        assert!(!eval.include_memory_bootstrap());
+        assert!(!eval.allow_external_effects());
     }
 }
