@@ -62,6 +62,7 @@
 
 - [System Prompt](system-prompt.md)
 - [Streaming](streaming.md)
+- [Compaction V2](compaction-v2.md)
 - [SQLite Migrations](sqlite-migration.md)
 - [Metrics & Tracing](metrics-and-tracing.md)
 - [Tool Registry](tool-registry.md)

@@ -128,6 +128,25 @@ message_queue_mode = "followup"  # Default: one-by-one replay
 #   "collect"  - Merge queued text and run once after the active run
 ```
 
+## Context Compaction (V2)
+
+Compaction is layered and importance-aware. Configure thresholds and budgets under
+`[chat.compaction]`:
+
+```toml
+[chat.compaction]
+enabled = true
+soft_trigger_percent = 80
+hard_trigger_percent = 90
+emergency_trigger_percent = 95
+verbatim_turns = 10
+min_verbatim_turns = 6
+anchor_budget_tokens = 5000
+summary_budget_tokens = 2500
+```
+
+See [Compaction V2](compaction-v2.md) for retention rules and runtime behavior.
+
 ## Memory System
 
 Long-term memory uses embeddings for semantic search:
