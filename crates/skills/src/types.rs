@@ -14,12 +14,6 @@ pub enum SkillStatus {
     Quarantined,
 }
 
-impl Default for SkillStatus {
-    fn default() -> Self {
-        Self::Untrusted
-    }
-}
-
 impl SkillStatus {
     pub fn is_trusted(self) -> bool {
         matches!(self, Self::Trusted)
@@ -104,7 +98,6 @@ pub struct RepoEntry {
 pub struct SkillState {
     pub name: String,
     pub relative_path: String,
-    #[serde(default)]
     pub status: SkillStatus,
     #[serde(default)]
     pub quarantine_reason: Option<String>,
@@ -139,12 +132,12 @@ mod tests {
     }
 
     #[test]
-    fn skill_state_missing_status_defaults_to_untrusted() {
-        let parsed: SkillState =
-            serde_json::from_str(r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":false}"#)
-                .unwrap();
-        assert_eq!(parsed.status, SkillStatus::Untrusted);
-        assert!(!parsed.is_trusted());
+    fn skill_state_missing_status_is_rejected() {
+        let err = serde_json::from_str::<SkillState>(
+            r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":false}"#,
+        )
+        .expect_err("manifest v2 skill state must include status");
+        assert!(err.to_string().contains("missing field `status`"));
     }
 
     #[test]
