@@ -46,12 +46,19 @@ use {
 };
 
 pub mod chat_error;
+mod compaction;
 pub mod error;
+mod history_context;
 pub mod runtime;
 
 pub use runtime::{ChatRuntime, TtsOverride};
 use {
     chat_error::parse_chat_error,
+    compaction::{
+        ContextCompactionAction, ContextCompactionStrategy, archive_keep_recent_for_reduction,
+        context_compaction_action_for_usage, context_compaction_config_from_chat,
+    },
+    history_context::normalize_for_context_view,
     moltis_common::handoff::{
         HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
     },
@@ -320,87 +327,6 @@ fn estimate_text_tokens(text: &str) -> u64 {
     }
     let bytes = trimmed.len() as u64;
     bytes.div_ceil(4).max(1)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextCompactionStrategy {
-    Truncate,
-    MoveToWorkspace,
-}
-
-impl ContextCompactionStrategy {
-    fn as_config_value(self) -> &'static str {
-        match self {
-            Self::Truncate => "truncate",
-            Self::MoveToWorkspace => "move_to_workspace",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ContextCompactionConfig {
-    strategy: ContextCompactionStrategy,
-    keep_recent: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextCompactionAction {
-    None,
-    /// Early memory flush at ~70% occupancy — no summarization, only persists
-    /// important memories before they might be lost to compaction.
-    PreCompact,
-    Compact,
-    ArchiveTier,
-    TruncateTier,
-}
-
-#[must_use]
-fn context_compaction_config_from_chat(
-    chat: &moltis_config::ChatConfig,
-) -> ContextCompactionConfig {
-    let strategy = match chat
-        .context_compaction_strategy
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "move_to_workspace" => ContextCompactionStrategy::MoveToWorkspace,
-        _ => ContextCompactionStrategy::Truncate,
-    };
-    ContextCompactionConfig {
-        strategy,
-        keep_recent: chat.context_compaction_keep_recent.max(1),
-    }
-}
-
-#[must_use]
-fn context_compaction_action_for_usage(
-    estimated_next_input: u64,
-    context_window: u64,
-) -> ContextCompactionAction {
-    let pre_compact_threshold = (context_window * 70) / 100;
-    let compact_threshold = (context_window * 80) / 100;
-    let archive_threshold = (context_window * 90) / 100;
-    let truncate_threshold = (context_window * 95) / 100;
-    if estimated_next_input >= truncate_threshold {
-        ContextCompactionAction::TruncateTier
-    } else if estimated_next_input >= archive_threshold {
-        ContextCompactionAction::ArchiveTier
-    } else if estimated_next_input >= compact_threshold {
-        ContextCompactionAction::Compact
-    } else if estimated_next_input >= pre_compact_threshold {
-        ContextCompactionAction::PreCompact
-    } else {
-        ContextCompactionAction::None
-    }
-}
-
-#[must_use]
-fn archive_keep_recent_for_reduction(history_len: usize, configured_keep_recent: usize) -> usize {
-    if history_len <= 1 {
-        return history_len;
-    }
-    configured_keep_recent.max(1).min(history_len - 1)
 }
 
 fn now_ms() -> u64 {
@@ -5707,31 +5633,7 @@ impl ChatService for LiveChatService {
 
         // Reconstruct `role: "tool"` messages from persisted `tool_result`
         // entries so the context view shows what the LLM actually saw.
-        let history_with_tools: Vec<Value> = history
-            .into_iter()
-            .map(|val| {
-                if val.get("role").and_then(|r| r.as_str()) != Some("tool_result") {
-                    return val;
-                }
-                let tool_call_id = val
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let content = if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
-                    format!("Error: {err}")
-                } else if let Some(res) = val.get("result") {
-                    res.to_string()
-                } else {
-                    String::new()
-                };
-                serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": content,
-                })
-            })
-            .collect();
+        let history_with_tools = normalize_for_context_view(history);
 
         // Build the full messages array: system prompt + conversation history.
         let mut messages = Vec::with_capacity(1 + history_with_tools.len());
