@@ -6487,6 +6487,7 @@ dependencies = [
  "moltis-config",
  "moltis-metrics",
  "notify-debouncer-full",
+ "regex",
  "reqwest 0.12.28",
  "rstest",
  "serde",
