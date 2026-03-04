@@ -1444,7 +1444,7 @@ fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
 fn apply_runtime_tool_filters(
     base: &ToolRegistry,
     config: &moltis_config::MoltisConfig,
-    _skills: &[moltis_skills::types::SkillMetadata],
+    skills: &[moltis_skills::types::SkillMetadata],
     mcp_disabled: bool,
 ) -> ToolRegistry {
     let base_registry = if mcp_disabled {
@@ -1454,12 +1454,35 @@ fn apply_runtime_tool_filters(
     };
 
     let policy = effective_tool_policy(config);
-    // NOTE: Do not globally restrict tools by discovered skill `allowed_tools`.
-    // Skills are always discovered for prompt injection; applying those lists at
-    // runtime can unintentionally remove unrelated tools (for example, leaving
-    // only `web_fetch` and preventing `create_skill` from being called).
-    // Tool availability here is controlled by configured runtime policy.
-    base_registry.clone_allowed_by(|name| policy.is_allowed(name))
+    let policy_filtered = base_registry.clone_allowed_by(|name| policy.is_allowed(name));
+
+    if skills.is_empty() {
+        return policy_filtered;
+    }
+
+    let active_skills: Vec<(&moltis_skills::types::SkillMetadata, moltis_skills::types::SkillTrust)> =
+        skills
+            .iter()
+            .map(|skill| {
+                let trust = match skill.source.as_ref() {
+                    Some(moltis_skills::types::SkillSource::Project)
+                    | Some(moltis_skills::types::SkillSource::Personal) => {
+                        moltis_skills::types::SkillTrust::Trusted
+                    },
+                    Some(moltis_skills::types::SkillSource::Registry)
+                    | Some(moltis_skills::types::SkillSource::Plugin)
+                    | None => moltis_skills::types::SkillTrust::Installed,
+                };
+                (skill, trust)
+            })
+            .collect();
+
+    let tool_names = policy_filtered.list_names();
+    let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+    let allowed_names = moltis_skills::attenuation::attenuate_tools(&active_skills, &tool_name_refs);
+    let allowed_set: HashSet<String> = allowed_names.into_iter().map(ToString::to_string).collect();
+
+    policy_filtered.clone_allowed_by(|name| allowed_set.contains(name))
 }
 
 const DEFAULT_SKILL_SELECTION_TOKEN_BUDGET: usize = 4_000;
@@ -10396,7 +10419,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_filters_apply_policy_without_skill_tool_restrictions() {
+    fn runtime_filters_apply_policy_and_trusted_skill_allowlist() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(DummyTool {
             name: "exec".to_string(),
@@ -10424,18 +10447,18 @@ mod tests {
             dockerfile: None,
             requires: Default::default(),
             path: PathBuf::new(),
-            source: None,
+            source: Some(moltis_skills::types::SkillSource::Project),
         }];
 
         let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
         assert!(filtered.get("exec").is_some());
-        assert!(filtered.get("web_fetch").is_some());
-        assert!(filtered.get("create_skill").is_some());
+        assert!(filtered.get("web_fetch").is_none());
+        assert!(filtered.get("create_skill").is_none());
         assert!(filtered.get("session_state").is_none());
     }
 
     #[test]
-    fn runtime_filters_do_not_hide_create_skill_when_skill_allows_only_web_fetch() {
+    fn runtime_filters_apply_installed_skill_read_only_ceiling() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(DummyTool {
             name: "create_skill".to_string(),
@@ -10443,9 +10466,12 @@ mod tests {
         registry.register(Box::new(DummyTool {
             name: "web_fetch".to_string(),
         }));
+        registry.register(Box::new(DummyTool {
+            name: "read_file".to_string(),
+        }));
 
         let mut cfg = moltis_config::MoltisConfig::default();
-        cfg.tools.policy.allow = vec!["create_skill".into(), "web_fetch".into()];
+        cfg.tools.policy.allow = vec!["create_skill".into(), "web_fetch".into(), "read_file".into()];
 
         let skills = vec![moltis_skills::types::SkillMetadata {
             name: "weather".into(),
@@ -10457,10 +10483,29 @@ mod tests {
             dockerfile: None,
             requires: Default::default(),
             path: PathBuf::new(),
-            source: None,
+            source: Some(moltis_skills::types::SkillSource::Registry),
         }];
 
         let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        assert!(filtered.get("create_skill").is_none());
+        assert!(filtered.get("web_fetch").is_none());
+        assert!(filtered.get("read_file").is_some());
+    }
+
+    #[test]
+    fn runtime_filters_keep_policy_surface_when_no_skills_selected() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "create_skill".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "web_fetch".to_string(),
+        }));
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.policy.allow = vec!["create_skill".into(), "web_fetch".into()];
+
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false);
         assert!(filtered.get("create_skill").is_some());
         assert!(filtered.get("web_fetch").is_some());
     }
