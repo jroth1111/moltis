@@ -8,7 +8,7 @@
 //! 1. Injects a comprehensive JS script via `Page.addScriptToEvaluateOnNewDocument`
 //!    that runs before any page scripts on every navigation.
 //! 2. Adds Chrome launch flags that reduce automation fingerprinting at the browser level.
-//! 3. Overrides the User-Agent to remove `HeadlessChrome` strings.
+//! 3. Optionally overrides User-Agent and request headers when explicitly configured.
 //!
 //! # Feature gate
 //!
@@ -17,7 +17,7 @@
 pub mod args;
 pub mod behavior;
 
-use chromiumoxide::Page;
+use chromiumoxide::{Page, cdp::browser_protocol::network::SetExtraHttpHeadersParams};
 
 use crate::{error::Error, types::StealthConfig};
 
@@ -41,6 +41,61 @@ pub fn chrome_stealth_args() -> &'static [&'static str] {
 #[must_use]
 pub fn default_user_agent() -> &'static str {
     STEALTH_USER_AGENT
+}
+
+/// Build `sec-ch-ua` from a Chromium-style User-Agent string.
+#[must_use]
+pub fn build_sec_ch_ua(user_agent: &str) -> Option<String> {
+    let marker = "Chrome/";
+    let start = user_agent.find(marker)? + marker.len();
+    let major: String = user_agent[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if major.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\"Google Chrome\";v=\"{major}\", \"Chromium\";v=\"{major}\", \";Not A Brand\";v=\"99\""
+    ))
+}
+
+fn infer_sec_ch_platform(user_agent: &str) -> &'static str {
+    let lower = user_agent.to_lowercase();
+    if lower.contains("mac os x") {
+        "\"macOS\""
+    } else if lower.contains("windows") {
+        "\"Windows\""
+    } else if lower.contains("android") {
+        "\"Android\""
+    } else if lower.contains("linux") {
+        "\"Linux\""
+    } else {
+        "\"Unknown\""
+    }
+}
+
+fn build_accept_language(config: &StealthConfig) -> String {
+    if let Some(langs) = config.languages.as_ref()
+        && !langs.is_empty()
+    {
+        let mut parts = Vec::with_capacity(langs.len());
+        for (idx, lang) in langs.iter().enumerate() {
+            if idx == 0 {
+                parts.push(lang.clone());
+            } else {
+                let quality = match idx {
+                    1 => "0.9",
+                    2 => "0.8",
+                    3 => "0.7",
+                    _ => "0.6",
+                };
+                parts.push(format!("{lang};q={quality}"));
+            }
+        }
+        return parts.join(",");
+    }
+    "en-US,en;q=0.9".to_string()
 }
 
 /// Build the evasion JS with `config` values substituted into the placeholders.
@@ -120,6 +175,48 @@ pub async fn inject_stealth(page: &Page, config: &StealthConfig) -> Result<(), E
 
     #[cfg(feature = "metrics")]
     moltis_metrics::counter!(moltis_metrics::browser::STEALTH_INJECTIONS_TOTAL).increment(1);
+
+    Ok(())
+}
+
+/// Apply low-risk default headers aligned with stealth settings.
+///
+/// This sets `Accept-Language` and Chromium client hints (`sec-ch-ua*`) via
+/// CDP `Network.setExtraHTTPHeaders`.
+pub async fn apply_stealth_headers(page: &Page, config: &StealthConfig) -> Result<(), Error> {
+    let user_agent = if let Some(ua) = config.user_agent.as_deref() {
+        ua.to_string()
+    } else {
+        page.user_agent()
+            .await
+            .map_err(|e| Error::Cdp(format!("failed to read browser user agent: {e}")))?
+    };
+
+    let mut headers = serde_json::Map::new();
+    headers.insert(
+        "Accept-Language".to_string(),
+        serde_json::Value::String(build_accept_language(config)),
+    );
+    if let Some(sec_ch_ua) = build_sec_ch_ua(&user_agent) {
+        headers.insert(
+            "sec-ch-ua".to_string(),
+            serde_json::Value::String(sec_ch_ua),
+        );
+    }
+    headers.insert(
+        "sec-ch-ua-mobile".to_string(),
+        serde_json::Value::String("?0".to_string()),
+    );
+    headers.insert(
+        "sec-ch-ua-platform".to_string(),
+        serde_json::Value::String(infer_sec_ch_platform(&user_agent).to_string()),
+    );
+
+    page.execute(SetExtraHttpHeadersParams::new(serde_json::Value::Object(
+        headers,
+    )))
+    .await
+    .map_err(|e| Error::Cdp(format!("failed to set stealth headers: {e}")))?;
 
     Ok(())
 }
@@ -257,5 +354,32 @@ mod tests {
             args.iter().any(|a| a.contains("AutomationControlled")),
             "must disable AutomationControlled"
         );
+    }
+
+    #[test]
+    fn build_sec_ch_ua_extracts_chrome_major_version() {
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36";
+        assert_eq!(
+            build_sec_ch_ua(ua).as_deref(),
+            Some("\"Google Chrome\";v=\"123\", \"Chromium\";v=\"123\", \";Not A Brand\";v=\"99\"")
+        );
+    }
+
+    #[test]
+    fn build_sec_ch_ua_returns_none_for_non_chromium_ua() {
+        assert!(build_sec_ch_ua("Mozilla/5.0 Firefox/123.0").is_none());
+    }
+
+    #[test]
+    fn build_accept_language_prefers_configured_languages() {
+        let config = StealthConfig {
+            languages: Some(vec![
+                "en-AU".to_string(),
+                "en-US".to_string(),
+                "en".to_string(),
+            ]),
+            ..default_config()
+        };
+        assert_eq!(build_accept_language(&config), "en-AU,en-US;q=0.9,en;q=0.8");
     }
 }

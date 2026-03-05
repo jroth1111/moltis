@@ -259,6 +259,16 @@ impl BrowserPool {
             }
         }
 
+        #[cfg(feature = "stealth")]
+        if self.config.stealth.enabled {
+            if let Err(e) = crate::stealth::apply_stealth_headers(&page, &self.config.stealth).await
+            {
+                warn!(session_id, error = %e, "stealth header setup failed");
+            } else {
+                debug!(session_id, "stealth headers configured");
+            }
+        }
+
         inst.pages.insert("main".to_string(), page.clone());
         Ok(page)
     }
@@ -323,20 +333,32 @@ impl BrowserPool {
             let task = tokio::spawn(async move {
                 let mut stream = event_stream;
                 while let Some(event) = stream.next().await {
-                    // Record into HAR if active — lock briefly, release before CDP call.
-                    {
+                    // Record into HAR if active and capture latest header overrides.
+                    // Keep lock scope short and always release before CDP awaits.
+                    let extra_headers = {
                         let mut inst = instance_arc.lock().await;
                         if let Some(ref mut rec) = inst.interception.recorder {
                             rec.record(crate::network::HarEntry::from_event(&event));
                         }
-                    }
+                        if inst.interception.extra_headers.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                inst.interception
+                                    .extra_headers
+                                    .iter()
+                                    .map(|(name, value)| (name.clone(), value.clone()))
+                                    .collect::<Vec<_>>(),
+                            )
+                        }
+                    };
                     // Forward to external subscribers (ignore if none).
                     let _ = paused_tx_clone.send(event.clone());
                     // Auto-continue so the request is never left hanging.
                     let _ = crate::network::continue_request(
                         &page_clone,
                         event.request_id.clone(),
-                        None,
+                        extra_headers,
                     )
                     .await;
                 }
