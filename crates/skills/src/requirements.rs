@@ -174,7 +174,10 @@ pub async fn run_install(spec: &InstallSpec) -> anyhow::Result<InstallResult> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::types::SkillRequirements};
+    use {
+        super::*,
+        crate::types::{SkillEvals, SkillPermissions, SkillRequirements, SkillTriggers},
+    };
 
     #[test]
     fn test_current_os() {
@@ -197,8 +200,12 @@ mod tests {
     #[test]
     fn test_no_requirements_is_eligible() {
         let meta = SkillMetadata {
+            version: 3,
             name: "test".into(),
             description: String::new(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             homepage: None,
             license: None,
             compatibility: None,
@@ -216,8 +223,12 @@ mod tests {
     #[test]
     fn test_missing_bin_is_blocked() {
         let meta = SkillMetadata {
+            version: 3,
             name: "test".into(),
             description: String::new(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             homepage: None,
             license: None,
             compatibility: None,
@@ -239,8 +250,12 @@ mod tests {
     #[test]
     fn test_any_bins_one_present() {
         let meta = SkillMetadata {
+            version: 3,
             name: "test".into(),
             description: String::new(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             homepage: None,
             license: None,
             compatibility: None,
@@ -264,8 +279,12 @@ mod tests {
     #[test]
     fn test_any_bins_none_present() {
         let meta = SkillMetadata {
+            version: 3,
             name: "test".into(),
             description: String::new(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             homepage: None,
             license: None,
             compatibility: None,
@@ -287,8 +306,12 @@ mod tests {
     #[test]
     fn test_install_options_filtered_by_os() {
         let meta = SkillMetadata {
+            version: 3,
             name: "test".into(),
             description: String::new(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             homepage: None,
             license: None,
             compatibility: None,

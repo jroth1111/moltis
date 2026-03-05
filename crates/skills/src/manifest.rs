@@ -24,7 +24,7 @@ impl ManifestStore {
         }
         let data = std::fs::read_to_string(&self.path)?;
         if let Some(migrated) = crate::migration::migrate_manifest_v1_to_v2(&data)? {
-            // One-time in-place upgrade to schema v2.
+            // One-time in-place upgrade to schema v3.
             self.save(&migrated)?;
             return Ok(migrated);
         }
@@ -62,7 +62,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ManifestStore::new(tmp.path().join("missing.json"));
         let m = store.load().unwrap();
-        assert_eq!(m.version, 2);
+        assert_eq!(m.version, 3);
         assert!(m.repos.is_empty());
     }
 
@@ -153,7 +153,7 @@ mod tests {
             skills: vec![SkillState {
                 name: "s1".into(),
                 relative_path: "s1".into(),
-                status: SkillStatus::Untrusted,
+                status: SkillStatus::Pending,
                 quarantine_reason: None,
                 last_audited_ms: None,
                 content_hash: None,
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_migrates_v1_manifest_to_v2() {
+    fn test_load_migrates_v1_manifest_to_v3() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("skills-manifest.json");
         std::fs::write(
@@ -222,11 +222,12 @@ mod tests {
 
         let store = ManifestStore::new(path.clone());
         let loaded = store.load().unwrap();
-        assert_eq!(loaded.version, 2);
-        assert_eq!(loaded.repos[0].skills[0].status, SkillStatus::Trusted);
+        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.repos[0].skills[0].status, SkillStatus::Pending);
+        assert!(!loaded.repos[0].skills[0].enabled);
 
         let rewritten = std::fs::read_to_string(path).unwrap();
-        assert!(rewritten.contains("\"version\": 2"));
-        assert!(rewritten.contains("\"status\": \"trusted\""));
+        assert!(rewritten.contains("\"version\": 3"));
+        assert!(rewritten.contains("\"status\": \"pending\""));
     }
 }

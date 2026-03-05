@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::types::SkillTrust;
 
-/// Tools available in read-only (untrusted/installed) mode.
+/// Tools available in read-only (pending/installed) mode.
 /// This is the minimum set that lets an installed skill be useful
 /// without being able to exfiltrate data or run arbitrary code.
 const READ_ONLY_TOOLS: &[&str] = &["memory_search", "read_file", "list_directory", "echo"];
@@ -146,7 +146,7 @@ fn is_read_only_tool(tool_name: &str) -> bool {
 /// Rules:
 /// 1. No active skills -> return all tools unchanged.
 /// 2. All active skills are `Trusted` -> return union of `allowed_tools` across all skills.
-///    If `allowed_tools` is empty for all skills, return all tools (backward compat).
+///    If `allowed_tools` is empty for all skills, return no tools (default-deny).
 /// 3. Any `Installed` skill is active -> return read-only subset only.
 #[must_use]
 pub fn attenuate_tools<'a>(
@@ -177,8 +177,7 @@ pub fn attenuate_tools<'a>(
         .collect();
 
     if allowed_patterns.is_empty() {
-        // No restrictions declared -> all tools available
-        return all_tool_names.to_vec();
+        return Vec::new();
     }
 
     all_tool_names
@@ -192,14 +191,21 @@ pub fn attenuate_tools<'a>(
 mod tests {
     use {
         super::*,
-        crate::types::{SkillMetadata, SkillRequirements},
+        crate::types::{SkillEvals, SkillMetadata, SkillPermissions, SkillRequirements, SkillTriggers},
         std::path::PathBuf,
     };
 
     fn mock_skill(allowed_tools: Vec<String>) -> SkillMetadata {
+        let permissions = SkillPermissions {
+            allowed_tools: allowed_tools.clone(),
+        };
         SkillMetadata {
+            version: 3,
             name: "test".to_string(),
             description: String::new(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions,
             homepage: None,
             license: None,
             compatibility: None,
@@ -240,11 +246,11 @@ mod tests {
     }
 
     #[test]
-    fn trusted_skill_no_allowed_tools_returns_all() {
+    fn trusted_skill_no_allowed_tools_returns_none() {
         let skill = mock_skill(vec![]);
         let all = &["read_file", "exec", "web_search"];
         let result = attenuate_tools(&[(&skill, SkillTrust::Trusted)], all);
-        assert_eq!(result, all.to_vec());
+        assert!(result.is_empty());
     }
 
     #[test]

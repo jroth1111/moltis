@@ -118,7 +118,46 @@ pub async fn load_skill_from_path(skill_dir: &Path) -> anyhow::Result<SkillConte
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::types::SkillSource, std::path::PathBuf};
+    use {
+        super::*,
+        crate::types::{SkillEvals, SkillPermissions, SkillSource, SkillTriggers},
+        std::path::PathBuf,
+    };
+
+    fn valid_skill_markdown(name: &str, description: &str) -> String {
+        format!(
+            r#"---
+version: 3
+name: {name}
+description: {description}
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
+permissions:
+  allowed_tools: ["Read"]
+---
+## Purpose
+Support {description}.
+
+## Inputs
+- User request
+
+## Workflow
+1. Parse request.
+2. Apply instructions.
+3. Return result.
+
+## Failure Modes
+- Invalid input.
+- Missing dependencies.
+
+## Examples
+- Example invocation.
+"#
+        )
+    }
 
     #[tokio::test]
     async fn test_in_memory_registry_list_and_load() {
@@ -127,14 +166,18 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: test\n---\n# Instructions\nDo things.\n",
+            valid_skill_markdown("my-skill", "test"),
         )
         .unwrap();
 
         let mut reg = InMemoryRegistry::new();
         reg.insert(SkillMetadata {
+            version: 3,
             name: "my-skill".into(),
             description: "test".into(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             license: None,
             compatibility: None,
             allowed_tools: vec![],
@@ -149,7 +192,7 @@ mod tests {
         assert_eq!(skills.len(), 1);
 
         let content = reg.load_skill("my-skill").await.unwrap();
-        assert!(content.body.contains("Do things"));
+        assert!(content.body.contains("## Workflow"));
     }
 
     #[tokio::test]
@@ -171,8 +214,12 @@ mod tests {
 
         let mut reg = InMemoryRegistry::new();
         reg.insert(SkillMetadata {
+            version: 3,
             name: "bad-skill".into(),
             description: "test".into(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             license: None,
             compatibility: None,
             allowed_tools: vec![],
@@ -190,8 +237,12 @@ mod tests {
     async fn test_remove_non_registry_skill_fails() {
         let mut reg = InMemoryRegistry::new();
         reg.insert(SkillMetadata {
+            version: 3,
             name: "local".into(),
             description: "".into(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             license: None,
             compatibility: None,
             allowed_tools: vec![],

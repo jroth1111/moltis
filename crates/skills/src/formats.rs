@@ -336,12 +336,18 @@ impl ClaudeCodeAdapter {
                     .map(|p| p.to_string_lossy().to_string());
 
                 let meta = SkillMetadata {
+                    version: 3,
                     name: namespaced_name,
                     description: if description.is_empty() {
                         plugin_json.description.clone().unwrap_or_default()
                     } else {
                         description
                     },
+                    triggers: Default::default(),
+                    evals: crate::types::SkillEvals {
+                        path: "evals/evals.json".to_string(),
+                    },
+                    permissions: Default::default(),
                     homepage: author.as_ref().map(|a| format!("https://github.com/{a}")),
                     license: None,
                     compatibility: None,
@@ -744,11 +750,35 @@ mod tests {
         std::fs::write(
             root.join("skills/xlsx/SKILL.md"),
             r#"---
+version: 3
 name: xlsx
 description: Work with spreadsheets
+triggers:
+  should_trigger: ["open xlsx", "edit spreadsheet", "export workbook"]
+  should_not_trigger: ["translate text", "general coding", "random chat"]
+evals:
+  path: evals/evals.json
+permissions:
+  allowed_tools: ["Read"]
 ---
 
+## Purpose
 Read and write spreadsheets.
+
+## Inputs
+- Spreadsheet files
+
+## Workflow
+1. Load data.
+2. Apply requested changes.
+3. Save output.
+
+## Failure Modes
+- Corrupt workbook.
+- Missing worksheet.
+
+## Examples
+- Convert CSV to XLSX.
 "#,
         )
         .unwrap();
@@ -757,11 +787,35 @@ Read and write spreadsheets.
         std::fs::write(
             root.join("skills/pdf/SKILL.md"),
             r#"---
+version: 3
 name: pdf
 description: Work with PDF documents
+triggers:
+  should_trigger: ["summarize pdf", "extract pdf text", "merge pdf files"]
+  should_not_trigger: ["translate text", "general coding", "random chat"]
+evals:
+  path: evals/evals.json
+permissions:
+  allowed_tools: ["Read"]
 ---
 
+## Purpose
 Read and write PDF documents.
+
+## Inputs
+- PDF files
+
+## Workflow
+1. Open PDF.
+2. Perform requested operation.
+3. Return results.
+
+## Failure Modes
+- Unsupported encryption.
+- Invalid document structure.
+
+## Examples
+- Extract table text from a report.
 "#,
         )
         .unwrap();

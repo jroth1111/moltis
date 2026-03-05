@@ -36,6 +36,8 @@ pub fn parse_metadata(content: &str, skill_dir: &Path) -> anyhow::Result<SkillMe
     }
 
     merge_openclaw_requires(&frontmatter, &mut meta);
+    normalize_permissions(&mut meta);
+    validate_frontmatter_contract(&meta)?;
     meta.path = skill_dir.to_path_buf();
     Ok(meta)
 }
@@ -54,11 +56,62 @@ pub fn parse_skill(content: &str, skill_dir: &Path) -> anyhow::Result<SkillConte
     }
 
     merge_openclaw_requires(&frontmatter, &mut meta);
+    normalize_permissions(&mut meta);
+    validate_frontmatter_contract(&meta)?;
+    validate_body_contract(&body)?;
     meta.path = skill_dir.to_path_buf();
     Ok(SkillContent {
         metadata: meta,
         body: body.to_string(),
     })
+}
+
+fn normalize_permissions(meta: &mut SkillMetadata) {
+    if meta.allowed_tools.is_empty() && !meta.permissions.allowed_tools.is_empty() {
+        meta.allowed_tools = meta.permissions.allowed_tools.clone();
+    } else {
+        meta.permissions.allowed_tools = meta.allowed_tools.clone();
+    }
+}
+
+fn validate_frontmatter_contract(meta: &SkillMetadata) -> anyhow::Result<()> {
+    if meta.version != 3 {
+        bail!(
+            "invalid skill version '{}': SKILL.md must declare `version: 3`",
+            meta.version
+        );
+    }
+    if meta.description.trim().is_empty() {
+        bail!("invalid skill frontmatter: `description` is required");
+    }
+    if meta.triggers.should_trigger.len() < 3 {
+        bail!("invalid skill frontmatter: `triggers.should_trigger` must contain at least 3 prompts");
+    }
+    if meta.triggers.should_not_trigger.len() < 3 {
+        bail!(
+            "invalid skill frontmatter: `triggers.should_not_trigger` must contain at least 3 prompts"
+        );
+    }
+    if meta.evals.path.trim().is_empty() {
+        bail!("invalid skill frontmatter: `evals.path` is required");
+    }
+    Ok(())
+}
+
+fn validate_body_contract(body: &str) -> anyhow::Result<()> {
+    let lc = body.to_lowercase();
+    for section in [
+        "## purpose",
+        "## inputs",
+        "## workflow",
+        "## failure modes",
+        "## examples",
+    ] {
+        if !lc.contains(section) {
+            bail!("invalid skill body: missing required section `{section}`");
+        }
+    }
+    Ok(())
 }
 
 // ── OpenClaw metadata extraction ────────────────────────────────────────────
@@ -273,8 +326,14 @@ mod tests {
     #[test]
     fn test_parse_metadata() {
         let content = r#"---
+version: 3
 name: my-skill
 description: A test skill
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
 license: MIT
 allowed_tools:
   - exec
@@ -296,10 +355,30 @@ Instructions here.
     #[test]
     fn test_parse_skill_full() {
         let content = r#"---
+version: 3
 name: commit
 description: Create git commits
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
 ---
 
+## Purpose
+Commit code changes.
+
+## Inputs
+Git diff.
+
+## Workflow
+1. Stage files.
+2. Write commit message.
+
+## Failure Modes
+No staged files.
+
+## Examples
 When asked to commit, run `git add` then `git commit`.
 "#;
         let skill = parse_skill(content, Path::new("/skills/commit")).unwrap();
@@ -309,7 +388,7 @@ When asked to commit, run `git add` then `git commit`.
 
     #[test]
     fn test_invalid_name_rejected() {
-        let content = "---\nname: Bad-Name\n---\nbody\n";
+        let content = "---\nversion: 3\nname: Bad-Name\ndescription: test\ntriggers:\n  should_trigger: [a, b, c]\n  should_not_trigger: [d, e, f]\nevals:\n  path: evals/evals.json\n---\nbody\n";
         assert!(parse_metadata(content, Path::new("/tmp")).is_err());
     }
 
@@ -328,8 +407,14 @@ When asked to commit, run `git add` then `git commit`.
     #[test]
     fn test_top_level_requires() {
         let content = r#"---
+version: 3
 name: songsee
 description: Generate spectrograms
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
 requires:
   bins: [songsee]
   install:
@@ -351,8 +436,14 @@ Instructions.
     #[test]
     fn test_openclaw_metadata_requires() {
         let content = r#"---
+version: 3
 name: himalaya
 description: CLI email client
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
 metadata:
   openclaw:
     requires:
@@ -379,8 +470,14 @@ Instructions.
     #[test]
     fn test_top_level_requires_takes_precedence_over_openclaw() {
         let content = r#"---
+version: 3
 name: test-skill
 description: test
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
 requires:
   bins: [mytool]
 metadata:
@@ -400,8 +497,14 @@ Body.
     fn test_clawdbot_metadata_requires() {
         // Real openclaw format: metadata is single-line JSON with "clawdbot" key
         let content = r#"---
+version: 3
 name: beeper
 description: Search and browse local Beeper chat history
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
 metadata: {"clawdbot":{"requires":{"bins":["beeper-cli"]},"install":[{"id":"go","kind":"go","pkg":"github.com/krausefx/beeper-cli/cmd/beeper-cli","bins":["beeper-cli"],"label":"Install beeper-cli (go install)"}]}}
 ---
 
@@ -425,8 +528,14 @@ Instructions.
     #[test]
     fn test_compatibility_field() {
         let content = r#"---
+version: 3
 name: docker-skill
 description: Runs containers
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
 compatibility: Requires docker and network access
 ---
 
@@ -441,7 +550,7 @@ Body.
 
     #[test]
     fn test_allowed_tools_hyphenated() {
-        let content = "---\nname: git-skill\ndescription: Git helper\nallowed-tools:\n  - Bash(git:*)\n  - Read\n---\nBody.\n";
+        let content = "---\nversion: 3\nname: git-skill\ndescription: Git helper\ntriggers:\n  should_trigger: [a, b, c]\n  should_not_trigger: [d, e, f]\nevals:\n  path: evals/evals.json\nallowed-tools:\n  - Bash(git:*)\n  - Read\n---\nBody.\n";
         let meta = parse_metadata(content, Path::new("/tmp/git-skill")).unwrap();
         assert_eq!(meta.allowed_tools, vec!["Bash(git:*)", "Read"]);
     }
@@ -449,8 +558,14 @@ Body.
     #[test]
     fn test_dockerfile_field() {
         let content = r#"---
+version: 3
 name: docker-skill
 description: Needs a custom image
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
 dockerfile: Dockerfile
 ---
 
@@ -462,14 +577,14 @@ Body.
 
     #[test]
     fn test_dockerfile_field_absent() {
-        let content = "---\nname: simple\ndescription: no docker\n---\nBody.\n";
+        let content = "---\nversion: 3\nname: simple\ndescription: no docker\ntriggers:\n  should_trigger: [a, b, c]\n  should_not_trigger: [d, e, f]\nevals:\n  path: evals/evals.json\n---\nBody.\n";
         let meta = parse_metadata(content, Path::new("/tmp/simple")).unwrap();
         assert!(meta.dockerfile.is_none());
     }
 
     #[test]
     fn test_no_requires_is_default() {
-        let content = "---\nname: simple\ndescription: no deps\n---\nBody.\n";
+        let content = "---\nversion: 3\nname: simple\ndescription: no deps\ntriggers:\n  should_trigger: [a, b, c]\n  should_not_trigger: [d, e, f]\nevals:\n  path: evals/evals.json\n---\nBody.\n";
         let meta = parse_metadata(content, Path::new("/tmp/simple")).unwrap();
         assert!(meta.requires.bins.is_empty());
         assert!(meta.requires.any_bins.is_empty());

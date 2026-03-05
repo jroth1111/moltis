@@ -6,6 +6,7 @@ use moltis_metrics::{counter, histogram, skills as skills_metrics};
 use crate::{
     archive_audit,
     audit,
+    evals::{SkillEvalInput, SkillEvalStore, evaluate_install_gate},
     formats::{PluginFormat, detect_format, scan_with_adapter},
     integrity,
     manifest::ManifestStore,
@@ -52,8 +53,23 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
 
     // Auto-detect repo format and scan accordingly.
     let format = detect_format(&target);
-    let (skills_meta, skill_states) = match format {
-        PluginFormat::Skill => scan_repo_skills(&target, install_dir).await?,
+    if format == PluginFormat::Generic {
+        let _ = tokio::fs::remove_dir_all(&target).await;
+        anyhow::bail!(
+            "repository format '{}' is not supported in V3 (supported: skill, claude_code)",
+            format
+        );
+    }
+
+    let (skills_meta, mut skill_states, mut eval_inputs): (
+        Vec<SkillMetadata>,
+        Vec<SkillState>,
+        Vec<SkillEvalInput>,
+    ) = match format {
+        PluginFormat::Skill => {
+            let (meta, states) = scan_repo_skills(&target, install_dir).await?;
+            (meta, states, Vec::new())
+        },
         _ => match scan_with_adapter(&target, format) {
             Some(result) => {
                 let entries = result?;
@@ -78,7 +94,7 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
                     .map(|e| SkillState {
                         name: e.metadata.name.clone(),
                         relative_path: relative.clone(),
-                        status: crate::types::SkillStatus::Untrusted,
+                        status: crate::types::SkillStatus::Pending,
                         quarantine_reason: None,
                         last_audited_ms: None,
                         content_hash: Some(integrity::hash_adapter_skill(
@@ -89,7 +105,21 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
                         enabled: false,
                     })
                     .collect();
-                (meta, states)
+                let inputs: Vec<SkillEvalInput> = entries
+                    .into_iter()
+                    .map(|entry| SkillEvalInput {
+                        name: entry.metadata.name.clone(),
+                        source: source.to_string(),
+                        description: entry.metadata.description.clone(),
+                        body: entry.body,
+                        allowed_tools: entry.metadata.allowed_tools.clone(),
+                        compatibility: entry.metadata.compatibility.clone(),
+                        requires: entry.metadata.requires.clone(),
+                        should_trigger: entry.metadata.triggers.should_trigger.clone(),
+                        should_not_trigger: entry.metadata.triggers.should_not_trigger.clone(),
+                    })
+                    .collect();
+                (meta, states, inputs)
             },
             None => {
                 let _ = tokio::fs::remove_dir_all(&target).await;
@@ -98,12 +128,44 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
         },
     };
 
+    if format == PluginFormat::Skill && eval_inputs.is_empty() {
+        eval_inputs = build_eval_inputs_for_skill_repo(&skill_states, install_dir, source)?;
+    }
+
     if skills_meta.is_empty() {
         let _ = tokio::fs::remove_dir_all(&target).await;
         anyhow::bail!(
             "repository contains no skills (checked {})",
             target.display()
         );
+    }
+
+    let eval_store = SkillEvalStore::new(SkillEvalStore::default_path()?);
+    for state in &mut skill_states {
+        let Some(input) = eval_inputs.iter().find(|candidate| candidate.name == state.name) else {
+            state.status = crate::types::SkillStatus::FailedValidation;
+            state.enabled = false;
+            state.trusted_hash = None;
+            state.quarantine_reason =
+                Some("install gate failed: missing eval input for skill".to_string());
+            continue;
+        };
+
+        let decision = evaluate_install_gate(input, Some(1));
+        let _ = eval_store.append(decision.run.clone());
+        if decision.passed {
+            state.status = crate::types::SkillStatus::Trusted;
+            state.quarantine_reason = None;
+            state.trusted_hash = state.content_hash.clone();
+        } else {
+            state.status = crate::types::SkillStatus::FailedValidation;
+            state.enabled = false;
+            state.trusted_hash = None;
+            state.quarantine_reason = Some(format!(
+                "install gate failed: {}",
+                decision.reasons.join("; ")
+            ));
+        }
     }
 
     // Write manifest.
@@ -299,7 +361,7 @@ async fn scan_repo_skills(
         let state = SkillState {
             name: meta.name.clone(),
             relative_path: relative,
-            status: crate::types::SkillStatus::Untrusted,
+            status: crate::types::SkillStatus::Pending,
             quarantine_reason: None,
             last_audited_ms: None,
             content_hash: Some(integrity::hash_skill_markdown(&content)),
@@ -349,7 +411,7 @@ async fn scan_repo_skills(
                         skill_states.push(SkillState {
                             name: meta.name.clone(),
                             relative_path: relative,
-                            status: crate::types::SkillStatus::Untrusted,
+                            status: crate::types::SkillStatus::Pending,
                             quarantine_reason: None,
                             last_audited_ms: None,
                             content_hash: Some(integrity::hash_skill_markdown(&content)),
@@ -369,6 +431,31 @@ async fn scan_repo_skills(
     }
 
     Ok((skills_meta, skill_states))
+}
+
+fn build_eval_inputs_for_skill_repo(
+    states: &[SkillState],
+    install_dir: &Path,
+    source: &str,
+) -> anyhow::Result<Vec<SkillEvalInput>> {
+    let mut out = Vec::new();
+    for state in states {
+        let skill_dir = install_dir.join(&state.relative_path);
+        let raw = std::fs::read_to_string(skill_dir.join("SKILL.md"))?;
+        let content = parse::parse_skill(&raw, &skill_dir)?;
+        out.push(SkillEvalInput {
+            name: content.metadata.name.clone(),
+            source: source.to_string(),
+            description: content.metadata.description.clone(),
+            body: content.body,
+            allowed_tools: content.metadata.allowed_tools.clone(),
+            compatibility: content.metadata.compatibility.clone(),
+            requires: content.metadata.requires.clone(),
+            should_trigger: content.metadata.triggers.should_trigger.clone(),
+            should_not_trigger: content.metadata.triggers.should_not_trigger.clone(),
+        });
+    }
+    Ok(out)
 }
 
 /// Parse `owner/repo` from a source string.
@@ -399,6 +486,41 @@ pub fn default_install_dir() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_skill_markdown(name: &str, description: &str) -> String {
+        format!(
+            r#"---
+version: 3
+name: {name}
+description: {description}
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
+permissions:
+  allowed_tools: ["Read"]
+---
+## Purpose
+Support {description}.
+
+## Inputs
+- User request
+
+## Workflow
+1. Inspect input.
+2. Apply skill guidance.
+3. Return result.
+
+## Failure Modes
+- Missing context.
+- Unsupported format.
+
+## Examples
+- Example usage.
+"#
+        )
+    }
 
     #[test]
     fn test_parse_source_valid() {
@@ -455,7 +577,7 @@ mod tests {
         std::fs::create_dir_all(&repo_dir).unwrap();
         std::fs::write(
             repo_dir.join("SKILL.md"),
-            "---\nname: single\ndescription: test\n---\nbody\n",
+            valid_skill_markdown("single", "test skill"),
         )
         .unwrap();
 
@@ -504,7 +626,7 @@ mod tests {
             .map(|e| SkillState {
                 name: e.metadata.name.clone(),
                 relative_path: "test-owner-test-repo".into(),
-                status: crate::types::SkillStatus::Untrusted,
+                status: crate::types::SkillStatus::Pending,
                 quarantine_reason: None,
                 last_audited_ms: None,
                 content_hash: Some(integrity::hash_adapter_skill(
@@ -529,12 +651,12 @@ mod tests {
         std::fs::create_dir_all(repo_dir.join("skills/b")).unwrap();
         std::fs::write(
             repo_dir.join("skills/a/SKILL.md"),
-            "---\nname: skill-a\ndescription: A\n---\nbody\n",
+            valid_skill_markdown("skill-a", "Skill A"),
         )
         .unwrap();
         std::fs::write(
             repo_dir.join("skills/b/SKILL.md"),
-            "---\nname: skill-b\ndescription: B\n---\nbody\n",
+            valid_skill_markdown("skill-b", "Skill B"),
         )
         .unwrap();
 

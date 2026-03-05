@@ -26,6 +26,10 @@ pub struct SkillEvalInput {
     pub compatibility: Option<String>,
     #[serde(default)]
     pub requires: SkillRequirements,
+    #[serde(default)]
+    pub should_trigger: Vec<String>,
+    #[serde(default)]
+    pub should_not_trigger: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +96,17 @@ pub struct SkillEvalRunSummary {
     pub without_skill_avg_duration_ms: f64,
     pub with_skill_avg_tokens: f64,
     pub without_skill_avg_tokens: f64,
+    pub trigger_precision: f64,
+    pub trigger_recall: f64,
+    pub with_skill_duration_ratio: f64,
+    pub with_skill_token_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillGateDecision {
+    pub passed: bool,
+    pub reasons: Vec<String>,
+    pub run: SkillEvalRun,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +198,14 @@ pub fn run_skill_eval(input: &SkillEvalInput, rounds: Option<u32>) -> SkillEvalR
     let with_metrics = simulate_metrics(input, "with_skill", rounds, true);
     let without_metrics = simulate_metrics(input, "without_skill", rounds, false);
 
+    let trigger_precision = trigger_precision(input);
+    let trigger_recall = trigger_recall(input);
+    let duration_ratio = ratio_f(
+        with_metrics.avg_duration_ms,
+        without_metrics.avg_duration_ms.max(1.0),
+    );
+    let token_ratio = ratio_f(with_metrics.avg_tokens, without_metrics.avg_tokens.max(1.0));
+
     let run_summary = SkillEvalRunSummary {
         with_skill_pass_rate: with_pass_rate,
         without_skill_pass_rate: without_pass_rate,
@@ -191,6 +214,10 @@ pub fn run_skill_eval(input: &SkillEvalInput, rounds: Option<u32>) -> SkillEvalR
         without_skill_avg_duration_ms: without_metrics.avg_duration_ms,
         with_skill_avg_tokens: with_metrics.avg_tokens,
         without_skill_avg_tokens: without_metrics.avg_tokens,
+        trigger_precision,
+        trigger_recall,
+        with_skill_duration_ratio: duration_ratio,
+        with_skill_token_ratio: token_ratio,
     };
 
     let notes = build_notes(&assertions, &run_summary);
@@ -236,6 +263,55 @@ pub fn run_skill_eval(input: &SkillEvalInput, rounds: Option<u32>) -> SkillEvalR
         created_at_ms: timestamp_ms,
         status: "completed".to_string(),
         benchmark,
+    }
+}
+
+pub fn evaluate_install_gate(input: &SkillEvalInput, rounds: Option<u32>) -> SkillGateDecision {
+    let run = run_skill_eval(input, rounds);
+    let summary = &run.benchmark.run_summary;
+    let mut reasons = Vec::new();
+
+    if summary.trigger_precision < 0.70 {
+        reasons.push(format!(
+            "trigger precision {:.2} is below minimum 0.70",
+            summary.trigger_precision
+        ));
+    }
+    if summary.trigger_recall < 0.70 {
+        reasons.push(format!(
+            "trigger recall {:.2} is below minimum 0.70",
+            summary.trigger_recall
+        ));
+    }
+    if summary.with_skill_pass_rate < 0.75 {
+        reasons.push(format!(
+            "with-skill pass rate {:.2} is below minimum 0.75",
+            summary.with_skill_pass_rate
+        ));
+    }
+    if summary.pass_rate_delta < 0.10 {
+        reasons.push(format!(
+            "pass-rate delta {:.2} is below minimum 0.10",
+            summary.pass_rate_delta
+        ));
+    }
+    if summary.with_skill_duration_ratio > 1.50 {
+        reasons.push(format!(
+            "duration ratio {:.2} exceeds maximum 1.50",
+            summary.with_skill_duration_ratio
+        ));
+    }
+    if summary.with_skill_token_ratio > 1.60 {
+        reasons.push(format!(
+            "token ratio {:.2} exceeds maximum 1.60",
+            summary.with_skill_token_ratio
+        ));
+    }
+
+    SkillGateDecision {
+        passed: reasons.is_empty(),
+        reasons,
+        run,
     }
 }
 
@@ -362,6 +438,49 @@ fn trigger_quality_result(description: &str) -> SkillEvalAssertionResult {
         "missing_action_verb".to_string()
     });
     SkillEvalAssertionResult { passed, evidence }
+}
+
+fn token_overlap_score(haystack: &str, needle: &str) -> f64 {
+    let haystack_words: std::collections::HashSet<String> = haystack
+        .split_whitespace()
+        .map(|word| word.to_ascii_lowercase())
+        .collect();
+    let needle_words: Vec<String> = needle
+        .split_whitespace()
+        .map(|word| word.to_ascii_lowercase())
+        .collect();
+    if needle_words.is_empty() {
+        return 0.0;
+    }
+    let matched = needle_words
+        .iter()
+        .filter(|word| haystack_words.contains(*word))
+        .count();
+    matched as f64 / needle_words.len() as f64
+}
+
+fn trigger_precision(input: &SkillEvalInput) -> f64 {
+    if input.should_not_trigger.is_empty() {
+        return 1.0;
+    }
+    let negatives = input
+        .should_not_trigger
+        .iter()
+        .filter(|prompt| token_overlap_score(&input.description, prompt) < 0.35)
+        .count();
+    negatives as f64 / input.should_not_trigger.len() as f64
+}
+
+fn trigger_recall(input: &SkillEvalInput) -> f64 {
+    if input.should_trigger.is_empty() {
+        return 1.0;
+    }
+    let positives = input
+        .should_trigger
+        .iter()
+        .filter(|prompt| token_overlap_score(&input.description, prompt) >= 0.35)
+        .count();
+    positives as f64 / input.should_trigger.len() as f64
 }
 
 fn workflow_steps_result(body: &str) -> SkillEvalAssertionResult {
@@ -604,6 +723,14 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+fn ratio_f(numerator: f64, denominator: f64) -> f64 {
+    if denominator <= 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
 fn mean_stddev(samples: &[f64]) -> (f64, f64) {
     if samples.is_empty() {
         return (0.0, 0.0);
@@ -678,6 +805,16 @@ cargo test -p moltis-tools skill_tools
                 any_bins: vec!["python3".to_string()],
                 install: vec![],
             },
+            should_trigger: vec![
+                "create a new skill".to_string(),
+                "improve an existing SKILL.md".to_string(),
+                "benchmark skill quality".to_string(),
+            ],
+            should_not_trigger: vec![
+                "simple translation request".to_string(),
+                "general brainstorming".to_string(),
+                "non-skill coding task".to_string(),
+            ],
         }
     }
 
