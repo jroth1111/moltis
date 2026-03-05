@@ -3719,10 +3719,6 @@ pub async fn prepare_gateway(
                 base_tools,
             )
             .with_on_event(on_spawn_event)
-            .with_agents_config(agents_config)
-            .with_task_store(Arc::clone(&task_store))
-            .with_tasks_config(config.tasks.clone())
-            .with_tool_policy_resolver(tool_policy_resolver);
             .with_session_store(Arc::clone(&session_store))
             .with_agents_config(agents_config)
             .with_task_store(Arc::clone(&task_store))

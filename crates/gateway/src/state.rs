@@ -566,9 +566,7 @@ impl GatewayState {
             metrics_store,
             #[cfg(feature = "vault")]
             vault,
-            provider_health: Arc::new(
-                moltis_agents::provider_health::ProviderHealthTracker::default_window(),
-            ),
+            provider_health: moltis_agents::provider_health::global_tracker(),
             seq: AtomicU64::new(0),
             tts_phrase_counter: AtomicUsize::new(0),
             #[cfg(feature = "graphql")]
