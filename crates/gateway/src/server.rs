@@ -3407,9 +3407,11 @@ pub async fn prepare_gateway(
         tool_registry.register(Box::new(crate::mcp_agent_tools::McpDescribeToolTool::new(
             Arc::clone(&mcp_manager),
         )));
-        tool_registry.register(Box::new(crate::mcp_agent_tools::McpCodeExecTool::new(
-            mcp_manager,
-            &config.mcp.code,
+        let mcp_code_exec =
+            crate::mcp_agent_tools::McpCodeExecTool::new(mcp_manager, &config.mcp.code);
+        tool_registry.register(Box::new(mcp_code_exec.clone()));
+        tool_registry.register(Box::new(crate::mcp_agent_tools::McpSkillRunTool::new(
+            mcp_code_exec,
         )));
         #[cfg(feature = "wasm")]
         {

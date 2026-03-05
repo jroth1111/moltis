@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -12,7 +13,10 @@ use {
     moltis_mcp::types::{McpToolDef, ToolContent, ToolsCallResult},
     serde::Deserialize,
     serde_json::Value,
+    tokio::fs,
     tokio::time::timeout,
+    tracing::warn,
+    uuid::Uuid,
 };
 
 #[derive(Deserialize)]
@@ -21,14 +25,14 @@ struct SelectedTool {
     tool: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct Program {
     steps: Vec<ProgramStep>,
     #[serde(default)]
     return_step: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 struct ProgramStep {
     id: String,
     server: String,
@@ -280,6 +284,33 @@ fn redact_pii_value(value: &Value) -> Value {
     }
 }
 
+fn code_runs_dir() -> PathBuf {
+    moltis_config::data_dir().join("mcp").join("runs")
+}
+
+fn skill_programs_dir() -> PathBuf {
+    moltis_config::data_dir().join("mcp").join("skills")
+}
+
+fn normalize_skill_name(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("skill name must not be empty"));
+    }
+    if trimmed.contains("..") || trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(anyhow!("invalid skill name '{trimmed}'"));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(anyhow!(
+            "invalid skill name '{trimmed}': allowed chars are [A-Za-z0-9_-]"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 pub struct McpSearchToolsTool {
     manager: Arc<moltis_mcp::McpManager>,
 }
@@ -411,6 +442,7 @@ impl AgentTool for McpDescribeToolTool {
     }
 }
 
+#[derive(Clone)]
 pub struct McpCodeExecTool {
     manager: Arc<moltis_mcp::McpManager>,
     enabled: bool,
@@ -423,6 +455,7 @@ pub struct McpCodeExecTool {
     max_steps: usize,
     max_tool_calls: usize,
     max_result_bytes: usize,
+    runs_dir: PathBuf,
 }
 
 impl McpCodeExecTool {
@@ -459,6 +492,7 @@ impl McpCodeExecTool {
             max_steps: cfg.max_steps.max(1),
             max_tool_calls: cfg.max_tool_calls.max(1),
             max_result_bytes: cfg.max_result_bytes.max(1_024),
+            runs_dir: code_runs_dir(),
         }
     }
 
@@ -582,6 +616,92 @@ impl McpCodeExecTool {
 
         Ok((final_result, summaries, tool_calls))
     }
+
+    async fn persist_run_artifact(
+        &self,
+        program: &Program,
+        summaries: &[Value],
+        tool_calls: usize,
+        final_result: &Value,
+    ) -> Result<PathBuf> {
+        fs::create_dir_all(&self.runs_dir).await?;
+        let path = self.runs_dir.join(format!("run-{}.json", Uuid::new_v4()));
+        let payload = serde_json::json!({
+            "program": program,
+            "steps": summaries,
+            "toolCalls": tool_calls,
+            "result": final_result,
+        });
+        let encoded = serde_json::to_vec_pretty(&payload)?;
+        fs::write(&path, encoded).await?;
+        Ok(path)
+    }
+
+    pub(crate) async fn run(&self, params: Value) -> Result<Value> {
+        let language = params
+            .get("language")
+            .and_then(Value::as_str)
+            .unwrap_or("plan-json");
+        if language != "plan-json" {
+            return Err(anyhow!(
+                "unsupported language '{language}', expected 'plan-json'"
+            ));
+        }
+
+        if !self.enabled {
+            return Err(anyhow!(
+                "mcp_code_exec is disabled by config (mcp.code.enabled = false)"
+            ));
+        }
+
+        let program = parse_program(&params)?;
+        let selected_tools = parse_selected_tools(&params);
+
+        let effective_max_steps = params
+            .get("max_steps")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(self.max_steps)
+            .clamp(1, self.max_steps);
+
+        let effective_max_tool_calls = params
+            .get("max_tool_calls")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(self.max_tool_calls)
+            .clamp(1, self.max_tool_calls);
+
+        let timeout_duration = Duration::from_millis(self.timeout_ms);
+        let (final_result, summaries, tool_calls) = timeout(
+            timeout_duration,
+            self.execute_program(
+                &program,
+                &selected_tools,
+                effective_max_steps,
+                effective_max_tool_calls,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "mcp_code_exec timed out after {} ms",
+                timeout_duration.as_millis()
+            )
+        })??;
+
+        if let Err(error) = self
+            .persist_run_artifact(&program, &summaries, tool_calls, &final_result)
+            .await
+        {
+            warn!(%error, "failed to persist MCP code run artifact");
+        }
+
+        Ok(serde_json::json!({
+            "result": final_result,
+            "steps": summaries,
+            "toolCalls": tool_calls,
+        }))
+    }
 }
 
 #[async_trait]
@@ -651,62 +771,96 @@ impl AgentTool for McpCodeExecTool {
     }
 
     async fn execute(&self, params: Value) -> Result<Value> {
-        let language = params
-            .get("language")
+        self.run(params).await
+    }
+}
+
+pub struct McpSkillRunTool {
+    code_exec: McpCodeExecTool,
+}
+
+impl McpSkillRunTool {
+    pub fn new(code_exec: McpCodeExecTool) -> Self {
+        Self { code_exec }
+    }
+}
+
+#[async_trait]
+impl AgentTool for McpSkillRunTool {
+    fn name(&self) -> &str {
+        "mcp_skill_run"
+    }
+
+    fn description(&self) -> &str {
+        "Run a saved MCP skill program from ~/.moltis/mcp/skills/<name>.json through mcp_code_exec."
+    }
+
+    fn side_effect_class(&self) -> ToolEffectClass {
+        ToolEffectClass::ExternalEffect
+    }
+
+    fn categories(&self) -> &'static [&'static str] {
+        &["mcp", "code", "skill"]
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill file name from ~/.moltis/mcp/skills/<name>.json"
+                },
+                "selected_tools": {
+                    "type": "array",
+                    "description": "Optional allowlist override for this run",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string" },
+                            "tool": { "type": "string" }
+                        },
+                        "required": ["server", "tool"]
+                    }
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Optional per-run max steps (capped by config)"
+                },
+                "max_tool_calls": {
+                    "type": "integer",
+                    "description": "Optional per-run max tool calls (capped by config)"
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let name = params
+            .get("name")
             .and_then(Value::as_str)
-            .unwrap_or("plan-json");
-        if language != "plan-json" {
-            return Err(anyhow!(
-                "unsupported language '{language}', expected 'plan-json'"
-            ));
+            .ok_or_else(|| anyhow!("missing 'name' parameter"))?;
+        let normalized = normalize_skill_name(name)?;
+        let path = skill_programs_dir().join(format!("{normalized}.json"));
+        let content = fs::read_to_string(&path)
+            .await
+            .map_err(|error| anyhow!("failed to load skill '{}': {error}", path.display()))?;
+        let program: Value = serde_json::from_str(&content)
+            .map_err(|error| anyhow!("skill '{}' is not valid JSON: {error}", path.display()))?;
+
+        let mut exec_params = serde_json::Map::new();
+        exec_params.insert("program".to_string(), program);
+        if let Some(value) = params.get("selected_tools").cloned() {
+            exec_params.insert("selected_tools".to_string(), value);
         }
-
-        if !self.enabled {
-            return Err(anyhow!(
-                "mcp_code_exec is disabled by config (mcp.code.enabled = false)"
-            ));
+        if let Some(value) = params.get("max_steps").cloned() {
+            exec_params.insert("max_steps".to_string(), value);
         }
-
-        let program = parse_program(&params)?;
-        let selected_tools = parse_selected_tools(&params);
-
-        let effective_max_steps = params
-            .get("max_steps")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize)
-            .unwrap_or(self.max_steps)
-            .clamp(1, self.max_steps);
-
-        let effective_max_tool_calls = params
-            .get("max_tool_calls")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize)
-            .unwrap_or(self.max_tool_calls)
-            .clamp(1, self.max_tool_calls);
-
-        let timeout_duration = Duration::from_millis(self.timeout_ms);
-        let (final_result, summaries, tool_calls) = timeout(
-            timeout_duration,
-            self.execute_program(
-                &program,
-                &selected_tools,
-                effective_max_steps,
-                effective_max_tool_calls,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "mcp_code_exec timed out after {} ms",
-                timeout_duration.as_millis()
-            )
-        })??;
-
-        Ok(serde_json::json!({
-            "result": final_result,
-            "steps": summaries,
-            "toolCalls": tool_calls,
-        }))
+        if let Some(value) = params.get("max_tool_calls").cloned() {
+            exec_params.insert("max_tool_calls".to_string(), value);
+        }
+        self.code_exec.run(Value::Object(exec_params)).await
     }
 }
 
@@ -770,5 +924,12 @@ mod tests {
         assert!(!rendered.contains("alice@example.com"));
         assert!(!rendered.contains("123-45-6789"));
         assert!(!rendered.contains("(415)5551212"));
+    }
+
+    #[test]
+    fn normalize_skill_name_rejects_path_traversal() {
+        assert!(normalize_skill_name("daily_sync").is_ok());
+        assert!(normalize_skill_name("../daily_sync").is_err());
+        assert!(normalize_skill_name("nested/path").is_err());
     }
 }
