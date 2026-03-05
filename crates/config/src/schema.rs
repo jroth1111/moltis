@@ -1395,6 +1395,24 @@ pub struct McpCodeConfig {
     pub max_result_bytes: usize,
     /// Tool summary cache TTL used by search/describe.
     pub tool_summary_cache_ttl_secs: u64,
+    /// Default retry attempts for MCP tool steps.
+    pub default_retry_attempts: u32,
+    /// Default retry backoff in milliseconds for MCP tool steps.
+    pub default_retry_backoff_ms: u64,
+    /// Max retry backoff in milliseconds for MCP tool steps.
+    pub default_retry_max_backoff_ms: u64,
+    /// Automatically promote repeatedly successful runs to named skills.
+    pub auto_promote_enabled: bool,
+    /// Number of successful runs required before auto-promotion.
+    pub auto_promote_min_successes: u32,
+    /// Prefix used for generated skill names.
+    pub auto_skill_prefix: String,
+    /// Optional per-server ranking priors for `mcp_search_tools`.
+    pub search_server_priors: HashMap<String, i32>,
+    /// Weight for historical success/failure ranking signal.
+    pub search_success_weight: i32,
+    /// Weight for semantic matching in search ranking.
+    pub search_semantic_weight: i32,
 }
 
 impl Default for McpCodeConfig {
@@ -1412,6 +1430,15 @@ impl Default for McpCodeConfig {
             max_stdout_bytes: 64 * 1024,
             max_result_bytes: 128 * 1024,
             tool_summary_cache_ttl_secs: 300,
+            default_retry_attempts: 2,
+            default_retry_backoff_ms: 250,
+            default_retry_max_backoff_ms: 4_000,
+            auto_promote_enabled: true,
+            auto_promote_min_successes: 3,
+            auto_skill_prefix: "auto".to_string(),
+            search_server_priors: HashMap::new(),
+            search_success_weight: 120,
+            search_semantic_weight: 60,
         }
     }
 }
@@ -3388,6 +3415,15 @@ tool_mode = "native"
         assert!(cfg.max_stdout_bytes > 0);
         assert!(cfg.max_result_bytes > 0);
         assert!(cfg.tool_summary_cache_ttl_secs > 0);
+        assert!(cfg.default_retry_attempts > 0);
+        assert!(cfg.default_retry_backoff_ms > 0);
+        assert!(cfg.default_retry_max_backoff_ms >= cfg.default_retry_backoff_ms);
+        assert!(cfg.auto_promote_enabled);
+        assert!(cfg.auto_promote_min_successes > 0);
+        assert!(!cfg.auto_skill_prefix.is_empty());
+        assert!(cfg.search_server_priors.is_empty());
+        assert!(cfg.search_success_weight >= 0);
+        assert!(cfg.search_semantic_weight >= 0);
     }
 
     #[test]
@@ -3414,6 +3450,18 @@ max_tool_calls = 24
 max_stdout_bytes = 8192
 max_result_bytes = 16384
 tool_summary_cache_ttl_secs = 60
+default_retry_attempts = 4
+default_retry_backoff_ms = 150
+default_retry_max_backoff_ms = 2000
+auto_promote_enabled = true
+auto_promote_min_successes = 5
+auto_skill_prefix = "repeat"
+search_success_weight = 140
+search_semantic_weight = 75
+
+[mcp.code.search_server_priors]
+filesystem = 25
+github = 10
 
 [mcp.legacy_direct]
 enabled = true
@@ -3427,7 +3475,10 @@ allow_servers = ["filesystem", "github"]
             config.mcp.code.allow_servers,
             vec!["filesystem".to_string(), "github".to_string()]
         );
-        assert_eq!(config.mcp.code.deny_servers, vec!["legacy-test".to_string()]);
+        assert_eq!(
+            config.mcp.code.deny_servers,
+            vec!["legacy-test".to_string()]
+        );
         assert_eq!(
             config.mcp.code.allow_tools,
             vec![
@@ -3445,6 +3496,23 @@ allow_servers = ["filesystem", "github"]
         assert_eq!(config.mcp.code.max_stdout_bytes, 8_192);
         assert_eq!(config.mcp.code.max_result_bytes, 16_384);
         assert_eq!(config.mcp.code.tool_summary_cache_ttl_secs, 60);
+        assert_eq!(config.mcp.code.default_retry_attempts, 4);
+        assert_eq!(config.mcp.code.default_retry_backoff_ms, 150);
+        assert_eq!(config.mcp.code.default_retry_max_backoff_ms, 2_000);
+        assert!(config.mcp.code.auto_promote_enabled);
+        assert_eq!(config.mcp.code.auto_promote_min_successes, 5);
+        assert_eq!(config.mcp.code.auto_skill_prefix, "repeat");
+        assert_eq!(config.mcp.code.search_success_weight, 140);
+        assert_eq!(config.mcp.code.search_semantic_weight, 75);
+        assert_eq!(
+            config
+                .mcp
+                .code
+                .search_server_priors
+                .get("filesystem")
+                .copied(),
+            Some(25)
+        );
         assert!(config.mcp.legacy_direct.enabled);
         assert_eq!(config.mcp.legacy_direct.ttl_minutes, 30);
         assert_eq!(

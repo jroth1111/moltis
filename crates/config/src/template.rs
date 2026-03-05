@@ -506,6 +506,17 @@ max_tool_calls = 64             # Max MCP tool calls in one run
 max_stdout_bytes = 65536        # Max stdout bytes retained from execution
 max_result_bytes = 131072       # Max serialized result bytes returned to model
 tool_summary_cache_ttl_secs = 300 # Cached tools metadata TTL
+default_retry_attempts = 2      # Default retries for tool steps
+default_retry_backoff_ms = 250  # Initial retry backoff per step
+default_retry_max_backoff_ms = 4000 # Max exponential backoff per step
+auto_promote_enabled = true     # Persist repeated successful programs as reusable skills
+auto_promote_min_successes = 3  # Successes required before auto-promotion
+auto_skill_prefix = "auto"      # Prefix for generated skill names
+search_success_weight = 120     # Weight for historical success in tool ranking
+search_semantic_weight = 60     # Weight for semantic token overlap in tool ranking
+# [mcp.code.search_server_priors]
+# filesystem = 25
+# github = 10
 
 # Emergency legacy direct MCP bridge (disabled by default).
 [mcp.legacy_direct]
