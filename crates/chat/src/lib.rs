@@ -1869,7 +1869,12 @@ fn apply_runtime_tool_filters(
 ) -> ToolRegistry {
     let base_registry = if mcp_disabled {
         let without_mcp = base.clone_without_mcp();
-        without_mcp.clone_without(&["mcp_search_tools", "mcp_describe_tool", "mcp_code_exec"])
+        without_mcp.clone_without(&[
+            "mcp_search_tools",
+            "mcp_describe_tool",
+            "mcp_code_exec",
+            "mcp_skill_run",
+        ])
     } else {
         base.clone_without(&[])
     };
@@ -13375,6 +13380,9 @@ mod tests {
         registry.register(Box::new(DummyTool {
             name: "mcp_code_exec".to_string(),
         }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_skill_run".to_string(),
+        }));
         registry.register_mcp(
             Box::new(DummyTool {
                 name: "mcp__filesystem__read_file".to_string(),
@@ -13388,6 +13396,7 @@ mod tests {
             "mcp_search_tools".into(),
             "mcp_describe_tool".into(),
             "mcp_code_exec".into(),
+            "mcp_skill_run".into(),
             "mcp__filesystem__read_file".into(),
         ];
 
@@ -13396,6 +13405,7 @@ mod tests {
         assert!(filtered.get("mcp_search_tools").is_none());
         assert!(filtered.get("mcp_describe_tool").is_none());
         assert!(filtered.get("mcp_code_exec").is_none());
+        assert!(filtered.get("mcp_skill_run").is_none());
         assert!(filtered.get("mcp__filesystem__read_file").is_none());
     }
 

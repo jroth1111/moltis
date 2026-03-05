@@ -108,12 +108,14 @@ Moltis monitors MCP servers and automatically:
 
 Moltis runs MCP in **code-only mode** by default. Instead of injecting every MCP tool schema into prompt context, the agent uses meta-tools:
 
-- `mcp_search_tools` to find relevant tools (`detail_level`: `name`, `summary`, `full`)
+- `mcp_search_tools` to find relevant tools (`detail_level`: `name`, `summary`, `full`), ranked by lexical + semantic match, server priors, and historical success
 - `mcp_describe_tool` for exact schema details
-- `mcp_code_exec` to execute multi-step MCP programs in one call
-- `mcp_skill_run` to run saved programs from `~/.moltis/mcp/skills/<name>.json`
+- `mcp_code_exec` to execute multi-step MCP programs in one call (v2 plan: `tool`, `if`, `for_each`, `retry`, `transform`)
+- `mcp_skill_run` to run saved programs from `~/.moltis/mcp/skills/<name>.json` before falling back to new planning
 
-`mcp_code_exec` run artifacts are persisted at `~/.moltis/mcp/runs/` for audit/debug.
+`mcp_code_exec` persists run artifacts at `~/.moltis/mcp/runs/` and checkpoints/idempotency data in `~/.moltis/mcp/code_exec.sqlite`.  
+Each step can shape output (`select`, `map`, `limit`, `max_bytes`) to keep intermediate payloads small.  
+Successful repeated workflows are auto-promoted into reusable skills.
 
 The emergency `legacy_direct` bridge can still be enabled temporarily, but should remain off in normal operation.
 
