@@ -1276,16 +1276,9 @@ pub struct ChatConfig {
     /// live discovery), so this field is currently ignored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
-    /// Enable two-pass fact extraction during compaction.
+    /// Context compaction policy and budgets.
     #[serde(default)]
-    pub fact_extraction: bool,
-    /// Context compaction strategy when the context window approaches its limit.
-    /// Options: "truncate" (default), "move_to_workspace"
-    #[serde(default = "default_compaction_strategy")]
-    pub context_compaction_strategy: String,
-    /// Number of recent messages to keep after compaction.
-    #[serde(default = "default_compaction_keep_recent")]
-    pub context_compaction_keep_recent: usize,
+    pub compaction: ChatCompactionConfig,
     /// Research phase settings.
     #[serde(default)]
     pub research: ResearchConfig,
@@ -1304,12 +1297,36 @@ fn default_message_queue_mode() -> MessageQueueMode {
     MessageQueueMode::Followup
 }
 
-fn default_compaction_strategy() -> String {
-    "truncate".to_string()
+fn default_compaction_enabled() -> bool {
+    true
 }
 
-fn default_compaction_keep_recent() -> usize {
-    20
+fn default_compaction_soft_trigger_percent() -> u8 {
+    80
+}
+
+fn default_compaction_hard_trigger_percent() -> u8 {
+    90
+}
+
+fn default_compaction_emergency_trigger_percent() -> u8 {
+    95
+}
+
+fn default_compaction_verbatim_turns() -> usize {
+    10
+}
+
+fn default_compaction_min_verbatim_turns() -> usize {
+    6
+}
+
+fn default_compaction_anchor_budget_tokens() -> u64 {
+    5_000
+}
+
+fn default_compaction_summary_budget_tokens() -> u64 {
+    2_500
 }
 
 fn default_message_queue_max_size() -> usize {
@@ -1326,12 +1343,55 @@ impl Default for ChatConfig {
             message_queue_mode: default_message_queue_mode(),
             priority_models: Vec::new(),
             allowed_models: Vec::new(),
-            fact_extraction: false,
-            context_compaction_strategy: default_compaction_strategy(),
-            context_compaction_keep_recent: default_compaction_keep_recent(),
+            compaction: ChatCompactionConfig::default(),
             research: ResearchConfig::default(),
             message_queue_max_size: default_message_queue_max_size(),
             priority_starvation_bound: default_priority_starvation_bound(),
+        }
+    }
+}
+
+/// Context compaction configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatCompactionConfig {
+    /// Master toggle for automatic context compaction.
+    #[serde(default = "default_compaction_enabled")]
+    pub enabled: bool,
+    /// Soft compaction trigger threshold in percent of context window usage.
+    #[serde(default = "default_compaction_soft_trigger_percent")]
+    pub soft_trigger_percent: u8,
+    /// Hard compaction trigger threshold in percent of context window usage.
+    #[serde(default = "default_compaction_hard_trigger_percent")]
+    pub hard_trigger_percent: u8,
+    /// Emergency compaction trigger threshold in percent of context window usage.
+    #[serde(default = "default_compaction_emergency_trigger_percent")]
+    pub emergency_trigger_percent: u8,
+    /// Number of most-recent turns to preserve verbatim in normal compaction.
+    #[serde(default = "default_compaction_verbatim_turns")]
+    pub verbatim_turns: usize,
+    /// Minimum number of verbatim turns preserved under hard/emergency pressure.
+    #[serde(default = "default_compaction_min_verbatim_turns")]
+    pub min_verbatim_turns: usize,
+    /// Token budget for anchor preservation.
+    #[serde(default = "default_compaction_anchor_budget_tokens")]
+    pub anchor_budget_tokens: u64,
+    /// Token budget for generated rolling summary.
+    #[serde(default = "default_compaction_summary_budget_tokens")]
+    pub summary_budget_tokens: u64,
+}
+
+impl Default for ChatCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_compaction_enabled(),
+            soft_trigger_percent: default_compaction_soft_trigger_percent(),
+            hard_trigger_percent: default_compaction_hard_trigger_percent(),
+            emergency_trigger_percent: default_compaction_emergency_trigger_percent(),
+            verbatim_turns: default_compaction_verbatim_turns(),
+            min_verbatim_turns: default_compaction_min_verbatim_turns(),
+            anchor_budget_tokens: default_compaction_anchor_budget_tokens(),
+            summary_budget_tokens: default_compaction_summary_budget_tokens(),
         }
     }
 }
@@ -2571,6 +2631,45 @@ system_prompt_suffix = "Focus on evidence."
     fn chat_config_toml_parses_priority_starvation_bound() {
         let cfg: ChatConfig = toml::from_str("priority_starvation_bound = 9").unwrap();
         assert_eq!(cfg.priority_starvation_bound, 9);
+    }
+
+    #[test]
+    fn chat_compaction_defaults_match_v2_policy() {
+        let cfg = ChatConfig::default();
+        assert!(cfg.compaction.enabled);
+        assert_eq!(cfg.compaction.soft_trigger_percent, 80);
+        assert_eq!(cfg.compaction.hard_trigger_percent, 90);
+        assert_eq!(cfg.compaction.emergency_trigger_percent, 95);
+        assert_eq!(cfg.compaction.verbatim_turns, 10);
+        assert_eq!(cfg.compaction.min_verbatim_turns, 6);
+        assert_eq!(cfg.compaction.anchor_budget_tokens, 5_000);
+        assert_eq!(cfg.compaction.summary_budget_tokens, 2_500);
+    }
+
+    #[test]
+    fn chat_compaction_parses_overrides() {
+        let cfg: ChatConfig = toml::from_str(
+            r#"
+[compaction]
+enabled = false
+soft_trigger_percent = 75
+hard_trigger_percent = 88
+emergency_trigger_percent = 96
+verbatim_turns = 14
+min_verbatim_turns = 8
+anchor_budget_tokens = 7000
+summary_budget_tokens = 3000
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.compaction.enabled);
+        assert_eq!(cfg.compaction.soft_trigger_percent, 75);
+        assert_eq!(cfg.compaction.hard_trigger_percent, 88);
+        assert_eq!(cfg.compaction.emergency_trigger_percent, 96);
+        assert_eq!(cfg.compaction.verbatim_turns, 14);
+        assert_eq!(cfg.compaction.min_verbatim_turns, 8);
+        assert_eq!(cfg.compaction.anchor_budget_tokens, 7_000);
+        assert_eq!(cfg.compaction.summary_budget_tokens, 3_000);
     }
 
     #[test]

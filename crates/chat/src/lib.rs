@@ -16,7 +16,7 @@ use {
         task::AbortHandle,
     },
     tokio_stream::StreamExt,
-    tracing::{debug, info, warn},
+    tracing::{Instrument, debug, info, warn},
 };
 
 use moltis_config::{MessageQueueMode, ToolMode};
@@ -46,12 +46,21 @@ use {
 };
 
 pub mod chat_error;
+mod compaction;
 pub mod error;
+mod history_context;
 pub mod runtime;
 
 pub use runtime::{ChatRuntime, TtsOverride};
 use {
     chat_error::parse_chat_error,
+    compaction::{
+        ContextCompactionAction, emergency_reduction_plan, hard_reduction_plan,
+        context_compaction_action_for_usage, context_compaction_config_from_chat,
+        layer_stats_for_history, parse_compaction_facts, partition_history_for_summary,
+        retain_with_importance, summary_context_plan, trim_summary_to_budget,
+    },
+    history_context::{normalize_for_context_view, normalize_for_model_context},
     moltis_common::handoff::{
         HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
     },
@@ -118,6 +127,12 @@ async fn broadcast(
 
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
+#[cfg(feature = "metrics")]
+const CHAT_COMPACTION_RUNS_TOTAL: &str = "chat.compaction.runs_total";
+#[cfg(feature = "metrics")]
+const CHAT_COMPACTION_DURATION_SECONDS: &str = "chat.compaction.duration_seconds";
+#[cfg(feature = "metrics")]
+const CHAT_COMPACTION_STAGE_DURATION_SECONDS: &str = "chat.compaction.stage_duration_seconds";
 
 /// Convert session-crate `MessageContent` to agents-crate `UserContent`.
 ///
@@ -322,85 +337,387 @@ fn estimate_text_tokens(text: &str) -> u64 {
     bytes.div_ceil(4).max(1)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextCompactionStrategy {
-    Truncate,
-    MoveToWorkspace,
+#[must_use]
+fn estimate_history_tokens(history: &[Value]) -> u64 {
+    history
+        .iter()
+        .map(|msg| estimate_text_tokens(&msg.to_string()))
+        .sum()
 }
 
-impl ContextCompactionStrategy {
-    fn as_config_value(self) -> &'static str {
-        match self {
-            Self::Truncate => "truncate",
-            Self::MoveToWorkspace => "move_to_workspace",
+const MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS: usize = 4_000;
+const COMPACTION_STRUCTURED_SUMMARY_SYSTEM_PROMPT: &str =
+    "You are a conversation summarizer. Summarize only the compressible history and preserve key context. Do not invent facts. Do not include raw tool payload dumps.";
+const COMPACTION_EMPTY_GAP_SUMMARY: &str =
+    "No compressible background turns required summarization. Anchors and recent turns were preserved verbatim.";
+
+#[must_use]
+fn compaction_structured_summary_user_prompt(summary_budget_tokens: u64) -> String {
+    format!(
+        "Summarize the compressible history into at most {summary_budget_tokens} tokens. \
+Use exactly these sections in order and output only these sections:\n\
+Decisions\n\
+State\n\
+Open Items\n\
+Constraints\n\
+Artifacts\n\
+For empty sections write '- none'."
+    )
+}
+
+#[must_use]
+fn build_compaction_summary_messages(
+    normalized_summary_source: &[Value],
+    summary_budget_tokens: u64,
+) -> Vec<ChatMessage> {
+    let mut summary_messages = vec![ChatMessage::system(COMPACTION_STRUCTURED_SUMMARY_SYSTEM_PROMPT)];
+    summary_messages.extend(values_to_chat_messages(normalized_summary_source));
+    summary_messages.push(ChatMessage::user(compaction_structured_summary_user_prompt(
+        summary_budget_tokens,
+    )));
+    summary_messages
+}
+
+#[must_use]
+fn default_compaction_summary(summary_budget_tokens: u64) -> String {
+    trim_summary_to_budget(COMPACTION_EMPTY_GAP_SUMMARY, summary_budget_tokens)
+}
+
+#[must_use]
+fn dropped_messages_for_retention(history: &[Value], retained: &[Value]) -> Vec<Value> {
+    let mut retained_counts: HashMap<String, usize> = HashMap::new();
+    for msg in retained {
+        let key = serde_json::to_string(msg).unwrap_or_else(|_| msg.to_string());
+        *retained_counts.entry(key).or_insert(0) += 1;
+    }
+
+    let mut dropped = Vec::new();
+    for msg in history {
+        let key = serde_json::to_string(msg).unwrap_or_else(|_| msg.to_string());
+        match retained_counts.get_mut(&key) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+            },
+            _ => dropped.push(msg.clone()),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ContextCompactionConfig {
-    strategy: ContextCompactionStrategy,
-    keep_recent: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextCompactionAction {
-    None,
-    /// Early memory flush at ~70% occupancy — no summarization, only persists
-    /// important memories before they might be lost to compaction.
-    PreCompact,
-    Compact,
-    ArchiveTier,
-    TruncateTier,
+    dropped
 }
 
 #[must_use]
-fn context_compaction_config_from_chat(
-    chat: &moltis_config::ChatConfig,
-) -> ContextCompactionConfig {
-    let strategy = match chat
-        .context_compaction_strategy
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "move_to_workspace" => ContextCompactionStrategy::MoveToWorkspace,
-        _ => ContextCompactionStrategy::Truncate,
-    };
-    ContextCompactionConfig {
-        strategy,
-        keep_recent: chat.context_compaction_keep_recent.max(1),
-    }
-}
-
-#[must_use]
-fn context_compaction_action_for_usage(
-    estimated_next_input: u64,
+fn compaction_failure_fallback_reduction(
+    history: &[Value],
+    compaction_config: compaction::ContextCompactionConfig,
     context_window: u64,
-) -> ContextCompactionAction {
-    let pre_compact_threshold = (context_window * 70) / 100;
-    let compact_threshold = (context_window * 80) / 100;
-    let archive_threshold = (context_window * 90) / 100;
-    let truncate_threshold = (context_window * 95) / 100;
-    if estimated_next_input >= truncate_threshold {
-        ContextCompactionAction::TruncateTier
-    } else if estimated_next_input >= archive_threshold {
-        ContextCompactionAction::ArchiveTier
-    } else if estimated_next_input >= compact_threshold {
-        ContextCompactionAction::Compact
-    } else if estimated_next_input >= pre_compact_threshold {
-        ContextCompactionAction::PreCompact
-    } else {
-        ContextCompactionAction::None
+) -> Option<compaction::ImportanceRetentionResult> {
+    if history.is_empty() {
+        return None;
     }
+    let reduction = retain_with_importance(
+        history,
+        emergency_reduction_plan(compaction_config, context_window),
+    );
+    (reduction.removed_messages > 0).then_some(reduction)
 }
 
 #[must_use]
-fn archive_keep_recent_for_reduction(history_len: usize, configured_keep_recent: usize) -> usize {
-    if history_len <= 1 {
-        return history_len;
+fn compaction_summary_chars(history: &[Value]) -> usize {
+    history
+        .first()
+        .and_then(|msg| msg.get("content").and_then(Value::as_str))
+        .and_then(|content| content.strip_prefix("[Conversation Summary]\n\n"))
+        .map(|summary| summary.trim().chars().count())
+        .unwrap_or(0)
+}
+
+const COMPACTION_REDACTED_VALUE: &str = "[REDACTED]";
+
+fn is_compaction_assignment_key_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'"' | b'\'' | b'$')
+}
+
+fn is_compaction_value_delimiter(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'&' | b',' | b';' | b')' | b']' | b'}' | b'"' | b'\'')
+}
+
+fn normalize_compaction_assignment_key(key: &str) -> String {
+    key.trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .trim_start_matches('$')
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+}
+
+fn is_compaction_env_var_key(key: &str) -> bool {
+    let trimmed = key
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .trim_start_matches('$');
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_uppercase()) {
+        return false;
     }
-    configured_keep_recent.max(1).min(history_len - 1)
+    chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
+fn is_compaction_sensitive_assignment_key(key: &str) -> bool {
+    let normalized = normalize_compaction_assignment_key(key);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    let compact: String = normalized
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if compact.is_empty() {
+        return false;
+    }
+
+    matches!(compact.as_str(), "authorization" | "proxyauthorization")
+        || compact.ends_with("apikey")
+        || compact.ends_with("token")
+        || compact.ends_with("secret")
+        || compact.ends_with("password")
+        || compact.ends_with("passwd")
+}
+
+fn should_redact_compaction_assignment_key(key: &str) -> bool {
+    is_compaction_sensitive_assignment_key(key) || is_compaction_env_var_key(key)
+}
+
+fn starts_with_ignore_ascii_case(text: &str, start: usize, pattern: &str) -> bool {
+    let end = start.saturating_add(pattern.len());
+    text.get(start..end)
+        .is_some_and(|value| value.eq_ignore_ascii_case(pattern))
+}
+
+fn compaction_assignment_key_bounds(text: &str, separator_idx: usize) -> Option<(usize, usize)> {
+    if separator_idx == 0 || separator_idx >= text.len() {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut key_end = separator_idx;
+    while key_end > 0 && bytes[key_end - 1].is_ascii_whitespace() {
+        key_end -= 1;
+    }
+    if key_end == 0 {
+        return None;
+    }
+
+    let mut key_start = key_end;
+    while key_start > 0 && is_compaction_assignment_key_byte(bytes[key_start - 1]) {
+        key_start -= 1;
+    }
+    (key_start < key_end).then_some((key_start, key_end))
+}
+
+fn compaction_assignment_value_bounds(
+    text: &str,
+    separator_idx: usize,
+    key: &str,
+) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    if separator_idx >= bytes.len() {
+        return None;
+    }
+
+    let mut value_start = separator_idx + 1;
+    while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+        value_start += 1;
+    }
+    if value_start >= bytes.len() {
+        return None;
+    }
+
+    let normalized_key = normalize_compaction_assignment_key(key);
+    let mut quoted = None;
+    let mut redact_start = value_start;
+    if matches!(bytes[value_start], b'"' | b'\'') {
+        quoted = Some(bytes[value_start]);
+        redact_start = value_start + 1;
+    }
+    if redact_start >= bytes.len() {
+        return None;
+    }
+
+    if matches!(
+        normalized_key.as_str(),
+        "authorization" | "proxyauthorization"
+    ) && starts_with_ignore_ascii_case(text, redact_start, "bearer ")
+    {
+        redact_start += "bearer ".len();
+    }
+    if redact_start >= bytes.len() {
+        return None;
+    }
+
+    let mut value_end = redact_start;
+    if let Some(quote_byte) = quoted {
+        while value_end < bytes.len() && bytes[value_end] != quote_byte {
+            value_end += 1;
+        }
+    } else {
+        while value_end < bytes.len() && !is_compaction_value_delimiter(bytes[value_end]) {
+            value_end += 1;
+        }
+    }
+    (value_end > redact_start).then_some((redact_start, value_end))
+}
+
+fn redact_compaction_assignment_values(text: &str) -> String {
+    let mut redacted = text.to_string();
+    let mut idx = 0usize;
+
+    while idx < redacted.len() {
+        let next_separator = redacted.as_bytes()[idx..]
+            .iter()
+            .position(|byte| matches!(byte, b'=' | b':'))
+            .map(|offset| idx + offset);
+        let Some(separator_idx) = next_separator else {
+            break;
+        };
+
+        let Some((key_start, key_end)) = compaction_assignment_key_bounds(&redacted, separator_idx)
+        else {
+            idx = separator_idx + 1;
+            continue;
+        };
+        let key = redacted[key_start..key_end].trim();
+        if !should_redact_compaction_assignment_key(key) {
+            idx = separator_idx + 1;
+            continue;
+        }
+
+        let Some((value_start, value_end)) =
+            compaction_assignment_value_bounds(&redacted, separator_idx, key)
+        else {
+            idx = separator_idx + 1;
+            continue;
+        };
+        if redacted[value_start..value_end].trim().is_empty()
+            || &redacted[value_start..value_end] == COMPACTION_REDACTED_VALUE
+        {
+            idx = separator_idx + 1;
+            continue;
+        }
+
+        redacted.replace_range(value_start..value_end, COMPACTION_REDACTED_VALUE);
+        idx = value_start + COMPACTION_REDACTED_VALUE.len();
+    }
+
+    redacted
+}
+
+fn find_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    if from >= haystack.len() {
+        return None;
+    }
+    let needle_lower = needle.to_ascii_lowercase();
+    let haystack_lower = haystack[from..].to_ascii_lowercase();
+    haystack_lower
+        .find(&needle_lower)
+        .map(|offset| from + offset)
+}
+
+fn redact_compaction_bearer_tokens(text: &str) -> String {
+    let mut redacted = text.to_string();
+    let mut idx = 0usize;
+    let needle = "bearer ";
+
+    while let Some(start) = find_case_insensitive(&redacted, needle, idx) {
+        let token_start = start + needle.len();
+        if token_start >= redacted.len() {
+            break;
+        }
+        if start > 0 && redacted.as_bytes()[start - 1].is_ascii_alphanumeric() {
+            idx = token_start;
+            continue;
+        }
+
+        let bytes = redacted.as_bytes();
+        let mut token_end = token_start;
+        while token_end < bytes.len() && !is_compaction_value_delimiter(bytes[token_end]) {
+            token_end += 1;
+        }
+        if token_end <= token_start
+            || &redacted[token_start..token_end] == COMPACTION_REDACTED_VALUE
+        {
+            idx = token_end.saturating_add(1);
+            continue;
+        }
+
+        redacted.replace_range(token_start..token_end, COMPACTION_REDACTED_VALUE);
+        idx = token_start + COMPACTION_REDACTED_VALUE.len();
+    }
+
+    redacted
+}
+
+fn redact_compaction_secret_values(text: &str) -> String {
+    let with_assignments = redact_compaction_assignment_values(text);
+    redact_compaction_bearer_tokens(&with_assignments)
+}
+
+fn build_archive_snapshot_body(dropped_messages: &[Value], limit: usize) -> String {
+    let mut lines = String::new();
+    for msg in dropped_messages.iter().take(limit) {
+        let role = msg
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_ascii_uppercase();
+        if let Some(preview) = extract_preview_from_value(msg) {
+            lines.push_str("- [");
+            lines.push_str(&role);
+            lines.push_str("] ");
+            lines.push_str(redact_compaction_secret_values(preview.trim()).trim());
+            lines.push('\n');
+        }
+    }
+    if lines.trim().is_empty() {
+        "- [INFO] Archived messages had no previewable text content.\n".to_string()
+    } else {
+        lines
+    }
+}
+
+async fn persist_archive_snapshot_to_memory(
+    memory_manager: Arc<moltis_memory::manager::MemoryManager>,
+    session_agent_id: String,
+    session_key: String,
+    archive_filename: String,
+    dropped_messages: Vec<Value>,
+) {
+    let memory_dir = moltis_config::agent_workspace_dir(&session_agent_id).join("memory");
+    if let Err(error) = tokio::fs::create_dir_all(&memory_dir).await {
+        warn!(%error, "archive snapshot: failed to create memory dir");
+        return;
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let safe_session_key = SessionStore::key_to_filename(&session_key);
+    let path = memory_dir.join(format!("archive-{safe_session_key}-{ts}.md"));
+    let archived_preview = build_archive_snapshot_body(&dropped_messages, 200);
+    let content = format!(
+        "# Archived Context Snapshot\n\n- **Session**: {session_key}\n- **Archive File**: {archive_filename}\n- **Archived Messages**: {}\n\n## Archived Excerpts\n\n{archived_preview}",
+        dropped_messages.len()
+    );
+    if let Err(error) = tokio::fs::write(&path, content).await {
+        warn!(%error, "archive snapshot: failed to write memory file");
+        return;
+    }
+
+    if let Err(error) = memory_manager.sync().await {
+        warn!(%error, "archive snapshot: memory sync failed");
+    }
 }
 
 fn now_ms() -> u64 {
@@ -408,6 +725,32 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(feature = "metrics")]
+fn record_compaction_stage(path: &str, stage: &str, elapsed: Duration) {
+    histogram!(
+        CHAT_COMPACTION_STAGE_DURATION_SECONDS,
+        "path" => path.to_string(),
+        "stage" => stage.to_string()
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+#[cfg(feature = "metrics")]
+fn record_compaction_result(path: &str, status: &str, elapsed: Duration) {
+    counter!(
+        CHAT_COMPACTION_RUNS_TOTAL,
+        "path" => path.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+    histogram!(
+        CHAT_COMPACTION_DURATION_SECONDS,
+        "path" => path.to_string(),
+        "status" => status.to_string()
+    )
+    .record(elapsed.as_secs_f64());
 }
 
 pub fn normalize_model_key(value: &str) -> String {
@@ -3854,188 +4197,191 @@ impl ChatService for LiveChatService {
             .and_then(|v| v.as_str())
             .map(String::from);
         let trace_id = trace_id.clone();
-        // Four-tier context management:
-        //   70% (pre-compact) — silent memory flush only; no summarization. Runs once
-        //                       per compaction window to capture memories before the
-        //                       compact window is reached.
-        //   80% (compact)     — LLM fact-extraction + narrative summary replaces history.
-        //   90% (archive tier)— strategy-driven truncate/archive while preserving recency.
-        //   95% (truncate)    — emergency: keep last 6 messages, no LLM call needed.
+        // Layered context management:
+        //   pre-soft         — silent memory flush only; no summarization.
+        //   soft trigger     — summarize background history while preserving
+        //                      anchor + working layers verbatim.
+        //   hard trigger     — reduce background first and shrink working layer.
+        //   emergency trigger— keep critical anchors + minimal working context.
         let context_window = provider.context_window() as u64;
         let token_usage = session_token_usage_from_messages(&history);
-        let compaction_config =
-            context_compaction_config_from_chat(&moltis_config::discover_and_load().chat);
+        let compaction_config = context_compaction_config_from_chat(&self.chat_config);
         let estimated_next_input = token_usage
             .current_request_input_tokens
             .saturating_add(estimate_text_tokens(&text));
-        match context_compaction_action_for_usage(estimated_next_input, context_window) {
-            ContextCompactionAction::TruncateTier => {
-                let keep_messages = 6usize;
-                let start = history.len().saturating_sub(keep_messages);
-                let truncated = history[start..].to_vec();
+        let layer_stats = layer_stats_for_history(&history, summary_context_plan(compaction_config));
+        match context_compaction_action_for_usage(
+            estimated_next_input,
+            context_window,
+            compaction_config,
+        ) {
+            ContextCompactionAction::EmergencyCompact => {
+                let reduction = retain_with_importance(
+                    &history,
+                    emergency_reduction_plan(compaction_config, context_window),
+                );
 
-                if let Err(error) = self
-                    .session_store
-                    .replace_history(&session_key, truncated.clone())
-                    .await
-                {
-                    warn!(
-                        session = %session_key,
-                        %error,
-                        "emergency truncate failed, continuing with full history"
-                    );
-                } else {
-                    history = truncated;
-                    self.session_metadata
-                        .touch(&session_key, history.len() as u32)
-                        .await;
-                    warn!(
-                        session = %session_key,
-                        estimated_next_input,
-                        context_window,
-                        "emergency history truncate applied at 95% context threshold"
-                    );
-                    broadcast(
-                        &self.state,
-                        "chat",
-                        serde_json::json!({
-                            "sessionKey": session_key,
-                            "state": "auto_compact",
-                            "phase": "truncate",
-                            "estimatedNextInputTokens": estimated_next_input,
-                            "contextWindow": context_window,
-                            "keptMessages": keep_messages,
-                        }),
-                        BroadcastOpts::default(),
-                    )
-                    .await;
-                }
-            },
-            ContextCompactionAction::ArchiveTier => {
-                let keep_recent =
-                    archive_keep_recent_for_reduction(history.len(), compaction_config.keep_recent);
-                let archived_count = history.len().saturating_sub(keep_recent);
-
-                if archived_count == 0 {
+                if reduction.removed_messages == 0 {
                     debug!(
                         session = %session_key,
-                        strategy = compaction_config.strategy.as_config_value(),
-                        "archive tier skipped: not enough history to reduce"
+                        "emergency compaction skipped: not enough history to reduce"
                     );
                 } else {
-                    let recent_messages =
-                        history[history.len().saturating_sub(keep_recent)..].to_vec();
-                    match compaction_config.strategy {
-                        ContextCompactionStrategy::MoveToWorkspace => {
-                            match self
-                                .session_store
-                                .archive_to_cold_store(&session_key, &history)
-                                .await
-                            {
-                                Ok(archive_filename) => {
-                                    let notice = PersistedMessage::notice(format!(
-                                        "[Context Archive] {archived_count} older message(s) archived to \
-                                         cold storage ({archive_filename}). Retaining {keep_recent} most \
-                                         recent messages."
-                                    ));
-                                    let mut new_history = vec![notice.to_value()];
-                                    new_history.extend(recent_messages);
+                    if let Err(error) = self
+                        .session_store
+                        .replace_history(&session_key, reduction.messages.clone())
+                        .await
+                    {
+                        warn!(
+                            session = %session_key,
+                            %error,
+                            "emergency compaction failed, continuing with full history"
+                        );
+                    } else {
+                        history = reduction.messages;
+                        self.session_metadata
+                            .touch(&session_key, history.len() as u32)
+                            .await;
+                        warn!(
+                            session = %session_key,
+                            estimated_next_input,
+                            context_window,
+                            removed_messages = reduction.removed_messages,
+                            retained_anchors = reduction.retained_anchor_messages,
+                            "emergency layered compaction applied"
+                        );
+                        broadcast(
+                            &self.state,
+                            "chat",
+                            serde_json::json!({
+                                "sessionKey": session_key,
+                                "state": "auto_compact",
+                                "phase": "emergency",
+                                "reason": "threshold_emergency",
+                                "estimatedNextInputTokens": estimated_next_input,
+                                "contextWindow": context_window,
+                                "layerStats": {
+                                    "criticalAnchors": layer_stats.critical_anchor_messages,
+                                    "working": layer_stats.working_messages,
+                                    "background": layer_stats.background_messages,
+                                },
+                                "anchorCount": reduction.retained_anchor_messages,
+                                "summaryChars": 0,
+                                "removedMessages": reduction.removed_messages,
+                                "messagesRemoved": reduction.removed_messages,
+                                "keptMessages": history.len(),
+                                "messagesKept": history.len(),
+                                "retainedAnchors": reduction.retained_anchor_messages
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                    }
+                }
+            },
+            ContextCompactionAction::HardCompact => {
+                let reduction = retain_with_importance(&history, hard_reduction_plan(compaction_config));
+                let removed_messages = reduction.removed_messages;
 
-                                    if let Err(error) = self
-                                        .session_store
-                                        .replace_history(&session_key, new_history.clone())
-                                        .await
-                                    {
-                                        warn!(
-                                            session = %session_key,
-                                            %error,
-                                            "context archive: replace_history failed, continuing with full history"
-                                        );
-                                    } else {
-                                        history = new_history;
-                                        self.session_metadata
-                                            .touch(&session_key, history.len() as u32)
-                                            .await;
-                                        info!(
-                                            session = %session_key,
-                                            estimated_next_input,
-                                            context_window,
-                                            archived_count,
-                                            archive = %archive_filename,
-                                            strategy = compaction_config.strategy.as_config_value(),
-                                            "context archive tier applied at 90% threshold"
-                                        );
-                                        broadcast(
-                                            &self.state,
-                                            "chat",
-                                            serde_json::json!({
-                                                "sessionKey": session_key,
-                                                "state": "auto_compact",
-                                                "phase": "archive",
-                                                "strategy": compaction_config.strategy.as_config_value(),
-                                                "estimatedNextInputTokens": estimated_next_input,
-                                                "contextWindow": context_window,
-                                                "archivedMessages": archived_count,
-                                                "keptMessages": keep_recent,
-                                                "archiveFile": archive_filename,
-                                            }),
-                                            BroadcastOpts::default(),
-                                        )
-                                        .await;
-                                    }
-                                },
-                                Err(error) => {
-                                    warn!(
-                                        session = %session_key,
-                                        %error,
-                                        "context archive failed, continuing with full history"
-                                    );
-                                },
-                            }
+                if removed_messages == 0 {
+                    debug!(
+                        session = %session_key,
+                        "hard compaction skipped: no compressible background history"
+                    );
+                } else {
+                    let dropped_messages = dropped_messages_for_retention(&history, &reduction.messages);
+                    let mut archive_file: Option<String> = None;
+                    let mut new_history = reduction.messages.clone();
+                    match self
+                        .session_store
+                        .archive_to_cold_store(&session_key, &history)
+                        .await
+                    {
+                        Ok(filename) => {
+                            let notice = PersistedMessage::notice(format!(
+                                "[Context Archive] {removed_messages} background message(s) archived to \
+                                 cold storage ({filename}). Retaining {} working message(s) and {} anchor message(s).",
+                                reduction.kept_recent_messages,
+                                reduction.retained_anchor_messages
+                            ));
+                            let mut with_notice = vec![notice.to_value()];
+                            with_notice.extend(new_history);
+                            new_history = with_notice;
+                            archive_file = Some(filename);
                         },
-                        ContextCompactionStrategy::Truncate => {
-                            if let Err(error) = self
-                                .session_store
-                                .replace_history(&session_key, recent_messages.clone())
-                                .await
-                            {
-                                warn!(
-                                    session = %session_key,
-                                    %error,
-                                    "context archive-tier truncate failed, continuing with full history"
-                                );
-                            } else {
-                                history = recent_messages;
-                                self.session_metadata
-                                    .touch(&session_key, history.len() as u32)
-                                    .await;
-                                info!(
-                                    session = %session_key,
-                                    estimated_next_input,
-                                    context_window,
-                                    removed_messages = archived_count,
-                                    kept_messages = keep_recent,
-                                    strategy = compaction_config.strategy.as_config_value(),
-                                    "context archive tier applied at 90% threshold"
-                                );
-                                broadcast(
-                                    &self.state,
-                                    "chat",
-                                    serde_json::json!({
-                                        "sessionKey": session_key,
-                                        "state": "auto_compact",
-                                        "phase": "archive",
-                                        "strategy": compaction_config.strategy.as_config_value(),
-                                        "estimatedNextInputTokens": estimated_next_input,
-                                        "contextWindow": context_window,
-                                        "removedMessages": archived_count,
-                                        "keptMessages": keep_recent,
-                                    }),
-                                    BroadcastOpts::default(),
-                                )
-                                .await;
-                            }
+                        Err(error) => {
+                            warn!(
+                                session = %session_key,
+                                %error,
+                                "hard compaction archive step failed, applying in-session reduction only"
+                            );
                         },
+                    }
+
+                    if let Err(error) = self
+                        .session_store
+                        .replace_history(&session_key, new_history.clone())
+                        .await
+                    {
+                        warn!(
+                            session = %session_key,
+                            %error,
+                            "hard compaction replace_history failed, continuing with full history"
+                        );
+                    } else {
+                        history = new_history;
+                        self.session_metadata
+                            .touch(&session_key, history.len() as u32)
+                            .await;
+                        if let Some(memory_manager) = self.state.memory_manager()
+                            && let Some(archive_filename) = archive_file.clone()
+                        {
+                            let session_key_for_snapshot = session_key.clone();
+                            let session_agent_for_snapshot = session_agent_id.clone();
+                            tokio::spawn(persist_archive_snapshot_to_memory(
+                                Arc::clone(memory_manager),
+                                session_agent_for_snapshot,
+                                session_key_for_snapshot,
+                                archive_filename,
+                                dropped_messages,
+                            ));
+                        }
+                        info!(
+                            session = %session_key,
+                            estimated_next_input,
+                            context_window,
+                            removed_messages,
+                            retained_anchors = reduction.retained_anchor_messages,
+                            kept_messages = history.len(),
+                            "hard layered compaction applied"
+                        );
+                        broadcast(
+                            &self.state,
+                            "chat",
+                            serde_json::json!({
+                                "sessionKey": session_key,
+                                "state": "auto_compact",
+                                "phase": "hard",
+                                "reason": "threshold_hard",
+                                "estimatedNextInputTokens": estimated_next_input,
+                                "contextWindow": context_window,
+                                "layerStats": {
+                                    "criticalAnchors": layer_stats.critical_anchor_messages,
+                                    "working": layer_stats.working_messages,
+                                    "background": layer_stats.background_messages,
+                                },
+                                "anchorCount": reduction.retained_anchor_messages,
+                                "summaryChars": 0,
+                                "removedMessages": removed_messages,
+                                "messagesRemoved": removed_messages,
+                                "keptMessages": history.len(),
+                                "messagesKept": history.len(),
+                                "retainedAnchors": reduction.retained_anchor_messages,
+                                "archiveFile": archive_file,
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
                     }
                 }
             },
@@ -4070,7 +4416,12 @@ impl ChatService for LiveChatService {
                         && let Ok(flush_provider) =
                             self.resolve_provider(&session_key, &history).await
                     {
-                        let chat_history_for_memory = values_to_chat_messages(&history);
+                        let normalized_history_for_memory = normalize_for_model_context(
+                            &history,
+                            MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+                        );
+                        let chat_history_for_memory =
+                            values_to_chat_messages(&normalized_history_for_memory);
                         let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::new(
                             AgentScopedMemoryWriter::new(Arc::clone(mm), session_agent_id.clone()),
                         );
@@ -4099,7 +4450,7 @@ impl ChatService for LiveChatService {
                     }
                 }
             },
-            ContextCompactionAction::Compact => {
+            ContextCompactionAction::SoftCompact => {
                 // Reset the pre-compact dedup flag — a fresh compaction window begins.
                 self.pre_compact_flushed.write().await.remove(&session_key);
 
@@ -4121,6 +4472,7 @@ impl ChatService for LiveChatService {
                         "sessionKey": session_key,
                         "state": "auto_compact",
                         "phase": "start",
+                        "reason": "threshold_soft",
                         "messageCount": pre_compact_msg_count,
                         "totalTokens": pre_compact_total,
                         "inputTokens": token_usage.current_request_input_tokens,
@@ -4129,6 +4481,15 @@ impl ChatService for LiveChatService {
                         "sessionInputTokens": token_usage.session_input_tokens,
                         "sessionOutputTokens": token_usage.session_output_tokens,
                         "contextWindow": context_window,
+                        "layerStats": {
+                            "criticalAnchors": layer_stats.critical_anchor_messages,
+                            "working": layer_stats.working_messages,
+                            "background": layer_stats.background_messages,
+                        },
+                        "anchorCount": layer_stats.critical_anchor_messages,
+                        "summaryChars": 0,
+                        "messagesRemoved": 0,
+                        "messagesKept": pre_compact_msg_count,
                     }),
                     BroadcastOpts::default(),
                 )
@@ -4143,6 +4504,8 @@ impl ChatService for LiveChatService {
                             .read(&session_key)
                             .await
                             .unwrap_or_default();
+                        let messages_removed = pre_compact_msg_count.saturating_sub(history.len());
+                        let summary_chars = compaction_summary_chars(&history);
                         broadcast(
                             &self.state,
                             "chat",
@@ -4150,28 +4513,98 @@ impl ChatService for LiveChatService {
                                 "sessionKey": session_key,
                                 "state": "auto_compact",
                                 "phase": "done",
+                                "reason": "threshold_soft",
                                 "messageCount": pre_compact_msg_count,
                                 "totalTokens": pre_compact_total,
                                 "contextWindow": context_window,
+                                "layerStats": {
+                                    "criticalAnchors": layer_stats.critical_anchor_messages,
+                                    "working": layer_stats.working_messages,
+                                    "background": layer_stats.background_messages,
+                                },
+                                "anchorCount": layer_stats.critical_anchor_messages,
+                                "summaryChars": summary_chars,
+                                "removedMessages": messages_removed,
+                                "messagesRemoved": messages_removed,
+                                "keptMessages": history.len(),
+                                "messagesKept": history.len(),
                             }),
                             BroadcastOpts::default(),
                         )
                         .await;
                     },
                     Err(e) => {
-                        warn!(session = %session_key, error = %e, "auto-compact failed, proceeding with full history");
-                        broadcast(
-                            &self.state,
-                            "chat",
-                            serde_json::json!({
-                                "sessionKey": session_key,
-                                "state": "auto_compact",
-                                "phase": "error",
-                                "error": e.to_string(),
-                            }),
-                            BroadcastOpts::default(),
-                        )
-                        .await;
+                        warn!(session = %session_key, error = %e, "auto-compact failed, attempting deterministic fallback reduction");
+                        let mut fallback_applied = false;
+                        if let Some(fallback) = compaction_failure_fallback_reduction(
+                            &history,
+                            compaction_config,
+                            context_window,
+                        ) {
+                            if let Err(fallback_error) = self
+                                .session_store
+                                .replace_history(&session_key, fallback.messages.clone())
+                                .await
+                            {
+                                warn!(
+                                    session = %session_key,
+                                    error = %fallback_error,
+                                    "auto-compact fallback reduction failed; keeping full history"
+                                );
+                            } else {
+                                history = fallback.messages;
+                                self.session_metadata
+                                    .touch(&session_key, history.len() as u32)
+                                    .await;
+                                broadcast(
+                                    &self.state,
+                                    "chat",
+                                    serde_json::json!({
+                                        "sessionKey": session_key,
+                                        "state": "auto_compact",
+                                        "phase": "fallback",
+                                        "reason": "threshold_soft_compact_error",
+                                        "layerStats": {
+                                            "criticalAnchors": layer_stats.critical_anchor_messages,
+                                            "working": layer_stats.working_messages,
+                                            "background": layer_stats.background_messages,
+                                        },
+                                        "anchorCount": fallback.retained_anchor_messages,
+                                        "summaryChars": 0,
+                                        "messagesRemoved": fallback.removed_messages,
+                                        "messagesKept": history.len(),
+                                        "error": e.to_string(),
+                                    }),
+                                    BroadcastOpts::default(),
+                                )
+                                .await;
+                                fallback_applied = true;
+                            }
+                        }
+                        if !fallback_applied {
+                            broadcast(
+                                &self.state,
+                                "chat",
+                                serde_json::json!({
+                                    "sessionKey": session_key,
+                                    "state": "auto_compact",
+                                    "phase": "error",
+                                    "reason": "threshold_soft",
+                                    "layerStats": {
+                                        "criticalAnchors": layer_stats.critical_anchor_messages,
+                                        "working": layer_stats.working_messages,
+                                        "background": layer_stats.background_messages,
+                                    },
+                                    "anchorCount": layer_stats.critical_anchor_messages,
+                                    "summaryChars": 0,
+                                    "messagesRemoved": 0,
+                                    "messagesKept": history.len(),
+                                    "error": e.to_string(),
+                                }),
+                                BroadcastOpts::default(),
+                            )
+                            .await;
+                        }
                     },
                 }
             },
@@ -4951,8 +5384,11 @@ impl ChatService for LiveChatService {
             .read(&session_key)
             .await
             .map_err(ServiceError::message)?;
+        let compact_started = Instant::now();
 
         if history.is_empty() {
+            #[cfg(feature = "metrics")]
+            record_compaction_result("manual", "error", compact_started.elapsed());
             return Err("nothing to compact".into());
         }
 
@@ -4973,7 +5409,11 @@ impl ChatService for LiveChatService {
         if let Some(mm) = self.state.memory_manager()
             && let Ok(provider) = self.resolve_provider(&session_key, &history).await
         {
-            let chat_history_for_memory = values_to_chat_messages(&history);
+            let normalized_history_for_memory = normalize_for_model_context(
+                &history,
+                MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+            );
+            let chat_history_for_memory = values_to_chat_messages(&normalized_history_for_memory);
             let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::new(
                 AgentScopedMemoryWriter::new(Arc::clone(mm), session_agent_id.clone()),
             );
@@ -4996,144 +5436,207 @@ impl ChatService for LiveChatService {
             }
         }
 
-        fn parse_compaction_facts(raw: &str) -> Vec<String> {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Vec::new();
-            }
-
-            let candidate = trimmed
-                .strip_prefix("```json")
-                .and_then(|s| s.strip_suffix("```"))
-                .map(str::trim)
-                .or_else(|| {
-                    trimmed
-                        .strip_prefix("```")
-                        .and_then(|s| s.strip_suffix("```"))
-                })
-                .map(str::trim)
-                .unwrap_or(trimmed);
-
-            serde_json::from_str::<Vec<String>>(candidate)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|fact| fact.trim().to_string())
-                .filter(|fact| !fact.is_empty())
-                .collect()
-        }
-
         // Use the session's model if available, otherwise fall back to the model
         // from the last assistant message, then to the first registered provider.
         let provider = self
             .resolve_provider(&session_key, &history)
             .await
             .map_err(ServiceError::message)?;
+        let planning_started = Instant::now();
+        let (summary_plan, sections, summary_source, normalized_summary_source) = tracing::info_span!(
+            "chat.compaction.plan",
+            session = %session_key
+        )
+        .in_scope(|| {
+            let compaction_config = context_compaction_config_from_chat(&self.chat_config);
+            let summary_plan = summary_context_plan(compaction_config);
+            let sections = partition_history_for_summary(&history, summary_plan);
+            let summary_source = sections.summary_source.clone();
+            let normalized_summary_source =
+                normalize_for_model_context(&summary_source, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
+            (summary_plan, sections, summary_source, normalized_summary_source)
+        });
+        let planning_elapsed = planning_started.elapsed();
+        #[cfg(feature = "metrics")]
+        record_compaction_stage("manual", "plan", planning_elapsed);
+        let has_compressible_gap = !summary_source.is_empty();
 
         info!(
             session = %session_key,
-            messages = history.len(),
+            messages = summary_source.len(),
+            retained_anchors = sections.anchors.len(),
+            retained_recent = sections.recent.len(),
+            planning_ms = planning_elapsed.as_millis() as u64,
             "chat.compact: extracting facts"
         );
 
-        // TODO(fact_extraction): if config.compaction.fact_extraction {
-        //     // Two-pass: extract facts as JSON, store as memory docs, then narrative summary
-        // }
+        // TODO(compaction): expose a dedicated config toggle for optional fact extraction.
 
-        // Pass 1: extract discrete facts as JSON for higher-quality memory retrieval.
-        let mut fact_messages = vec![ChatMessage::system(
-            "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
-        )];
-        fact_messages.extend(values_to_chat_messages(&history));
-        fact_messages.push(ChatMessage::user(
-            "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
-        ));
+        let summarization_started = Instant::now();
+        let summarization_span = tracing::info_span!(
+            "chat.compaction.summarize",
+            session = %session_key
+        );
+        let facts = if !has_compressible_gap {
+            Vec::new()
+        } else {
+            // Pass 1: extract discrete facts as JSON for higher-quality memory retrieval.
+            let mut fact_messages = vec![ChatMessage::system(
+                "Extract durable facts from the conversation. Return only a JSON array of single-sentence strings. Do not include markdown, code fences, or commentary.",
+            )];
+            fact_messages.extend(values_to_chat_messages(&normalized_summary_source));
+            fact_messages.push(ChatMessage::user(
+                "Return key facts as JSON array of strings. Include decisions, commitments, preferences, identifiers, and deadlines. Output JSON only.",
+            ));
 
-        let mut fact_stream = provider.stream(fact_messages);
-        let mut facts_raw = String::new();
-        while let Some(event) = fact_stream.next().await {
-            match event {
-                StreamEvent::Delta(delta) => facts_raw.push_str(&delta),
-                StreamEvent::Done(_) => break,
-                StreamEvent::Error(e) => {
-                    warn!(session = %session_key, error = %e, "compact fact extraction failed");
-                    break;
-                },
-                StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. }
-                | StreamEvent::ProviderRaw(_)
-                | StreamEvent::ReasoningDelta(_) => {},
+            let mut fact_stream = provider.stream(fact_messages);
+            let mut facts_raw = String::new();
+            while let Some(event) = fact_stream.next().instrument(summarization_span.clone()).await {
+                match event {
+                    StreamEvent::Delta(delta) => facts_raw.push_str(&delta),
+                    StreamEvent::Done(_) => break,
+                    StreamEvent::Error(e) => {
+                        warn!(session = %session_key, error = %e, "compact fact extraction failed");
+                        break;
+                    },
+                    StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallArgumentsDelta { .. }
+                    | StreamEvent::ToolCallComplete { .. }
+                    | StreamEvent::ProviderRaw(_)
+                    | StreamEvent::ReasoningDelta(_) => {},
+                }
             }
-        }
-        let facts = parse_compaction_facts(&facts_raw);
-
-        // Pass 2: concise narrative summary for conversation replacement.
-        let mut summary_messages = vec![ChatMessage::system(
-            "You are a conversation summarizer. Preserve key context while compressing aggressively.",
-        )];
-        summary_messages.extend(values_to_chat_messages(&history));
-        summary_messages.push(ChatMessage::user(
-            "Summarize the conversation into a short narrative that preserves decisions, status, and actionable context. Output only the summary.",
-        ));
-
-        info!(session = %session_key, messages = history.len(), "chat.compact: summarizing");
-
-        let mut summary_stream = provider.stream(summary_messages);
-        let mut summary = String::new();
-        while let Some(event) = summary_stream.next().await {
-            match event {
-                StreamEvent::Delta(delta) => summary.push_str(&delta),
-                StreamEvent::Done(_) => break,
-                StreamEvent::Error(e) => {
-                    return Err(format!("compact summarization failed: {e}").into());
-                },
-                // Tool events not expected in summarization stream.
-                StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. }
-                // Provider raw payloads are debug metadata, not summary text.
-                | StreamEvent::ProviderRaw(_)
-                // Ignore provider reasoning blocks; summary body should only
-                // include final answer text.
-                | StreamEvent::ReasoningDelta(_) => {},
-            }
-        }
-
-        if summary.trim().is_empty() {
-            return Err("compact produced empty summary".into());
-        }
-
-        // Replace history with a single assistant message containing the summary.
-        let compacted_msg = PersistedMessage::Assistant {
-            content: format!("[Conversation Summary]\n\n{summary}"),
-            created_at: Some(now_ms()),
-            model: None,
-            provider: None,
-            input_tokens: None,
-            output_tokens: None,
-            duration_ms: None,
-            request_input_tokens: None,
-            request_output_tokens: None,
-            tool_calls: None,
-            reasoning: None,
-            llm_api_response: None,
-            audio: None,
-            seq: None,
-            run_id: None,
+            parse_compaction_facts(&facts_raw)
         };
-        let compacted = vec![compacted_msg.to_value()];
+
+        // Pass 2: summarize only the compressible gap; anchors and recent turns are
+        // preserved verbatim.
+        let summary = if !has_compressible_gap {
+            info!(
+                session = %session_key,
+                retained_anchors = sections.anchors.len(),
+                retained_recent = sections.recent.len(),
+                "chat.compact: no compressible gap, using deterministic summary"
+            );
+            default_compaction_summary(summary_plan.summary_budget_tokens)
+        } else {
+            let summary_messages = build_compaction_summary_messages(
+                &normalized_summary_source,
+                summary_plan.summary_budget_tokens,
+            );
+            info!(
+                session = %session_key,
+                messages = summary_source.len(),
+                summary_budget_tokens = summary_plan.summary_budget_tokens,
+                "chat.compact: summarizing"
+            );
+
+            let mut summary_stream = provider.stream(summary_messages);
+            let mut summary = String::new();
+            while let Some(event) = summary_stream
+                .next()
+                .instrument(summarization_span.clone())
+                .await
+            {
+                match event {
+                    StreamEvent::Delta(delta) => summary.push_str(&delta),
+                    StreamEvent::Done(_) => break,
+                    StreamEvent::Error(e) => {
+                        #[cfg(feature = "metrics")]
+                        record_compaction_result("manual", "error", compact_started.elapsed());
+                        return Err(format!("compact summarization failed: {e}").into());
+                    },
+                    // Tool events not expected in summarization stream.
+                    StreamEvent::ToolCallStart { .. }
+                    | StreamEvent::ToolCallArgumentsDelta { .. }
+                    | StreamEvent::ToolCallComplete { .. }
+                    // Provider raw payloads are debug metadata, not summary text.
+                    | StreamEvent::ProviderRaw(_)
+                    // Ignore provider reasoning blocks; summary body should only
+                    // include final answer text.
+                    | StreamEvent::ReasoningDelta(_) => {},
+                }
+            }
+
+            let summary = trim_summary_to_budget(&summary, summary_plan.summary_budget_tokens);
+            if summary.trim().is_empty() {
+                #[cfg(feature = "metrics")]
+                record_compaction_result("manual", "error", compact_started.elapsed());
+                return Err("compact produced empty summary".into());
+            }
+            summary
+        };
+        let summarization_elapsed = summarization_started.elapsed();
+        #[cfg(feature = "metrics")]
+        record_compaction_stage("manual", "summarize", summarization_elapsed);
+        info!(
+            session = %session_key,
+            summary_chars = summary.chars().count(),
+            summarization_ms = summarization_elapsed.as_millis() as u64,
+            "chat.compact: summarization stage complete"
+        );
+        let apply_started = Instant::now();
+        let apply_span = tracing::info_span!("chat.compaction.apply", session = %session_key);
+
+        // Layered compacted history:
+        // - Narrative summary for compressible background
+        // - Verbatim anchors (critical/high-value turns)
+        // - Verbatim recent working memory turns
+        let summary_message = has_compressible_gap.then(|| {
+            PersistedMessage::Assistant {
+                content: format!("[Conversation Summary]\n\n{summary}"),
+                created_at: Some(now_ms()),
+                model: None,
+                provider: None,
+                input_tokens: None,
+                output_tokens: None,
+                duration_ms: None,
+                request_input_tokens: None,
+                request_output_tokens: None,
+                tool_calls: None,
+                reasoning: None,
+                llm_api_response: None,
+                audio: None,
+                seq: None,
+                run_id: None,
+            }
+            .to_value()
+        });
+        let mut compacted =
+            Vec::with_capacity(summary_message.is_some() as usize + 1 + sections.anchors.len() + sections.recent.len());
+        if let Some(message) = summary_message {
+            compacted.push(message);
+        }
+        if !sections.anchors.is_empty() {
+            compacted.push(
+                PersistedMessage::notice(format!(
+                    "[Compaction Anchors] Preserved {} high-value message(s) verbatim.",
+                    sections.anchors.len()
+                ))
+                .to_value(),
+            );
+        }
+        compacted.extend(sections.anchors.clone());
+        compacted.extend(sections.recent.clone());
 
         self.session_store
             .replace_history(&session_key, compacted.clone())
+            .instrument(apply_span.clone())
             .await
             .map_err(ServiceError::message)?;
 
-        self.session_metadata.touch(&session_key, 1).await;
+        self.session_metadata
+            .touch(&session_key, compacted.len() as u32)
+            .instrument(apply_span.clone())
+            .await;
 
         // Save compaction summary and extracted facts as memory files, then sync.
         if let Some(mm) = self.state.memory_manager() {
             let memory_dir = moltis_config::agent_workspace_dir(&session_agent_id).join("memory");
-            if let Err(e) = tokio::fs::create_dir_all(&memory_dir).await {
+            if let Err(e) = tokio::fs::create_dir_all(&memory_dir)
+                .instrument(apply_span.clone())
+                .await
+            {
                 warn!(error = %e, "compact: failed to create memory dir");
             } else {
                 let ts = std::time::SystemTime::now()
@@ -5143,19 +5646,28 @@ impl ChatService for LiveChatService {
                 let safe_session_key = SessionStore::key_to_filename(&session_key);
                 let filename = format!("compaction-{safe_session_key}-{ts}.md");
                 let path = memory_dir.join(&filename);
+                let redacted_summary = redact_compaction_secret_values(summary.trim());
+                let redacted_facts: Vec<String> = facts
+                    .iter()
+                    .map(|fact| redact_compaction_secret_values(fact.trim()))
+                    .filter(|fact| !fact.trim().is_empty())
+                    .collect();
                 let content = format!(
                     "# Compaction Summary\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n- **Facts Extracted**: {}\n\n{}",
-                    facts.len(),
-                    summary.trim()
+                    redacted_facts.len(),
+                    redacted_summary.trim()
                 );
                 let mut wrote_files = false;
-                if let Err(e) = tokio::fs::write(&path, &content).await {
+                if let Err(e) = tokio::fs::write(&path, &content)
+                    .instrument(apply_span.clone())
+                    .await
+                {
                     warn!(error = %e, "compact: failed to write summary memory file");
                 } else {
                     wrote_files = true;
                 }
 
-                for (idx, fact) in facts.iter().take(128).enumerate() {
+                for (idx, fact) in redacted_facts.iter().take(128).enumerate() {
                     let fact_filename = format!(
                         "fact-{safe_session_key}-{ts}-{:03}.md",
                         idx.saturating_add(1)
@@ -5165,7 +5677,10 @@ impl ChatService for LiveChatService {
                         "# Fact\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{}",
                         fact.trim()
                     );
-                    if let Err(e) = tokio::fs::write(&fact_path, &fact_content).await {
+                    if let Err(e) = tokio::fs::write(&fact_path, &fact_content)
+                        .instrument(apply_span.clone())
+                        .await
+                    {
                         warn!(error = %e, "compact: failed to write fact memory file");
                     } else {
                         wrote_files = true;
@@ -5189,12 +5704,22 @@ impl ChatService for LiveChatService {
                 session_key: session_key.clone(),
                 summary_len: summary.len(),
             };
-            if let Err(e) = hooks.dispatch(&payload).await {
+            if let Err(e) = hooks.dispatch(&payload).instrument(apply_span.clone()).await {
                 warn!(session = %session_key, error = %e, "AfterCompaction hook failed");
             }
         }
 
-        info!(session = %session_key, "chat.compact: done");
+        let apply_elapsed = apply_started.elapsed();
+        #[cfg(feature = "metrics")]
+        record_compaction_stage("manual", "apply", apply_elapsed);
+        #[cfg(feature = "metrics")]
+        record_compaction_result("manual", "success", compact_started.elapsed());
+        info!(
+            session = %session_key,
+            apply_ms = apply_elapsed.as_millis() as u64,
+            total_ms = compact_started.elapsed().as_millis() as u64,
+            "chat.compact: done"
+        );
         Ok(serde_json::json!(compacted))
     }
 
@@ -5707,31 +6232,7 @@ impl ChatService for LiveChatService {
 
         // Reconstruct `role: "tool"` messages from persisted `tool_result`
         // entries so the context view shows what the LLM actually saw.
-        let history_with_tools: Vec<Value> = history
-            .into_iter()
-            .map(|val| {
-                if val.get("role").and_then(|r| r.as_str()) != Some("tool_result") {
-                    return val;
-                }
-                let tool_call_id = val
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let content = if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
-                    format!("Error: {err}")
-                } else if let Some(res) = val.get("result") {
-                    res.to_string()
-                } else {
-                    String::new()
-                };
-                serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": content,
-                })
-            })
-            .collect();
+        let history_with_tools = normalize_for_context_view(history);
 
         // Build the full messages array: system prompt + conversation history.
         let mut messages = Vec::with_capacity(1 + history_with_tools.len());
@@ -6273,8 +6774,10 @@ async fn run_explicit_shell_command(
         reasoning: None,
         seq: client_seq,
     };
-    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-    let payload = serde_json::to_value(&final_payload).unwrap();
+    let payload = serde_json::to_value(&final_payload).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to serialize final broadcast payload");
+        serde_json::json!({})
+    });
     broadcast(state, "chat", payload, BroadcastOpts::default()).await;
 
     AssistantTurnOutput {
@@ -7220,7 +7723,9 @@ async fn run_with_tools(
     });
 
     // Convert persisted JSON history to typed ChatMessages for the LLM provider.
-    let chat_history = values_to_chat_messages(history_raw);
+    let normalized_history =
+        normalize_for_model_context(history_raw, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
+    let chat_history = values_to_chat_messages(&normalized_history);
     let hist = if chat_history.is_empty() {
         None
     } else {
@@ -7281,6 +7786,10 @@ async fn run_with_tools(
     let result = match first_result {
         Err(AgentRunError::ContextWindowExceeded(ref msg)) if session_store.is_some() => {
             let store = session_store?;
+            let compaction_config = context_compaction_config_from_chat(&persona.config.chat);
+            let pre_layer_stats =
+                layer_stats_for_history(history_raw, summary_context_plan(compaction_config));
+            let pre_message_count = history_raw.len();
             info!(
                 run_id,
                 session = session_key,
@@ -7297,14 +7806,27 @@ async fn run_with_tools(
                     "state": "auto_compact",
                     "phase": "start",
                     "reason": "context_window_exceeded",
+                    "layerStats": {
+                        "criticalAnchors": pre_layer_stats.critical_anchor_messages,
+                        "working": pre_layer_stats.working_messages,
+                        "background": pre_layer_stats.background_messages,
+                    },
+                    "anchorCount": pre_layer_stats.critical_anchor_messages,
+                    "summaryChars": 0,
+                    "messagesRemoved": 0,
+                    "messagesKept": pre_message_count,
                 }),
                 BroadcastOpts::default(),
             )
             .await;
 
             // Inline compaction: summarize history, replace in store.
-            match compact_session(store, session_key, &provider_ref).await {
+            match compact_session(store, session_key, &provider_ref, compaction_config).await {
                 Ok(()) => {
+                    let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
+                    let messages_removed =
+                        pre_message_count.saturating_sub(compacted_history_raw.len());
+                    let summary_chars = compaction_summary_chars(&compacted_history_raw);
                     broadcast(
                         state,
                         "chat",
@@ -7314,14 +7836,26 @@ async fn run_with_tools(
                             "state": "auto_compact",
                             "phase": "done",
                             "reason": "context_window_exceeded",
+                            "layerStats": {
+                                "criticalAnchors": pre_layer_stats.critical_anchor_messages,
+                                "working": pre_layer_stats.working_messages,
+                                "background": pre_layer_stats.background_messages,
+                            },
+                            "anchorCount": pre_layer_stats.critical_anchor_messages,
+                            "summaryChars": summary_chars,
+                            "messagesRemoved": messages_removed,
+                            "messagesKept": compacted_history_raw.len(),
                         }),
                         BroadcastOpts::default(),
                     )
                     .await;
 
                     // Reload compacted history and retry.
-                    let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
-                    let compacted_chat = values_to_chat_messages(&compacted_history_raw);
+                    let normalized_compacted_history = normalize_for_model_context(
+                        &compacted_history_raw,
+                        MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+                    );
+                    let compacted_chat = values_to_chat_messages(&normalized_compacted_history);
                     let retry_hist = if compacted_chat.is_empty() {
                         None
                     } else {
@@ -7343,21 +7877,124 @@ async fn run_with_tools(
                 },
                 Err(e) => {
                     warn!(run_id, error = %e, "retry compaction failed");
-                    broadcast(
-                        state,
-                        "chat",
-                        serde_json::json!({
-                            "runId": run_id,
-                            "sessionKey": session_key,
-                            "state": "auto_compact",
-                            "phase": "error",
-                            "error": e.to_string(),
-                        }),
-                        BroadcastOpts::default(),
-                    )
-                    .await;
-                    // Return the original error.
-                    first_result
+                    if let Some(fallback) = compaction_failure_fallback_reduction(
+                        history_raw,
+                        compaction_config,
+                        provider_ref.context_window() as u64,
+                    ) {
+                        match store.replace_history(session_key, fallback.messages.clone()).await {
+                            Ok(()) => {
+                                let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
+                                let messages_removed =
+                                    pre_message_count.saturating_sub(compacted_history_raw.len());
+                                broadcast(
+                                    state,
+                                    "chat",
+                                    serde_json::json!({
+                                        "runId": run_id,
+                                        "sessionKey": session_key,
+                                        "state": "auto_compact",
+                                        "phase": "fallback",
+                                        "reason": "context_window_exceeded_compact_error",
+                                        "layerStats": {
+                                            "criticalAnchors": pre_layer_stats.critical_anchor_messages,
+                                            "working": pre_layer_stats.working_messages,
+                                            "background": pre_layer_stats.background_messages,
+                                        },
+                                        "anchorCount": fallback.retained_anchor_messages,
+                                        "summaryChars": 0,
+                                        "messagesRemoved": messages_removed,
+                                        "messagesKept": compacted_history_raw.len(),
+                                        "error": e.to_string(),
+                                    }),
+                                    BroadcastOpts::default(),
+                                )
+                                .await;
+
+                                let normalized_compacted_history = normalize_for_model_context(
+                                    &compacted_history_raw,
+                                    MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+                                );
+                                let compacted_chat =
+                                    values_to_chat_messages(&normalized_compacted_history);
+                                let retry_hist = if compacted_chat.is_empty() {
+                                    None
+                                } else {
+                                    Some(compacted_chat)
+                                };
+
+                                run_agent_loop_streaming(
+                                    provider_ref.clone(),
+                                    &filtered_registry,
+                                    &system_prompt,
+                                    user_content,
+                                    Some(&on_event),
+                                    retry_hist,
+                                    Some(tool_context),
+                                    hook_registry.clone(),
+                                    trace_id.clone(),
+                                )
+                                .await
+                            },
+                            Err(fallback_error) => {
+                                warn!(
+                                    run_id,
+                                    error = %fallback_error,
+                                    "retry compaction fallback reduction failed"
+                                );
+                                broadcast(
+                                    state,
+                                    "chat",
+                                    serde_json::json!({
+                                        "runId": run_id,
+                                        "sessionKey": session_key,
+                                        "state": "auto_compact",
+                                        "phase": "error",
+                                        "reason": "context_window_exceeded",
+                                        "layerStats": {
+                                            "criticalAnchors": pre_layer_stats.critical_anchor_messages,
+                                            "working": pre_layer_stats.working_messages,
+                                            "background": pre_layer_stats.background_messages,
+                                        },
+                                        "anchorCount": pre_layer_stats.critical_anchor_messages,
+                                        "summaryChars": 0,
+                                        "messagesRemoved": 0,
+                                        "messagesKept": pre_message_count,
+                                        "error": e.to_string(),
+                                    }),
+                                    BroadcastOpts::default(),
+                                )
+                                .await;
+                                first_result
+                            },
+                        }
+                    } else {
+                        broadcast(
+                            state,
+                            "chat",
+                            serde_json::json!({
+                                "runId": run_id,
+                                "sessionKey": session_key,
+                                "state": "auto_compact",
+                                "phase": "error",
+                                "reason": "context_window_exceeded",
+                                "layerStats": {
+                                    "criticalAnchors": pre_layer_stats.critical_anchor_messages,
+                                    "working": pre_layer_stats.working_messages,
+                                    "background": pre_layer_stats.background_messages,
+                                },
+                                "anchorCount": pre_layer_stats.critical_anchor_messages,
+                                "summaryChars": 0,
+                                "messagesRemoved": 0,
+                                "messagesKept": pre_message_count,
+                                "error": e.to_string(),
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                        // Return the original error.
+                        first_result
+                    }
                 },
             }
         },
@@ -7465,8 +8102,10 @@ async fn run_with_tools(
                     error: error_obj,
                     seq: client_seq,
                 };
-                #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let payload_val = serde_json::to_value(&error_payload).unwrap();
+                let payload_val = serde_json::to_value(&error_payload).unwrap_or_else(|e| {
+                    tracing::error!(error = %e, "failed to serialize error broadcast payload");
+                    serde_json::json!({})
+                });
                 broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
                 return None;
             }
@@ -7532,8 +8171,10 @@ async fn run_with_tools(
                 reasoning: reasoning.clone(),
                 seq: client_seq,
             };
-            #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let payload_val = serde_json::to_value(&final_payload).unwrap();
+            let payload_val = serde_json::to_value(&final_payload).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "failed to serialize final broadcast payload");
+                serde_json::json!({})
+            });
             broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
 
             if !is_silent {
@@ -7604,8 +8245,10 @@ async fn run_with_tools(
                 error: error_obj,
                 seq: client_seq,
             };
-            #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let payload_val = serde_json::to_value(&error_payload).unwrap();
+            let payload_val = serde_json::to_value(&error_payload).unwrap_or_else(|e| {
+                tracing::error!(error = %e, "failed to serialize error broadcast payload");
+                serde_json::json!({})
+            });
             broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
             None
         },
@@ -7620,76 +8263,170 @@ async fn compact_session(
     store: &Arc<SessionStore>,
     session_key: &str,
     provider: &Arc<dyn moltis_agents::model::LlmProvider>,
+    compaction_config: compaction::ContextCompactionConfig,
 ) -> error::Result<()> {
+    #[cfg(feature = "metrics")]
+    let compact_started = Instant::now();
+    const COMPACTION_PATH: &str = "overflow_retry";
     let history = store
         .read(session_key)
         .await
         .map_err(|source| error::Error::external("failed to read session history", source))?;
     if history.is_empty() {
+        #[cfg(feature = "metrics")]
+        record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
         return Err(error::Error::message("nothing to compact"));
     }
 
-    // Use structured ChatMessage objects so role boundaries are maintained via
-    // the API's message structure, preventing prompt injection where user content
-    // could mimic role prefixes in concatenated text.
-    let mut summary_messages = vec![ChatMessage::system(
-        "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
-    )];
-    summary_messages.extend(values_to_chat_messages(&history));
-    summary_messages.push(ChatMessage::user(
-        "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
-    ));
+    #[cfg(feature = "metrics")]
+    let planning_started = Instant::now();
+    let (summary_plan, sections, summary_source, normalized_summary_source) = tracing::info_span!(
+        "chat.compaction.plan",
+        session = %session_key,
+        path = COMPACTION_PATH
+    )
+    .in_scope(|| {
+        let summary_plan = summary_context_plan(compaction_config);
+        let sections = partition_history_for_summary(&history, summary_plan);
+        let summary_source = sections.summary_source.clone();
+        let normalized_summary_source =
+            normalize_for_model_context(&summary_source, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
+        (summary_plan, sections, summary_source, normalized_summary_source)
+    });
+    #[cfg(feature = "metrics")]
+    let planning_elapsed = planning_started.elapsed();
+    #[cfg(feature = "metrics")]
+    record_compaction_stage(COMPACTION_PATH, "plan", planning_elapsed);
+    let has_compressible_gap = !summary_source.is_empty();
 
-    let mut stream = provider.stream(summary_messages);
-    let mut summary = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            StreamEvent::Delta(delta) => summary.push_str(&delta),
-            StreamEvent::Done(_) => break,
-            StreamEvent::Error(e) => {
-                return Err(error::Error::message(format!(
-                    "compact summarization failed: {e}"
-                )));
-            },
-            // Tool events not expected in summarization stream.
-            StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolCallArgumentsDelta { .. }
-            | StreamEvent::ToolCallComplete { .. }
-            // Provider raw payloads are debug metadata, not summary text.
-            | StreamEvent::ProviderRaw(_)
-            // Ignore provider reasoning blocks; summary body should only
-            // include final answer text.
-            | StreamEvent::ReasoningDelta(_) => {},
+    #[cfg(feature = "metrics")]
+    let summarization_started = Instant::now();
+    let summarization_span = tracing::info_span!(
+        "chat.compaction.summarize",
+        session = %session_key,
+        path = COMPACTION_PATH
+    );
+    let summary = if !has_compressible_gap {
+        default_compaction_summary(summary_plan.summary_budget_tokens)
+    } else {
+        // Use structured ChatMessage objects so role boundaries are maintained via
+        // the API's message structure, preventing prompt injection where user content
+        // could mimic role prefixes in concatenated text.
+        let summary_messages = build_compaction_summary_messages(
+            &normalized_summary_source,
+            summary_plan.summary_budget_tokens,
+        );
+        let mut stream = provider.stream(summary_messages);
+        let mut summary = String::new();
+        while let Some(event) = stream.next().instrument(summarization_span.clone()).await {
+            match event {
+                StreamEvent::Delta(delta) => summary.push_str(&delta),
+                StreamEvent::Done(_) => break,
+                StreamEvent::Error(e) => {
+                    #[cfg(feature = "metrics")]
+                    record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
+                    return Err(error::Error::message(format!(
+                        "compact summarization failed: {e}"
+                    )));
+                },
+                // Tool events not expected in summarization stream.
+                StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgumentsDelta { .. }
+                | StreamEvent::ToolCallComplete { .. }
+                // Provider raw payloads are debug metadata, not summary text.
+                | StreamEvent::ProviderRaw(_)
+                // Ignore provider reasoning blocks; summary body should only
+                // include final answer text.
+                | StreamEvent::ReasoningDelta(_) => {},
+            }
+        }
+
+        let summary = trim_summary_to_budget(&summary, summary_plan.summary_budget_tokens);
+        if summary.is_empty() {
+            #[cfg(feature = "metrics")]
+            record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
+            return Err(error::Error::message("compact produced empty summary"));
+        }
+        summary
+    };
+    #[cfg(feature = "metrics")]
+    let summarization_elapsed = summarization_started.elapsed();
+    #[cfg(feature = "metrics")]
+    record_compaction_stage(COMPACTION_PATH, "summarize", summarization_elapsed);
+
+    let summary_message = has_compressible_gap.then(|| {
+        PersistedMessage::Assistant {
+            content: format!("[Conversation Summary]\n\n{summary}"),
+            created_at: Some(now_ms()),
+            model: None,
+            provider: None,
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+            request_input_tokens: None,
+            request_output_tokens: None,
+            tool_calls: None,
+            reasoning: None,
+            llm_api_response: None,
+            audio: None,
+            seq: None,
+            run_id: None,
+        }
+        .to_value()
+    });
+    let mut compacted =
+        Vec::with_capacity(summary_message.is_some() as usize + 1 + sections.anchors.len() + sections.recent.len());
+    if let Some(message) = summary_message {
+        compacted.push(message);
+    }
+    if !sections.anchors.is_empty() {
+        compacted.push(
+            PersistedMessage::notice(format!(
+                "[Compaction Anchors] Preserved {} high-value message(s) verbatim.",
+                sections.anchors.len()
+            ))
+            .to_value(),
+        );
+    }
+    compacted.extend(sections.anchors);
+    compacted.extend(sections.recent);
+
+    let original_estimated_tokens = estimate_history_tokens(&history);
+    let mut compacted_estimated_tokens = estimate_history_tokens(&compacted);
+    if compacted_estimated_tokens >= original_estimated_tokens {
+        let reduction = retain_with_importance(
+            &history,
+            emergency_reduction_plan(compaction_config, provider.context_window() as u64),
+        );
+        if reduction.removed_messages > 0 {
+            compacted = reduction.messages;
+            compacted_estimated_tokens = estimate_history_tokens(&compacted);
+        }
+        if compacted_estimated_tokens >= original_estimated_tokens {
+            #[cfg(feature = "metrics")]
+            record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
+            return Err(error::Error::message("compact produced no effective reduction"));
         }
     }
 
-    if summary.is_empty() {
-        return Err(error::Error::message("compact produced empty summary"));
-    }
-
-    let compacted_msg = PersistedMessage::Assistant {
-        content: format!("[Conversation Summary]\n\n{summary}"),
-        created_at: Some(now_ms()),
-        model: None,
-        provider: None,
-        input_tokens: None,
-        output_tokens: None,
-        duration_ms: None,
-        request_input_tokens: None,
-        request_output_tokens: None,
-        tool_calls: None,
-        reasoning: None,
-        llm_api_response: None,
-        audio: None,
-        seq: None,
-        run_id: None,
-    };
-    let compacted = vec![compacted_msg.to_value()];
-
+    #[cfg(feature = "metrics")]
+    let apply_started = Instant::now();
+    let apply_span = tracing::info_span!(
+        "chat.compaction.apply",
+        session = %session_key,
+        path = COMPACTION_PATH
+    );
     store
         .replace_history(session_key, compacted)
+        .instrument(apply_span)
         .await
         .map_err(|source| error::Error::external("failed to replace compacted history", source))?;
+    #[cfg(feature = "metrics")]
+    let apply_elapsed = apply_started.elapsed();
+    #[cfg(feature = "metrics")]
+    record_compaction_stage(COMPACTION_PATH, "apply", apply_elapsed);
+    #[cfg(feature = "metrics")]
+    record_compaction_result(COMPACTION_PATH, "success", compact_started.elapsed());
 
     Ok(())
 }
@@ -7808,7 +8545,9 @@ async fn run_streaming(
         apply_voice_reply_suffix(system_prompt, desired_reply_medium, runtime_context);
 
     // Convert persisted JSON history to typed ChatMessages for the LLM provider.
-    let chat_history = values_to_chat_messages(history_raw);
+    let normalized_history =
+        normalize_for_model_context(history_raw, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
+    let chat_history = values_to_chat_messages(&normalized_history);
     let _ = maybe_append_research_context(
         &mut system_prompt,
         provider.clone(),
@@ -7975,8 +8714,10 @@ async fn run_streaming(
                             error: error_obj,
                             seq: client_seq,
                         };
-                        #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                        let payload_val = serde_json::to_value(&error_payload).unwrap();
+                        let payload_val = serde_json::to_value(&error_payload).unwrap_or_else(|e| {
+                            tracing::error!(error = %e, "failed to serialize error broadcast payload");
+                            serde_json::json!({})
+                        });
                         broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
                         return None;
                     }
@@ -8041,8 +8782,10 @@ async fn run_streaming(
                         reasoning: reasoning.clone(),
                         seq: client_seq,
                     };
-                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                    let payload_val = serde_json::to_value(&final_payload).unwrap();
+                    let payload_val = serde_json::to_value(&final_payload).unwrap_or_else(|e| {
+                        tracing::error!(error = %e, "failed to serialize final broadcast payload");
+                        serde_json::json!({})
+                    });
                     broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
 
                     if !is_silent {
@@ -8141,8 +8884,10 @@ async fn run_streaming(
                         error: error_obj,
                         seq: client_seq,
                     };
-                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                    let payload_val = serde_json::to_value(&error_payload).unwrap();
+                    let payload_val = serde_json::to_value(&error_payload).unwrap_or_else(|e| {
+                        tracing::error!(error = %e, "failed to serialize error broadcast payload");
+                        serde_json::json!({})
+                    });
                     broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
                     return None;
                 },
@@ -9535,65 +10280,256 @@ mod tests {
     }
 
     #[test]
+    fn compaction_summary_messages_use_structured_sections() {
+        let messages = build_compaction_summary_messages(&[], 512);
+        let Some(ChatMessage::System { content }) = messages.first() else {
+            panic!("first message should be system");
+        };
+        assert!(content.contains("Do not include raw tool payload dumps"));
+
+        let Some(ChatMessage::User { content }) = messages.last() else {
+            panic!("last message should be user");
+        };
+        let UserContent::Text(prompt) = content else {
+            panic!("summary prompt should be text");
+        };
+        assert!(prompt.contains("Decisions"));
+        assert!(prompt.contains("State"));
+        assert!(prompt.contains("Open Items"));
+        assert!(prompt.contains("Constraints"));
+        assert!(prompt.contains("Artifacts"));
+    }
+
+    #[test]
+    fn default_compaction_summary_honors_budget() {
+        let summary = default_compaction_summary(8);
+        assert!(!summary.is_empty());
+        assert!(summary.contains("Anchors and recent turns") || summary.ends_with('…'));
+    }
+
+    #[test]
+    fn compaction_failure_fallback_reduction_preserves_tool_chain_and_reduces() {
+        let config = context_compaction_config_from_chat(&moltis_config::ChatConfig::default());
+        let long = "x".repeat(1_200);
+        let history = vec![
+            serde_json::json!({"role": "user", "content": long}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "running tool",
+                "tool_calls": [{ "id": "tc-1", "type": "function", "function": { "name": "exec", "arguments": "{}" }}]
+            }),
+            serde_json::json!({
+                "role": "tool_result",
+                "tool_call_id": "tc-1",
+                "result": {"stdout": "ok"}
+            }),
+            serde_json::json!({"role": "assistant", "content": "ack"}),
+            serde_json::json!({"role": "user", "content": "ack"}),
+            serde_json::json!({"role": "assistant", "content": "ack"}),
+            serde_json::json!({"role": "user", "content": "ack"}),
+            serde_json::json!({"role": "assistant", "content": "ack"}),
+            serde_json::json!({"role": "user", "content": "ack"}),
+            serde_json::json!({"role": "assistant", "content": "ack"}),
+        ];
+
+        let fallback =
+            compaction_failure_fallback_reduction(&history, config, 20).expect("fallback reduction");
+        assert!(fallback.removed_messages > 0);
+        assert!(
+            fallback
+                .messages
+                .iter()
+                .any(|msg| msg.get("tool_calls").is_some()),
+            "fallback should preserve assistant tool call anchor"
+        );
+        assert!(
+            fallback
+                .messages
+                .iter()
+                .any(|msg| msg.get("tool_call_id").and_then(Value::as_str) == Some("tc-1")),
+            "fallback should preserve matching tool result anchor"
+        );
+    }
+
+    #[test]
+    fn compaction_failure_fallback_reduction_returns_none_when_not_reducible() {
+        let config = context_compaction_config_from_chat(&moltis_config::ChatConfig::default());
+        let history = vec![serde_json::json!({"role": "user", "content": "only turn"})];
+        assert!(compaction_failure_fallback_reduction(&history, config, 20).is_none());
+    }
+
+    #[test]
     fn context_compaction_action_orchestrates_threshold_tiers() {
+        let config = context_compaction_config_from_chat(&moltis_config::ChatConfig::default());
         assert_eq!(
-            context_compaction_action_for_usage(69, 100),
+            context_compaction_action_for_usage(69, 100, config),
             ContextCompactionAction::None
         );
         assert_eq!(
-            context_compaction_action_for_usage(70, 100),
+            context_compaction_action_for_usage(70, 100, config),
             ContextCompactionAction::PreCompact
         );
         assert_eq!(
-            context_compaction_action_for_usage(79, 100),
+            context_compaction_action_for_usage(79, 100, config),
             ContextCompactionAction::PreCompact
         );
         assert_eq!(
-            context_compaction_action_for_usage(80, 100),
-            ContextCompactionAction::Compact
+            context_compaction_action_for_usage(80, 100, config),
+            ContextCompactionAction::SoftCompact
         );
         assert_eq!(
-            context_compaction_action_for_usage(90, 100),
-            ContextCompactionAction::ArchiveTier
+            context_compaction_action_for_usage(90, 100, config),
+            ContextCompactionAction::HardCompact
         );
         assert_eq!(
-            context_compaction_action_for_usage(95, 100),
-            ContextCompactionAction::TruncateTier
+            context_compaction_action_for_usage(95, 100, config),
+            ContextCompactionAction::EmergencyCompact
         );
     }
 
     #[test]
-    fn context_compaction_config_uses_strategy_and_keep_recent() {
+    fn context_compaction_action_respects_custom_threshold_boundaries() {
         let chat = moltis_config::ChatConfig {
-            context_compaction_strategy: "move_to_workspace".to_string(),
-            context_compaction_keep_recent: 7,
+            compaction: moltis_config::schema::ChatCompactionConfig {
+                enabled: true,
+                soft_trigger_percent: 60,
+                hard_trigger_percent: 75,
+                emergency_trigger_percent: 92,
+                verbatim_turns: 10,
+                min_verbatim_turns: 6,
+                anchor_budget_tokens: 5_000,
+                summary_budget_tokens: 2_500,
+            },
+            ..Default::default()
+        };
+        let config = context_compaction_config_from_chat(&chat);
+
+        assert_eq!(
+            context_compaction_action_for_usage(49, 100, config),
+            ContextCompactionAction::None
+        );
+        assert_eq!(
+            context_compaction_action_for_usage(50, 100, config),
+            ContextCompactionAction::PreCompact
+        );
+        assert_eq!(
+            context_compaction_action_for_usage(60, 100, config),
+            ContextCompactionAction::SoftCompact
+        );
+        assert_eq!(
+            context_compaction_action_for_usage(75, 100, config),
+            ContextCompactionAction::HardCompact
+        );
+        assert_eq!(
+            context_compaction_action_for_usage(92, 100, config),
+            ContextCompactionAction::EmergencyCompact
+        );
+    }
+
+    #[test]
+    fn context_compaction_config_uses_layered_values() {
+        let chat = moltis_config::ChatConfig {
+            compaction: moltis_config::schema::ChatCompactionConfig {
+                enabled: true,
+                soft_trigger_percent: 77,
+                hard_trigger_percent: 88,
+                emergency_trigger_percent: 96,
+                verbatim_turns: 14,
+                min_verbatim_turns: 8,
+                anchor_budget_tokens: 7_000,
+                summary_budget_tokens: 3_000,
+            },
             ..Default::default()
         };
 
         let parsed = context_compaction_config_from_chat(&chat);
-        assert_eq!(parsed.strategy, ContextCompactionStrategy::MoveToWorkspace);
-        assert_eq!(parsed.keep_recent, 7);
+        assert!(parsed.enabled);
+        assert_eq!(parsed.soft_trigger_percent, 77);
+        assert_eq!(parsed.hard_trigger_percent, 88);
+        assert_eq!(parsed.emergency_trigger_percent, 96);
+        assert_eq!(parsed.verbatim_turns, 14);
+        assert_eq!(parsed.min_verbatim_turns, 8);
+        assert_eq!(parsed.anchor_budget_tokens, 7_000);
+        assert_eq!(parsed.summary_budget_tokens, 3_000);
     }
 
     #[test]
-    fn context_compaction_config_defaults_invalid_values_to_safe_truncate() {
+    fn context_compaction_config_sanitizes_invalid_values() {
         let chat = moltis_config::ChatConfig {
-            context_compaction_strategy: "invalid".to_string(),
-            context_compaction_keep_recent: 0,
+            compaction: moltis_config::schema::ChatCompactionConfig {
+                enabled: true,
+                soft_trigger_percent: 0,
+                hard_trigger_percent: 0,
+                emergency_trigger_percent: 0,
+                verbatim_turns: 0,
+                min_verbatim_turns: 0,
+                anchor_budget_tokens: 0,
+                summary_budget_tokens: 0,
+            },
             ..Default::default()
         };
 
         let parsed = context_compaction_config_from_chat(&chat);
-        assert_eq!(parsed.strategy, ContextCompactionStrategy::Truncate);
-        assert_eq!(parsed.keep_recent, 1);
+        assert_eq!(parsed.soft_trigger_percent, 1);
+        assert_eq!(parsed.hard_trigger_percent, 2);
+        assert_eq!(parsed.emergency_trigger_percent, 3);
+        assert_eq!(parsed.verbatim_turns, 1);
+        assert_eq!(parsed.min_verbatim_turns, 1);
+        assert_eq!(parsed.anchor_budget_tokens, 1);
+        assert_eq!(parsed.summary_budget_tokens, 64);
     }
 
     #[test]
-    fn archive_keep_recent_for_reduction_avoids_noop_when_history_is_short() {
-        assert_eq!(archive_keep_recent_for_reduction(0, 20), 0);
-        assert_eq!(archive_keep_recent_for_reduction(1, 20), 1);
-        assert_eq!(archive_keep_recent_for_reduction(3, 20), 2);
-        assert_eq!(archive_keep_recent_for_reduction(10, 3), 3);
+    fn keep_recent_for_reduction_avoids_noop_when_history_is_short() {
+        assert_eq!(compaction::keep_recent_for_reduction(0, 20), 0);
+        assert_eq!(compaction::keep_recent_for_reduction(1, 20), 1);
+        assert_eq!(compaction::keep_recent_for_reduction(3, 20), 2);
+        assert_eq!(compaction::keep_recent_for_reduction(10, 3), 3);
+    }
+
+    #[test]
+    fn dropped_messages_for_retention_tracks_duplicates_by_count() {
+        let history = vec![
+            serde_json::json!({ "role": "user", "content": "same" }),
+            serde_json::json!({ "role": "assistant", "content": "same" }),
+            serde_json::json!({ "role": "assistant", "content": "same" }),
+        ];
+        let retained = vec![
+            serde_json::json!({ "role": "assistant", "content": "same" }),
+            serde_json::json!({ "role": "user", "content": "same" }),
+        ];
+
+        let dropped = dropped_messages_for_retention(&history, &retained);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(
+            dropped[0].get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
+    }
+
+    #[test]
+    fn redact_compaction_secret_values_masks_api_keys_and_bearer_tokens() {
+        let input = "OPENAI_API_KEY=sk-openai-secret Authorization: Bearer bearer-secret api_key=url-secret";
+        let redacted = redact_compaction_secret_values(input);
+
+        assert!(!redacted.contains("sk-openai-secret"));
+        assert!(!redacted.contains("bearer-secret"));
+        assert!(!redacted.contains("url-secret"));
+        assert!(redacted.contains("OPENAI_API_KEY=[REDACTED]"));
+        assert!(redacted.contains("Bearer [REDACTED]"));
+        assert!(redacted.contains("api_key=[REDACTED]"));
+    }
+
+    #[test]
+    fn build_archive_snapshot_body_redacts_sensitive_values() {
+        let dropped = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "OPENAI_API_KEY=sk-secret Authorization: Bearer bearer-secret"
+        })];
+        let body = build_archive_snapshot_body(&dropped, 10);
+        assert!(!body.contains("sk-secret"));
+        assert!(!body.contains("bearer-secret"));
+        assert!(body.contains("[REDACTED]"));
     }
 
     #[test]
@@ -10393,6 +11329,30 @@ mod tests {
             "completed targets must be reported regardless of reply medium"
         );
         assert_eq!(completions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn compact_empty_history_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        let runtime = Arc::new(MockChatRuntime::new());
+        let state: Arc<dyn ChatRuntime> = runtime;
+        let providers = Arc::new(RwLock::new(ProviderRegistry::empty()));
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+
+        let chat = LiveChatService::new(providers, disabled, state, store, metadata);
+
+        let err = chat
+            .compact(serde_json::json!({}))
+            .await
+            .expect_err("chat.compact should fail for empty history");
+        assert!(
+            err.to_string().contains("nothing to compact"),
+            "unexpected compact error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -12624,23 +13584,24 @@ mod tests {
 
     #[test]
     fn test_pre_compact_fires_memory_flush_before_compact() {
+        let config = context_compaction_config_from_chat(&moltis_config::ChatConfig::default());
         // At 72% occupancy the action is PreCompact: silent memory flush, no
-        // summarisation.  This guarantees a ~10% buffer before full compaction
-        // (Compact) fires at 80%, so memories are not lost in a large-token jump.
+        // summarisation. This guarantees a ~10% buffer before full compaction
+        // (SoftCompact) fires at 80%, so memories are not lost in a large-token jump.
         assert_eq!(
-            context_compaction_action_for_usage(72, 100),
+            context_compaction_action_for_usage(72, 100, config),
             ContextCompactionAction::PreCompact
         );
         // Below 70% no action is taken — we are not near the compaction boundary.
         assert_eq!(
-            context_compaction_action_for_usage(69, 100),
+            context_compaction_action_for_usage(69, 100, config),
             ContextCompactionAction::None
         );
-        // At 80% the action escalates to Compact (full summarisation path), not
+        // At 80% the action escalates to SoftCompact (full summarisation path), not
         // PreCompact, so the two code paths are distinct.
         assert_eq!(
-            context_compaction_action_for_usage(80, 100),
-            ContextCompactionAction::Compact
+            context_compaction_action_for_usage(80, 100, config),
+            ContextCompactionAction::SoftCompact
         );
     }
 

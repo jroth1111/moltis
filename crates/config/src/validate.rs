@@ -383,9 +383,19 @@ fn build_schema_map() -> KnownKeys {
                 ("message_queue_mode", Leaf),
                 ("priority_models", Leaf),
                 ("allowed_models", Leaf),
-                ("fact_extraction", Leaf),
-                ("context_compaction_strategy", Leaf),
-                ("context_compaction_keep_recent", Leaf),
+                (
+                    "compaction",
+                    Struct(HashMap::from([
+                        ("enabled", Leaf),
+                        ("soft_trigger_percent", Leaf),
+                        ("hard_trigger_percent", Leaf),
+                        ("emergency_trigger_percent", Leaf),
+                        ("verbatim_turns", Leaf),
+                        ("min_verbatim_turns", Leaf),
+                        ("anchor_budget_tokens", Leaf),
+                        ("summary_budget_tokens", Leaf),
+                    ])),
+                ),
                 ("message_queue_max_size", Leaf),
                 ("priority_starvation_bound", Leaf),
                 (
@@ -2032,6 +2042,62 @@ max_iterations = 4
             unknown.is_empty(),
             "chat.research keys should be known, got: {:?}",
             result.diagnostics
+        );
+    }
+
+    #[test]
+    fn chat_compaction_fields_are_known() {
+        let toml = r#"
+[chat.compaction]
+enabled = true
+soft_trigger_percent = 80
+hard_trigger_percent = 90
+emergency_trigger_percent = 95
+verbatim_turns = 10
+min_verbatim_turns = 6
+anchor_budget_tokens = 5000
+summary_budget_tokens = 2500
+"#;
+        let result = validate_toml_str(toml);
+        let unknown: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.category == "unknown-field" && d.path.starts_with("chat.compaction"))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "chat.compaction keys should be known, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn chat_legacy_compaction_fields_are_rejected() {
+        let toml = r#"
+[chat]
+fact_extraction = true
+context_compaction_strategy = "truncate"
+context_compaction_keep_recent = 20
+"#;
+        let result = validate_toml_str(toml);
+        let unknown_paths: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.category == "unknown-field" && d.path.starts_with("chat."))
+            .map(|d| d.path.clone())
+            .collect();
+
+        assert!(
+            unknown_paths.contains(&"chat.fact_extraction".to_string()),
+            "legacy fact_extraction must be unknown, got: {unknown_paths:?}"
+        );
+        assert!(
+            unknown_paths.contains(&"chat.context_compaction_strategy".to_string()),
+            "legacy context_compaction_strategy must be unknown, got: {unknown_paths:?}"
+        );
+        assert!(
+            unknown_paths.contains(&"chat.context_compaction_keep_recent".to_string()),
+            "legacy context_compaction_keep_recent must be unknown, got: {unknown_paths:?}"
         );
     }
 

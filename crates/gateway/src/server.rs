@@ -5370,6 +5370,7 @@ fn is_public_ip(ip: &str) -> bool {
 
 pub(crate) use moltis_auth::locality::is_local_connection;
 
+#[cfg(test)]
 async fn websocket_header_authenticated(
     headers: &axum::http::HeaderMap,
     credential_store: Option<&Arc<auth::CredentialStore>>,
