@@ -407,10 +407,10 @@ impl AgentTool for ExecTool {
             "exec tool invoked"
         );
 
-        // Approval gating: gate on runs_on_host (the authoritative variable for
-        // whether execution is container-isolated) rather than !is_sandboxed.
-        // This ensures restricted-host sessions — where is_sandboxed may be true
-        // but has_container_backend is false — still enforce approval checks.
+        // Approval gating.
+        // Commands that execute on the host must always pass approval checks,
+        // even when the session mode is "sandboxed" but the backend is
+        // host-backed (e.g. restricted-host).
         if runs_on_host && let Some(ref mgr) = self.approval_manager {
             let action = mgr.check_command(command).await?;
             if action == ApprovalAction::NeedsApproval {
@@ -919,6 +919,74 @@ mod tests {
             .unwrap();
         assert_eq!(result["stdout"].as_str().unwrap().trim(), "sandboxed");
         assert_eq!(result["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_restricted_host_requires_approval() {
+        use crate::sandbox::{RestrictedHostSandbox, SandboxConfig, SandboxRouter};
+
+        let mgr = Arc::new(ApprovalManager::default());
+        let bc = Arc::new(TestBroadcaster::new());
+        let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
+
+        let router = Arc::new(SandboxRouter::with_backend(
+            SandboxConfig::default(),
+            Arc::new(RestrictedHostSandbox::new(SandboxConfig::default())),
+        ));
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut tool = ExecTool::default()
+            .with_sandbox_router(router)
+            .with_approval(Arc::clone(&mgr), bc_dyn);
+        tool.working_dir = Some(temp_dir.path().to_path_buf());
+
+        let mgr2 = Arc::clone(&mgr);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let ids = mgr2.pending_ids().await;
+            if let Some(id) = ids.first() {
+                mgr2.resolve(id, ApprovalDecision::Denied, None).await;
+            }
+        });
+
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "curl https://example.com"
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
+        assert!(bc.called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_container_backend_skips_approval() {
+        use crate::sandbox::{SandboxConfig, SandboxRouter};
+
+        let mut mgr = ApprovalManager::default();
+        mgr.timeout = Duration::from_millis(50);
+        let mgr = Arc::new(mgr);
+        let bc = Arc::new(TestBroadcaster::new());
+        let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
+
+        let router = Arc::new(SandboxRouter::with_backend(
+            SandboxConfig::default(),
+            Arc::new(CaptureWorkingDirSandbox::default()),
+        ));
+
+        let tool = ExecTool::default()
+            .with_sandbox_router(router)
+            .with_approval(Arc::clone(&mgr), bc_dyn);
+
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "curl https://example.com"
+            }))
+            .await;
+
+        assert!(result.is_ok(), "approval should be skipped for container backends");
+        assert!(!bc.called.load(Ordering::SeqCst));
     }
 
     struct RetryRecoverySandbox {

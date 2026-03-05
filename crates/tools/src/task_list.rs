@@ -449,6 +449,27 @@ impl AgentTool for TaskListTool {
 
                 // Apply metadata update first if any.
                 if subject.is_some() || description.is_some() || new_blocked_by.is_some() {
+                    let task_before = self
+                        .store
+                        .get(list_id, id)
+                        .await
+                        .map_err(anyhow::Error::from)?
+                        .ok_or_else(|| Error::message(format!("task not found: {id}")))?;
+
+                    if (subject.is_some() || description.is_some())
+                        && let Some(current_owner) = task_before.runtime.owner.as_deref()
+                    {
+                        let caller_identity =
+                            str_param_any(&params, &["owner", "_session_key"]).unwrap_or("agent");
+                        if caller_identity != current_owner {
+                            return Err(Error::message(format!(
+                                "task {id} is owned by '{current_owner}'; \
+                                 caller '{caller_identity}' cannot modify subject or description"
+                            ))
+                            .into());
+                        }
+                    }
+
                     self.store
                         .update_metadata(
                             list_id,
@@ -1053,5 +1074,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved["task"]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn update_rejects_foreign_owner_subject_description_change() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
+
+        t.execute(json!({ "action": "claim", "id": id, "owner": "owner-a" }))
+            .await
+            .unwrap();
+
+        let result = t
+            .execute(json!({
+                "action": "update",
+                "id": id,
+                "subject": "updated subject",
+                "description": "updated description",
+                "owner": "owner-b",
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("owned by 'owner-a'"), "unexpected error: {err}");
+        assert!(err.contains("owner-b"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn update_allows_owner_subject_description_change() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
+
+        t.execute(json!({ "action": "claim", "id": id, "owner": "owner-a" }))
+            .await
+            .unwrap();
+
+        let updated = t
+            .execute(json!({
+                "action": "update",
+                "id": id,
+                "subject": "updated subject",
+                "description": "updated description",
+                "owner": "owner-a",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(updated["task"]["subject"], "updated subject");
+        assert_eq!(updated["task"]["description"], "updated description");
+    }
+
+    #[tokio::test]
+    async fn update_allows_anyone_subject_description_change_when_unowned() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
+
+        let updated = t
+            .execute(json!({
+                "action": "update",
+                "id": id,
+                "subject": "updated subject",
+                "description": "updated description",
+                "owner": "owner-b",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(updated["task"]["subject"], "updated subject");
+        assert_eq!(updated["task"]["description"], "updated description");
     }
 }

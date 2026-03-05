@@ -136,6 +136,9 @@ onEvent("session.recovered", (payload) => {
 	var msg = details.length > 0 ? `Session recovered: ${details.join(", ")}.` : "Session recovered after interruption.";
 	chatAddMsg("system", msg);
 });
+onEvent("identity.updated", () => {
+	gon.refresh();
+});
 
 function applyMemory(mem) {
 	if (!mem) return;

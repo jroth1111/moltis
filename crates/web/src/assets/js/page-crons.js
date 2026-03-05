@@ -196,6 +196,7 @@ function collectHeartbeatForm(form) {
 		every: form.querySelector("[data-hb=every]").value.trim() || "30m",
 		model: heartbeatModel.value || null,
 		prompt: form.querySelector("[data-hb=prompt]").value.trim() || null,
+		surprise_me: form.querySelector("[data-hb=surpriseMe]").checked,
 		ack_max_chars: parseInt(form.querySelector("[data-hb=ackMax]").value, 10) || 300,
 		deliver: form.querySelector("[data-hb=deliver]").checked,
 		channel: form.querySelector("[data-hb=channel]").value.trim() || null,
@@ -328,6 +329,14 @@ function HeartbeatSection() {
       <textarea data-hb="prompt" class="provider-key-input textarea-sm" placeholder="Leave blank to use default heartbeat prompt">${cfg.prompt || ""}</textarea>
       <p class="text-xs text-[var(--muted)] mt-2">Leave this empty to use <code>HEARTBEAT.md</code> in your workspace root. If that file exists but is empty/comments-only, heartbeat LLM runs are skipped to save tokens.</p>
       <p class="text-xs text-[var(--muted)] mt-1">Effective prompt source: <span class="text-[var(--text)]">${promptSourceText}</span></p>
+      <div class="flex items-center gap-3 mt-3">
+        <label class="cron-toggle">
+          <input data-hb="surpriseMe" type="checkbox" checked=${cfg.surprise_me === true} />
+          <span class="cron-slider"></span>
+        </label>
+        <span class="text-sm text-[var(--text)]">Surprise me (proactive follow-ups)</span>
+      </div>
+      <p class="text-xs text-[var(--muted)] mt-2">When enabled, heartbeat adds a proactive hint so the agent can share interesting findings without waiting for a direct prompt.</p>
       <div class="grid gap-4 mt-3" style="grid-template-columns:1fr;">
         <div>
           <label class="block text-xs text-[var(--muted)] mb-1">Max Response Characters</label>

@@ -566,9 +566,7 @@ impl GatewayState {
             metrics_store,
             #[cfg(feature = "vault")]
             vault,
-            provider_health: Arc::new(
-                moltis_agents::provider_health::ProviderHealthTracker::default(),
-            ),
+            provider_health: moltis_agents::provider_health::global_tracker(),
             seq: AtomicU64::new(0),
             tts_phrase_counter: AtomicUsize::new(0),
             #[cfg(feature = "graphql")]
@@ -668,6 +666,16 @@ impl GatewayState {
     /// Number of connected clients.
     pub async fn client_count(&self) -> usize {
         self.inner.read().await.clients.len()
+    }
+
+    /// Whether any connected client is actively viewing `session_key`.
+    pub async fn has_active_session(&self, session_key: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .active_sessions
+            .values()
+            .any(|active| active == session_key)
     }
 
     /// Push a reply target for a session (used when a channel message triggers chat.send).
@@ -1162,6 +1170,23 @@ mod tests {
         // Should not panic.
         state.disconnect_all_clients("noop").await;
         assert_eq!(state.client_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn has_active_session_checks_active_session_map() {
+        let state = test_state();
+        {
+            let mut inner = state.inner.write().await;
+            inner
+                .active_sessions
+                .insert("conn-1".to_string(), "main".to_string());
+            inner
+                .active_sessions
+                .insert("conn-2".to_string(), "project:alpha".to_string());
+        }
+        assert!(state.has_active_session("main").await);
+        assert!(state.has_active_session("project:alpha").await);
+        assert!(!state.has_active_session("missing").await);
     }
 
     #[test]

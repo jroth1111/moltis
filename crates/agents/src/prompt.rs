@@ -228,6 +228,15 @@ Write for speech, not for reading:\n\
 - Keep responses concise — two to three short paragraphs at most.\n\
 - Use complete sentences and natural transitions between ideas.\n";
 
+/// One-shot prompt appended on the first real post-onboarding chat turn.
+pub const FIRST_CHAT_IDENTITY_PROMPT: &str = "\n\n\
+## First Chat Identity Moment\n\n\
+This is your first real conversation after onboarding. Offer a brief identity refinement moment:\n\
+- Ask whether the user wants to refine your personality, tone, or vibe now.\n\
+- If they provide refinements, persist them using `memory_save` to `SOUL.md` and/or `IDENTITY.md`.\n\
+- Keep this short and conversational.\n\
+- If the user declines, continue normally without repeating this prompt in future turns.\n";
+
 /// Build the system prompt for an agent run, including available tools.
 ///
 /// When `native_tools` is true, tool schemas are sent via the API's native

@@ -240,6 +240,7 @@ fn build_schema_map() -> KnownKeys {
             ("sandbox", Leaf),
             ("sandbox_image", Leaf),
             ("allowed_domains", Leaf),
+            ("autonomous_allowed_domains", Leaf),
             ("low_memory_threshold_mb", Leaf),
             ("persist_profile", Leaf),
             ("profile_dir", Leaf),
@@ -551,6 +552,7 @@ fn build_schema_map() -> KnownKeys {
                 ("every", Leaf),
                 ("model", Leaf),
                 ("prompt", Leaf),
+                ("surprise_me", Leaf),
                 ("ack_max_chars", Leaf),
                 ("active_hours", active_hours()),
                 ("deliver", Leaf),
@@ -1068,7 +1070,7 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
 
     // agents.default_preset should reference an existing preset key.
     if let Some(default_preset) = config.agents.default_preset.as_deref()
-        && !config.agents.presets.contains_key(default_preset)
+        && !config.agents.effective_presets().contains_key(default_preset)
     {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,

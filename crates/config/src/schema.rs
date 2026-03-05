@@ -230,9 +230,68 @@ pub struct AgentsConfig {
 }
 
 impl AgentsConfig {
+    /// Built-in spawn presets available even when the user does not define
+    /// `agents.presets` in `moltis.toml`.
+    #[must_use]
+    pub fn default_presets() -> HashMap<String, AgentPresetConfig> {
+        HashMap::from([
+            (
+                "researcher".to_string(),
+                AgentPresetConfig {
+                    allow_tools: vec![
+                        "web_search".to_string(),
+                        "web_fetch".to_string(),
+                        "memory_search".to_string(),
+                        "memory_save".to_string(),
+                    ],
+                    system_prompt_suffix: Some(
+                        "Prioritize evidence gathering, citations, and concise synthesis."
+                            .to_string(),
+                    ),
+                    ..AgentPresetConfig::default()
+                },
+            ),
+            (
+                "code-reviewer".to_string(),
+                AgentPresetConfig {
+                    allow_tools: vec!["read_file".to_string(), "exec".to_string()],
+                    deny_tools: vec!["write_file".to_string()],
+                    system_prompt_suffix: Some(
+                        "Focus on correctness risks, regressions, and concrete file-level findings."
+                            .to_string(),
+                    ),
+                    ..AgentPresetConfig::default()
+                },
+            ),
+            (
+                "project-manager".to_string(),
+                AgentPresetConfig {
+                    delegate_only: true,
+                    system_prompt_suffix: Some(
+                        "Coordinate work through delegation, track progress, and avoid direct implementation."
+                            .to_string(),
+                    ),
+                    ..AgentPresetConfig::default()
+                },
+            ),
+        ])
+    }
+
+    /// Return built-ins merged with user-defined presets.
+    /// User presets win when names collide.
+    #[must_use]
+    pub fn effective_presets(&self) -> HashMap<String, AgentPresetConfig> {
+        let mut merged = Self::default_presets();
+        merged.extend(self.presets.clone());
+        merged
+    }
+
     /// Return a preset by name.
-    pub fn get_preset(&self, name: &str) -> Option<&AgentPresetConfig> {
-        self.presets.get(name)
+    pub fn get_preset(&self, name: &str) -> Option<AgentPresetConfig> {
+        self.presets
+            .get(name)
+            .cloned()
+            .or_else(|| Self::default_presets().get(name).cloned())
     }
 }
 
@@ -746,6 +805,9 @@ pub struct HeartbeatConfig {
     pub model: Option<String>,
     /// Custom prompt override. If empty, the built-in default is used.
     pub prompt: Option<String>,
+    /// Enable proactive "surprise me" heartbeat behavior.
+    #[serde(default)]
+    pub surprise_me: bool,
     /// Max characters for an acknowledgment reply before truncation. Defaults to 300.
     pub ack_max_chars: usize,
     /// Active hours window — heartbeats only run during this window.
@@ -771,6 +833,7 @@ impl Default for HeartbeatConfig {
             every: "30m".into(),
             model: None,
             prompt: None,
+            surprise_me: false,
             ack_max_chars: 300,
             active_hours: ActiveHoursConfig::default(),
             deliver: false,
@@ -1971,6 +2034,11 @@ pub struct BrowserConfig {
     /// Supports wildcards: "*.example.com" matches subdomains.
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Allowed domains for autonomous browser runs (e.g. cron/dispatch).
+    /// Empty list means autonomous runs are blocked unless `allowed_domains` is set.
+    /// Supports the same wildcard behavior as `allowed_domains`.
+    #[serde(default)]
+    pub autonomous_allowed_domains: Vec<String>,
     /// Total system RAM threshold (MB) below which memory-saving Chrome flags
     /// are injected automatically. Set to 0 to disable. Default: 2048.
     #[serde(default = "default_low_memory_threshold_mb")]
@@ -2060,6 +2128,7 @@ impl Default for BrowserConfig {
             chrome_args: Vec::new(),
             sandbox_image: default_sandbox_image(),
             allowed_domains: Vec::new(),
+            autonomous_allowed_domains: Vec::new(),
             low_memory_threshold_mb: default_low_memory_threshold_mb(),
             persist_profile: default_persist_profile(),
             profile_dir: None,
@@ -2825,6 +2894,26 @@ system_prompt_suffix = "Focus on evidence."
         assert_eq!(
             preset.system_prompt_suffix.as_deref(),
             Some("Focus on evidence.")
+        );
+    }
+
+    #[test]
+    fn agents_effective_presets_include_builtins_and_user_overrides() {
+        let toml = r#"
+[agents.presets.researcher]
+allow_tools = ["web_fetch"]
+"#;
+        let config: MoltisConfig = toml::from_str(toml).unwrap();
+        let effective = config.agents.effective_presets();
+        assert!(effective.contains_key("project-manager"));
+        assert!(effective.contains_key("code-reviewer"));
+        assert!(effective.contains_key("researcher"));
+        assert_eq!(
+            effective
+                .get("researcher")
+                .map(|preset| preset.allow_tools.clone())
+                .unwrap_or_default(),
+            vec!["web_fetch".to_string()]
         );
     }
 

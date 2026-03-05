@@ -69,7 +69,7 @@ pub struct AgentPersona {
 }
 
 /// Parameters for creating a new agent.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CreateAgentParams {
     pub id: String,
     pub name: String,
@@ -82,7 +82,7 @@ pub struct CreateAgentParams {
 }
 
 /// Parameters for updating an existing agent.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UpdateAgentParams {
     #[serde(default)]
     pub name: Option<String>,

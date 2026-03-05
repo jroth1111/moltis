@@ -79,6 +79,70 @@ test.describe("Agents settings page", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
+	test("create form preset picker populates fields", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await navigateAndWait(page, "/settings/agents");
+
+		await page.getByRole("button", { name: "New Agent", exact: true }).click();
+		await expect(page.getByText("Create Agent", { exact: true })).toBeVisible();
+
+		const presetSelect = page.locator('label:has-text("Use Preset") select');
+		await expect(presetSelect).toBeVisible();
+		await presetSelect.selectOption("researcher");
+
+		await expect(page.getByPlaceholder("e.g. writer, coder, researcher")).toHaveValue("researcher");
+		await expect(page.getByPlaceholder("Creative Writer")).toHaveValue("Researcher");
+		await expect(
+			page.locator('label:has-text("Allowed Tools (comma separated)") input'),
+		).toHaveValue(/web_search/i);
+		await expect(
+			page.locator('label:has-text("Spawn Prompt Suffix") textarea'),
+		).toHaveValue(/Prioritize evidence gathering/i);
+
+		expect(pageErrors).toEqual([]);
+	});
+
+	test("create/edit preserves capability declaration fields", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await navigateAndWait(page, "/settings/agents");
+
+		await page.getByRole("button", { name: "New Agent", exact: true }).click();
+		await expect(page.getByText("Create Agent", { exact: true })).toBeVisible();
+
+		await page.getByPlaceholder("e.g. writer, coder, researcher").fill("caps-test-agent");
+		await page.getByPlaceholder("Creative Writer").fill("Capabilities Test Agent");
+		await page
+			.locator('label:has-text("Allowed Tools (comma separated)") input')
+			.fill("read_file, web_search");
+		await page.locator('label:has-text("Denied Tools (comma separated)") input').fill("exec");
+		await page
+			.locator('label:has-text("Delegate-only agent (can only spawn/delegate)") input[type="checkbox"]')
+			.check();
+		await page
+			.locator('label:has-text("Spawn Prompt Suffix") textarea')
+			.fill("Use strict review mode.");
+		await page.getByRole("button", { name: "Create", exact: true }).click();
+
+		const card = page.locator(".backend-card").filter({ hasText: "Capabilities Test Agent" });
+		await expect(card).toBeVisible({ timeout: 10_000 });
+		await card.getByRole("button", { name: "Edit", exact: true }).click();
+
+		await expect(
+			page.locator('label:has-text("Allowed Tools (comma separated)") input'),
+		).toHaveValue("read_file, web_search");
+		await expect(page.locator('label:has-text("Denied Tools (comma separated)") input')).toHaveValue("exec");
+		await expect(
+			page.locator('label:has-text("Delegate-only agent (can only spawn/delegate)") input[type="checkbox"]'),
+		).toBeChecked();
+		await expect(page.locator('label:has-text("Spawn Prompt Suffix") textarea')).toHaveValue(
+			"Use strict review mode.",
+		);
+		await page.getByRole("button", { name: "Cancel", exact: true }).click();
+
+		await deleteAgentByName(page, "Capabilities Test Agent");
+		expect(pageErrors).toEqual([]);
+	});
+
 	test("create form Cancel button returns to list", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/settings/agents");

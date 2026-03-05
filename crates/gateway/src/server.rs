@@ -554,6 +554,14 @@ fn approval_manager_from_config(config: &moltis_config::MoltisConfig) -> Approva
     manager
 }
 
+fn heartbeat_is_outside_active_hours(hb_cfg: &moltis_config::schema::HeartbeatConfig) -> bool {
+    !moltis_cron::heartbeat::is_within_active_hours(
+        &hb_cfg.active_hours.start,
+        &hb_cfg.active_hours.end,
+        &hb_cfg.active_hours.timezone,
+    )
+}
+
 // ── Shared app state ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -1852,9 +1860,11 @@ pub async fn prepare_gateway(
     // Agent turn: run an LLM turn in a session determined by the job's session_target.
     let agent_state = Arc::clone(&deferred_state);
     let agent_events_queue = Arc::clone(&events_queue);
+    let agent_db_pool = db_pool.clone();
     let on_agent_turn: moltis_cron::service::AgentTurnFn = Arc::new(move |req| {
         let st = Arc::clone(&agent_state);
         let eq = Arc::clone(&agent_events_queue);
+        let pool = agent_db_pool.clone();
         Box::pin(async move {
             let state = st
                 .get()
@@ -1871,6 +1881,22 @@ pub async fn prepare_gateway(
             let has_pending_events = is_heartbeat_turn && !eq.is_empty().await;
             if is_heartbeat_turn && !has_pending_events {
                 let hb_cfg = state.inner.read().await.heartbeat_config.clone();
+                if heartbeat_is_outside_active_hours(&hb_cfg) {
+                    tracing::info!(
+                        start = %hb_cfg.active_hours.start,
+                        end = %hb_cfg.active_hours.end,
+                        timezone = %hb_cfg.active_hours.timezone,
+                        "skipping heartbeat LLM turn: outside active hours"
+                    );
+                    return Ok(moltis_cron::service::AgentTurnResult {
+                        output: moltis_cron::heartbeat::HEARTBEAT_OK.to_string(),
+                        input_tokens: None,
+                        output_tokens: None,
+                        delivery_channel: None,
+                        delivery_to: None,
+                        delivered_at_ms: None,
+                    });
+                }
                 let has_prompt_override = hb_cfg
                     .prompt
                     .as_deref()
@@ -1887,6 +1913,9 @@ pub async fn prepare_gateway(
                         output: moltis_cron::heartbeat::HEARTBEAT_OK.to_string(),
                         input_tokens: None,
                         output_tokens: None,
+                        delivery_channel: None,
+                        delivery_to: None,
+                        delivered_at_ms: None,
                     });
                 }
             }
@@ -1922,7 +1951,7 @@ pub async fn prepare_gateway(
 
             let prompt_text = if is_heartbeat_turn {
                 let events = eq.drain().await;
-                if events.is_empty() {
+                let mut prompt = if events.is_empty() {
                     req.message.clone()
                 } else {
                     tracing::info!(
@@ -1930,7 +1959,24 @@ pub async fn prepare_gateway(
                         "enriching heartbeat prompt with system events"
                     );
                     moltis_cron::heartbeat::build_event_enriched_prompt(&events, &req.message)
+                };
+                if let Ok(Some(stats)) =
+                    moltis_cron::store_sqlite::SqliteStore::engagement_stats_with_pool(
+                        &pool,
+                        "__heartbeat__",
+                        20,
+                    )
+                    .await
+                    && stats.sample_size >= 5
+                {
+                    let response_rate_pct = (stats.response_rate * 100.0).round();
+                    let average_minutes = stats.average_response_minutes.unwrap_or(0.0).round();
+                    prompt.push_str(&format!(
+                        "\n\nEngagement summary (last {} delivered runs): user engages with ~{}% of heartbeat messages, average response time ~{} minutes.",
+                        stats.sample_size, response_rate_pct as u64, average_minutes as u64
+                    ));
                 }
+                prompt
             } else {
                 req.message.clone()
             };
@@ -1988,6 +2034,9 @@ pub async fn prepare_gateway(
             };
 
             // Deliver output to a channel if requested.
+            let mut delivery_channel = None;
+            let mut delivery_to = None;
+            let mut delivered_at_ms = None;
             if req.deliver
                 && !delivery_text.trim().is_empty()
                 && let (Some(channel_account), Some(chat_id)) = (&req.channel, &req.to)
@@ -2003,6 +2052,51 @@ pub async fn prepare_gateway(
                             error = %e,
                             "cron job channel delivery failed"
                         );
+                    } else {
+                        delivery_channel = Some(channel_account.clone());
+                        delivery_to = Some(chat_id.clone());
+                        delivered_at_ms = Some(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                        );
+                        #[cfg(feature = "push-notifications")]
+                        {
+                            if !state.has_active_session(&session_key).await {
+                                if let Some(push_service) = state.get_push_service().await {
+                                    let summary = {
+                                        let max_chars = 120;
+                                        let mut truncated =
+                                            delivery_text.chars().take(max_chars).collect::<String>();
+                                        if delivery_text.chars().count() > max_chars {
+                                            truncated.push('…');
+                                        }
+                                        truncated
+                                    };
+                                    let title = if is_heartbeat_turn {
+                                        "Heartbeat update"
+                                    } else {
+                                        "Scheduled task update"
+                                    };
+                                    if let Err(error) = crate::push_routes::send_push_notification(
+                                        &push_service,
+                                        title,
+                                        &summary,
+                                        Some("/chats"),
+                                        Some(&session_key),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            session_key = %session_key,
+                                            error = %error,
+                                            "cron push notification failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else {
                     tracing::debug!(
@@ -2015,6 +2109,9 @@ pub async fn prepare_gateway(
                 output: text,
                 input_tokens,
                 output_tokens,
+                delivery_channel,
+                delivery_to,
+                delivered_at_ms,
             })
         })
     });
@@ -2518,9 +2615,11 @@ pub async fn prepare_gateway(
             crate::channel_store::SqliteChannelStore::new(db_pool.clone()),
         );
 
-        let channel_sink: Arc<dyn moltis_channels::ChannelEventSink> = Arc::new(
-            crate::channel_events::GatewayChannelEventSink::new(Arc::clone(&deferred_state)),
-        );
+        let channel_sink: Arc<dyn moltis_channels::ChannelEventSink> =
+            Arc::new(crate::channel_events::GatewayChannelEventSink::new(
+                Arc::clone(&deferred_state),
+                Some(Arc::new(db_pool.clone())),
+            ));
         let tg_plugin = Arc::new(tokio::sync::RwLock::new(
             moltis_telegram::TelegramPlugin::new()
                 .with_message_log(Arc::clone(&message_log))
@@ -3261,7 +3360,8 @@ pub async fn prepare_gateway(
 
     // Wire live chat service (needs state reference, so done after state creation).
     {
-        let broadcaster = Arc::new(GatewayApprovalBroadcaster::new(Arc::clone(&state)));
+        let broadcaster: Arc<dyn moltis_tools::exec::ApprovalBroadcaster> =
+            Arc::new(GatewayApprovalBroadcaster::new(Arc::clone(&state)));
         let env_provider: Arc<dyn EnvVarProvider> = credential_store.clone();
         let eq = cron_service.events_queue().clone();
         let cs = Arc::clone(&cron_service);
@@ -3275,7 +3375,7 @@ pub async fn prepare_gateway(
             });
         });
         let exec_tool = moltis_tools::exec::ExecTool::default()
-            .with_approval(Arc::clone(&approval_manager), broadcaster)
+            .with_approval(Arc::clone(&approval_manager), Arc::clone(&broadcaster))
             .with_approval_store(Arc::new(db_pool.clone()))
             .with_sandbox_router(Arc::clone(&sandbox_router))
             .with_env_provider(Arc::clone(&env_provider))
@@ -3334,6 +3434,16 @@ pub async fn prepare_gateway(
         tool_registry.register(Box::new(
             moltis_tools::send_image::SendImageTool::new()
                 .with_sandbox_router(Arc::clone(&sandbox_router)),
+        ));
+        tool_registry.register(Box::new(
+            moltis_tools::read_file::ReadFileTool::new()
+                .with_sandbox_router(Arc::clone(&sandbox_router)),
+        ));
+        tool_registry.register(Box::new(
+            moltis_tools::write_file::WriteFileTool::new()
+                .with_sandbox_router(Arc::clone(&sandbox_router))
+                .with_approval(Arc::clone(&approval_manager), Arc::clone(&broadcaster))
+                .with_approval_store(Arc::new(db_pool.clone())),
         ));
         if let Some(t) = moltis_tools::web_search::WebSearchTool::from_config_with_env_overrides(
             &config.tools.web.search,
@@ -3781,6 +3891,7 @@ pub async fn prepare_gateway(
                 base_tools,
             )
             .with_on_event(on_spawn_event)
+            .with_session_store(Arc::clone(&session_store))
             .with_agents_config(agents_config)
             .with_task_store(Arc::clone(&task_store))
             .with_tasks_config(config.tasks.clone())
@@ -4811,7 +4922,7 @@ pub async fn prepare_gateway(
     {
         use moltis_cron::{
             heartbeat::{
-                DEFAULT_INTERVAL_MS, HeartbeatPromptSource, parse_interval_ms,
+                DEFAULT_INTERVAL_MS, HeartbeatPromptSource, apply_surprise_me, parse_interval_ms,
                 resolve_heartbeat_prompt,
             },
             types::{CronJobCreate, CronJobPatch, CronPayload, CronSchedule, SessionTarget},
@@ -4836,6 +4947,7 @@ pub async fn prepare_gateway(
                 "heartbeat prompt source conflict: config heartbeat.prompt overrides HEARTBEAT.md"
             );
         }
+        let prompt = apply_surprise_me(&prompt, hb.surprise_me);
 
         // Check if heartbeat job already exists.
         let existing = cron_service.list().await;
@@ -6490,6 +6602,23 @@ mod tests {
         let manager = approval_manager_from_config(&cfg);
         assert_eq!(manager.mode, ApprovalMode::OnMiss);
         assert_eq!(manager.security_level, SecurityLevel::Allowlist);
+    }
+
+    #[test]
+    fn heartbeat_active_hours_helper_detects_disabled_window() {
+        let mut hb = moltis_config::schema::HeartbeatConfig::default();
+        hb.active_hours.start = "00:00".to_string();
+        hb.active_hours.end = "00:00".to_string();
+        hb.active_hours.timezone = "UTC".to_string();
+        assert!(heartbeat_is_outside_active_hours(&hb));
+    }
+
+    #[test]
+    fn heartbeat_active_hours_helper_treats_invalid_config_as_active() {
+        let mut hb = moltis_config::schema::HeartbeatConfig::default();
+        hb.active_hours.start = "invalid".to_string();
+        hb.active_hours.end = "24:00".to_string();
+        assert!(!heartbeat_is_outside_active_hours(&hb));
     }
 
     #[tokio::test]

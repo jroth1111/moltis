@@ -2,12 +2,12 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use {async_trait::async_trait, tracing::info};
+use {async_trait::async_trait, serde::Deserialize, tracing::info};
 
 use {
     crate::{
         error::Error,
-        params::{bool_param, str_param, u64_param},
+        params::{bool_param, str_param, str_param_any, u64_param},
     },
     moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent},
     time::OffsetDateTime,
@@ -15,12 +15,14 @@ use {
 
 use {
     moltis_agents::{
-        model::LlmProvider,
+        ChatMessage, ContentPart, UserContent,
+        model::{LlmProvider, values_to_chat_messages},
         runner::{RunnerEvent, run_agent_loop_with_context},
         tool_registry::{AgentTool, ToolRegistry},
     },
     moltis_config::schema::{AgentPresetConfig, AgentsConfig},
     moltis_providers::ProviderRegistry,
+    moltis_sessions::store::SessionStore,
 };
 
 /// Maximum nesting depth for sub-agents (prevents infinite recursion).
@@ -51,6 +53,7 @@ pub struct SpawnAgentTool {
     provider_registry: Arc<tokio::sync::RwLock<ProviderRegistry>>,
     default_provider: Arc<dyn LlmProvider>,
     tool_registry: Arc<ToolRegistry>,
+    session_store: Option<Arc<SessionStore>>,
     agents_config: Option<Arc<tokio::sync::RwLock<AgentsConfig>>>,
     on_event: Option<OnSpawnEvent>,
     /// Optional task store for lifecycle management when `task_id` is provided.
@@ -60,6 +63,18 @@ pub struct SpawnAgentTool {
     /// Global tool policy resolver — enforced on all sub-agent tool registries.
     /// Resolved at spawn time so policy updates are picked up without restart.
     tool_policy_resolver: crate::policy::ToolPolicyResolver,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PersonaSpawnPolicy {
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    denied_tools: Vec<String>,
+    #[serde(default)]
+    delegate_only: bool,
+    #[serde(default)]
+    system_prompt_suffix: Option<String>,
 }
 
 impl SpawnAgentTool {
@@ -72,6 +87,7 @@ impl SpawnAgentTool {
             provider_registry,
             default_provider,
             tool_registry,
+            session_store: None,
             agents_config: None,
             on_event: None,
             task_store: None,
@@ -94,6 +110,12 @@ impl SpawnAgentTool {
         agents_config: Arc<tokio::sync::RwLock<AgentsConfig>>,
     ) -> Self {
         self.agents_config = Some(agents_config);
+        self
+    }
+
+    /// Attach session storage so sub-agents can optionally inherit parent context.
+    pub fn with_session_store(mut self, session_store: Arc<SessionStore>) -> Self {
+        self.session_store = Some(session_store);
         self
     }
 
@@ -140,6 +162,13 @@ impl SpawnAgentTool {
         let arr = raw
             .as_array()
             .ok_or_else(|| Error::message(format!("parameter '{key}' must be an array")))?;
+        Self::normalize_tool_names_array(arr, key)
+    }
+
+    fn normalize_tool_names_array(
+        arr: &[serde_json::Value],
+        key: &str,
+    ) -> crate::Result<Vec<String>> {
         let mut out = Vec::new();
         for (idx, item) in arr.iter().enumerate() {
             let name = item.as_str().ok_or_else(|| {
@@ -154,6 +183,77 @@ impl SpawnAgentTool {
             out.push(trimmed.to_string());
         }
         Ok(out)
+    }
+
+    fn validate_policy_agent_id(agent_id: &str) -> crate::Result<()> {
+        let is_valid = !agent_id.is_empty()
+            && agent_id.len() <= 50
+            && !agent_id.starts_with('-')
+            && !agent_id.ends_with('-')
+            && agent_id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if is_valid {
+            Ok(())
+        } else {
+            Err(Error::message(
+                "invalid agent_id for spawn policy (expected lowercase slug)",
+            ))
+        }
+    }
+
+    async fn load_persona_spawn_policy(
+        params: &serde_json::Value,
+    ) -> crate::Result<Option<(String, PersonaSpawnPolicy)>> {
+        let Some(agent_id) = str_param_any(params, &["agent_id", "_agent_id"]) else {
+            return Ok(None);
+        };
+        Self::validate_policy_agent_id(agent_id)?;
+        let policy_path = moltis_config::agent_workspace_dir(agent_id).join(".spawn-policy.json");
+        let content = match tokio::fs::read_to_string(&policy_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(Error::message(format!(
+                    "failed to read agent policy '{}': {error}",
+                    policy_path.display()
+                )));
+            },
+        };
+        let policy = serde_json::from_str::<PersonaSpawnPolicy>(&content).map_err(|error| {
+            Error::message(format!(
+                "failed to parse agent policy '{}': {error}",
+                policy_path.display()
+            ))
+        })?;
+        Ok(Some((agent_id.to_string(), policy)))
+    }
+
+    fn apply_persona_policy(
+        allow_tools: Vec<String>,
+        mut deny_tools: Vec<String>,
+        mut delegate_only: bool,
+        policy: &PersonaSpawnPolicy,
+    ) -> (Vec<String>, Vec<String>, bool) {
+        let allow_tools = if policy.allowed_tools.is_empty() {
+            allow_tools
+        } else if allow_tools.is_empty() {
+            policy.allowed_tools.clone()
+        } else {
+            let allowed: HashSet<&str> = policy.allowed_tools.iter().map(String::as_str).collect();
+            allow_tools
+                .into_iter()
+                .filter(|tool| allowed.contains(tool.as_str()))
+                .collect()
+        };
+
+        for denied in &policy.denied_tools {
+            if !deny_tools.iter().any(|tool| tool == denied) {
+                deny_tools.push(denied.clone());
+            }
+        }
+        delegate_only |= policy.delegate_only;
+        (allow_tools, deny_tools, delegate_only)
     }
 
     fn build_sub_tools(
@@ -209,12 +309,124 @@ impl SpawnAgentTool {
         let Some(preset_name) = preset_name else {
             return Ok((None, None));
         };
-        let preset = agents.get_preset(&preset_name).cloned().ok_or_else(|| {
+        let preset = agents.get_preset(&preset_name).ok_or_else(|| {
             Error::message(format!(
-                "spawn preset '{preset_name}' not found in config.agents.presets"
+                "spawn preset '{preset_name}' not found in built-ins or config.agents.presets"
             ))
         })?;
         Ok((Some(preset_name), Some(preset)))
+    }
+
+    fn build_tool_context(params: &serde_json::Value, depth: u64) -> serde_json::Value {
+        let mut tool_context = serde_json::json!({
+            SPAWN_DEPTH_KEY: depth + 1,
+        });
+        if let Some(session_key) = params.get("_session_key") {
+            tool_context["_session_key"] = session_key.clone();
+        }
+        if let Some(trace_id) = params.get("_trace_id") {
+            tool_context["_trace_id"] = trace_id.clone();
+        }
+        if let Some(agent_id) = params.get("_agent_id") {
+            tool_context["_agent_id"] = agent_id.clone();
+        }
+        tool_context
+    }
+
+    fn estimate_text_tokens(text: &str) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+        ((text.len() as u32).saturating_add(3) / 4).max(1)
+    }
+
+    fn estimate_message_tokens(message: &ChatMessage) -> u32 {
+        match message {
+            ChatMessage::System { content } => Self::estimate_text_tokens(content),
+            ChatMessage::User { content } => match content {
+                UserContent::Text(text) => Self::estimate_text_tokens(text),
+                UserContent::Multimodal(parts) => parts
+                    .iter()
+                    .map(|part| match part {
+                        ContentPart::Text(text) => Self::estimate_text_tokens(text),
+                        ContentPart::Image { data, .. } => Self::estimate_text_tokens(data),
+                    })
+                    .sum(),
+            },
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let content_tokens = content
+                    .as_deref()
+                    .map(Self::estimate_text_tokens)
+                    .unwrap_or_default();
+                let tool_tokens = tool_calls
+                    .iter()
+                    .map(|call| {
+                        Self::estimate_text_tokens(&call.name)
+                            .saturating_add(Self::estimate_text_tokens(&call.arguments.to_string()))
+                    })
+                    .sum::<u32>();
+                content_tokens.saturating_add(tool_tokens)
+            },
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => Self::estimate_text_tokens(tool_call_id)
+                .saturating_add(Self::estimate_text_tokens(content)),
+        }
+    }
+
+    fn trim_history_to_token_budget(
+        history: Vec<ChatMessage>,
+        max_tokens: u32,
+    ) -> Vec<ChatMessage> {
+        if history.is_empty() {
+            return history;
+        }
+
+        let mut kept_reversed: Vec<ChatMessage> = Vec::new();
+        let mut used_tokens = 0_u32;
+
+        for message in history.into_iter().rev() {
+            let estimate = Self::estimate_message_tokens(&message).max(1);
+            if used_tokens.saturating_add(estimate) > max_tokens {
+                if kept_reversed.is_empty() {
+                    kept_reversed.push(message);
+                }
+                break;
+            }
+            used_tokens = used_tokens.saturating_add(estimate);
+            kept_reversed.push(message);
+        }
+
+        kept_reversed.reverse();
+        kept_reversed
+    }
+
+    async fn load_parent_history(
+        &self,
+        params: &serde_json::Value,
+        include_context: bool,
+        context_max_tokens: u32,
+    ) -> Option<Vec<ChatMessage>> {
+        if !include_context {
+            return None;
+        }
+        let session_key = params
+            .get("_session_key")
+            .and_then(|value| value.as_str())?;
+        let store = self.session_store.as_ref()?;
+        let raw_history = store.read(session_key).await.ok()?;
+        let history = values_to_chat_messages(&raw_history);
+        if history.is_empty() {
+            return None;
+        }
+        Some(Self::trim_history_to_token_budget(
+            history,
+            context_max_tokens,
+        ))
     }
 }
 
@@ -253,6 +465,10 @@ impl AgentTool for SpawnAgentTool {
                     "type": "string",
                     "description": "Optional spawn preset from config.agents.presets."
                 },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Optional agent persona id whose spawn policy should be enforced."
+                },
                 "model": {
                     "type": "string",
                     "description": "Model ID to use (e.g. a cheaper model). If not specified, uses the parent's current model."
@@ -278,6 +494,15 @@ impl AgentTool for SpawnAgentTool {
                 "list_id": {
                     "type": "string",
                     "description": "Task list ID required when task_id is provided."
+                },
+                "include_context": {
+                    "type": "boolean",
+                    "description": "If true, include recent parent session turns as sub-agent history."
+                },
+                "context_max_tokens": {
+                    "type": "integer",
+                    "description": "Approximate max tokens of parent context to include when include_context=true.",
+                    "default": 4000
                 }
             },
             "required": ["task"]
@@ -312,7 +537,7 @@ impl AgentTool for SpawnAgentTool {
             .or_else(|| preset.as_ref().and_then(|p| p.model.clone()));
 
         let explicit_allow_tools = Self::parse_tool_name_array(&params, "allow_tools")?;
-        let allow_tools = if explicit_allow_tools.is_empty() {
+        let mut allow_tools = if explicit_allow_tools.is_empty() {
             preset
                 .as_ref()
                 .map(|p| p.allow_tools.clone())
@@ -322,7 +547,7 @@ impl AgentTool for SpawnAgentTool {
         };
 
         let explicit_deny_tools = Self::parse_tool_name_array(&params, "deny_tools")?;
-        let deny_tools = if explicit_deny_tools.is_empty() {
+        let mut deny_tools = if explicit_deny_tools.is_empty() {
             preset
                 .as_ref()
                 .map(|p| p.deny_tools.clone())
@@ -331,11 +556,24 @@ impl AgentTool for SpawnAgentTool {
             explicit_deny_tools
         };
 
-        let delegate_only = bool_param(
+        let mut delegate_only = bool_param(
             &params,
             "delegate_only",
             preset.as_ref().map(|p| p.delegate_only).unwrap_or(false),
         );
+        let mut persona_suffix = None;
+        if let Some((persona_id, policy)) = Self::load_persona_spawn_policy(&params).await? {
+            (allow_tools, deny_tools, delegate_only) =
+                Self::apply_persona_policy(allow_tools, deny_tools, delegate_only, &policy);
+            persona_suffix = policy.system_prompt_suffix;
+            info!(
+                agent_id = %persona_id,
+                "applied persona spawn policy to sub-agent request"
+            );
+        }
+        let include_context = bool_param(&params, "include_context", false);
+        let context_max_tokens =
+            u64_param(&params, "context_max_tokens", 4000).clamp(256, 32000) as u32;
 
         // Check nesting depth.
         let depth = u64_param(&params, SPAWN_DEPTH_KEY, 0);
@@ -400,6 +638,14 @@ impl AgentTool for SpawnAgentTool {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(extra);
         }
+        if let Some(extra) = persona_suffix
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(extra);
+        }
 
         // Inject prior HandoffContext (dead-ends, last failure) into the system prompt
         // so this attempt knows what has already been tried.
@@ -411,13 +657,15 @@ impl AgentTool for SpawnAgentTool {
             }
         }
 
-        // Build tool context with incremented depth and propagated session key.
-        let mut tool_context = serde_json::json!({
-            SPAWN_DEPTH_KEY: depth + 1,
-        });
-        if let Some(session_key) = params.get("_session_key") {
-            tool_context["_session_key"] = session_key.clone();
-        }
+        // Build tool context with incremented depth and propagated session/trace IDs.
+        let tool_context = Self::build_tool_context(&params, depth);
+        let trace_id = params
+            .get("_trace_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let history = self
+            .load_parent_history(&params, include_context, context_max_tokens)
+            .await;
 
         // Set initial lease on the linked task before starting the agent loop.
         if let (Some(store), Some(tid), Some(lid)) = (&self.task_store, &task_id, &list_id) {
@@ -466,18 +714,18 @@ impl AgentTool for SpawnAgentTool {
                 None
             };
 
-        // Run the sub-agent loop (no event forwarding, no hooks, no history).
-        let user_content = moltis_agents::UserContent::text(task);
+        let user_content = UserContent::text(task);
+        // Run the sub-agent loop (no event forwarding, no hooks).
         let result = run_agent_loop_with_context(
             provider,
             &sub_tools,
             &system_prompt,
             &user_content,
             None,
-            None, // no history
+            history,
             Some(tool_context),
             None, // no hooks for sub-agents
-            None, // no trace_id propagated to sub-agents yet
+            trace_id,
         )
         .await;
 
@@ -552,7 +800,10 @@ mod tests {
     use {
         super::*,
         moltis_agents::model::{ChatMessage, CompletionResponse, StreamEvent, Usage},
-        std::pin::Pin,
+        std::{
+            pin::Pin,
+            sync::{Mutex, OnceLock},
+        },
         tokio_stream::Stream,
     };
 
@@ -648,6 +899,118 @@ mod tests {
             cfg.presets.insert((*name).to_string(), preset.clone());
         }
         Arc::new(tokio::sync::RwLock::new(cfg))
+    }
+
+    fn data_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_build_tool_context_propagates_session_and_trace_ids() {
+        let params = serde_json::json!({
+            "_session_key": "main",
+            "_trace_id": "trace-abc-123",
+            "_agent_id": "researcher",
+        });
+
+        let context = SpawnAgentTool::build_tool_context(&params, 1);
+        assert_eq!(context[SPAWN_DEPTH_KEY], 2);
+        assert_eq!(context["_session_key"], "main");
+        assert_eq!(context["_trace_id"], "trace-abc-123");
+        assert_eq!(context["_agent_id"], "researcher");
+    }
+
+    #[test]
+    fn test_trim_history_to_token_budget_keeps_most_recent_turns() {
+        let history = vec![
+            ChatMessage::user("old context"),
+            ChatMessage::assistant("middle context"),
+            ChatMessage::user("most recent detail"),
+        ];
+        let trimmed = SpawnAgentTool::trim_history_to_token_budget(history, 4);
+        assert_eq!(trimmed.len(), 1);
+        match &trimmed[0] {
+            ChatMessage::User {
+                content: UserContent::Text(text),
+            } => {
+                assert_eq!(text, "most recent detail");
+            },
+            other => panic!("expected user text message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_persona_policy_intersects_allows_and_unions_denies() {
+        let policy = PersonaSpawnPolicy {
+            allowed_tools: vec!["read_file".to_string(), "web_search".to_string()],
+            denied_tools: vec!["exec".to_string(), "write_file".to_string()],
+            delegate_only: true,
+            system_prompt_suffix: None,
+        };
+        let (allow_tools, deny_tools, delegate_only) = SpawnAgentTool::apply_persona_policy(
+            vec!["read_file".to_string(), "exec".to_string()],
+            vec!["browser".to_string(), "exec".to_string()],
+            false,
+            &policy,
+        );
+        assert_eq!(allow_tools, vec!["read_file".to_string()]);
+        assert!(deny_tools.contains(&"browser".to_string()));
+        assert!(deny_tools.contains(&"exec".to_string()));
+        assert!(deny_tools.contains(&"write_file".to_string()));
+        assert!(delegate_only);
+    }
+
+    #[tokio::test]
+    async fn test_load_persona_spawn_policy_from_agent_workspace() {
+        let _guard = data_dir_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let previous_data_dir = moltis_config::data_dir();
+        let temp = tempfile::tempdir().unwrap();
+        moltis_config::set_data_dir(temp.path().to_path_buf());
+
+        let agent_dir = moltis_config::agent_workspace_dir("reviewer");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        tokio::fs::write(
+            agent_dir.join(".spawn-policy.json"),
+            r#"{
+  "allowed_tools": ["read_file"],
+  "denied_tools": ["exec"],
+  "delegate_only": true,
+  "system_prompt_suffix": "Use strict review mode."
+}"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = SpawnAgentTool::load_persona_spawn_policy(
+            &serde_json::json!({ "_agent_id": "reviewer" }),
+        )
+        .await
+        .unwrap();
+        assert!(loaded.is_some());
+        let (agent_id, policy) = loaded.unwrap();
+        assert_eq!(agent_id, "reviewer");
+        assert_eq!(policy.allowed_tools, vec!["read_file".to_string()]);
+        assert_eq!(policy.denied_tools, vec!["exec".to_string()]);
+        assert!(policy.delegate_only);
+        assert_eq!(
+            policy.system_prompt_suffix.as_deref(),
+            Some("Use strict review mode.")
+        );
+
+        moltis_config::set_data_dir(previous_data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_load_persona_spawn_policy_rejects_invalid_agent_id() {
+        let err =
+            SpawnAgentTool::load_persona_spawn_policy(&serde_json::json!({ "agent_id": "../bad" }))
+                .await
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid agent_id for spawn policy (expected lowercase slug)")
+        );
     }
 
     #[tokio::test]

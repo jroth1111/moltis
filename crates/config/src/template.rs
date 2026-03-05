@@ -435,6 +435,8 @@ sandbox = false                   # Run browser in Docker/Apple Container for is
 # When set, browser will refuse to navigate to domains not in this list.
 # This helps prevent prompt injection from untrusted websites.
 allowed_domains = []              # Empty = all domains allowed
+# For autonomous browser runs (cron/dispatch). Empty + empty allowed_domains = block autonomous navigation.
+autonomous_allowed_domains = []
 # allowed_domains = [
 #     "docs.example.com",         # Exact match
 #     "*.github.com",             # Wildcard: matches any subdomain of github.com
@@ -511,6 +513,7 @@ enabled = true                    # Enable periodic heartbeats
 every = "30m"                     # Interval between heartbeats (e.g., "30m", "1h", "6h")
 # model = "anthropic/claude-sonnet-4-20250514"  # Override model for heartbeats
 # prompt = "..."                  # Custom heartbeat prompt (default: built-in)
+surprise_me = false               # Add a proactive "share interesting findings" hint to heartbeat prompt
 ack_max_chars = 300               # Max characters for acknowledgment reply
 deliver = false                   # Deliver heartbeat replies to a channel account
 # channel = "my-bot"              # Channel account identifier (required when deliver = true)

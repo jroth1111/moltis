@@ -28,6 +28,8 @@ struct VapidKeyResponse {
 pub struct SubscribeRequest {
     pub endpoint: String,
     pub keys: SubscriptionKeys,
+    #[serde(default)]
+    pub session_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +55,8 @@ struct SubscriptionSummary {
     ip: Option<String>,
     /// When the subscription was created (ISO 8601).
     created_at: String,
+    /// Optional session scope for this subscription.
+    session_key: Option<String>,
 }
 
 /// Status response.
@@ -139,6 +143,7 @@ async fn subscribe_handler(
         user_agent,
         ip_address,
         created_at: Utc::now(),
+        session_key: req.session_key,
     };
 
     push_service
@@ -253,6 +258,7 @@ async fn status_handler(State(state): State<AppState>) -> Json<PushStatusRespons
                     device: parse_device_name(s.user_agent.as_deref()),
                     ip: s.ip_address,
                     created_at: s.created_at.to_rfc3339(),
+                    session_key: s.session_key,
                 })
                 .collect();
             (true, count, summaries)
@@ -291,5 +297,5 @@ pub async fn send_push_notification(
         session_key: session_key.map(String::from),
     };
 
-    push_service.send_to_all(&payload).await
+    push_service.send_to_scope(&payload, session_key).await
 }

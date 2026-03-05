@@ -30,6 +30,9 @@ pub struct AgentTurnResult {
     pub output: String,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub delivery_channel: Option<String>,
+    pub delivery_to: Option<String>,
+    pub delivered_at_ms: Option<u64>,
 }
 
 /// Callback for running an isolated agent turn.
@@ -576,6 +579,9 @@ impl CronService {
                     output: "system event injected".to_string(),
                     input_tokens: None,
                     output_tokens: None,
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivered_at_ms: None,
                 })
             },
             CronPayload::AgentTurn {
@@ -621,6 +627,9 @@ impl CronService {
                         output: format!("task created: {}", r.task_id),
                         input_tokens: None,
                         output_tokens: None,
+                        delivery_channel: None,
+                        delivery_to: None,
+                        delivered_at_ms: None,
                     })
                 } else {
                     Err(Error::message(format!(
@@ -633,7 +642,16 @@ impl CronService {
 
         let finished = now_ms();
         let duration_ms = finished - started;
-        let (status, error_msg, output, input_tokens, output_tokens) = match &result {
+        let (
+            status,
+            error_msg,
+            output,
+            input_tokens,
+            output_tokens,
+            delivery_channel,
+            delivery_to,
+            delivered_at_ms,
+        ) = match &result {
             Ok(r) => {
                 #[cfg(feature = "metrics")]
                 {
@@ -650,13 +668,16 @@ impl CronService {
                     Some(r.output.clone()),
                     r.input_tokens,
                     r.output_tokens,
+                    r.delivery_channel.clone(),
+                    r.delivery_to.clone(),
+                    r.delivered_at_ms,
                 )
             },
             Err(e) => {
                 error!(id = %job.id, error = %e, "cron job failed");
                 #[cfg(feature = "metrics")]
                 counter!(cron_metrics::ERRORS_TOTAL).increment(1);
-                (RunStatus::Error, Some(e.to_string()), None, None, None)
+                (RunStatus::Error, Some(e.to_string()), None, None, None, None, None, None)
             },
         };
 
@@ -674,6 +695,11 @@ impl CronService {
             output,
             input_tokens,
             output_tokens,
+            delivery_channel,
+            delivery_to,
+            delivered_at_ms,
+            user_responded: false,
+            user_response_at_ms: None,
         };
         if let Err(e) = self.store.append_run(&job.id, &run).await {
             warn!(error = %e, "failed to record cron run");
@@ -858,6 +884,9 @@ mod tests {
                     output: "ok".into(),
                     input_tokens: None,
                     output_tokens: None,
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivered_at_ms: None,
                 })
             })
         })
@@ -878,6 +907,9 @@ mod tests {
                     output: "done".into(),
                     input_tokens: None,
                     output_tokens: None,
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivered_at_ms: None,
                 })
             })
         })

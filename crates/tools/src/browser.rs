@@ -11,8 +11,8 @@ use {
     crate::sandbox::SandboxRouter,
     async_trait::async_trait,
     moltis_agents::tool_registry::{AgentTool, ToolEffectClass},
-    moltis_browser::{BrowserManager, BrowserRequest},
-    std::sync::Arc,
+    moltis_browser::{BrowserManager, BrowserRequest, types::is_domain_allowed},
+    std::{collections::HashMap, sync::Arc},
     tokio::sync::RwLock,
     tracing::debug,
 };
@@ -32,9 +32,12 @@ use crate::error::Error;
 pub struct BrowserTool {
     manager: Arc<BrowserManager>,
     sandbox_router: Option<Arc<SandboxRouter>>,
-    /// Track the most recent session ID for automatic reuse.
-    /// This prevents pool exhaustion when the LLM forgets to pass session_id.
-    last_session_id: RwLock<Option<String>>,
+    allowed_domains: Vec<String>,
+    autonomous_allowed_domains: Vec<String>,
+    /// Track the most recent session ID per caller session key.
+    /// This prevents cross-session leakage when multiple agents/conversations
+    /// share one BrowserTool instance.
+    last_session_ids: RwLock<HashMap<String, String>>,
 }
 
 impl BrowserTool {
@@ -43,7 +46,9 @@ impl BrowserTool {
         Self {
             manager,
             sandbox_router: None,
-            last_session_id: RwLock::new(None),
+            allowed_domains: Vec::new(),
+            autonomous_allowed_domains: Vec::new(),
+            last_session_ids: RwLock::new(HashMap::new()),
         }
     }
 
@@ -60,27 +65,69 @@ impl BrowserTool {
         }
         let browser_config = moltis_browser::BrowserConfig::from(config);
         let manager = Arc::new(BrowserManager::new(browser_config));
-        Some(Self::new(manager))
+        Some(Self {
+            manager,
+            sandbox_router: None,
+            allowed_domains: config.allowed_domains.clone(),
+            autonomous_allowed_domains: config.autonomous_allowed_domains.clone(),
+            last_session_ids: RwLock::new(HashMap::new()),
+        })
     }
 
     /// Clear the tracked session ID (e.g., after explicit close).
-    async fn clear_session(&self) {
-        let mut guard = self.last_session_id.write().await;
-        *guard = None;
+    async fn clear_session(&self, session_key: &str) {
+        let mut guard = self.last_session_ids.write().await;
+        guard.remove(session_key);
     }
 
     /// Save the session ID for future reuse.
-    async fn save_session(&self, session_id: &str) {
+    async fn save_session(&self, session_key: &str, session_id: &str) {
         if !session_id.is_empty() {
-            let mut guard = self.last_session_id.write().await;
-            *guard = Some(session_id.to_string());
+            let mut guard = self.last_session_ids.write().await;
+            guard.insert(session_key.to_string(), session_id.to_string());
         }
     }
 
     /// Get the tracked session ID if available.
-    async fn get_saved_session(&self) -> Option<String> {
-        let guard = self.last_session_id.read().await;
-        guard.clone()
+    async fn get_saved_session(&self, session_key: &str) -> Option<String> {
+        let guard = self.last_session_ids.read().await;
+        guard.get(session_key).cloned()
+    }
+
+    fn is_autonomous_source(source: Option<&str>) -> bool {
+        matches!(source, Some("cron" | "dispatch"))
+    }
+
+    fn is_navigation_request(params: &serde_json::Value) -> bool {
+        match params.get("action").and_then(|v| v.as_str()) {
+            Some("navigate") => true,
+            None => params.get("url").and_then(|v| v.as_str()).is_some(),
+            _ => false,
+        }
+    }
+
+    fn autonomous_domain_allowlist(&self) -> Option<&[String]> {
+        if !self.autonomous_allowed_domains.is_empty() {
+            return Some(&self.autonomous_allowed_domains);
+        }
+        if !self.allowed_domains.is_empty() {
+            return Some(&self.allowed_domains);
+        }
+        None
+    }
+
+    fn ensure_autonomous_navigation_allowed(&self, url: &str) -> Result<(), Error> {
+        let Some(allowlist) = self.autonomous_domain_allowlist() else {
+            return Err(Error::message(
+                "autonomous browser navigation blocked: configure tools.browser.autonomous_allowed_domains or tools.browser.allowed_domains",
+            ));
+        };
+        if is_domain_allowed(url, allowlist) {
+            return Ok(());
+        }
+        Err(Error::message(format!(
+            "autonomous browser navigation blocked for '{url}'; allowed domains: {allowlist:?}"
+        )))
     }
 }
 
@@ -305,17 +352,26 @@ impl AgentTool for BrowserTool {
 
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let mut params = params;
+        let source = params.get("_source").and_then(|v| v.as_str());
+
+        if Self::is_autonomous_source(source) && Self::is_navigation_request(&params) {
+            let Some(url) = params.get("url").and_then(|v| v.as_str()) else {
+                return Err(Error::message("navigate action requires a 'url' parameter").into());
+            };
+            self.ensure_autonomous_navigation_allowed(url)?;
+        }
 
         // Browser sandbox mode follows the session sandbox mode from the shared router.
         let session_key = params
             .get("_session_key")
             .and_then(|v| v.as_str())
-            .unwrap_or("main");
+            .unwrap_or("main")
+            .to_string();
         let sandbox_mode = if let Some(ref router) = self.sandbox_router {
-            router.is_sandboxed(session_key).await
+            router.is_sandboxed(&session_key).await
         } else {
             debug!(
-                session_key,
+                session_key = %session_key,
                 "browser running in host mode (no container backend)"
             );
             false
@@ -330,7 +386,9 @@ impl AgentTool for BrowserTool {
                 _ => false,
             };
 
-            if needs_session && let Some(saved_sid) = self.get_saved_session().await {
+            if needs_session
+                && let Some(saved_sid) = self.get_saved_session(session_key.as_str()).await
+            {
                 debug!(
                     session_id = %saved_sid,
                     "injecting saved session_id (LLM didn't provide one)"
@@ -356,7 +414,7 @@ impl AgentTool for BrowserTool {
                 if let Some(obj) = params.as_object_mut() {
                     if obj.contains_key("url") {
                         obj.insert("action".to_string(), serde_json::json!("navigate"));
-                        serde_json::from_value(params)?
+                        serde_json::from_value(params.clone())?
                     } else {
                         // No URL either - return helpful error
                         return Err(Error::message(
@@ -377,9 +435,10 @@ impl AgentTool for BrowserTool {
         // Track the session ID for future reuse
         if response.success {
             if is_close {
-                self.clear_session().await;
+                self.clear_session(session_key.as_str()).await;
             } else {
-                self.save_session(&response.session_id).await;
+                self.save_session(session_key.as_str(), &response.session_id)
+                    .await;
             }
         }
 
@@ -549,5 +608,99 @@ mod tests {
                 "Phase 5-7 property '{expected}' must be in schema"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_saved_session_ids_are_scoped_per_session_key() {
+        let config = moltis_config::schema::BrowserConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tool = BrowserTool::from_config(&config).unwrap();
+
+        tool.save_session("session:a", "sid-a").await;
+        tool.save_session("session:b", "sid-b").await;
+
+        assert_eq!(tool.get_saved_session("session:a").await.as_deref(), Some("sid-a"));
+        assert_eq!(tool.get_saved_session("session:b").await.as_deref(), Some("sid-b"));
+        assert_eq!(tool.get_saved_session("main").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_clearing_one_session_key_does_not_clear_others() {
+        let config = moltis_config::schema::BrowserConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tool = BrowserTool::from_config(&config).unwrap();
+
+        tool.save_session("session:a", "sid-a").await;
+        tool.save_session("session:b", "sid-b").await;
+        tool.clear_session("session:a").await;
+
+        assert_eq!(tool.get_saved_session("session:a").await, None);
+        assert_eq!(tool.get_saved_session("session:b").await.as_deref(), Some("sid-b"));
+    }
+
+    #[test]
+    fn test_autonomous_navigation_blocked_when_no_allowlists() {
+        let config = moltis_config::schema::BrowserConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tool = BrowserTool::from_config(&config).unwrap();
+
+        let err = tool
+            .ensure_autonomous_navigation_allowed("https://example.com")
+            .unwrap_err();
+        assert!(err.to_string().contains("autonomous browser navigation blocked"));
+    }
+
+    #[test]
+    fn test_autonomous_navigation_uses_dedicated_allowlist() {
+        let config = moltis_config::schema::BrowserConfig {
+            enabled: true,
+            allowed_domains: vec!["fallback.com".to_string()],
+            autonomous_allowed_domains: vec!["*.example.com".to_string()],
+            ..Default::default()
+        };
+        let tool = BrowserTool::from_config(&config).unwrap();
+
+        assert!(
+            tool.ensure_autonomous_navigation_allowed("https://api.example.com")
+                .is_ok()
+        );
+        assert!(
+            tool.ensure_autonomous_navigation_allowed("https://fallback.com")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_autonomous_navigation_falls_back_to_allowed_domains() {
+        let config = moltis_config::schema::BrowserConfig {
+            enabled: true,
+            allowed_domains: vec!["trusted.org".to_string()],
+            autonomous_allowed_domains: Vec::new(),
+            ..Default::default()
+        };
+        let tool = BrowserTool::from_config(&config).unwrap();
+
+        assert!(
+            tool.ensure_autonomous_navigation_allowed("https://trusted.org/path")
+                .is_ok()
+        );
+        assert!(
+            tool.ensure_autonomous_navigation_allowed("https://evil.org")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_autonomous_source_detection() {
+        assert!(BrowserTool::is_autonomous_source(Some("cron")));
+        assert!(BrowserTool::is_autonomous_source(Some("dispatch")));
+        assert!(!BrowserTool::is_autonomous_source(Some("web")));
+        assert!(!BrowserTool::is_autonomous_source(None));
     }
 }

@@ -157,6 +157,11 @@ mod tests {
                 output: None,
                 input_tokens: None,
                 output_tokens: None,
+                delivery_channel: None,
+                delivery_to: None,
+                delivered_at_ms: None,
+                user_responded: false,
+                user_response_at_ms: None,
             };
             store.append_run("j1", &run).await.unwrap();
         }

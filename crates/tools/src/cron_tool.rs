@@ -1021,6 +1021,9 @@ mod tests {
                     output: "ok".into(),
                     input_tokens: None,
                     output_tokens: None,
+                    delivery_channel: None,
+                    delivery_to: None,
+                    delivered_at_ms: None,
                 })
             })
         })
