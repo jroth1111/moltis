@@ -100,11 +100,36 @@ pub fn system_liveness() -> CronJobCreate {
         payload: CronPayload::SystemEvent {
             text: "tinder-liveness-check".to_string(),
         },
-        session_target: SessionTarget::Named("system-liveness".to_string()),
+        session_target: SessionTarget::Main,
         delete_after_run: false,
         enabled: true,
         system: true,
         sandbox: CronSandboxConfig::default(),
         wake_mode: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn predefined_jobs_use_valid_payload_target_pairs() {
+        let jobs = [
+            daily_session(),
+            hourly_replies(),
+            ghost_recovery(),
+            system_liveness(),
+        ];
+        for job in jobs {
+            match (&job.session_target, &job.payload) {
+                (SessionTarget::Main, CronPayload::SystemEvent { .. }) => {},
+                (
+                    SessionTarget::Isolated | SessionTarget::Named(_),
+                    CronPayload::AgentTurn { .. },
+                ) => {},
+                _ => panic!("invalid payload/target pairing for job {}", job.name),
+            }
+        }
     }
 }
