@@ -24,6 +24,7 @@ pub struct VirtualDisplay {
 
 impl VirtualDisplay {
     /// Start a virtual display if enabled.
+    #[allow(clippy::needless_return)]
     pub fn start(config: &VirtualDisplayConfig) -> Result<Option<Self>, Error> {
         if !config.enabled {
             return Ok(None);

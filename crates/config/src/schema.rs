@@ -2117,6 +2117,8 @@ pub struct PatchrightFallbackConfig {
     pub challenge_types: Vec<String>,
     /// Optional domain allowlist for fallback execution.
     pub domains: Vec<String>,
+    /// Number of retries for patchright probe (default: 2).
+    pub max_retries: u32,
 }
 
 impl Default for PatchrightFallbackConfig {
@@ -2128,6 +2130,7 @@ impl Default for PatchrightFallbackConfig {
             headless: true,
             challenge_types: vec!["kasada".to_string(), "imperva".to_string()],
             domains: Vec::new(),
+            max_retries: 2,
         }
     }
 }

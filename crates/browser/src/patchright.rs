@@ -27,6 +27,7 @@ fn default_cookie_path() -> String {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PatchrightProbe {
     pub final_url: String,
     pub title_len: usize,
@@ -77,7 +78,11 @@ pub async fn run_patchright_probe(
     cmd.arg("-c")
         .arg(PATCHRIGHT_PROBE_PY)
         .arg(url)
-        .arg(if headless { "1" } else { "0" })
+        .arg(if headless {
+            "1"
+        } else {
+            "0"
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -128,6 +133,33 @@ pub async fn run_patchright_probe(
         title: parsed.title,
         body_text: parsed.body_text,
     })
+}
+
+/// Run Patchright probe with retry logic and exponential backoff.
+pub async fn run_patchright_probe_with_retry(
+    url: &str,
+    config: &PatchrightFallbackConfig,
+    headless: bool,
+    display: Option<&str>,
+    max_retries: u32,
+) -> Result<PatchrightProbe, Error> {
+    let mut last_error = None;
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let backoff_ms = 500 * (2_u64.pow(attempt));
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+
+        match run_patchright_probe(url, config, headless, display).await {
+            Ok(probe) => return Ok(probe),
+            Err(e) => {
+                last_error = Some(e);
+            },
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| Error::NavigationFailed("patchright retry exhausted".into())))
 }
 
 const PATCHRIGHT_PROBE_PY: &str = r#"

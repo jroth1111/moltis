@@ -267,6 +267,7 @@ fn build_schema_map() -> KnownKeys {
                     ("headless", Leaf),
                     ("challenge_types", Leaf),
                     ("domains", Leaf),
+                    ("max_retries", Leaf),
                 ])),
             ),
             ("stealth", stealth()),
@@ -1061,7 +1062,12 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
     }
 
     if config.tools.exec.sandbox.pool_min_warm > 0
-        && !config.tools.exec.sandbox.scope.eq_ignore_ascii_case("shared")
+        && !config
+            .tools
+            .exec
+            .sandbox
+            .scope
+            .eq_ignore_ascii_case("shared")
     {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
@@ -1095,7 +1101,10 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
 
     // agents.default_preset should reference an existing preset key.
     if let Some(default_preset) = config.agents.default_preset.as_deref()
-        && !config.agents.effective_presets().contains_key(default_preset)
+        && !config
+            .agents
+            .effective_presets()
+            .contains_key(default_preset)
     {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
@@ -2069,16 +2078,12 @@ memory_relevance_min_score = 1.5
 max_memory_facts_in_prompt = 0
 "#;
         let result = validate_toml_str(toml);
-        assert!(result
-            .diagnostics
-            .iter()
-            .any(|d| d.path == "chat.deterministic_policy.memory_relevance_min_score"
-                && d.severity == Severity::Error));
-        assert!(result
-            .diagnostics
-            .iter()
-            .any(|d| d.path == "chat.deterministic_policy.max_memory_facts_in_prompt"
-                && d.severity == Severity::Error));
+        assert!(result.diagnostics.iter().any(|d| d.path
+            == "chat.deterministic_policy.memory_relevance_min_score"
+            && d.severity == Severity::Error));
+        assert!(result.diagnostics.iter().any(|d| d.path
+            == "chat.deterministic_policy.max_memory_facts_in_prompt"
+            && d.severity == Severity::Error));
     }
 
     #[test]

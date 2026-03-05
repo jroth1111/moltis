@@ -6,8 +6,10 @@
 use std::time::Duration;
 
 use moltis_browser::{
-    types::{BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest, PatchrightFallbackConfig},
     BrowserManager,
+    types::{
+        BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest, PatchrightFallbackConfig,
+    },
 };
 use tokio::time::timeout;
 
@@ -71,13 +73,17 @@ struct SiteTestResult {
 
 impl std::fmt::Display for SiteTestResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status = if self.success { "PASS" } else { "FAIL" };
+        let status = if self.success {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         writeln!(f, "=== {} [{}] ===", self.name, status)?;
         writeln!(f, "  challenge_type: {:?}", self.challenge_type)?;
         writeln!(f, "  title_len: {}", self.title_len)?;
         writeln!(f, "  body_text_len: {}", self.body_text_len)?;
         writeln!(f, "  final_url: {}", self.final_url)?;
-        if let Some(ref err) = &self.error {
+        if let Some(err) = &self.error {
             writeln!(f, "  error: {}", err)?;
         }
         Ok(())
@@ -172,12 +178,8 @@ async fn test_woolworths_navigation() {
 
 /// Test Coles (Imperva-protected site) navigation.
 ///
-/// NOTE: This test is currently ignored because Imperva bot detection
-/// validates browser fingerprint, not just cookies. Cookie transfer from
-/// patchright to chromiumoxide doesn't work because fingerprints don't match.
-/// Requires using patchright directly for navigation (architectural change).
+/// Uses patchright fallback with HTML injection to bypass Imperva detection.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Imperva detection requires patchright direct navigation (cookie transfer insufficient)"]
 async fn test_coles_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
     // Use patchright fallback for hard sites (Imperva)
@@ -276,7 +278,10 @@ async fn test_all_target_sites_summary() {
         }
     }
 
-    println!("=== RESULTS: {} passed, {} failed ===\n", pass_count, fail_count);
+    println!(
+        "=== RESULTS: {} passed, {} failed ===\n",
+        pass_count, fail_count
+    );
 
     // Ensure at least google.com.au passes (regression guard)
     let google_result = &results[0];

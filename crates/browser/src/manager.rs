@@ -22,7 +22,7 @@ use {
 use crate::{
     challenge::ChallengeType,
     error::Error,
-    patchright::{PatchrightProbe, run_patchright_probe},
+    patchright::{PatchrightProbe, run_patchright_probe_with_retry},
     pool::BrowserPool,
     snapshot::{
         extract_snapshot, find_element_by_ref, focus_element_by_ref, scroll_element_into_view,
@@ -517,10 +517,7 @@ impl BrowserManager {
                 challenge_type,
                 diagnostics.challenge_markers,
             );
-        Ok((
-            active_sid,
-            response,
-        ))
+        Ok((active_sid, response))
     }
 
     async fn collect_navigation_diagnostics(&self, page: &Page) -> NavigationDiagnostics {
@@ -813,7 +810,15 @@ impl BrowserManager {
         let mut best = diagnostics;
         let fallback = &self.config.patchright_fallback;
 
-        match run_patchright_probe(url, fallback, fallback.headless, None).await {
+        match run_patchright_probe_with_retry(
+            url,
+            fallback,
+            fallback.headless,
+            None,
+            fallback.max_retries,
+        )
+        .await
+        {
             Ok(probe) => {
                 if let Some(refreshed) = self
                     .apply_patchright_probe(page, &probe, url, challenge_name, "primary")
@@ -868,7 +873,15 @@ impl BrowserManager {
         };
 
         let display = virtual_display.display().to_string();
-        match run_patchright_probe(url, fallback, false, Some(display.as_str())).await {
+        match run_patchright_probe_with_retry(
+            url,
+            fallback,
+            false,
+            Some(display.as_str()),
+            fallback.max_retries,
+        )
+        .await
+        {
             Ok(probe) => {
                 if let Some(refreshed) = self
                     .apply_patchright_probe(
@@ -2198,8 +2211,14 @@ mod tests {
     #[test]
     fn patchright_challenge_allowlist_matches_case_insensitively() {
         let allow = vec!["KASADA".to_string(), "imperva".to_string()];
-        assert!(is_patchright_challenge_allowed(ChallengeType::Kasada, &allow));
-        assert!(is_patchright_challenge_allowed(ChallengeType::Imperva, &allow));
+        assert!(is_patchright_challenge_allowed(
+            ChallengeType::Kasada,
+            &allow
+        ));
+        assert!(is_patchright_challenge_allowed(
+            ChallengeType::Imperva,
+            &allow
+        ));
         assert!(!is_patchright_challenge_allowed(
             ChallengeType::Cloudflare,
             &allow
@@ -2266,9 +2285,7 @@ mod tests {
             Some(ChallengeType::Kasada)
         ));
         assert!(!should_attempt_virtual_display_patchright_retry(
-            true,
-            true,
-            None
+            true, true, None
         ));
     }
 

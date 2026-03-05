@@ -111,6 +111,8 @@ pub struct PatchrightFallbackConfig {
     pub challenge_types: Vec<String>,
     /// Optional domain allowlist for fallback (empty = all).
     pub domains: Vec<String>,
+    /// Number of retries for patchright probe (default: 2).
+    pub max_retries: u32,
 }
 
 impl Default for PatchrightFallbackConfig {
@@ -122,6 +124,7 @@ impl Default for PatchrightFallbackConfig {
             headless: true,
             challenge_types: vec!["kasada".to_string(), "imperva".to_string()],
             domains: Vec::new(),
+            max_retries: 2,
         }
     }
 }
@@ -930,6 +933,7 @@ impl From<&moltis_config::schema::BrowserConfig> for BrowserConfig {
                 headless: cfg.patchright_fallback.headless,
                 challenge_types: cfg.patchright_fallback.challenge_types.clone(),
                 domains: cfg.patchright_fallback.domains.clone(),
+                max_retries: cfg.patchright_fallback.max_retries,
             },
             stealth: StealthConfig {
                 enabled: cfg.stealth.enabled,
