@@ -5982,6 +5982,7 @@ fn seed_dcg_guard_hook() {
 /// is never overwritten.
 fn seed_example_skill() {
     seed_skill_if_missing("template-skill", EXAMPLE_SKILL_MD);
+    seed_skill_if_missing("skill-creator", SKILL_CREATOR_SKILL_MD);
     seed_skill_if_missing("tmux", TMUX_SKILL_MD);
 }
 
@@ -6194,6 +6195,76 @@ Use this as a starting point for your own skills.
 - Keep instructions explicit and task-focused
 - Avoid broad permissions unless required
 - Document required tools and expected inputs
+"#;
+
+/// Content for a built-in meta-skill that creates and improves skills.
+const SKILL_CREATOR_SKILL_MD: &str = r#"---
+name: skill-creator
+description: Create and improve Moltis skills with iterative prompts, baseline comparisons, and measurable quality checks. Use this whenever a user asks to create, update, optimize, evaluate, benchmark, or debug any skill.
+allowed-tools:
+  - read_file
+  - write_file
+  - create_skill
+  - update_skill
+  - delete_skill
+  - spawn_agent
+  - exec
+---
+
+# Skill Creator
+
+Use this skill for any task about skill authoring, tuning, or evaluation.
+
+## Outcomes
+
+- Produce a clear SKILL.md with precise trigger language
+- Validate behavior with realistic prompts
+- Compare new behavior against baseline behavior
+- Iterate until quality is stable
+
+## Workflow
+
+1. Capture intent before writing:
+- what the skill should do
+- when it should trigger
+- expected outputs
+- required tools, binaries, or setup
+
+2. Draft or revise SKILL.md:
+- keep frontmatter accurate (`name`, `description`, `allowed-tools`, optional `requires`)
+- keep body task-focused, concrete, and imperative
+- move long references into separate files when needed
+
+3. Build an eval set:
+- write 2-5 realistic user prompts
+- include at least one edge case
+- include one prompt that should NOT trigger the skill
+
+4. Run side-by-side checks:
+- run the prompt with the updated skill
+- run the same prompt against baseline (previous skill revision or no-skill)
+- capture correctness, latency, and token cost
+
+5. Improve and retest:
+- tighten ambiguous instructions
+- remove low-signal or redundant text
+- improve trigger phrasing in description to avoid under-triggering
+
+## SKILL.md checklist
+
+- frontmatter parses as YAML
+- `description` includes explicit "when to use" cues
+- instructions explain expected output format
+- dependencies are declared in `requires` when needed
+- examples are realistic and short
+- no unsafe or misleading instructions
+
+## Implementation notes
+
+- Use `create_skill` for new skills.
+- Use `update_skill` for revisions.
+- Keep old revisions by writing snapshots to a workspace file before major rewrites.
+- Prefer small iterations over one large rewrite.
 "#;
 
 /// Content for the built-in tmux skill (interactive terminal processes).

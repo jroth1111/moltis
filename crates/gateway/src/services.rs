@@ -95,7 +95,7 @@ async fn run_mcp_scan(installed_dir: &Path) -> anyhow::Result<Value> {
 }
 
 fn is_protected_discovered_skill(name: &str) -> bool {
-    matches!(name, "template-skill" | "template" | "tmux")
+    matches!(name, "template-skill" | "template" | "tmux" | "skill-creator")
 }
 
 fn commit_url_for_source(source: &str, sha: &str) -> Option<String> {
