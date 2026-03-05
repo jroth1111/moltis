@@ -244,6 +244,20 @@ fn build_schema_map() -> KnownKeys {
             ("low_memory_threshold_mb", Leaf),
             ("persist_profile", Leaf),
             ("profile_dir", Leaf),
+            (
+                "virtual_display",
+                Struct(HashMap::from([
+                    ("enabled", Leaf),
+                    ("force_non_headless", Leaf),
+                    ("binary", Leaf),
+                    ("width", Leaf),
+                    ("height", Leaf),
+                    ("color_depth", Leaf),
+                    ("display_min", Leaf),
+                    ("display_max", Leaf),
+                    ("startup_timeout_ms", Leaf),
+                ])),
+            ),
             ("stealth", stealth()),
         ]))
     };
@@ -1415,6 +1429,20 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             category: "invalid-value",
             path: "tools.browser.profile_dir".into(),
             message: "profile_dir should be an absolute path".into(),
+        });
+    }
+
+    // Virtual display: display range must be valid when enabled
+    if config.tools.browser.virtual_display.enabled
+        && config.tools.browser.virtual_display.display_min
+            > config.tools.browser.virtual_display.display_max
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "tools.browser.virtual_display.display_min".into(),
+            message: "display_min is greater than display_max; X display allocation will fail"
+                .into(),
         });
     }
 

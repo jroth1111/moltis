@@ -42,6 +42,7 @@ pub mod screencast;
 pub mod session_state;
 pub mod snapshot;
 pub mod types;
+mod virtual_display;
 
 #[cfg(feature = "stealth")]
 pub mod stealth;

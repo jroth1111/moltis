@@ -55,6 +55,46 @@ impl Default for StealthConfig {
     }
 }
 
+/// Virtual display configuration for headful browser launches without visible UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VirtualDisplayConfig {
+    /// Enable virtual display management.
+    pub enabled: bool,
+    /// Force non-headless launch when virtual display is enabled.
+    pub force_non_headless: bool,
+    /// Xvfb executable path or name.
+    pub binary: String,
+    /// Virtual display width in pixels.
+    pub width: u32,
+    /// Virtual display height in pixels.
+    pub height: u32,
+    /// Color depth (bits per pixel).
+    pub color_depth: u8,
+    /// Inclusive lower bound for display number scan.
+    pub display_min: u16,
+    /// Inclusive upper bound for display number scan.
+    pub display_max: u16,
+    /// Startup timeout for display readiness.
+    pub startup_timeout_ms: u64,
+}
+
+impl Default for VirtualDisplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            force_non_headless: false,
+            binary: "Xvfb".to_string(),
+            width: 2560,
+            height: 1440,
+            color_depth: 24,
+            display_min: 99,
+            display_max: 120,
+            startup_timeout_ms: 3000,
+        }
+    }
+}
+
 /// Browser action to perform.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -759,6 +799,8 @@ pub struct BrowserConfig {
     pub persist_profile: bool,
     /// Custom path for the persistent Chrome profile directory.
     pub profile_dir: Option<String>,
+    /// Virtual display settings (Linux/Xvfb).
+    pub virtual_display: VirtualDisplayConfig,
     /// Stealth / anti-bot-detection configuration.
     pub stealth: StealthConfig,
 }
@@ -792,6 +834,7 @@ impl Default for BrowserConfig {
             low_memory_threshold_mb: 2048,
             persist_profile: true,
             profile_dir: None,
+            virtual_display: VirtualDisplayConfig::default(),
             stealth: StealthConfig::default(),
         }
     }
@@ -835,6 +878,17 @@ impl From<&moltis_config::schema::BrowserConfig> for BrowserConfig {
             low_memory_threshold_mb: cfg.low_memory_threshold_mb,
             persist_profile: cfg.persist_profile,
             profile_dir: cfg.profile_dir.clone(),
+            virtual_display: VirtualDisplayConfig {
+                enabled: cfg.virtual_display.enabled,
+                force_non_headless: cfg.virtual_display.force_non_headless,
+                binary: cfg.virtual_display.binary.clone(),
+                width: cfg.virtual_display.width,
+                height: cfg.virtual_display.height,
+                color_depth: cfg.virtual_display.color_depth,
+                display_min: cfg.virtual_display.display_min,
+                display_max: cfg.virtual_display.display_max,
+                startup_timeout_ms: cfg.virtual_display.startup_timeout_ms,
+            },
             stealth: StealthConfig {
                 enabled: cfg.stealth.enabled,
                 js_evasion: cfg.stealth.js_evasion,

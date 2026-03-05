@@ -431,6 +431,19 @@ sandbox = false                   # Run browser in Docker/Apple Container for is
 # chrome_args = []                # Extra Chrome command-line arguments
                                   # Example: ["--disable-extensions", "--disable-gpu"]
 
+# Optional: run headful Chrome on a Linux virtual display (Xvfb), with no visible UI.
+# Useful when sites block true headless mode.
+# [tools.browser.virtual_display]
+# enabled = false                 # Enable Xvfb orchestration for browser launches
+# force_non_headless = false      # If true, launch non-headless even when tools.browser.headless = true
+# binary = "Xvfb"                 # Xvfb executable path/name
+# width = 2560                    # Virtual display width
+# height = 1440                   # Virtual display height
+# color_depth = 24                # Bits per pixel
+# display_min = 99                # Scan range start for :DISPLAY allocation
+# display_max = 120               # Scan range end for :DISPLAY allocation
+# startup_timeout_ms = 3000       # Wait for X socket readiness
+
 # Domain restrictions for security.
 # When set, browser will refuse to navigate to domains not in this list.
 # This helps prevent prompt injection from untrusted websites.

@@ -22,6 +22,7 @@ use crate::{
     container::BrowserContainer,
     error::Error,
     types::{BrowserConfig, BrowserPreference},
+    virtual_display::VirtualDisplay,
 };
 
 /// Get current system memory usage as a percentage (0-100).
@@ -95,6 +96,9 @@ struct BrowserInstance {
     interception: crate::network::InterceptionState,
     /// Active screencast handle (if screencast is running).
     screencast_handle: Option<crate::screencast::ScreencastHandle>,
+    /// Optional virtual display backing headful runs without visible UI.
+    #[allow(dead_code)]
+    virtual_display: Option<VirtualDisplay>,
 }
 
 /// Pool of browser instances for reuse.
@@ -777,6 +781,7 @@ impl BrowserPool {
             current_mouse_pos: (0.0, 0.0),
             interception: crate::network::InterceptionState::default(),
             screencast_handle: None,
+            virtual_display: None,
         })
     }
 
@@ -838,10 +843,18 @@ impl BrowserPool {
             };
 
         let mut builder = CdpBrowserConfig::builder();
+        let force_non_headless =
+            self.config.virtual_display.enabled && self.config.virtual_display.force_non_headless;
+        let effective_headless = self.config.headless && !force_non_headless;
+        let virtual_display = if !effective_headless && self.config.virtual_display.enabled {
+            VirtualDisplay::start(&self.config.virtual_display)?
+        } else {
+            None
+        };
 
         // with_head() shows the browser window (non-headless mode)
         // By default chromiumoxide runs headless, so we only call with_head() when NOT headless
-        if !self.config.headless {
+        if !effective_headless {
             builder = builder.with_head();
         }
 
@@ -851,6 +864,8 @@ impl BrowserPool {
             viewport_height = self.config.viewport_height,
             device_scale_factor = self.config.device_scale_factor,
             headless = self.config.headless,
+            effective_headless,
+            virtual_display = self.config.virtual_display.enabled,
             "configuring browser viewport"
         );
 
@@ -869,6 +884,9 @@ impl BrowserPool {
         let ua = self.config.user_agent.as_deref();
         if let Some(ua) = ua {
             builder = builder.arg(format!("--user-agent={ua}"));
+        }
+        if let Some(ref display) = virtual_display {
+            builder = builder.env("DISPLAY", display.display());
         }
         builder = builder.chrome_executable(selected.path.clone());
 
@@ -964,6 +982,7 @@ impl BrowserPool {
             current_mouse_pos: (0.0, 0.0),
             interception: crate::network::InterceptionState::default(),
             screencast_handle: None,
+            virtual_display,
         })
     }
 }

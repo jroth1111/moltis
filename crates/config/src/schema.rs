@@ -2052,8 +2052,51 @@ pub struct BrowserConfig {
     /// When set, `persist_profile` is implicitly true.
     /// If not set and `persist_profile` is true, defaults to `data_dir()/browser/profile/`.
     pub profile_dir: Option<String>,
+    /// Headful browser on a virtual display (Linux/Xvfb).
+    pub virtual_display: VirtualDisplayConfig,
     /// Stealth / anti-bot-detection configuration.
     pub stealth: StealthConfig,
+}
+
+/// Virtual display configuration for running headful Chrome without visible UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VirtualDisplayConfig {
+    /// Master switch for virtual display support.
+    pub enabled: bool,
+    /// Force non-headless launch when virtual display is enabled.
+    /// Allows "headless-like" operation while presenting headful browser traits.
+    pub force_non_headless: bool,
+    /// Xvfb executable path or name.
+    pub binary: String,
+    /// Width of the virtual display.
+    pub width: u32,
+    /// Height of the virtual display.
+    pub height: u32,
+    /// Color depth (bits per pixel).
+    pub color_depth: u8,
+    /// Inclusive lower bound of display number scan range.
+    pub display_min: u16,
+    /// Inclusive upper bound of display number scan range.
+    pub display_max: u16,
+    /// Startup timeout while waiting for X socket readiness.
+    pub startup_timeout_ms: u64,
+}
+
+impl Default for VirtualDisplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            force_non_headless: false,
+            binary: "Xvfb".to_string(),
+            width: 2560,
+            height: 1440,
+            color_depth: 24,
+            display_min: 99,
+            display_max: 120,
+            startup_timeout_ms: 3000,
+        }
+    }
 }
 
 /// Stealth / anti-bot-detection configuration for the browser.
@@ -2132,6 +2175,7 @@ impl Default for BrowserConfig {
             low_memory_threshold_mb: default_low_memory_threshold_mb(),
             persist_profile: default_persist_profile(),
             profile_dir: None,
+            virtual_display: VirtualDisplayConfig::default(),
             stealth: StealthConfig::default(),
         }
     }
