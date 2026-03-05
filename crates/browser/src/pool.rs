@@ -1,7 +1,7 @@
 //! Browser instance pool management.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -53,6 +53,27 @@ pub(crate) fn low_memory_chrome_args(total_mb: u64, threshold_mb: u64) -> &'stat
         "--renderer-process-limit=1",
         "--js-flags=--max-old-space-size=128",
     ]
+}
+
+/// Sanitize user-provided Chrome args for safer stealth operation.
+///
+/// - Removes duplicate args while preserving order.
+/// - Removes `--enable-automation` in stealth mode.
+#[must_use]
+fn sanitize_user_chrome_args(args: &[String], stealth_enabled: bool) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut sanitized = Vec::with_capacity(args.len());
+    for arg in args {
+        if stealth_enabled
+            && (arg == "--enable-automation" || arg.starts_with("--enable-automation="))
+        {
+            continue;
+        }
+        if seen.insert(arg.clone()) {
+            sanitized.push(arg.clone());
+        }
+    }
+    sanitized
 }
 
 /// A pooled browser instance with one or more pages.
@@ -822,22 +843,16 @@ impl BrowserPool {
             })
             .request_timeout(Duration::from_millis(self.config.navigation_timeout_ms));
 
-        // User agent: explicit config > stealth default > none
+        // User agent: only explicit config override.
         let ua = self.config.user_agent.as_deref();
-        #[cfg(feature = "stealth")]
-        let ua = ua.or_else(|| {
-            if self.config.stealth.enabled {
-                Some(crate::stealth::default_user_agent())
-            } else {
-                None
-            }
-        });
         if let Some(ua) = ua {
             builder = builder.arg(format!("--user-agent={ua}"));
         }
         builder = builder.chrome_executable(selected.path.clone());
 
-        for arg in &self.config.chrome_args {
+        let user_args =
+            sanitize_user_chrome_args(&self.config.chrome_args, self.config.stealth.enabled);
+        for arg in &user_args {
             builder = builder.arg(arg);
         }
 
@@ -1070,5 +1085,48 @@ mod tests {
     #[test]
     fn low_memory_args_disabled_when_threshold_zero() {
         assert!(low_memory_chrome_args(512, 0).is_empty());
+    }
+
+    #[test]
+    fn sanitize_user_chrome_args_removes_enable_automation_in_stealth() {
+        let input = vec![
+            "--enable-automation".to_string(),
+            "--window-size=1280,720".to_string(),
+        ];
+        let result = sanitize_user_chrome_args(&input, true);
+        assert_eq!(result, vec!["--window-size=1280,720".to_string()]);
+    }
+
+    #[test]
+    fn sanitize_user_chrome_args_keeps_enable_automation_when_not_stealth() {
+        let input = vec![
+            "--enable-automation".to_string(),
+            "--window-size=1280,720".to_string(),
+        ];
+        let result = sanitize_user_chrome_args(&input, false);
+        assert_eq!(
+            result,
+            vec![
+                "--enable-automation".to_string(),
+                "--window-size=1280,720".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_user_chrome_args_dedupes_preserving_order() {
+        let input = vec![
+            "--window-size=1280,720".to_string(),
+            "--window-size=1280,720".to_string(),
+            "--disable-gpu".to_string(),
+        ];
+        let result = sanitize_user_chrome_args(&input, true);
+        assert_eq!(
+            result,
+            vec![
+                "--window-size=1280,720".to_string(),
+                "--disable-gpu".to_string()
+            ]
+        );
     }
 }

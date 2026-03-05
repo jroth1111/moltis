@@ -110,12 +110,13 @@ pub async fn inject_stealth(page: &Page, config: &StealthConfig) -> Result<(), E
         .await
         .map_err(|e| Error::Cdp(format!("stealth script injection failed: {e}")))?;
 
-    // Set the UA via CDP Network.setUserAgentOverride so it applies to all requests
-    // (not just the initial navigation, which --user-agent already handles).
-    let ua = config.user_agent.as_deref().unwrap_or(STEALTH_USER_AGENT);
-    page.set_user_agent(ua)
-        .await
-        .map_err(|e| Error::Cdp(format!("failed to set stealth user agent: {e}")))?;
+    // Keep browser-native UA by default to avoid UA/client-hints mismatches
+    // against modern bot defenses. Only override when explicitly configured.
+    if let Some(ua) = config.user_agent.as_deref() {
+        page.set_user_agent(ua)
+            .await
+            .map_err(|e| Error::Cdp(format!("failed to set stealth user agent: {e}")))?;
+    }
 
     #[cfg(feature = "metrics")]
     moltis_metrics::counter!(moltis_metrics::browser::STEALTH_INJECTIONS_TOTAL).increment(1);
