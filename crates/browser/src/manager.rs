@@ -11,6 +11,7 @@ use {
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
                 DispatchMouseEventType, MouseButton,
             },
+            network::{CookieParam, SetCookiesParams, TimeSinceEpoch},
             page::CaptureScreenshotFormat,
         },
     },
@@ -21,6 +22,7 @@ use {
 use crate::{
     challenge::ChallengeType,
     error::Error,
+    patchright::run_patchright_probe,
     pool::BrowserPool,
     snapshot::{
         extract_snapshot, find_element_by_ref, focus_element_by_ref, scroll_element_into_view,
@@ -57,6 +59,37 @@ fn should_suppress_generic_challenge(
     body_text_len: usize,
 ) -> bool {
     challenge_type == Some(ChallengeType::GenericChallenge) && (title_len > 0 || body_text_len > 80)
+}
+
+fn is_patchright_challenge_allowed(
+    challenge_type: ChallengeType,
+    challenge_allowlist: &[String],
+) -> bool {
+    if challenge_allowlist.is_empty() {
+        return true;
+    }
+    let challenge = challenge_type.as_str();
+    challenge_allowlist
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(challenge))
+}
+
+fn should_attempt_patchright_fallback(
+    challenge_type: Option<ChallengeType>,
+    sandbox: bool,
+    url: &str,
+    config: &crate::types::PatchrightFallbackConfig,
+) -> bool {
+    if !config.enabled || sandbox {
+        return false;
+    }
+    if !crate::types::is_domain_allowed(url, &config.domains) {
+        return false;
+    }
+    match challenge_type {
+        Some(kind) => is_patchright_challenge_allowed(kind, &config.challenge_types),
+        None => false,
+    }
 }
 
 /// Extract session_id or return an error for actions that require an existing session.
@@ -428,8 +461,11 @@ impl BrowserManager {
 
         // Wait for post-navigation lifecycle signals.
         let _ = active_page.wait_for_navigation().await;
-        let diagnostics = self
+        let mut diagnostics = self
             .wait_for_challenge_resolution_if_needed(&active_page)
+            .await;
+        diagnostics = self
+            .retry_with_patchright_if_needed(&active_page, diagnostics, url, sandbox)
             .await;
 
         #[cfg(feature = "metrics")]
@@ -572,6 +608,137 @@ impl BrowserManager {
         }
 
         diagnostics
+    }
+
+    async fn retry_with_patchright_if_needed(
+        &self,
+        page: &Page,
+        diagnostics: NavigationDiagnostics,
+        url: &str,
+        sandbox: bool,
+    ) -> NavigationDiagnostics {
+        if !should_attempt_patchright_fallback(
+            diagnostics.challenge_type,
+            sandbox,
+            url,
+            &self.config.patchright_fallback,
+        ) {
+            return diagnostics;
+        }
+
+        let challenge_name = diagnostics.challenge_type.map(ChallengeType::as_str);
+        info!(
+            url = url,
+            challenge_type = ?challenge_name,
+            "attempting patchright fallback for challenge page"
+        );
+
+        let probe = match run_patchright_probe(url, &self.config.patchright_fallback).await {
+            Ok(probe) => probe,
+            Err(e) => {
+                warn!(
+                    url = url,
+                    challenge_type = ?challenge_name,
+                    error = %e,
+                    "patchright fallback failed"
+                );
+                return diagnostics;
+            },
+        };
+        debug!(
+            url = url,
+            patchright_final_url = probe.final_url,
+            patchright_title_len = probe.title_len,
+            patchright_body_text_len = probe.body_text_len,
+            patchright_cookie_count = probe.cookies.len(),
+            "patchright probe completed"
+        );
+
+        let cookie_params: Vec<CookieParam> = probe
+            .cookies
+            .iter()
+            .filter(|cookie| !cookie.name.is_empty())
+            .map(|cookie| CookieParam {
+                name: cookie.name.clone(),
+                value: cookie.value.clone(),
+                url: None,
+                domain: if cookie.domain.is_empty() {
+                    None
+                } else {
+                    Some(cookie.domain.clone())
+                },
+                path: if cookie.path.is_empty() {
+                    None
+                } else {
+                    Some(cookie.path.clone())
+                },
+                secure: Some(cookie.secure),
+                http_only: Some(cookie.http_only),
+                same_site: None,
+                expires: cookie
+                    .expires
+                    .filter(|ts| ts.is_finite() && *ts > 0.0)
+                    .map(TimeSinceEpoch::new),
+                priority: None,
+                same_party: None,
+                source_scheme: None,
+                source_port: None,
+                partition_key: None,
+            })
+            .collect();
+
+        if cookie_params.is_empty() {
+            warn!(
+                url = url,
+                challenge_type = ?challenge_name,
+                "patchright fallback returned no transferable cookies"
+            );
+            return diagnostics;
+        }
+
+        if let Err(e) = page.execute(SetCookiesParams::new(cookie_params)).await {
+            warn!(
+                url = url,
+                challenge_type = ?challenge_name,
+                error = %e,
+                "failed to inject patchright cookies into active session"
+            );
+            return diagnostics;
+        }
+
+        if let Err(e) = page.reload().await {
+            warn!(
+                url = url,
+                challenge_type = ?challenge_name,
+                error = %e,
+                "failed to reload after patchright cookie injection"
+            );
+            return diagnostics;
+        }
+
+        let _ = page.wait_for_navigation().await;
+        let refreshed = self.wait_for_challenge_resolution_if_needed(page).await;
+
+        if refreshed.challenge_type.is_none() {
+            info!(
+                original_url = url,
+                patchright_final_url = probe.final_url,
+                title_len = refreshed.title_len,
+                body_text_len = refreshed.body_text_len,
+                "patchright fallback resolved challenge"
+            );
+        } else {
+            warn!(
+                original_url = url,
+                patchright_final_url = probe.final_url,
+                challenge_type = refreshed.challenge_type.map(ChallengeType::as_str),
+                title_len = refreshed.title_len,
+                body_text_len = refreshed.body_text_len,
+                "patchright fallback did not clear challenge"
+            );
+        }
+
+        refreshed
     }
 
     /// Take a screenshot of the page.
@@ -1870,6 +2037,59 @@ mod tests {
             Some(ChallengeType::GenericChallenge),
             0,
             0
+        ));
+    }
+
+    #[test]
+    fn patchright_challenge_allowlist_matches_case_insensitively() {
+        let allow = vec!["KASADA".to_string(), "imperva".to_string()];
+        assert!(is_patchright_challenge_allowed(ChallengeType::Kasada, &allow));
+        assert!(is_patchright_challenge_allowed(ChallengeType::Imperva, &allow));
+        assert!(!is_patchright_challenge_allowed(
+            ChallengeType::Cloudflare,
+            &allow
+        ));
+    }
+
+    #[test]
+    fn patchright_fallback_gate_respects_enabled_sandbox_domain_and_challenge() {
+        let mut cfg = crate::types::PatchrightFallbackConfig {
+            enabled: true,
+            ..crate::types::PatchrightFallbackConfig::default()
+        };
+        cfg.domains = vec!["*.example.com".to_string()];
+        cfg.challenge_types = vec!["kasada".to_string()];
+
+        assert!(should_attempt_patchright_fallback(
+            Some(ChallengeType::Kasada),
+            false,
+            "https://shop.example.com/",
+            &cfg
+        ));
+
+        assert!(!should_attempt_patchright_fallback(
+            Some(ChallengeType::Kasada),
+            true,
+            "https://shop.example.com/",
+            &cfg
+        ));
+        assert!(!should_attempt_patchright_fallback(
+            Some(ChallengeType::Kasada),
+            false,
+            "https://www.other.com/",
+            &cfg
+        ));
+        assert!(!should_attempt_patchright_fallback(
+            Some(ChallengeType::Imperva),
+            false,
+            "https://shop.example.com/",
+            &cfg
+        ));
+        assert!(!should_attempt_patchright_fallback(
+            None,
+            false,
+            "https://shop.example.com/",
+            &cfg
         ));
     }
 

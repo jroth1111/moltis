@@ -95,6 +95,37 @@ impl Default for VirtualDisplayConfig {
     }
 }
 
+/// Patchright subprocess fallback configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PatchrightFallbackConfig {
+    /// Master switch for fallback behavior.
+    pub enabled: bool,
+    /// Python executable with Patchright installed.
+    pub python_binary: String,
+    /// Subprocess timeout in milliseconds.
+    pub timeout_ms: u64,
+    /// Whether Patchright probe should run headless.
+    pub headless: bool,
+    /// Challenge type allowlist (`kasada`, `imperva`, etc.).
+    pub challenge_types: Vec<String>,
+    /// Optional domain allowlist for fallback (empty = all).
+    pub domains: Vec<String>,
+}
+
+impl Default for PatchrightFallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            python_binary: "python3".to_string(),
+            timeout_ms: 45_000,
+            headless: true,
+            challenge_types: vec!["kasada".to_string(), "imperva".to_string()],
+            domains: Vec::new(),
+        }
+    }
+}
+
 /// Browser action to perform.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -801,6 +832,8 @@ pub struct BrowserConfig {
     pub profile_dir: Option<String>,
     /// Virtual display settings (Linux/Xvfb).
     pub virtual_display: VirtualDisplayConfig,
+    /// Patchright fallback settings.
+    pub patchright_fallback: PatchrightFallbackConfig,
     /// Stealth / anti-bot-detection configuration.
     pub stealth: StealthConfig,
 }
@@ -835,6 +868,7 @@ impl Default for BrowserConfig {
             persist_profile: true,
             profile_dir: None,
             virtual_display: VirtualDisplayConfig::default(),
+            patchright_fallback: PatchrightFallbackConfig::default(),
             stealth: StealthConfig::default(),
         }
     }
@@ -888,6 +922,14 @@ impl From<&moltis_config::schema::BrowserConfig> for BrowserConfig {
                 display_min: cfg.virtual_display.display_min,
                 display_max: cfg.virtual_display.display_max,
                 startup_timeout_ms: cfg.virtual_display.startup_timeout_ms,
+            },
+            patchright_fallback: PatchrightFallbackConfig {
+                enabled: cfg.patchright_fallback.enabled,
+                python_binary: cfg.patchright_fallback.python_binary.clone(),
+                timeout_ms: cfg.patchright_fallback.timeout_ms,
+                headless: cfg.patchright_fallback.headless,
+                challenge_types: cfg.patchright_fallback.challenge_types.clone(),
+                domains: cfg.patchright_fallback.domains.clone(),
             },
             stealth: StealthConfig {
                 enabled: cfg.stealth.enabled,

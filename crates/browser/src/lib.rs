@@ -37,6 +37,7 @@ pub mod emulation;
 pub mod error;
 pub mod manager;
 pub mod network;
+mod patchright;
 pub mod pool;
 pub mod screencast;
 pub mod session_state;

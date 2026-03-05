@@ -2054,6 +2054,8 @@ pub struct BrowserConfig {
     pub profile_dir: Option<String>,
     /// Headful browser on a virtual display (Linux/Xvfb).
     pub virtual_display: VirtualDisplayConfig,
+    /// External Patchright fallback for challenge pages.
+    pub patchright_fallback: PatchrightFallbackConfig,
     /// Stealth / anti-bot-detection configuration.
     pub stealth: StealthConfig,
 }
@@ -2095,6 +2097,37 @@ impl Default for VirtualDisplayConfig {
             display_min: 99,
             display_max: 120,
             startup_timeout_ms: 3000,
+        }
+    }
+}
+
+/// Patchright subprocess fallback for challenge/captcha navigation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PatchrightFallbackConfig {
+    /// Master switch for Patchright fallback.
+    pub enabled: bool,
+    /// Python executable used to run Patchright.
+    pub python_binary: String,
+    /// Patchright probe timeout.
+    pub timeout_ms: u64,
+    /// Headless mode for Patchright subprocess.
+    pub headless: bool,
+    /// Challenge type allowlist (lowercase identifiers, e.g. `kasada`, `imperva`).
+    pub challenge_types: Vec<String>,
+    /// Optional domain allowlist for fallback execution.
+    pub domains: Vec<String>,
+}
+
+impl Default for PatchrightFallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            python_binary: "python3".to_string(),
+            timeout_ms: 45_000,
+            headless: true,
+            challenge_types: vec!["kasada".to_string(), "imperva".to_string()],
+            domains: Vec::new(),
         }
     }
 }
@@ -2176,6 +2209,7 @@ impl Default for BrowserConfig {
             persist_profile: default_persist_profile(),
             profile_dir: None,
             virtual_display: VirtualDisplayConfig::default(),
+            patchright_fallback: PatchrightFallbackConfig::default(),
             stealth: StealthConfig::default(),
         }
     }

@@ -258,6 +258,17 @@ fn build_schema_map() -> KnownKeys {
                     ("startup_timeout_ms", Leaf),
                 ])),
             ),
+            (
+                "patchright_fallback",
+                Struct(HashMap::from([
+                    ("enabled", Leaf),
+                    ("python_binary", Leaf),
+                    ("timeout_ms", Leaf),
+                    ("headless", Leaf),
+                    ("challenge_types", Leaf),
+                    ("domains", Leaf),
+                ])),
+            ),
             ("stealth", stealth()),
         ]))
     };
@@ -1443,6 +1454,24 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             path: "tools.browser.virtual_display.display_min".into(),
             message: "display_min is greater than display_max; X display allocation will fail"
                 .into(),
+        });
+    }
+
+    // Patchright fallback: python binary path should not be empty when enabled.
+    if config.tools.browser.patchright_fallback.enabled
+        && config
+            .tools
+            .browser
+            .patchright_fallback
+            .python_binary
+            .trim()
+            .is_empty()
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "tools.browser.patchright_fallback.python_binary".into(),
+            message: "python_binary is empty; patchright fallback cannot start".into(),
         });
     }
 
