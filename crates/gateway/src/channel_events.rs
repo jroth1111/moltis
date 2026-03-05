@@ -11,6 +11,7 @@ use {
         ChannelAttachment, ChannelEvent, ChannelEventSink, ChannelMessageMeta, ChannelReplyTarget,
         Error as ChannelError, Result as ChannelResult,
     },
+    moltis_skills::discover::SkillDiscoverer,
     moltis_sessions::metadata::SqliteSessionMetadata,
 };
 
@@ -1027,8 +1028,9 @@ impl ChannelEventSink for GatewayChannelEventSink {
         let chat = state.chat().await;
 
         // Extract the command name (first word) and args (rest).
-        let cmd = command.split_whitespace().next().unwrap_or("");
-        let args = command[cmd.len()..].trim();
+        let raw_cmd = command.split_whitespace().next().unwrap_or("");
+        let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd);
+        let args = command[raw_cmd.len()..].trim();
 
         match cmd {
             "new" => {
@@ -1789,9 +1791,39 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     Err(e) => Err(ChannelError::external("peek", e)),
                 }
             },
-            _ => Err(ChannelError::invalid_input(format!(
-                "unknown command: /{cmd}"
-            ))),
+            _ => {
+                let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
+                let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
+                let discovered_skills = discoverer
+                    .discover()
+                    .await
+                    .unwrap_or_else(|_| Vec::new());
+
+                if discovered_skills.iter().any(|skill| skill.name == cmd) {
+                    let slash_text = if args.is_empty() {
+                        format!("/{cmd}")
+                    } else {
+                        format!("/{cmd} {args}")
+                    };
+                    let response = chat
+                        .send_sync(serde_json::json!({
+                            "_session_key": &session_key,
+                            "text": slash_text,
+                        }))
+                        .await
+                        .map_err(ChannelError::unavailable)?;
+                    let reply_text = response
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("Executed /{cmd}."));
+                    Ok(reply_text)
+                } else {
+                    Err(ChannelError::invalid_input(format!("unknown command: /{cmd}")))
+                }
+            },
         }
     }
 }
