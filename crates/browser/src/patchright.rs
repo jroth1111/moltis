@@ -2,7 +2,7 @@
 
 use std::process::Stdio;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{process::Command, time::Duration};
 
 use crate::{error::Error, types::PatchrightFallbackConfig};
@@ -26,12 +26,22 @@ fn default_cookie_path() -> String {
     "/".to_string()
 }
 
+/// Storage item extracted from patchright context (localStorage or sessionStorage).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StorageItem {
+    pub origin: String,
+    pub key: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PatchrightProbe {
     pub final_url: String,
     pub title_len: usize,
     pub body_text_len: usize,
     pub cookies: Vec<PatchrightCookie>,
+    pub local_storage: Vec<StorageItem>,
+    pub session_storage: Vec<StorageItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +57,10 @@ struct PatchrightProbeOutput {
     body_text_len: usize,
     #[serde(default)]
     cookies: Vec<PatchrightCookie>,
+    #[serde(default)]
+    local_storage: Vec<StorageItem>,
+    #[serde(default)]
+    session_storage: Vec<StorageItem>,
 }
 
 /// Run a one-shot Patchright navigation probe and return cookies/metrics.
@@ -64,7 +78,11 @@ pub async fn run_patchright_probe(
     cmd.arg("-c")
         .arg(PATCHRIGHT_PROBE_PY)
         .arg(url)
-        .arg(if headless { "1" } else { "0" })
+        .arg(if headless {
+            "1"
+        } else {
+            "0"
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -111,6 +129,8 @@ pub async fn run_patchright_probe(
         title_len: parsed.title_len,
         body_text_len: parsed.body_text_len,
         cookies: parsed.cookies,
+        local_storage: parsed.local_storage,
+        session_storage: parsed.session_storage,
     })
 }
 
@@ -188,12 +208,30 @@ try:
                 "expires": c.get("expires", None),
             })
 
+        # Extract localStorage from storage_state
+        local_storage = []
+        session_storage = []
+        try:
+            state = context.storage_state()
+            for origin_data in state.get("origins", []):
+                origin = origin_data.get("origin", "")
+                for item in origin_data.get("localStorage", []):
+                    local_storage.append({
+                        "origin": origin,
+                        "key": item.get("name", ""),
+                        "value": item.get("value", ""),
+                    })
+        except Exception:
+            pass
+
         _emit({
             "ok": True,
             "final_url": page.url,
             "title_len": len(title),
             "body_text_len": int(text_len),
             "cookies": cookies,
+            "local_storage": local_storage,
+            "session_storage": session_storage,
         })
 
         context.close()
