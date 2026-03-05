@@ -397,10 +397,6 @@ impl moltis_service_traits::SkillsService for MockSkills {
         self.0.call("skills.install", p)
     }
 
-    async fn update(&self, p: Value) -> ServiceResult {
-        self.0.call("skills.update", p)
-    }
-
     async fn list(&self) -> ServiceResult {
         self.0.call("skills.list", json!({}))
     }
@@ -433,8 +429,12 @@ impl moltis_service_traits::SkillsService for MockSkills {
         self.0.call("skills.skill.disable", p)
     }
 
-    async fn skill_trust(&self, p: Value) -> ServiceResult {
-        self.0.call("skills.skill.trust", p)
+    async fn skill_revalidate(&self, p: Value) -> ServiceResult {
+        self.0.call("skills.skill.revalidate", p)
+    }
+
+    async fn skill_delete(&self, p: Value) -> ServiceResult {
+        self.0.call("skills.skill.delete", p)
     }
 
     async fn skill_unquarantine(&self, p: Value) -> ServiceResult {
@@ -455,6 +455,18 @@ impl moltis_service_traits::SkillsService for MockSkills {
 
     async fn security_scan(&self) -> ServiceResult {
         self.0.call("skills.security.scan", json!({}))
+    }
+
+    async fn evals_list(&self) -> ServiceResult {
+        self.0.call("skills.evals.list", json!({}))
+    }
+
+    async fn evals_get(&self, p: Value) -> ServiceResult {
+        self.0.call("skills.evals.get", p)
+    }
+
+    async fn evals_run(&self, p: Value) -> ServiceResult {
+        self.0.call("skills.evals.run", p)
     }
 }
 

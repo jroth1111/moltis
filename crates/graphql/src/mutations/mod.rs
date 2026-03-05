@@ -630,11 +630,6 @@ impl SkillsMutation {
         )
     }
 
-    async fn update(&self, ctx: &Context<'_>, name: String) -> Result<BoolResult> {
-        let s = services!(ctx);
-        from_service(s.skills.update(serde_json::json!({ "name": name })).await)
-    }
-
     async fn repos_remove(&self, ctx: &Context<'_>, source: String) -> Result<BoolResult> {
         let s = services!(ctx);
         from_service(
@@ -649,11 +644,25 @@ impl SkillsMutation {
         from_service(s.skills.emergency_disable().await)
     }
 
-    async fn trust(&self, ctx: &Context<'_>, source: String, skill: String) -> Result<BoolResult> {
+    async fn revalidate(
+        &self,
+        ctx: &Context<'_>,
+        source: String,
+        skill: String,
+    ) -> Result<BoolResult> {
         let s = services!(ctx);
         from_service(
             s.skills
-                .skill_trust(serde_json::json!({ "source": source, "skill": skill }))
+                .skill_revalidate(serde_json::json!({ "source": source, "skill": skill }))
+                .await,
+        )
+    }
+
+    async fn delete(&self, ctx: &Context<'_>, source: String, skill: String) -> Result<BoolResult> {
+        let s = services!(ctx);
+        from_service(
+            s.skills
+                .skill_delete(serde_json::json!({ "source": source, "skill": skill }))
                 .await,
         )
     }

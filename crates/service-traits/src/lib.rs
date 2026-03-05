@@ -589,7 +589,6 @@ pub trait SkillsService: Send + Sync {
     async fn status(&self) -> ServiceResult;
     async fn bins(&self) -> ServiceResult;
     async fn install(&self, params: Value) -> ServiceResult;
-    async fn update(&self, params: Value) -> ServiceResult;
     async fn list(&self) -> ServiceResult;
     async fn remove(&self, params: Value) -> ServiceResult;
     async fn repos_list(&self) -> ServiceResult;
@@ -599,7 +598,8 @@ pub trait SkillsService: Send + Sync {
     async fn emergency_disable(&self) -> ServiceResult;
     async fn skill_enable(&self, params: Value) -> ServiceResult;
     async fn skill_disable(&self, params: Value) -> ServiceResult;
-    async fn skill_trust(&self, params: Value) -> ServiceResult;
+    async fn skill_revalidate(&self, params: Value) -> ServiceResult;
+    async fn skill_delete(&self, params: Value) -> ServiceResult;
     async fn skill_unquarantine(&self, params: Value) -> ServiceResult;
     async fn skill_detail(&self, params: Value) -> ServiceResult;
     async fn install_dep(&self, params: Value) -> ServiceResult;
@@ -626,10 +626,6 @@ impl SkillsService for NoopSkillsStub {
     }
 
     async fn install(&self, _params: Value) -> ServiceResult {
-        Err("skills service not configured".into())
-    }
-
-    async fn update(&self, _params: Value) -> ServiceResult {
         Err("skills service not configured".into())
     }
 
@@ -665,7 +661,11 @@ impl SkillsService for NoopSkillsStub {
         Err("skills service not configured".into())
     }
 
-    async fn skill_trust(&self, _params: Value) -> ServiceResult {
+    async fn skill_revalidate(&self, _params: Value) -> ServiceResult {
+        Err("skills service not configured".into())
+    }
+
+    async fn skill_delete(&self, _params: Value) -> ServiceResult {
         Err("skills service not configured".into())
     }
 

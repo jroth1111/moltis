@@ -2690,19 +2690,6 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         }),
     );
     reg.register(
-        "skills.update",
-        Box::new(|ctx| {
-            Box::pin(async move {
-                ctx.state
-                    .services
-                    .skills
-                    .update(ctx.params.clone())
-                    .await
-                    .map_err(ErrorShape::from)
-            })
-        }),
-    );
-    reg.register(
         "skills.repos.list",
         Box::new(|ctx| {
             Box::pin(async move {
@@ -2742,13 +2729,26 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         }),
     );
     reg.register(
-        "skills.skill.trust",
+        "skills.skill.revalidate",
         Box::new(|ctx| {
             Box::pin(async move {
                 ctx.state
                     .services
                     .skills
-                    .skill_trust(ctx.params.clone())
+                    .skill_revalidate(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "skills.skill.delete",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .skills
+                    .skill_delete(ctx.params.clone())
                     .await
                     .map_err(ErrorShape::from)
             })
