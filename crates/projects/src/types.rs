@@ -77,9 +77,17 @@ impl ProjectContext {
             out.push_str(prompt);
             out.push_str("\n\n");
         }
-        for cf in &self.context_files {
-            let name = cf.path.file_name().unwrap_or_default().to_string_lossy();
-            out.push_str(&format!("## {}\n\n{}\n\n", name, cf.content));
+        for (idx, cf) in self.context_files.iter().enumerate() {
+            let layer_rank = idx + 1;
+            let rendered_path = cf
+                .path
+                .strip_prefix(&self.project.directory)
+                .map(|relative| relative.display().to_string())
+                .unwrap_or_else(|_| cf.path.display().to_string());
+            out.push_str(&format!(
+                "## Context [{layer_rank}]: {rendered_path}\n\n{}\n\n",
+                cf.content
+            ));
         }
         out
     }
@@ -142,7 +150,7 @@ mod tests {
             worktree_dir: None,
         };
         let section = ctx.to_prompt_section();
-        assert!(section.contains("## CLAUDE.md"));
+        assert!(section.contains("## Context [1]: CLAUDE.md"));
         assert!(section.contains("Hello world"));
     }
 }

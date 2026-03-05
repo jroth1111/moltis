@@ -6186,14 +6186,9 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let (project_context, project_dir) = self
+        let (project_context, _project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
-        let scoped_rules = if let Some(ref dir) = project_dir {
-            self.resolve_scoped_rules(&session_key, dir).await
-        } else {
-            None
-        };
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -6243,7 +6238,6 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
-                scoped_rules.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -6255,9 +6249,11 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
-                scoped_rules.as_deref(),
             )
-        };
+        }
+        .map_err(|diagnostics| {
+            ServiceError::message(format!("failed to build system prompt: {diagnostics}"))
+        })?;
 
         let char_count = system_prompt.len();
 
@@ -6317,14 +6313,9 @@ impl ChatService for LiveChatService {
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
         // Resolve project context.
-        let (project_context, project_dir) = self
+        let (project_context, _project_dir) = self
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
-        let scoped_rules = if let Some(ref dir) = project_dir {
-            self.resolve_scoped_rules(&session_key, dir).await
-        } else {
-            None
-        };
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -6372,7 +6363,6 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
-                scoped_rules.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -6384,9 +6374,11 @@ impl ChatService for LiveChatService {
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
-                scoped_rules.as_deref(),
             )
-        };
+        }
+        .map_err(|diagnostics| {
+            ServiceError::message(format!("failed to build system prompt: {diagnostics}"))
+        })?;
 
         let system_prompt_chars = system_prompt.len();
 
@@ -8196,7 +8188,7 @@ async fn run_with_tools(
     agent_id: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
-    scoped_rules: Option<&str>,
+    _scoped_rules: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     user_message_index: usize,
     skills: &[moltis_skills::types::SkillMetadata],
@@ -8253,7 +8245,6 @@ async fn run_with_tools(
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
-            scoped_rules,
         )
     } else {
         build_system_prompt_minimal_runtime(
@@ -8265,8 +8256,20 @@ async fn run_with_tools(
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
-            scoped_rules,
         )
+    };
+
+    let system_prompt = match system_prompt {
+        Ok(prompt) => prompt,
+        Err(diagnostics) => {
+            warn!(
+                run_id = %run_id,
+                session = %session_key,
+                %diagnostics,
+                "failed to build system prompt"
+            );
+            return None;
+        },
     };
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
@@ -9473,7 +9476,7 @@ async fn run_streaming(
     agent_id: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
-    scoped_rules: Option<&str>,
+    _scoped_rules: Option<&str>,
     user_message_index: usize,
     _skills: &[moltis_skills::types::SkillMetadata],
     runtime_context: Option<&PromptRuntimeContext>,
@@ -9494,8 +9497,20 @@ async fn run_streaming(
         persona.tools_text.as_deref(),
         runtime_context,
         persona.memory_text.as_deref(),
-        scoped_rules,
     );
+
+    let system_prompt = match system_prompt {
+        Ok(prompt) => prompt,
+        Err(diagnostics) => {
+            warn!(
+                run_id = %run_id,
+                session = %session_key,
+                %diagnostics,
+                "failed to build system prompt"
+            );
+            return None;
+        },
+    };
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     // Keep the runtime datetime/date sentence as the final prompt line for better cache locality.

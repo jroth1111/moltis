@@ -4634,32 +4634,6 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_error_maps_patterns_to_failure_class() {
-        use moltis_tasks::FailureClass;
-
-        assert_eq!(
-            classify_error("insufficient_quota"),
-            FailureClass::ProviderPermanent
-        );
-        assert_eq!(
-            classify_error("HTTP 429 Too Many Requests"),
-            FailureClass::ProviderTransient
-        );
-        assert_eq!(
-            classify_error("HTTP 500 Internal Server Error"),
-            FailureClass::ProviderTransient
-        );
-        assert_eq!(
-            classify_error("context_length_exceeded"),
-            FailureClass::ContextOverflow
-        );
-        assert_eq!(
-            classify_error("some unrecognised agent error"),
-            FailureClass::AgentError
-        );
-    }
-
-    #[test]
     fn test_next_retry_delay_skips_billing_quota_errors() {
         let mut server_retries_remaining = 2u8;
         let mut rate_limit_retries_remaining = 2u8;

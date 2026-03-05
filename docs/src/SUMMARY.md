@@ -62,6 +62,7 @@
 # Architecture
 
 - [System Prompt](system-prompt.md)
+- [Persona Precedence](persona-precedence.md)
 - [Streaming](streaming.md)
 - [Compaction V2](compaction-v2.md)
 - [SQLite Migrations](sqlite-migration.md)

@@ -1352,6 +1352,12 @@ pub struct ChatConfig {
     /// Research phase settings.
     #[serde(default)]
     pub research: ResearchConfig,
+    /// Character budgets for major system-prompt sections.
+    #[serde(default)]
+    pub prompt_budgets: PromptBudgetsConfig,
+    /// Deterministic runtime policy controls for prompt/persona/tool handling.
+    #[serde(default)]
+    pub deterministic_policy: DeterministicPolicyConfig,
     /// Maximum number of messages that can be queued per session while a run is active.
     /// When the queue is full, new messages are rejected with an error.
     #[serde(default = "default_message_queue_max_size")]
@@ -1407,6 +1413,18 @@ fn default_priority_starvation_bound() -> usize {
     5
 }
 
+fn default_untrusted_content_mode() -> String {
+    "sanitize".to_string()
+}
+
+fn default_memory_relevance_min_score() -> f64 {
+    0.18
+}
+
+fn default_max_memory_facts_in_prompt() -> usize {
+    12
+}
+
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
@@ -1415,8 +1433,69 @@ impl Default for ChatConfig {
             allowed_models: Vec::new(),
             compaction: ChatCompactionConfig::default(),
             research: ResearchConfig::default(),
+            prompt_budgets: PromptBudgetsConfig::default(),
+            deterministic_policy: DeterministicPolicyConfig::default(),
             message_queue_max_size: default_message_queue_max_size(),
             priority_starvation_bound: default_priority_starvation_bound(),
+        }
+    }
+}
+
+/// Character budgets for major system-prompt sections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptBudgetsConfig {
+    /// Maximum characters injected for `## Soul`.
+    pub soul_max_chars: usize,
+    /// Maximum characters injected for project context files.
+    pub project_context_max_chars: usize,
+    /// Maximum characters injected for each workspace markdown file.
+    pub workspace_file_max_chars: usize,
+    /// Maximum characters injected for `MEMORY.md` bootstrap content.
+    pub memory_bootstrap_max_chars: usize,
+}
+
+impl Default for PromptBudgetsConfig {
+    fn default() -> Self {
+        Self {
+            soul_max_chars: 20_000,
+            project_context_max_chars: 8_000,
+            workspace_file_max_chars: 6_000,
+            memory_bootstrap_max_chars: 8_000,
+        }
+    }
+}
+
+/// Deterministic runtime policy controls for persona/prompt assembly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeterministicPolicyConfig {
+    /// When true, invalid/orphan SOUL lane markers fail prompt assembly.
+    pub strict_soul_routing: bool,
+    /// How to handle untrusted tool/web payloads before reinjection.
+    /// Supported values: "sanitize", "drop".
+    #[serde(default = "default_untrusted_content_mode")]
+    pub untrusted_content_mode: String,
+    /// Tool names that should always use drop-mode for untrusted reinjection.
+    /// Matching is case-insensitive.
+    #[serde(default)]
+    pub untrusted_drop_tools: Vec<String>,
+    /// Minimum relevance score required for memory facts to be injected.
+    #[serde(default = "default_memory_relevance_min_score")]
+    pub memory_relevance_min_score: f64,
+    /// Maximum number of memory facts injected into prompt bootstrap.
+    #[serde(default = "default_max_memory_facts_in_prompt")]
+    pub max_memory_facts_in_prompt: usize,
+}
+
+impl Default for DeterministicPolicyConfig {
+    fn default() -> Self {
+        Self {
+            strict_soul_routing: true,
+            untrusted_content_mode: default_untrusted_content_mode(),
+            untrusted_drop_tools: Vec::new(),
+            memory_relevance_min_score: default_memory_relevance_min_score(),
+            max_memory_facts_in_prompt: default_max_memory_facts_in_prompt(),
         }
     }
 }
@@ -2740,6 +2819,25 @@ summary_budget_tokens = 3000
         assert_eq!(cfg.compaction.min_verbatim_turns, 8);
         assert_eq!(cfg.compaction.anchor_budget_tokens, 7_000);
         assert_eq!(cfg.compaction.summary_budget_tokens, 3_000);
+    }
+
+    #[test]
+    fn chat_prompt_budgets_defaults_are_set() {
+        let cfg = ChatConfig::default();
+        assert_eq!(cfg.prompt_budgets.soul_max_chars, 20_000);
+        assert_eq!(cfg.prompt_budgets.project_context_max_chars, 8_000);
+        assert_eq!(cfg.prompt_budgets.workspace_file_max_chars, 6_000);
+        assert_eq!(cfg.prompt_budgets.memory_bootstrap_max_chars, 8_000);
+    }
+
+    #[test]
+    fn chat_deterministic_policy_defaults_are_set() {
+        let cfg = ChatConfig::default();
+        assert!(cfg.deterministic_policy.strict_soul_routing);
+        assert_eq!(cfg.deterministic_policy.untrusted_content_mode, "sanitize");
+        assert!(cfg.deterministic_policy.untrusted_drop_tools.is_empty());
+        assert_eq!(cfg.deterministic_policy.memory_relevance_min_score, 0.18);
+        assert_eq!(cfg.deterministic_policy.max_memory_facts_in_prompt, 12);
     }
 
     #[test]

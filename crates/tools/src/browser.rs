@@ -10,7 +10,7 @@
 use {
     crate::sandbox::SandboxRouter,
     async_trait::async_trait,
-    moltis_agents::tool_registry::AgentTool,
+    moltis_agents::tool_registry::{AgentTool, ToolEffectClass},
     moltis_browser::{BrowserManager, BrowserRequest},
     std::sync::Arc,
     tokio::sync::RwLock,
@@ -297,6 +297,10 @@ impl AgentTool for BrowserTool {
                 }
             }
         })
+    }
+
+    fn side_effect_class(&self) -> ToolEffectClass {
+        ToolEffectClass::ExternalEffect
     }
 
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {

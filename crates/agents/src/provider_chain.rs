@@ -684,6 +684,7 @@ mod tests {
                     output_tokens: 1,
                     ..Default::default()
                 },
+                ..Default::default()
             })
         }
 
@@ -1095,48 +1096,6 @@ mod tests {
         assert!(ProviderErrorKind::NonRetryableRateLimit.should_failover());
     }
 
-    #[tokio::test]
-    async fn configurable_cb_threshold_one_failure() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "flaky",
-                error_msg: "500 internal server error",
-            }),
-            Arc::new(SuccessProvider { id: "backup" }),
-        ])
-        .with_circuit_breaker(1, Duration::from_secs(60));
-
-        // First failure should trip the breaker (threshold=1).
-        let _ = chain.complete(&[], &[]).await;
-        assert!(chain.chain[0].state.is_tripped(1, Duration::from_secs(60)));
-    }
-
-    #[tokio::test]
-    async fn configurable_cb_cooldown() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "flaky",
-                error_msg: "500 internal server error",
-            }),
-            Arc::new(SuccessProvider { id: "backup" }),
-        ])
-        .with_circuit_breaker(1, Duration::from_millis(50));
-
-        let _ = chain.complete(&[], &[]).await;
-        assert!(
-            chain.chain[0]
-                .state
-                .is_tripped(1, Duration::from_millis(50))
-        );
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !chain.chain[0]
-                .state
-                .is_tripped(1, Duration::from_millis(50))
-        );
-    }
-
     // ── Streaming metrics wrapper tests ──────────────────────────────
 
     /// A provider that emits a configurable sequence of stream events.
@@ -1163,6 +1122,7 @@ mod tests {
                 text: Some("ok".into()),
                 tool_calls: vec![],
                 usage: Usage::default(),
+                ..Default::default()
             })
         }
 

@@ -8,6 +8,14 @@ use {
     },
 };
 
+/// Side-effect class used by deterministic execution policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEffectClass {
+    ReadOnly,
+    LocalMutation,
+    ExternalEffect,
+}
+
 struct RateLimitState {
     window_started_at: Instant,
     used: u32,
@@ -54,6 +62,9 @@ pub trait AgentTool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> serde_json::Value;
+    fn side_effect_class(&self) -> ToolEffectClass {
+        ToolEffectClass::ReadOnly
+    }
     async fn execute(&self, params: serde_json::Value) -> Result<serde_json::Value>;
 
     /// Semantic categories this tool belongs to (e.g. `["code", "files"]`).
@@ -182,12 +193,34 @@ impl ToolRegistry {
         self.tools.get(name).map(|e| &e.source)
     }
 
+    /// Validate tool-call parameters against schema without executing.
+    pub fn validate_call_arguments(&self, name: &str, params: &serde_json::Value) -> Result<()> {
+        let entry = self
+            .tools
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        let schema = entry.tool.parameters_schema();
+        validate_tool_call_arguments(name, &schema, params)
+    }
+
+    /// Resolve side-effect class for deterministic policy checks.
+    #[must_use]
+    pub fn side_effect_class(&self, name: &str) -> Option<ToolEffectClass> {
+        let entry = self.tools.get(name)?;
+        if matches!(entry.source, ToolSource::Mcp { .. } | ToolSource::Wasm { .. }) {
+            // Fail closed for externally supplied tool definitions.
+            return Some(ToolEffectClass::ExternalEffect);
+        }
+        Some(entry.tool.side_effect_class())
+    }
+
     /// Dispatch a tool call by name: check rate limit, then execute.
     pub async fn call(&self, name: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         let entry = self
             .tools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        self.validate_call_arguments(name, &params)?;
         if let Some(ref rl) = entry.rate_limit
             && let Err(e) = rl.try_acquire()
         {
@@ -322,6 +355,182 @@ fn hex_component_hash(component_hash: [u8; 32]) -> String {
     output
 }
 
+fn value_type_name(value: &serde_json::Value) -> &'static str {
+    if value.is_string() {
+        "string"
+    } else if value.is_boolean() {
+        "boolean"
+    } else if value.is_number() {
+        "number"
+    } else if value.is_array() {
+        "array"
+    } else if value.is_object() {
+        "object"
+    } else if value.is_null() {
+        "null"
+    } else {
+        "unknown"
+    }
+}
+
+fn type_matches(expected: &str, value: &serde_json::Value) -> bool {
+    match expected {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+fn validate_value_constraints(
+    tool_name: &str,
+    arg_name: &str,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<()> {
+    if let Some(expected_type) = schema.get("type").and_then(serde_json::Value::as_str)
+        && !type_matches(expected_type, value)
+    {
+        return Err(anyhow::anyhow!(
+            "invalid parameter '{arg_name}' for tool '{tool_name}': expected {expected_type}, got {}",
+            value_type_name(value)
+        ));
+    }
+
+    if let Some(options) = schema.get("enum").and_then(serde_json::Value::as_array)
+        && !options.iter().any(|candidate| candidate == value)
+    {
+        return Err(anyhow::anyhow!(
+            "invalid parameter '{arg_name}' for tool '{tool_name}': value {value} not in enum"
+        ));
+    }
+
+    if let Some(as_f64) = value.as_f64() {
+        if let Some(min) = schema.get("minimum").and_then(serde_json::Value::as_f64)
+            && as_f64 < min
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': {as_f64} < minimum {min}"
+            ));
+        }
+        if let Some(max) = schema.get("maximum").and_then(serde_json::Value::as_f64)
+            && as_f64 > max
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': {as_f64} > maximum {max}"
+            ));
+        }
+    }
+
+    if let Some(as_str) = value.as_str() {
+        let len = as_str.chars().count();
+        if let Some(min_len) = schema.get("minLength").and_then(serde_json::Value::as_u64)
+            && len < min_len as usize
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': length {len} < minLength {min_len}"
+            ));
+        }
+        if let Some(max_len) = schema.get("maxLength").and_then(serde_json::Value::as_u64)
+            && len > max_len as usize
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': length {len} > maxLength {max_len}"
+            ));
+        }
+    }
+
+    if let Some(items) = value.as_array() {
+        let len = items.len();
+        if let Some(min_items) = schema.get("minItems").and_then(serde_json::Value::as_u64)
+            && len < min_items as usize
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': item count {len} < minItems {min_items}"
+            ));
+        }
+        if let Some(max_items) = schema.get("maxItems").and_then(serde_json::Value::as_u64)
+            && len > max_items as usize
+        {
+            return Err(anyhow::anyhow!(
+                "invalid parameter '{arg_name}' for tool '{tool_name}': item count {len} > maxItems {max_items}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_tool_call_arguments(
+    tool_name: &str,
+    schema: &serde_json::Value,
+    params: &serde_json::Value,
+) -> Result<()> {
+    if schema.is_null() {
+        return Ok(());
+    }
+    let Some(object_schema) = schema.as_object() else {
+        return Ok(());
+    };
+    if object_schema
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind != "object")
+    {
+        return Ok(());
+    }
+
+    let Some(args_obj) = params.as_object() else {
+        return Err(anyhow::anyhow!(
+            "invalid arguments for tool '{tool_name}': expected object, got {}",
+            value_type_name(params)
+        ));
+    };
+
+    let properties = object_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    if let Some(required) = object_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+    {
+        for req in required.iter().filter_map(serde_json::Value::as_str) {
+            if !args_obj.contains_key(req) {
+                return Err(anyhow::anyhow!(
+                    "missing required parameter '{req}' for tool '{tool_name}'"
+                ));
+            }
+        }
+    }
+
+    let additional_allowed = object_schema
+        .get("additionalProperties")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    for (arg_name, arg_value) in args_obj {
+        if arg_name.starts_with('_') {
+            // Runtime/session metadata injected by the chat runtime.
+            continue;
+        }
+        let Some(prop_schema) = properties.and_then(|props| props.get(arg_name)) else {
+            if !additional_allowed {
+                return Err(anyhow::anyhow!(
+                    "unknown parameter '{arg_name}' for tool '{tool_name}'"
+                ));
+            }
+            continue;
+        };
+        validate_value_constraints(tool_name, arg_name, prop_schema, arg_value)?;
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
@@ -347,6 +556,35 @@ mod tests {
 
         async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
             Ok(serde_json::json!({}))
+        }
+    }
+
+    struct StrictArgsTool;
+
+    #[async_trait]
+    impl AgentTool for StrictArgsTool {
+        fn name(&self) -> &str {
+            "strict"
+        }
+
+        fn description(&self) -> &str {
+            "strict schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "minLength": 1 },
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": 300 }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({ "ok": true }))
         }
     }
 
@@ -560,5 +798,91 @@ mod tests {
         let err = cloned.call("limited", serde_json::json!({})).await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_call_rejects_missing_required_argument() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StrictArgsTool));
+        let err = registry
+            .call("strict", serde_json::json!({ "timeout": 30 }))
+            .await
+            .expect_err("missing required parameter should fail");
+        assert!(
+            err.to_string()
+                .contains("missing required parameter 'command'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_rejects_wrong_argument_type() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StrictArgsTool));
+        let err = registry
+            .call("strict", serde_json::json!({ "command": 42 }))
+            .await
+            .expect_err("wrong type should fail");
+        assert!(err.to_string().contains("expected string"));
+    }
+
+    #[tokio::test]
+    async fn test_call_allows_runtime_metadata_fields() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StrictArgsTool));
+        let result = registry
+            .call(
+                "strict",
+                serde_json::json!({
+                    "command": "ls -la",
+                    "_session_key": "main",
+                    "_accept_language": "en-US",
+                }),
+            )
+            .await;
+        assert!(result.is_ok(), "runtime metadata fields should be ignored");
+    }
+
+    #[test]
+    fn test_side_effect_class_fail_closed_for_mcp_and_wasm() {
+        struct ReadOnlyTool;
+        #[async_trait]
+        impl AgentTool for ReadOnlyTool {
+            fn name(&self) -> &str {
+                "ro"
+            }
+            fn description(&self) -> &str {
+                "read-only"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            fn side_effect_class(&self) -> ToolEffectClass {
+                ToolEffectClass::ReadOnly
+            }
+            async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({"ok":true}))
+            }
+        }
+
+        let mut builtin = ToolRegistry::new();
+        builtin.register(Box::new(ReadOnlyTool));
+        assert_eq!(
+            builtin.side_effect_class("ro"),
+            Some(ToolEffectClass::ReadOnly)
+        );
+
+        let mut mcp = ToolRegistry::new();
+        mcp.register_mcp(Box::new(ReadOnlyTool), "mcp-local".to_string());
+        assert_eq!(
+            mcp.side_effect_class("ro"),
+            Some(ToolEffectClass::ExternalEffect)
+        );
+
+        let mut wasm = ToolRegistry::new();
+        wasm.register_wasm(Box::new(ReadOnlyTool), [7u8; 32]);
+        assert_eq!(
+            wasm.side_effect_class("ro"),
+            Some(ToolEffectClass::ExternalEffect)
+        );
     }
 }

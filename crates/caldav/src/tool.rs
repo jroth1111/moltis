@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use {
     anyhow::{Result, anyhow},
     async_trait::async_trait,
-    moltis_agents::tool_registry::AgentTool,
+    moltis_agents::tool_registry::{AgentTool, ToolEffectClass},
     moltis_config::CalDavConfig,
     serde_json::{Value, json},
 };
@@ -184,6 +184,10 @@ impl AgentTool for CalDavTool {
                 }
             }
         })
+    }
+
+    fn side_effect_class(&self) -> ToolEffectClass {
+        ToolEffectClass::ExternalEffect
     }
 
     async fn execute(&self, params: Value) -> Result<Value> {
