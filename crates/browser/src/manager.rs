@@ -51,6 +51,14 @@ struct NavigationDiagnostics {
     challenge_markers: Vec<String>,
 }
 
+fn should_suppress_generic_challenge(
+    challenge_type: Option<ChallengeType>,
+    title_len: usize,
+    body_text_len: usize,
+) -> bool {
+    challenge_type == Some(ChallengeType::GenericChallenge) && (title_len > 0 || body_text_len > 80)
+}
+
 /// Extract session_id or return an error for actions that require an existing session.
 fn require_session(session_id: Option<&str>, action: &str) -> Result<String, Error> {
     session_id
@@ -491,17 +499,22 @@ impl BrowserManager {
         let html = page.content().await.unwrap_or_default();
         let html_len = html.len();
         let detection = crate::challenge::detect_challenge(&html);
-        let challenge_markers = detection
+        let mut challenge_type = detection.challenge_type;
+        let mut challenge_markers: Vec<String> = detection
             .markers
             .into_iter()
             .map(ToString::to_string)
             .collect();
+        if should_suppress_generic_challenge(challenge_type, title_len, body_text_len) {
+            challenge_type = None;
+            challenge_markers.clear();
+        }
         NavigationDiagnostics {
             final_url,
             title_len,
             body_text_len,
             html_len,
-            challenge_type: detection.challenge_type,
+            challenge_type,
             challenge_markers,
         }
     }
@@ -1835,6 +1848,29 @@ mod tests {
         assert_eq!(prefix.len(), 99);
         assert!(!prefix.contains('л'));
         assert!(prefix.ends_with('a'));
+    }
+
+    #[test]
+    fn suppresses_generic_challenge_when_page_has_real_content() {
+        assert!(should_suppress_generic_challenge(
+            Some(ChallengeType::GenericChallenge),
+            12,
+            0
+        ));
+        assert!(should_suppress_generic_challenge(
+            Some(ChallengeType::GenericChallenge),
+            0,
+            120
+        ));
+    }
+
+    #[test]
+    fn keeps_generic_challenge_for_empty_shells() {
+        assert!(!should_suppress_generic_challenge(
+            Some(ChallengeType::GenericChallenge),
+            0,
+            0
+        ));
     }
 
     #[tokio::test]
