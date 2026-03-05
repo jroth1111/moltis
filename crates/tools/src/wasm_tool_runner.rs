@@ -724,6 +724,7 @@ mod tests {
         },
         crate::{
             calc::CalcTool,
+            tool_names::WEB_FETCH,
             wasm_component::{
                 HttpToolError, HttpToolResult, HttpToolValue, PureToolError, PureToolResult,
                 PureToolValue,
