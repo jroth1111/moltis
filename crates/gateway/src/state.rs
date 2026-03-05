@@ -567,7 +567,7 @@ impl GatewayState {
             #[cfg(feature = "vault")]
             vault,
             provider_health: Arc::new(
-                moltis_agents::provider_health::ProviderHealthTracker::default_window(),
+                moltis_agents::provider_health::ProviderHealthTracker::default(),
             ),
             seq: AtomicU64::new(0),
             tts_phrase_counter: AtomicUsize::new(0),
