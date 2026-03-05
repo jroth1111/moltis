@@ -476,14 +476,9 @@ fn deterministic_policy_error_tuple(
 fn enforce_deterministic_tool_policy(
     tools: &ToolRegistry,
     tool_name: &str,
-    args: &serde_json::Value,
+    allow_external_effects: bool,
     explicit_external_effect_intent: bool,
 ) -> Option<(bool, serde_json::Value, Option<String>)> {
-    let allow_external_effects = args
-        .get("_allow_external_effects")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-
     let Some(effect_class) = tools.side_effect_class(tool_name) else {
         return Some(deterministic_policy_error_tuple(
             POLICY_CODE_UNKNOWN_TOOL_SIDE_EFFECT,
@@ -946,6 +941,11 @@ pub async fn run_agent_loop_with_context(
     });
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
     let explicit_external_effect_intent = user_explicitly_authorizes_external_effect(user_content);
+    let allow_external_effects = tool_context
+        .as_ref()
+        .and_then(|ctx| ctx.get("_allow_external_effects"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
 
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
@@ -1301,6 +1301,7 @@ pub async fn run_agent_loop_with_context(
                 let tc_name = tc.name.clone();
                 let _tc_id = tc.id.clone();
                 let explicit_external_effect_intent = explicit_external_effect_intent;
+                let allow_external_effects = allow_external_effects;
 
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
@@ -1318,7 +1319,7 @@ pub async fn run_agent_loop_with_context(
                     if let Some(err_tuple) = enforce_deterministic_tool_policy(
                         tools,
                         &tc_name,
-                        &args,
+                        allow_external_effects,
                         explicit_external_effect_intent,
                     ) {
                         return err_tuple;
@@ -1359,7 +1360,7 @@ pub async fn run_agent_loop_with_context(
                     if let Some(err_tuple) = enforce_deterministic_tool_policy(
                         tools,
                         &tc_name,
-                        &args,
+                        allow_external_effects,
                         explicit_external_effect_intent,
                     ) {
                         return err_tuple;
@@ -1532,6 +1533,11 @@ pub async fn run_agent_loop_streaming(
     });
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
     let explicit_external_effect_intent = user_explicitly_authorizes_external_effect(user_content);
+    let allow_external_effects = tool_context
+        .as_ref()
+        .and_then(|ctx| ctx.get("_allow_external_effects"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
 
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
@@ -2019,6 +2025,7 @@ pub async fn run_agent_loop_streaming(
                 let session_key = session_key_for_hooks.clone();
                 let tc_name = tc.name.clone();
                 let explicit_external_effect_intent = explicit_external_effect_intent;
+                let allow_external_effects = allow_external_effects;
 
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
@@ -2036,7 +2043,7 @@ pub async fn run_agent_loop_streaming(
                     if let Some(err_tuple) = enforce_deterministic_tool_policy(
                         tools,
                         &tc_name,
-                        &args,
+                        allow_external_effects,
                         explicit_external_effect_intent,
                     ) {
                         return err_tuple;
@@ -2077,7 +2084,7 @@ pub async fn run_agent_loop_streaming(
                     if let Some(err_tuple) = enforce_deterministic_tool_policy(
                         tools,
                         &tc_name,
-                        &args,
+                        allow_external_effects,
                         explicit_external_effect_intent,
                     ) {
                         return err_tuple;
@@ -2199,6 +2206,7 @@ mod tests {
             tool_parsing::parse_tool_call_from_text,
         },
         async_trait::async_trait,
+        moltis_common::hooks::{HookEvent, HookHandler},
         std::pin::Pin,
         tokio_stream::Stream,
     };
@@ -2348,7 +2356,7 @@ mod tests {
         let unknown_tool = enforce_deterministic_tool_policy(
             &tools,
             "missing_tool",
-            &serde_json::json!({}),
+            true,
             true,
         )
         .expect("unknown tool should be rejected");
@@ -2360,7 +2368,7 @@ mod tests {
         let no_surface_permission = enforce_deterministic_tool_policy(
             &tools,
             "external_tool",
-            &serde_json::json!({"payload":"x","_allow_external_effects":false}),
+            false,
             true,
         )
         .expect("surface policy should reject external effects");
@@ -2372,7 +2380,7 @@ mod tests {
         let missing_intent = enforce_deterministic_tool_policy(
             &tools,
             "external_tool",
-            &serde_json::json!({"payload":"x","_allow_external_effects":true}),
+            true,
             false,
         )
         .expect("missing explicit intent should be rejected");
@@ -2390,6 +2398,244 @@ mod tests {
         assert_eq!(
             schema_invalid.1["policy_code"].as_str(),
             Some(POLICY_CODE_SCHEMA_INVALID)
+        );
+    }
+
+    struct ExternalAnyArgsTool {
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::tool_registry::AgentTool for ExternalAnyArgsTool {
+        fn name(&self) -> &str {
+            "external_any_args"
+        }
+
+        fn description(&self) -> &str {
+            "External effect tool with permissive args schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            // Accept any argument payload so policy gating remains the only guard.
+            serde_json::Value::Bool(true)
+        }
+
+        fn side_effect_class(&self) -> ToolEffectClass {
+            ToolEffectClass::ExternalEffect
+        }
+
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            self.executions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::json!({ "ok": true }))
+        }
+    }
+
+    struct StrictSchemaReadOnlyTool {
+        executions: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::tool_registry::AgentTool for StrictSchemaReadOnlyTool {
+        fn name(&self) -> &str {
+            "strict_schema_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Read-only tool with strict schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {"type": "string"}
+                },
+                "required": ["payload"],
+                "additionalProperties": false
+            })
+        }
+
+        fn side_effect_class(&self) -> ToolEffectClass {
+            ToolEffectClass::ReadOnly
+        }
+
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            self.executions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(serde_json::json!({ "ok": true }))
+        }
+    }
+
+    struct TwoTurnToolCallProvider {
+        tool_name: &'static str,
+        arguments: serde_json::Value,
+        expected_policy_code: &'static str,
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for TwoTurnToolCallProvider {
+        fn name(&self) -> &str {
+            "two-turn-policy-probe"
+        }
+
+        fn id(&self) -> &str {
+            "two-turn-policy-probe-model"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let turn = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if turn == 0 {
+                return Ok(CompletionResponse {
+                    text: Some("planning".to_string()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_policy_probe".to_string(),
+                        name: self.tool_name.to_string(),
+                        arguments: self.arguments.clone(),
+                    }],
+                    usage: Usage::default(),
+                });
+            }
+
+            let needle = format!(r#""policy_code":"{}""#, self.expected_policy_code);
+            let saw_policy_code = messages.iter().any(|msg| match msg {
+                ChatMessage::Tool { content, .. } => content.contains(&needle),
+                _ => false,
+            });
+            assert!(
+                saw_policy_code,
+                "expected policy code `{}` in tool message",
+                self.expected_policy_code
+            );
+
+            Ok(CompletionResponse {
+                text: Some("policy_blocked".to_string()),
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::iter(vec![StreamEvent::Done(Usage::default())]))
+        }
+    }
+
+    struct ForcePayloadHook {
+        payload: serde_json::Value,
+    }
+
+    #[async_trait]
+    impl HookHandler for ForcePayloadHook {
+        fn name(&self) -> &str {
+            "force-payload-hook"
+        }
+
+        fn events(&self) -> &[HookEvent] {
+            const EVENTS: [HookEvent; 1] = [HookEvent::BeforeToolCall];
+            &EVENTS
+        }
+
+        async fn handle(
+            &self,
+            _event: HookEvent,
+            _payload: &HookPayload,
+        ) -> moltis_common::error::Result<HookAction> {
+            Ok(HookAction::ModifyPayload(self.payload.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_effect_gate_uses_runtime_policy_not_mutable_args() {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(ExternalAnyArgsTool {
+            executions: Arc::clone(&executions),
+        }));
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(TwoTurnToolCallProvider {
+            tool_name: "external_any_args",
+            // Non-object args ensure runtime context keys cannot be merged
+            // into arguments; policy must still deny external effects.
+            arguments: serde_json::json!("attempt external mutation"),
+            expected_policy_code: POLICY_CODE_SURFACE_NON_PRIVATE,
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let result = run_agent_loop_with_context(
+            provider,
+            &tools,
+            "sys",
+            &UserContent::text("Please send this externally."),
+            None,
+            None,
+            Some(serde_json::json!({ "_allow_external_effects": false })),
+            None,
+        )
+        .await
+        .expect("agent loop should complete");
+
+        assert_eq!(result.text, "policy_blocked");
+        assert_eq!(result.tool_calls_made, 1);
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "tool execution must be blocked by runtime policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hook_modified_args_revalidated_post_hook() {
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(StrictSchemaReadOnlyTool {
+            executions: Arc::clone(&executions),
+        }));
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(TwoTurnToolCallProvider {
+            tool_name: "strict_schema_tool",
+            arguments: serde_json::json!({ "payload": "valid" }),
+            expected_policy_code: POLICY_CODE_SCHEMA_INVALID,
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let mut hooks = HookRegistry::new();
+        hooks.register(Arc::new(ForcePayloadHook {
+            payload: serde_json::json!({ "payload": 42 }),
+        }));
+
+        let result = run_agent_loop_with_context(
+            provider,
+            &tools,
+            "sys",
+            &UserContent::text("run the tool"),
+            None,
+            None,
+            None,
+            Some(Arc::new(hooks)),
+        )
+        .await
+        .expect("agent loop should complete");
+
+        assert_eq!(result.text, "policy_blocked");
+        assert_eq!(result.tool_calls_made, 1);
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "tool execution must be blocked after hook payload mutation"
         );
     }
 

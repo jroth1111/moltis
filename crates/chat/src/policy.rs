@@ -53,7 +53,9 @@ impl PromptPolicyEvaluation {
         self.decisions
             .iter()
             .find_map(|decision| match decision.code {
-                PolicyReasonCode::SurfacePrivate | PolicyReasonCode::SurfaceNonChannel => Some(true),
+                PolicyReasonCode::SurfacePrivate | PolicyReasonCode::SurfaceNonChannel => {
+                    Some(true)
+                },
                 PolicyReasonCode::SurfaceNonPrivate | PolicyReasonCode::SurfaceUnclassified => {
                     Some(false)
                 },
@@ -89,6 +91,19 @@ impl PromptPolicyEvaluation {
     }
 }
 
+fn private_persona_strip_transforms() -> Vec<PolicyTransform> {
+    vec![
+        PolicyTransform {
+            kind: "strip_private_persona_data",
+            detail: "remove USER.md private fields for non-private surfaces".to_string(),
+        },
+        PolicyTransform {
+            kind: "drop_memory_bootstrap",
+            detail: "exclude MEMORY.md bootstrap on non-private/unclassified surfaces".to_string(),
+        },
+    ]
+}
+
 pub fn evaluate_surface_policy(
     channel_type: Option<&str>,
     channel_chat_type: Option<&str>,
@@ -102,11 +117,11 @@ pub fn evaluate_surface_policy(
         return PromptPolicyEvaluation {
             decisions: vec![PolicyDecision {
                 code: PolicyReasonCode::SurfaceUnclassified,
-                outcome: PolicyOutcome::Deny,
+                outcome: PolicyOutcome::AllowWithTransforms,
                 detail: format!(
                     "channel surface '{channel_type}' has unknown chat type; fail-closed policy applied"
                 ),
-                transforms: Vec::new(),
+                transforms: private_persona_strip_transforms(),
             }],
         };
     };
@@ -134,11 +149,11 @@ pub fn evaluate_surface_policy(
     PromptPolicyEvaluation {
         decisions: vec![PolicyDecision {
             code: PolicyReasonCode::SurfaceNonPrivate,
-            outcome: PolicyOutcome::Deny,
+            outcome: PolicyOutcome::AllowWithTransforms,
             detail: format!(
                 "channel surface '{channel_type}' with chat type '{chat_type}' is non-private"
             ),
-            transforms: Vec::new(),
+            transforms: private_persona_strip_transforms(),
         }],
     }
 }
@@ -173,6 +188,11 @@ mod tests {
         assert!(!eval.include_private_persona_data());
         assert!(!eval.include_memory_bootstrap());
         assert!(!eval.allow_external_effects());
+        assert_eq!(
+            eval.decisions[0].outcome,
+            PolicyOutcome::AllowWithTransforms
+        );
+        assert!(!eval.decisions[0].transforms.is_empty());
     }
 
     #[test]
@@ -189,5 +209,10 @@ mod tests {
         assert!(!eval.include_private_persona_data());
         assert!(!eval.include_memory_bootstrap());
         assert!(!eval.allow_external_effects());
+        assert_eq!(
+            eval.decisions[0].outcome,
+            PolicyOutcome::AllowWithTransforms
+        );
+        assert!(!eval.decisions[0].transforms.is_empty());
     }
 }

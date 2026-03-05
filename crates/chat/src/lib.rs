@@ -1240,6 +1240,58 @@ fn policy_transforms_to_json(items: &[policy::PolicyDecision]) -> Vec<Value> {
         .collect()
 }
 
+fn emit_runtime_policy_decision_logs(
+    context: &str,
+    session_key: &str,
+    decisions: &[policy::PolicyDecision],
+) {
+    for decision in decisions {
+        if !matches!(
+            decision.outcome,
+            policy::PolicyOutcome::Deny | policy::PolicyOutcome::AllowWithTransforms
+        ) {
+            continue;
+        }
+        warn!(
+            context,
+            session_key,
+            code = ?decision.code,
+            outcome = ?decision.outcome,
+            detail = %decision.detail,
+            transform_count = decision.transforms.len(),
+            "runtime policy decision"
+        );
+    }
+}
+
+fn annotate_memory_relevance_decision(
+    runtime_policy: &mut policy::PromptPolicyEvaluation,
+    memory_source_present: bool,
+    selected_memory: Option<&str>,
+) {
+    if !memory_source_present || selected_memory.is_some() {
+        return;
+    }
+    runtime_policy.decisions.push(policy::PolicyDecision {
+        code: policy::PolicyReasonCode::MemoryIrrelevant,
+        outcome: policy::PolicyOutcome::Deny,
+        detail: "memory bootstrap was available but no fact met deterministic relevance threshold"
+            .to_string(),
+        transforms: Vec::new(),
+    });
+}
+
+fn emit_dropped_sections_metrics(_dropped_sections: &[DroppedPromptSection]) {
+    #[cfg(feature = "metrics")]
+    for item in _dropped_sections {
+        counter!(
+            "moltis_policy_dropped_sections_total",
+            labels::MODE => item.bucket.as_str().to_string()
+        )
+        .increment(1);
+    }
+}
+
 fn truncations_to_json(items: &[PromptSectionTruncation]) -> Vec<Value> {
     items
         .iter()
@@ -5368,7 +5420,7 @@ impl ChatService for LiveChatService {
         )
         .await;
         apply_request_runtime_context(&mut runtime_context.host, &params);
-        let runtime_policy = policy::evaluate_runtime_policy(Some(&runtime_context));
+        let mut runtime_policy = policy::evaluate_runtime_policy(Some(&runtime_context));
 
         // Resolve project context.
         let project_context = self
@@ -5383,6 +5435,12 @@ impl ChatService for LiveChatService {
             memory_query,
             &persona.config.chat.deterministic_policy,
         );
+        annotate_memory_relevance_decision(
+            &mut runtime_policy,
+            persona.memory_text.is_some(),
+            selected_memory.as_deref(),
+        );
+        emit_runtime_policy_decision_logs("raw_prompt", &session_key, &runtime_policy.decisions);
         let truncations = collect_prompt_section_truncations(
             project_context.as_deref(),
             persona.soul_text.as_deref(),
@@ -5401,14 +5459,7 @@ impl ChatService for LiveChatService {
             selected_memory.as_deref(),
             Some(&persona.config.chat.prompt_budgets),
         );
-        #[cfg(feature = "metrics")]
-        for item in &dropped_sections {
-            counter!(
-                "moltis_policy_dropped_sections_total",
-                labels::MODE => item.bucket.as_str().to_string()
-            )
-            .increment(1);
-        }
+        emit_dropped_sections_metrics(&dropped_sections);
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -5550,7 +5601,7 @@ impl ChatService for LiveChatService {
         )
         .await;
         apply_request_runtime_context(&mut runtime_context.host, &params);
-        let runtime_policy = policy::evaluate_runtime_policy(Some(&runtime_context));
+        let mut runtime_policy = policy::evaluate_runtime_policy(Some(&runtime_context));
 
         // Resolve project context.
         let project_context = self
@@ -5565,6 +5616,12 @@ impl ChatService for LiveChatService {
             memory_query,
             &persona.config.chat.deterministic_policy,
         );
+        annotate_memory_relevance_decision(
+            &mut runtime_policy,
+            persona.memory_text.is_some(),
+            selected_memory.as_deref(),
+        );
+        emit_runtime_policy_decision_logs("full_context", &session_key, &runtime_policy.decisions);
         let truncations = collect_prompt_section_truncations(
             project_context.as_deref(),
             persona.soul_text.as_deref(),
@@ -5583,14 +5640,7 @@ impl ChatService for LiveChatService {
             selected_memory.as_deref(),
             Some(&persona.config.chat.prompt_budgets),
         );
-        #[cfg(feature = "metrics")]
-        for item in &dropped_sections {
-            counter!(
-                "moltis_policy_dropped_sections_total",
-                labels::MODE => item.bucket.as_str().to_string()
-            )
-            .increment(1);
-        }
+        emit_dropped_sections_metrics(&dropped_sections);
 
         // Discover skills.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -6745,7 +6795,7 @@ async fn run_with_tools(
         broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
         return None;
     }
-    let runtime_policy = policy::evaluate_runtime_policy(runtime_context);
+    let mut runtime_policy = policy::evaluate_runtime_policy(runtime_context);
     apply_private_persona_data_policy(
         &mut persona,
         runtime_policy.include_private_persona_data(),
@@ -6757,6 +6807,22 @@ async fn run_with_tools(
         &memory_query,
         &persona.config.chat.deterministic_policy,
     );
+    annotate_memory_relevance_decision(
+        &mut runtime_policy,
+        persona.memory_text.is_some(),
+        selected_memory.as_deref(),
+    );
+    emit_runtime_policy_decision_logs("run_with_tools", session_key, &runtime_policy.decisions);
+    let dropped_sections = collect_dropped_prompt_sections(
+        project_context,
+        persona.soul_text.as_deref(),
+        persona.agents_text.as_deref(),
+        persona.tools_text.as_deref(),
+        persona.heartbeat_text.as_deref(),
+        selected_memory.as_deref(),
+        Some(&persona.config.chat.prompt_budgets),
+    );
+    emit_dropped_sections_metrics(&dropped_sections);
 
     let tool_mode = effective_tool_mode(&*provider);
     let native_tools = matches!(tool_mode, ToolMode::Native);
@@ -7741,7 +7807,7 @@ async fn run_streaming(
         broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
         return None;
     }
-    let runtime_policy = policy::evaluate_runtime_policy(runtime_context);
+    let mut runtime_policy = policy::evaluate_runtime_policy(runtime_context);
     apply_private_persona_data_policy(
         &mut persona,
         runtime_policy.include_private_persona_data(),
@@ -7753,6 +7819,22 @@ async fn run_streaming(
         &memory_query,
         &persona.config.chat.deterministic_policy,
     );
+    annotate_memory_relevance_decision(
+        &mut runtime_policy,
+        persona.memory_text.is_some(),
+        selected_memory.as_deref(),
+    );
+    emit_runtime_policy_decision_logs("run_streaming", session_key, &runtime_policy.decisions);
+    let dropped_sections = collect_dropped_prompt_sections(
+        project_context,
+        persona.soul_text.as_deref(),
+        persona.agents_text.as_deref(),
+        persona.tools_text.as_deref(),
+        persona.heartbeat_text.as_deref(),
+        selected_memory.as_deref(),
+        Some(&persona.config.chat.prompt_budgets),
+    );
+    emit_dropped_sections_metrics(&dropped_sections);
 
     let system_prompt = build_system_prompt_minimal_runtime_workspace_budgets(
         project_context,

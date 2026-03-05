@@ -2932,6 +2932,73 @@ No fluff.
         assert_eq!(proactive_disposition_count, 1);
     }
 
+    fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.is_empty() {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for idx in 0..items.len() {
+            let mut rest = items.to_vec();
+            let item = rest.remove(idx);
+            for mut tail in permutations(&rest) {
+                let mut combined = vec![item.clone()];
+                combined.append(&mut tail);
+                out.push(combined);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_prepare_soul_sections_permutations_preserve_one_to_one_section_placement() {
+        let blocks: [(&str, &str); 4] = [
+            (
+                "<!-- lane:agents -->\n## Work Style\n- Understand -> Execute -> Verify -> Report.",
+                "## Work Style",
+            ),
+            (
+                "<!-- lane:tools -->\n## Routing Defaults\n- Use browser for web tasks.",
+                "## Routing Defaults",
+            ),
+            (
+                "<!-- lane:heartbeat -->\n## Proactive Disposition\n- Run heartbeat checks hourly.",
+                "## Proactive Disposition",
+            ),
+            ("## Identity\nI am calm and direct.", "## Identity"),
+        ];
+
+        let all_orders = permutations(&blocks);
+        assert_eq!(all_orders.len(), 24, "expected 4! permutations");
+
+        for (idx, order) in all_orders.iter().enumerate() {
+            let mut soul = String::from("# SOUL.md\n\n");
+            for (block, _) in order {
+                soul.push_str(block);
+                soul.push_str("\n\n");
+            }
+
+            let prepared = prepare_soul_sections(&soul);
+            let combined = [
+                prepared.identity_soul_text.as_str(),
+                prepared.redistributed_agents_text.as_deref().unwrap_or_default(),
+                prepared.redistributed_tools_text.as_deref().unwrap_or_default(),
+                prepared
+                    .redistributed_heartbeat_text
+                    .as_deref()
+                    .unwrap_or_default(),
+            ]
+            .join("\n\n");
+
+            for (_, heading) in blocks {
+                let count = combined.matches(heading).count();
+                assert_eq!(
+                    count, 1,
+                    "heading `{heading}` must appear exactly once in permutation {idx}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_prepare_soul_sections_without_lane_markers_stays_in_soul_lane() {
         let soul = r#"
