@@ -1255,6 +1255,146 @@ fn parse_explicit_shell_command(text: &str) -> Option<&str> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ExplicitSkillInvocation {
+    name: String,
+    rendered_prompt: String,
+    allowed_tools: Vec<String>,
+}
+
+fn parse_explicit_skill_command(text: &str) -> Option<(String, String)> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix('/')?;
+    let command_token = rest.split_whitespace().next()?;
+    let skill_name = command_token
+        .split('@')
+        .next()
+        .unwrap_or(command_token)
+        .trim();
+
+    if skill_name.eq_ignore_ascii_case("sh") || !moltis_skills::parse::validate_name(skill_name) {
+        return None;
+    }
+
+    let args = rest[command_token.len()..].trim().to_string();
+    Some((skill_name.to_string(), args))
+}
+
+fn extract_skill_body(markdown: &str) -> String {
+    let trimmed = markdown.trim_start();
+    if !trimmed.starts_with("---") {
+        return trimmed.trim().to_string();
+    }
+
+    let after_open = &trimmed[3..];
+    if let Some(close_pos) = after_open.find("\n---") {
+        return after_open[close_pos + 4..].trim().to_string();
+    }
+
+    trimmed.trim().to_string()
+}
+
+fn skill_markdown_path(skill: &moltis_skills::types::SkillMetadata) -> Option<PathBuf> {
+    if skill.path.is_file() {
+        return Some(skill.path.clone());
+    }
+
+    let path = skill.path.join("SKILL.md");
+    path.is_file().then_some(path)
+}
+
+fn load_skill_body(skill: &moltis_skills::types::SkillMetadata) -> Option<String> {
+    let path = skill_markdown_path(skill)?;
+    let markdown = std::fs::read_to_string(path).ok()?;
+    let body = extract_skill_body(&markdown);
+    if body.is_empty() {
+        None
+    } else {
+        Some(body)
+    }
+}
+
+fn render_skill_body_with_arguments(body: &str, arguments: &str) -> String {
+    let argument_tokens: Vec<&str> = arguments.split_whitespace().collect();
+    let mut rendered = String::with_capacity(body.len() + arguments.len() + 32);
+    let mut idx = 0usize;
+    let body_bytes = body.as_bytes();
+
+    while idx < body_bytes.len() {
+        if body_bytes[idx] == b'$' {
+            let suffix = &body[idx..];
+            if let Some(rest) = suffix.strip_prefix("$ARGUMENTS[") {
+                let mut end = 0usize;
+                while end < rest.len() && rest.as_bytes()[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > 0 && rest.as_bytes().get(end) == Some(&b']') {
+                    let index = rest[..end].parse::<usize>().unwrap_or(usize::MAX);
+                    rendered.push_str(argument_tokens.get(index).copied().unwrap_or(""));
+                    idx += "$ARGUMENTS[".len() + end + 1;
+                    continue;
+                }
+            }
+
+            if suffix.starts_with("$ARGUMENTS") {
+                rendered.push_str(arguments);
+                idx += "$ARGUMENTS".len();
+                continue;
+            }
+
+            let mut digit_end = idx + 1;
+            while digit_end < body_bytes.len() && body_bytes[digit_end].is_ascii_digit() {
+                digit_end += 1;
+            }
+            if digit_end > idx + 1 {
+                let index = body[idx + 1..digit_end]
+                    .parse::<usize>()
+                    .unwrap_or(usize::MAX);
+                rendered.push_str(argument_tokens.get(index).copied().unwrap_or(""));
+                idx = digit_end;
+                continue;
+            }
+        }
+
+        let ch = body[idx..].chars().next().unwrap_or_default();
+        rendered.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    if !arguments.is_empty() && !body.contains("$ARGUMENTS") {
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        if !rendered.ends_with("\n\n") {
+            rendered.push('\n');
+        }
+        rendered.push_str("ARGUMENTS: ");
+        rendered.push_str(arguments);
+    }
+
+    rendered
+}
+
+fn resolve_explicit_skill_invocation(
+    text: &str,
+    discovered_skills: &[moltis_skills::types::SkillMetadata],
+) -> Option<ExplicitSkillInvocation> {
+    let (skill_name, arguments) = parse_explicit_skill_command(text)?;
+    let skill = discovered_skills.iter().find(|skill| skill.name == skill_name)?;
+    let skill_body = load_skill_body(skill)?;
+    let rendered_body = render_skill_body_with_arguments(&skill_body, &arguments);
+    let rendered_prompt = format!(
+        "The user explicitly invoked `/{}`. Execute this skill now.\n\n{}",
+        skill.name, rendered_body
+    );
+
+    Some(ExplicitSkillInvocation {
+        name: skill.name.clone(),
+        rendered_prompt,
+        allowed_tools: skill.allowed_tools.clone(),
+    })
+}
+
 fn capped_tool_result_payload(result: &Value, max_len: usize) -> Value {
     let mut capped = result.clone();
     for field in &["stdout", "stderr"] {
@@ -4144,7 +4284,11 @@ impl ChatService for LiveChatService {
 
         // Convert session-crate content to agents-crate content for the LLM.
         // Must happen before `message_content` is moved into `user_msg`.
-        let user_content = to_user_content(&message_content);
+        let mut user_content = to_user_content(&message_content);
+        let explicit_skill_candidate = match &message_content {
+            MessageContent::Text(raw) => Some(raw.clone()),
+            MessageContent::Multimodal(_) => None,
+        };
 
         // Build the user message for later persistence (deferred until we
         // know the message won't be queued — avoids double-persist when a
@@ -4243,6 +4387,21 @@ impl ChatService for LiveChatService {
                 Vec::new()
             },
         };
+        let explicit_skill_invocation = explicit_skill_candidate
+            .as_deref()
+            .and_then(|text| resolve_explicit_skill_invocation(text, &discovered_skills));
+        if let Some(invocation) = explicit_skill_invocation.as_ref() {
+            info!(
+                run_id = %run_id,
+                session = %session_key,
+                skill = %invocation.name,
+                "resolved explicit skill invocation"
+            );
+            user_content = UserContent::text(&invocation.rendered_prompt);
+        }
+        let explicit_skill_allowed_tools = explicit_skill_invocation
+            .as_ref()
+            .map(|invocation| invocation.allowed_tools.clone());
 
         // Check if MCP tools are disabled for this session and capture
         // per-session sandbox override details for prompt runtime context.
@@ -4888,6 +5047,7 @@ impl ChatService for LiveChatService {
                         Some(&runtime_context),
                         user_message_index,
                         &discovered_skills,
+                        explicit_skill_allowed_tools.as_deref(),
                         hook_registry,
                         accept_language.clone(),
                         conn_id.clone(),
@@ -5164,6 +5324,29 @@ impl ChatService for LiveChatService {
         .await;
         apply_request_runtime_context(&mut runtime_context.host, &params);
 
+        // Discover enabled skills/plugins for prompt injection and explicit
+        // `/skill-name` invocation handling.
+        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
+        let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
+        let discovered_skills = match discoverer.discover().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("failed to discover skills: {e}");
+                Vec::new()
+            },
+        };
+        let explicit_skill_invocation = resolve_explicit_skill_invocation(&text, &discovered_skills);
+        if let Some(invocation) = explicit_skill_invocation.as_ref() {
+            info!(
+                session = %session_key,
+                skill = %invocation.name,
+                "resolved explicit skill invocation in send_sync"
+            );
+        }
+        let explicit_skill_allowed_tools = explicit_skill_invocation
+            .as_ref()
+            .map(|invocation| invocation.allowed_tools.clone());
+
         // Load conversation history (excluding the message we just appended).
         let mut history = self
             .session_store
@@ -5214,7 +5397,11 @@ impl ChatService for LiveChatService {
         }
 
         // send_sync is text-only (used by API calls and channels).
-        let user_content = UserContent::text(&text);
+        let user_content = if let Some(invocation) = explicit_skill_invocation.as_ref() {
+            UserContent::text(&invocation.rendered_prompt)
+        } else {
+            UserContent::text(&text)
+        };
         let _self_repair_guard = SelfRepairGuard::new(self.state_store.as_ref(), &session_key);
         _self_repair_guard.mark_started().await;
         let result = if stream_only {
@@ -5233,7 +5420,7 @@ impl ChatService for LiveChatService {
                 None,
                 None,
                 user_message_index,
-                &[],
+                &discovered_skills,
                 Some(&runtime_context),
                 Some(&self.session_store),
                 self.state_store.as_ref(),
@@ -5259,7 +5446,8 @@ impl ChatService for LiveChatService {
                 None,
                 Some(&runtime_context),
                 user_message_index,
-                &[],
+                &discovered_skills,
+                explicit_skill_allowed_tools.as_deref(),
                 hook_registry,
                 None,
                 None, // send_sync: no conn_id
@@ -8192,6 +8380,7 @@ async fn run_with_tools(
     runtime_context: Option<&PromptRuntimeContext>,
     user_message_index: usize,
     skills: &[moltis_skills::types::SkillMetadata],
+    explicit_skill_allowed_tools: Option<&[String]>,
     hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
     accept_language: Option<String>,
     conn_id: Option<String>,
@@ -8226,6 +8415,27 @@ async fn run_with_tools(
             agent_id,
             Arc::clone(&provider),
         );
+    }
+    if tools_enabled && let Some(allowed_specs) = explicit_skill_allowed_tools {
+        let tool_names = filtered_registry.list_names();
+        let tool_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+        let resolved = moltis_skills::attenuation::resolve_allowed_tools(allowed_specs, &tool_refs);
+        let allowed_set: HashSet<String> = resolved
+            .matched_tools
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+
+        filtered_registry = filtered_registry.clone_allowed_by(|name| allowed_set.contains(name));
+
+        if !resolved.unmatched_specs.is_empty() {
+            warn!(
+                run_id = %run_id,
+                session = %session_key,
+                unmatched_specs = ?resolved.unmatched_specs,
+                "explicit skill allowed-tools specs did not match runtime tools"
+            );
+        }
     }
 
     // Build system prompt:
@@ -11526,6 +11736,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_explicit_skill_command_extracts_name_and_args() {
+        assert_eq!(
+            parse_explicit_skill_command("/deploy production now"),
+            Some(("deploy".to_string(), "production now".to_string()))
+        );
+        assert_eq!(
+            parse_explicit_skill_command("/deploy@moltisbot 123"),
+            Some(("deploy".to_string(), "123".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_explicit_skill_command_rejects_invalid_inputs() {
+        assert!(parse_explicit_skill_command("/sh ls").is_none());
+        assert!(parse_explicit_skill_command("/BadSkill").is_none());
+        assert!(parse_explicit_skill_command("deploy").is_none());
+    }
+
+    #[test]
+    fn extract_skill_body_removes_frontmatter() {
+        let markdown = r#"---
+name: test
+description: demo
+---
+
+Do this.
+"#;
+        assert_eq!(extract_skill_body(markdown), "Do this.");
+    }
+
+    #[test]
+    fn render_skill_body_with_arguments_substitutes_placeholders() {
+        let body = "Fix $0 in $1.\nAll: $ARGUMENTS\nFirst: $ARGUMENTS[0]";
+        let rendered = render_skill_body_with_arguments(body, "issue-12 src/lib.rs");
+
+        assert!(rendered.contains("Fix issue-12 in src/lib.rs."));
+        assert!(rendered.contains("All: issue-12 src/lib.rs"));
+        assert!(rendered.contains("First: issue-12"));
+    }
+
+    #[test]
+    fn render_skill_body_with_arguments_appends_arguments_when_unreferenced() {
+        let rendered = render_skill_body_with_arguments("Run checks.", "issue-99");
+        assert!(rendered.contains("Run checks."));
+        assert!(rendered.contains("ARGUMENTS: issue-99"));
+    }
+
+    #[test]
     fn prompt_now_for_timezone_returns_non_empty_string() {
         let value = prompt_now_for_timezone(Some("UTC"));
         assert!(!value.is_empty());
@@ -13284,12 +13542,16 @@ mod tests {
         cfg.tools.policy.allow = vec!["exec".into(), "web_fetch".into(), "create_skill".into()];
 
         let skills = vec![moltis_skills::types::SkillMetadata {
+            version: 3,
             name: "my-skill".into(),
             description: "test".into(),
+            triggers: Default::default(),
+            evals: Default::default(),
+            permissions: Default::default(),
+            homepage: None,
             license: None,
             compatibility: None,
             allowed_tools: vec!["Bash(git:*)".into()],
-            homepage: None,
             dockerfile: None,
             requires: Default::default(),
             path: PathBuf::new(),
@@ -13317,12 +13579,16 @@ mod tests {
         cfg.tools.policy.allow = vec!["create_skill".into(), "web_fetch".into()];
 
         let skills = vec![moltis_skills::types::SkillMetadata {
+            version: 3,
             name: "weather".into(),
             description: "weather checker".into(),
+            triggers: Default::default(),
+            evals: Default::default(),
+            permissions: Default::default(),
+            homepage: None,
             license: None,
             compatibility: None,
             allowed_tools: vec!["WebFetch".into()],
-            homepage: None,
             dockerfile: None,
             requires: Default::default(),
             path: PathBuf::new(),
@@ -14659,6 +14925,7 @@ mod tests {
                 text: self.response_text.clone(),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 
@@ -14707,6 +14974,7 @@ mod tests {
                 text: Some(text),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 
@@ -14755,6 +15023,7 @@ mod tests {
                 text: Some(text),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 
