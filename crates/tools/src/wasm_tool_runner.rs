@@ -18,10 +18,10 @@ use {
 
 #[cfg(feature = "wasm")]
 use crate::{
+    tool_names::WEB_FETCH,
     wasm_component::{HttpHostImpl, HttpToolResult, PureToolResult, http_tool, pure_tool},
     wasm_engine::{WasmComponentEngine, hash_component_bytes},
-    wasm_limits::WasmResourceLimiter},
-    tool_names::WEB_FETCH,
+    wasm_limits::WasmResourceLimiter,
 };
 
 // ---------------------------------------------------------------------------
