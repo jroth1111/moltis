@@ -1,7 +1,7 @@
 //! McpManager: lifecycle management for multiple MCP server connections.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -47,6 +47,7 @@ pub struct ServerStatus {
 pub struct McpManagerInner {
     pub clients: HashMap<String, Arc<RwLock<dyn McpClientTrait>>>,
     pub tools: HashMap<String, Vec<McpToolDef>>,
+    tool_outcomes: HashMap<String, ToolOutcomeStats>,
     tool_search_cache: HashMap<SearchCacheKey, SearchCacheEntry>,
     tool_describe_cache: HashMap<DescribeCacheKey, DescribeCacheEntry>,
     pub registry: McpRegistry,
@@ -58,20 +59,35 @@ pub struct McpManagerInner {
 pub struct McpManager {
     pub inner: RwLock<McpManagerInner>,
     tool_cache_ttl: Duration,
+    search_server_priors: HashMap<String, i32>,
+    search_success_weight: i32,
+    search_semantic_weight: i32,
 }
 
 /// Manager options controlling runtime behavior.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct McpManagerOptions {
     pub tool_summary_cache_ttl_secs: u64,
+    pub search_server_priors: HashMap<String, i32>,
+    pub search_success_weight: i32,
+    pub search_semantic_weight: i32,
 }
 
 impl Default for McpManagerOptions {
     fn default() -> Self {
         Self {
             tool_summary_cache_ttl_secs: 300,
+            search_server_priors: HashMap::new(),
+            search_success_weight: 120,
+            search_semantic_weight: 60,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolOutcomeStats {
+    success_count: u64,
+    failure_count: u64,
 }
 
 /// Detail level for MCP tool search responses.
@@ -137,12 +153,16 @@ impl McpManager {
             inner: RwLock::new(McpManagerInner {
                 clients: HashMap::new(),
                 tools: HashMap::new(),
+                tool_outcomes: HashMap::new(),
                 tool_search_cache: HashMap::new(),
                 tool_describe_cache: HashMap::new(),
                 registry,
                 auth_providers: HashMap::new(),
             }),
             tool_cache_ttl: Duration::from_secs(ttl_secs),
+            search_server_priors: options.search_server_priors,
+            search_success_weight: options.search_success_weight.max(0),
+            search_semantic_weight: options.search_semantic_weight.max(0),
         }
     }
 
@@ -153,6 +173,49 @@ impl McpManager {
     fn clear_tool_caches(inner: &mut McpManagerInner) {
         inner.tool_search_cache.clear();
         inner.tool_describe_cache.clear();
+    }
+
+    fn semantic_tokenize(input: &str) -> HashSet<String> {
+        input
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|token| !token.trim().is_empty())
+            .map(|token| token.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn semantic_match_score(query: &str, text: &str) -> i32 {
+        let query_tokens = Self::semantic_tokenize(query);
+        if query_tokens.is_empty() {
+            return 0;
+        }
+        let text_tokens = Self::semantic_tokenize(text);
+        if text_tokens.is_empty() {
+            return 0;
+        }
+        let overlap = query_tokens.intersection(&text_tokens).count() as f64;
+        let union = query_tokens.union(&text_tokens).count() as f64;
+        if union <= 0.0 {
+            return 0;
+        }
+        ((overlap / union) * 100.0).round() as i32
+    }
+
+    fn tool_outcome_key(server: &str, tool: &str) -> String {
+        format!("{server}::{tool}")
+    }
+
+    pub async fn record_tool_outcome(&self, server: &str, tool: &str, success: bool) {
+        let mut inner = self.inner.write().await;
+        let key = Self::tool_outcome_key(server, tool);
+        let stats = inner.tool_outcomes.entry(key).or_default();
+        if success {
+            stats.success_count = stats.success_count.saturating_add(1);
+        } else {
+            stats.failure_count = stats.failure_count.saturating_add(1);
+        }
+        inner
+            .tool_search_cache
+            .retain(|_, entry| Self::cache_is_fresh(entry.created_at, self.tool_cache_ttl));
     }
 
     fn build_auth_provider(
@@ -559,6 +622,27 @@ impl McpManager {
                         score += 25;
                     }
                 }
+                let semantic_score =
+                    Self::semantic_match_score(&q, format!("{} {}", tool.name, desc).as_str());
+                score += semantic_score.saturating_mul(self.search_semantic_weight) / 100;
+
+                let key = Self::tool_outcome_key(server_name, &tool.name);
+                if let Some(stats) = inner.tool_outcomes.get(&key) {
+                    let success = stats.success_count as i64;
+                    let failure = stats.failure_count as i64;
+                    let weighted = ((success * 3) - (failure * 2)).clamp(
+                        -(self.search_success_weight as i64),
+                        self.search_success_weight as i64,
+                    );
+                    score += weighted as i32;
+                }
+
+                score += self
+                    .search_server_priors
+                    .get(server_name)
+                    .copied()
+                    .unwrap_or_default();
+
                 if score > 0 {
                     let description = match detail_level {
                         ToolDetailLevel::Name => None,
@@ -654,16 +738,21 @@ impl McpManager {
         tool: &str,
         arguments: serde_json::Value,
     ) -> Result<ToolsCallResult> {
-        let client = {
-            let inner = self.inner.read().await;
-            inner.clients.get(server).cloned().ok_or_else(|| {
-                McpManagerError::ServerNotFound {
-                    server: server.to_string(),
-                }
-            })?
-        };
+        let client =
+            {
+                let inner = self.inner.read().await;
+                inner.clients.get(server).cloned().ok_or_else(|| {
+                    McpManagerError::ServerNotFound {
+                        server: server.to_string(),
+                    }
+                })?
+            };
         let c = client.read().await;
-        c.call_tool(tool, arguments).await
+        let result = c.call_tool(tool, arguments).await;
+        if result.is_err() {
+            self.record_tool_outcome(server, tool, false).await;
+        }
+        result
     }
 
     // ── Registry operations ─────────────────────────────────────────
@@ -997,5 +1086,77 @@ mod tests {
             err,
             Error::Manager(McpManagerError::ServerNotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_historical_success_affects_rank() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "filesystem".to_string(),
+                vec![
+                    McpToolDef {
+                        name: "read_file".to_string(),
+                        description: Some("Read files".to_string()),
+                        input_schema: serde_json::json!({}),
+                    },
+                    McpToolDef {
+                        name: "search_file".to_string(),
+                        description: Some("Search file text".to_string()),
+                        input_schema: serde_json::json!({}),
+                    },
+                ],
+            );
+        }
+        mgr.record_tool_outcome("filesystem", "search_file", true)
+            .await;
+        mgr.record_tool_outcome("filesystem", "search_file", true)
+            .await;
+        mgr.record_tool_outcome("filesystem", "read_file", false)
+            .await;
+
+        let results = mgr
+            .search_tools("file", Some("filesystem"), 5, ToolDetailLevel::Summary)
+            .await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "search_file");
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_server_prior_affects_rank() {
+        let mut priors = HashMap::new();
+        priors.insert("preferred".to_string(), 50);
+        let mgr = McpManager::new_with_options(
+            McpRegistry::new(),
+            McpManagerOptions {
+                search_server_priors: priors,
+                ..McpManagerOptions::default()
+            },
+        );
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "preferred".to_string(),
+                vec![McpToolDef {
+                    name: "lookup".to_string(),
+                    description: Some("lookup".to_string()),
+                    input_schema: serde_json::json!({}),
+                }],
+            );
+            inner.tools.insert(
+                "other".to_string(),
+                vec![McpToolDef {
+                    name: "lookup".to_string(),
+                    description: Some("lookup".to_string()),
+                    input_schema: serde_json::json!({}),
+                }],
+            );
+        }
+        let results = mgr
+            .search_tools("lookup", None, 5, ToolDetailLevel::Name)
+            .await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].server, "preferred");
     }
 }

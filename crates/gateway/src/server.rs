@@ -1451,6 +1451,9 @@ pub async fn prepare_gateway(
             merged,
             moltis_mcp::McpManagerOptions {
                 tool_summary_cache_ttl_secs: config.mcp.code.tool_summary_cache_ttl_secs,
+                search_server_priors: config.mcp.code.search_server_priors.clone(),
+                search_success_weight: config.mcp.code.search_success_weight,
+                search_semantic_weight: config.mcp.code.search_semantic_weight,
             },
         ));
         live_mcp = Arc::new(crate::mcp_service::LiveMcpService::new(Arc::clone(
