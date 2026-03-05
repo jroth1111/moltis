@@ -1375,6 +1375,16 @@ pub struct McpCodeConfig {
     pub enabled: bool,
     /// Max wall-clock time per code execution run.
     pub timeout_ms: u64,
+    /// Optional allowlist of server names for MCP code execution.
+    pub allow_servers: Vec<String>,
+    /// Optional denylist of server names for MCP code execution.
+    pub deny_servers: Vec<String>,
+    /// Optional allowlist of tool selectors (`server::tool`) for MCP code execution.
+    pub allow_tools: Vec<String>,
+    /// Optional denylist of tool selectors (`server::tool`) for MCP code execution.
+    pub deny_tools: Vec<String>,
+    /// Redact common PII patterns from model-visible MCP execution output.
+    pub redact_pii: bool,
     /// Max steps permitted in a single program.
     pub max_steps: usize,
     /// Max MCP tool calls permitted in a single run.
@@ -1392,6 +1402,11 @@ impl Default for McpCodeConfig {
         Self {
             enabled: true,
             timeout_ms: 45_000,
+            allow_servers: Vec::new(),
+            deny_servers: Vec::new(),
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
+            redact_pii: true,
             max_steps: 32,
             max_tool_calls: 64,
             max_stdout_bytes: 64 * 1024,
@@ -3363,6 +3378,11 @@ tool_mode = "native"
         let cfg = McpCodeConfig::default();
         assert!(cfg.enabled);
         assert!(cfg.timeout_ms >= 1_000);
+        assert!(cfg.allow_servers.is_empty());
+        assert!(cfg.deny_servers.is_empty());
+        assert!(cfg.allow_tools.is_empty());
+        assert!(cfg.deny_tools.is_empty());
+        assert!(cfg.redact_pii);
         assert!(cfg.max_steps > 0);
         assert!(cfg.max_tool_calls >= cfg.max_steps);
         assert!(cfg.max_stdout_bytes > 0);
@@ -3384,6 +3404,11 @@ tool_mode = "native"
 [mcp.code]
 enabled = true
 timeout_ms = 120000
+allow_servers = ["filesystem", "github"]
+deny_servers = ["legacy-test"]
+allow_tools = ["filesystem::read_file", "github::search_code"]
+deny_tools = ["filesystem::delete_file"]
+redact_pii = false
 max_steps = 12
 max_tool_calls = 24
 max_stdout_bytes = 8192
@@ -3398,6 +3423,23 @@ allow_servers = ["filesystem", "github"]
         let config: MoltisConfig = toml::from_str(toml_str).unwrap();
         assert!(config.mcp.code.enabled);
         assert_eq!(config.mcp.code.timeout_ms, 120_000);
+        assert_eq!(
+            config.mcp.code.allow_servers,
+            vec!["filesystem".to_string(), "github".to_string()]
+        );
+        assert_eq!(config.mcp.code.deny_servers, vec!["legacy-test".to_string()]);
+        assert_eq!(
+            config.mcp.code.allow_tools,
+            vec![
+                "filesystem::read_file".to_string(),
+                "github::search_code".to_string()
+            ]
+        );
+        assert_eq!(
+            config.mcp.code.deny_tools,
+            vec!["filesystem::delete_file".to_string()]
+        );
+        assert!(!config.mcp.code.redact_pii);
         assert_eq!(config.mcp.code.max_steps, 12);
         assert_eq!(config.mcp.code.max_tool_calls, 24);
         assert_eq!(config.mcp.code.max_stdout_bytes, 8_192);

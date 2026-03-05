@@ -496,6 +496,11 @@ auto_load = []                    # Skills to always load without explicit activ
 [mcp.code]
 enabled = true                   # Force MCP workflows through the code executor
 timeout_ms = 45000              # Max runtime per code execution request
+allow_servers = []              # Optional server allowlist for code mode
+deny_servers = []               # Optional server denylist for code mode
+allow_tools = []                # Optional tool allowlist ("server::tool")
+deny_tools = []                 # Optional tool denylist ("server::tool")
+redact_pii = true               # Redact email/phone/SSN-like data from model-visible output
 max_steps = 32                  # Max orchestration steps
 max_tool_calls = 64             # Max MCP tool calls in one run
 max_stdout_bytes = 65536        # Max stdout bytes retained from execution
