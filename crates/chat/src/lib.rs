@@ -405,6 +405,22 @@ fn dropped_messages_for_retention(history: &[Value], retained: &[Value]) -> Vec<
 }
 
 #[must_use]
+fn compaction_failure_fallback_reduction(
+    history: &[Value],
+    compaction_config: compaction::ContextCompactionConfig,
+    context_window: u64,
+) -> Option<compaction::ImportanceRetentionResult> {
+    if history.is_empty() {
+        return None;
+    }
+    let reduction = retain_with_importance(
+        history,
+        emergency_reduction_plan(compaction_config, context_window),
+    );
+    (reduction.removed_messages > 0).then_some(reduction)
+}
+
+#[must_use]
 fn compaction_summary_chars(history: &[Value]) -> usize {
     history
         .first()
@@ -4518,29 +4534,77 @@ impl ChatService for LiveChatService {
                         .await;
                     },
                     Err(e) => {
-                        warn!(session = %session_key, error = %e, "auto-compact failed, proceeding with full history");
-                        broadcast(
-                            &self.state,
-                            "chat",
-                            serde_json::json!({
-                                "sessionKey": session_key,
-                                "state": "auto_compact",
-                                "phase": "error",
-                                "reason": "threshold_soft",
-                                "layerStats": {
-                                    "criticalAnchors": layer_stats.critical_anchor_messages,
-                                    "working": layer_stats.working_messages,
-                                    "background": layer_stats.background_messages,
-                                },
-                                "anchorCount": layer_stats.critical_anchor_messages,
-                                "summaryChars": 0,
-                                "messagesRemoved": 0,
-                                "messagesKept": history.len(),
-                                "error": e.to_string(),
-                            }),
-                            BroadcastOpts::default(),
-                        )
-                        .await;
+                        warn!(session = %session_key, error = %e, "auto-compact failed, attempting deterministic fallback reduction");
+                        let mut fallback_applied = false;
+                        if let Some(fallback) = compaction_failure_fallback_reduction(
+                            &history,
+                            compaction_config,
+                            context_window,
+                        ) {
+                            if let Err(fallback_error) = self
+                                .session_store
+                                .replace_history(&session_key, fallback.messages.clone())
+                                .await
+                            {
+                                warn!(
+                                    session = %session_key,
+                                    error = %fallback_error,
+                                    "auto-compact fallback reduction failed; keeping full history"
+                                );
+                            } else {
+                                history = fallback.messages;
+                                self.session_metadata
+                                    .touch(&session_key, history.len() as u32)
+                                    .await;
+                                broadcast(
+                                    &self.state,
+                                    "chat",
+                                    serde_json::json!({
+                                        "sessionKey": session_key,
+                                        "state": "auto_compact",
+                                        "phase": "fallback",
+                                        "reason": "threshold_soft_compact_error",
+                                        "layerStats": {
+                                            "criticalAnchors": layer_stats.critical_anchor_messages,
+                                            "working": layer_stats.working_messages,
+                                            "background": layer_stats.background_messages,
+                                        },
+                                        "anchorCount": fallback.retained_anchor_messages,
+                                        "summaryChars": 0,
+                                        "messagesRemoved": fallback.removed_messages,
+                                        "messagesKept": history.len(),
+                                        "error": e.to_string(),
+                                    }),
+                                    BroadcastOpts::default(),
+                                )
+                                .await;
+                                fallback_applied = true;
+                            }
+                        }
+                        if !fallback_applied {
+                            broadcast(
+                                &self.state,
+                                "chat",
+                                serde_json::json!({
+                                    "sessionKey": session_key,
+                                    "state": "auto_compact",
+                                    "phase": "error",
+                                    "reason": "threshold_soft",
+                                    "layerStats": {
+                                        "criticalAnchors": layer_stats.critical_anchor_messages,
+                                        "working": layer_stats.working_messages,
+                                        "background": layer_stats.background_messages,
+                                    },
+                                    "anchorCount": layer_stats.critical_anchor_messages,
+                                    "summaryChars": 0,
+                                    "messagesRemoved": 0,
+                                    "messagesKept": history.len(),
+                                    "error": e.to_string(),
+                                }),
+                                BroadcastOpts::default(),
+                            )
+                            .await;
+                        }
                     },
                 }
             },
@@ -7813,31 +7877,124 @@ async fn run_with_tools(
                 },
                 Err(e) => {
                     warn!(run_id, error = %e, "retry compaction failed");
-                    broadcast(
-                        state,
-                        "chat",
-                        serde_json::json!({
-                            "runId": run_id,
-                            "sessionKey": session_key,
-                            "state": "auto_compact",
-                            "phase": "error",
-                            "reason": "context_window_exceeded",
-                            "layerStats": {
-                                "criticalAnchors": pre_layer_stats.critical_anchor_messages,
-                                "working": pre_layer_stats.working_messages,
-                                "background": pre_layer_stats.background_messages,
+                    if let Some(fallback) = compaction_failure_fallback_reduction(
+                        history_raw,
+                        compaction_config,
+                        provider_ref.context_window() as u64,
+                    ) {
+                        match store.replace_history(session_key, fallback.messages.clone()).await {
+                            Ok(()) => {
+                                let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
+                                let messages_removed =
+                                    pre_message_count.saturating_sub(compacted_history_raw.len());
+                                broadcast(
+                                    state,
+                                    "chat",
+                                    serde_json::json!({
+                                        "runId": run_id,
+                                        "sessionKey": session_key,
+                                        "state": "auto_compact",
+                                        "phase": "fallback",
+                                        "reason": "context_window_exceeded_compact_error",
+                                        "layerStats": {
+                                            "criticalAnchors": pre_layer_stats.critical_anchor_messages,
+                                            "working": pre_layer_stats.working_messages,
+                                            "background": pre_layer_stats.background_messages,
+                                        },
+                                        "anchorCount": fallback.retained_anchor_messages,
+                                        "summaryChars": 0,
+                                        "messagesRemoved": messages_removed,
+                                        "messagesKept": compacted_history_raw.len(),
+                                        "error": e.to_string(),
+                                    }),
+                                    BroadcastOpts::default(),
+                                )
+                                .await;
+
+                                let normalized_compacted_history = normalize_for_model_context(
+                                    &compacted_history_raw,
+                                    MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+                                );
+                                let compacted_chat =
+                                    values_to_chat_messages(&normalized_compacted_history);
+                                let retry_hist = if compacted_chat.is_empty() {
+                                    None
+                                } else {
+                                    Some(compacted_chat)
+                                };
+
+                                run_agent_loop_streaming(
+                                    provider_ref.clone(),
+                                    &filtered_registry,
+                                    &system_prompt,
+                                    user_content,
+                                    Some(&on_event),
+                                    retry_hist,
+                                    Some(tool_context),
+                                    hook_registry.clone(),
+                                    trace_id.clone(),
+                                )
+                                .await
                             },
-                            "anchorCount": pre_layer_stats.critical_anchor_messages,
-                            "summaryChars": 0,
-                            "messagesRemoved": 0,
-                            "messagesKept": pre_message_count,
-                            "error": e.to_string(),
-                        }),
-                        BroadcastOpts::default(),
-                    )
-                    .await;
-                    // Return the original error.
-                    first_result
+                            Err(fallback_error) => {
+                                warn!(
+                                    run_id,
+                                    error = %fallback_error,
+                                    "retry compaction fallback reduction failed"
+                                );
+                                broadcast(
+                                    state,
+                                    "chat",
+                                    serde_json::json!({
+                                        "runId": run_id,
+                                        "sessionKey": session_key,
+                                        "state": "auto_compact",
+                                        "phase": "error",
+                                        "reason": "context_window_exceeded",
+                                        "layerStats": {
+                                            "criticalAnchors": pre_layer_stats.critical_anchor_messages,
+                                            "working": pre_layer_stats.working_messages,
+                                            "background": pre_layer_stats.background_messages,
+                                        },
+                                        "anchorCount": pre_layer_stats.critical_anchor_messages,
+                                        "summaryChars": 0,
+                                        "messagesRemoved": 0,
+                                        "messagesKept": pre_message_count,
+                                        "error": e.to_string(),
+                                    }),
+                                    BroadcastOpts::default(),
+                                )
+                                .await;
+                                first_result
+                            },
+                        }
+                    } else {
+                        broadcast(
+                            state,
+                            "chat",
+                            serde_json::json!({
+                                "runId": run_id,
+                                "sessionKey": session_key,
+                                "state": "auto_compact",
+                                "phase": "error",
+                                "reason": "context_window_exceeded",
+                                "layerStats": {
+                                    "criticalAnchors": pre_layer_stats.critical_anchor_messages,
+                                    "working": pre_layer_stats.working_messages,
+                                    "background": pre_layer_stats.background_messages,
+                                },
+                                "anchorCount": pre_layer_stats.critical_anchor_messages,
+                                "summaryChars": 0,
+                                "messagesRemoved": 0,
+                                "messagesKept": pre_message_count,
+                                "error": e.to_string(),
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                        // Return the original error.
+                        first_result
+                    }
                 },
             }
         },
@@ -10148,6 +10305,57 @@ mod tests {
         let summary = default_compaction_summary(8);
         assert!(!summary.is_empty());
         assert!(summary.contains("Anchors and recent turns") || summary.ends_with('…'));
+    }
+
+    #[test]
+    fn compaction_failure_fallback_reduction_preserves_tool_chain_and_reduces() {
+        let config = context_compaction_config_from_chat(&moltis_config::ChatConfig::default());
+        let long = "x".repeat(1_200);
+        let history = vec![
+            serde_json::json!({"role": "user", "content": long}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "running tool",
+                "tool_calls": [{ "id": "tc-1", "type": "function", "function": { "name": "exec", "arguments": "{}" }}]
+            }),
+            serde_json::json!({
+                "role": "tool_result",
+                "tool_call_id": "tc-1",
+                "result": {"stdout": "ok"}
+            }),
+            serde_json::json!({"role": "assistant", "content": "ack"}),
+            serde_json::json!({"role": "user", "content": "ack"}),
+            serde_json::json!({"role": "assistant", "content": "ack"}),
+            serde_json::json!({"role": "user", "content": "ack"}),
+            serde_json::json!({"role": "assistant", "content": "ack"}),
+            serde_json::json!({"role": "user", "content": "ack"}),
+            serde_json::json!({"role": "assistant", "content": "ack"}),
+        ];
+
+        let fallback =
+            compaction_failure_fallback_reduction(&history, config, 20).expect("fallback reduction");
+        assert!(fallback.removed_messages > 0);
+        assert!(
+            fallback
+                .messages
+                .iter()
+                .any(|msg| msg.get("tool_calls").is_some()),
+            "fallback should preserve assistant tool call anchor"
+        );
+        assert!(
+            fallback
+                .messages
+                .iter()
+                .any(|msg| msg.get("tool_call_id").and_then(Value::as_str) == Some("tc-1")),
+            "fallback should preserve matching tool result anchor"
+        );
+    }
+
+    #[test]
+    fn compaction_failure_fallback_reduction_returns_none_when_not_reducible() {
+        let config = context_compaction_config_from_chat(&moltis_config::ChatConfig::default());
+        let history = vec![serde_json::json!({"role": "user", "content": "only turn"})];
+        assert!(compaction_failure_fallback_reduction(&history, config, 20).is_none());
     }
 
     #[test]
