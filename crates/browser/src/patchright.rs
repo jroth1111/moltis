@@ -32,6 +32,12 @@ pub struct PatchrightProbe {
     pub title_len: usize,
     pub body_text_len: usize,
     pub cookies: Vec<PatchrightCookie>,
+    /// Full HTML content (for direct navigation mode)
+    pub html: Option<String>,
+    /// Page title text
+    pub title: Option<String>,
+    /// Body text content
+    pub body_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +53,13 @@ struct PatchrightProbeOutput {
     body_text_len: usize,
     #[serde(default)]
     cookies: Vec<PatchrightCookie>,
+    /// Full HTML content for direct navigation mode
+    #[serde(default)]
+    html: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body_text: Option<String>,
 }
 
 /// Run a one-shot Patchright navigation probe and return cookies/metrics.
@@ -111,6 +124,9 @@ pub async fn run_patchright_probe(
         title_len: parsed.title_len,
         body_text_len: parsed.body_text_len,
         cookies: parsed.cookies,
+        html: parsed.html,
+        title: parsed.title,
+        body_text: parsed.body_text,
     })
 }
 
@@ -171,11 +187,12 @@ try:
                 break
             time.sleep(1)
 
-        text_len = page.evaluate(\"\"\"(() => {
+        text_len = page.evaluate("""(() => {
             const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
             return text.length;
-        })()\"\"\") or 0
+        })()""") or 0
         title = (page.title() or '').strip()
+        html_content = page.content()
         cookies = []
         for c in context.cookies():
             cookies.append({
@@ -194,6 +211,8 @@ try:
             "title_len": len(title),
             "body_text_len": int(text_len),
             "cookies": cookies,
+            "html": html_content,
+            "title": title,
         })
 
         context.close()
