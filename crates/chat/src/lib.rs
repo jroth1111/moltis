@@ -1868,7 +1868,8 @@ fn apply_runtime_tool_filters(
     mcp_disabled: bool,
 ) -> ToolRegistry {
     let base_registry = if mcp_disabled {
-        base.clone_without_mcp()
+        let without_mcp = base.clone_without_mcp();
+        without_mcp.clone_without(&["mcp_search_tools", "mcp_describe_tool", "mcp_code_exec"])
     } else {
         base.clone_without(&[])
     };
@@ -13357,6 +13358,45 @@ mod tests {
         let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false);
         assert!(filtered.get("exec").is_none());
         assert!(filtered.get("web_fetch").is_some());
+    }
+
+    #[test]
+    fn runtime_filters_remove_mcp_meta_tools_when_mcp_disabled() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_search_tools".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_describe_tool".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_code_exec".to_string(),
+        }));
+        registry.register_mcp(
+            Box::new(DummyTool {
+                name: "mcp__filesystem__read_file".to_string(),
+            }),
+            "filesystem".to_string(),
+        );
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.policy.allow = vec![
+            "exec".into(),
+            "mcp_search_tools".into(),
+            "mcp_describe_tool".into(),
+            "mcp_code_exec".into(),
+            "mcp__filesystem__read_file".into(),
+        ];
+
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], true);
+        assert!(filtered.get("exec").is_some());
+        assert!(filtered.get("mcp_search_tools").is_none());
+        assert!(filtered.get("mcp_describe_tool").is_none());
+        assert!(filtered.get("mcp_code_exec").is_none());
+        assert!(filtered.get("mcp__filesystem__read_file").is_none());
     }
 
     #[test]

@@ -3395,6 +3395,17 @@ pub async fn prepare_gateway(
 
         tool_registry.register(Box::new(exec_tool));
         tool_registry.register(Box::new(moltis_tools::calc::CalcTool::new()));
+        let mcp_manager = Arc::clone(live_mcp.manager());
+        tool_registry.register(Box::new(crate::mcp_agent_tools::McpSearchToolsTool::new(
+            Arc::clone(&mcp_manager),
+        )));
+        tool_registry.register(Box::new(crate::mcp_agent_tools::McpDescribeToolTool::new(
+            Arc::clone(&mcp_manager),
+        )));
+        tool_registry.register(Box::new(crate::mcp_agent_tools::McpCodeExecTool::new(
+            mcp_manager,
+            &config.mcp.code,
+        )));
         #[cfg(feature = "wasm")]
         {
             let wasm_limits = sandbox_router

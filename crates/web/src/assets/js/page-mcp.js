@@ -12,6 +12,7 @@ import { ConfirmDialog, requestConfirm } from "./ui.js";
 // ── Signals ─────────────────────────────────────────────────
 var servers = signal([]);
 var loading = signal(false);
+var legacyDirectStatus = signal(null);
 var toasts = signal([]);
 var toastId = 0;
 
@@ -35,6 +36,15 @@ async function refreshServers() {
 		// fall back to WS RPC if HTTP fails
 		var rpc = await sendRpc("mcp.list", {});
 		if (rpc.ok) servers.value = rpc.payload || [];
+	}
+	try {
+		var legacyRes = await fetch("/api/mcp/legacy-direct");
+		if (legacyRes.ok) {
+			legacyDirectStatus.value = await legacyRes.json();
+		}
+	} catch {
+		var legacyRpc = await sendRpc("mcp.legacy_direct.status", {});
+		if (legacyRpc.ok) legacyDirectStatus.value = legacyRpc.payload || null;
 	}
 	loading.value = false;
 	updateNavCount("mcp", servers.value.filter((s) => s.state === "running").length);
@@ -825,6 +835,19 @@ function McpPage() {
 	        </div>
 	        <p class="text-xs text-[var(--muted)]">
 	          Moltis supports both <strong>local stdio MCP processes</strong> (spawned via npm/uvx) and <strong>remote Streamable HTTP/SSE servers</strong>. Remote servers may prompt browser OAuth when first enabled.
+	        </p>
+	      </div>
+	      <div class="max-w-[600px] border border-[var(--border)] rounded-[var(--radius-sm)] px-4 py-3 bg-[var(--surface)]">
+	        <div class="flex items-center gap-2 text-sm text-[var(--text-strong)]">
+	          <span class="font-medium">Execution Mode:</span>
+	          <span class="px-2 py-0.5 rounded-full bg-[var(--surface2)] text-[0.7rem] font-semibold">Code-Only</span>
+	        </div>
+	        <p class="text-xs text-[var(--muted)] mt-1.5">
+	          MCP tools are exposed through <code>mcp_search_tools</code>, <code>mcp_describe_tool</code>, and <code>mcp_code_exec</code> to keep tool definitions out of prompt context by default.
+	        </p>
+	        <p class="text-xs mt-1.5 ${legacyDirectStatus.value?.enabled ? "text-[var(--warn)]" : "text-[var(--muted)]"}">
+	          Legacy direct bridge:
+	          <strong>${legacyDirectStatus.value?.enabled ? "enabled (emergency)" : "disabled"}</strong>
 	        </p>
 	      </div>
 	      <div class="skills-warn max-w-[600px]">
