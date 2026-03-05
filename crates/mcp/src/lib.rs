@@ -23,7 +23,7 @@ pub use {
     auth::{McpAuthProvider, McpAuthState, McpOAuthOverride, McpOAuthProvider, SharedAuthProvider},
     client::{McpClient, McpClientState},
     error::{Context, Error, Result},
-    manager::McpManager,
+    manager::{McpManager, McpToolSummary},
     registry::{McpOAuthConfig, McpRegistry, McpServerConfig, TransportType},
     tool_bridge::{McpAgentTool, McpToolBridge},
     traits::{McpClientTrait, McpTransport},

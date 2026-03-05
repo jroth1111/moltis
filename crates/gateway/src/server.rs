@@ -1451,6 +1451,9 @@ pub async fn prepare_gateway(
         live_mcp = Arc::new(crate::mcp_service::LiveMcpService::new(Arc::clone(
             &mcp_manager,
         )));
+        live_mcp
+            .configure_legacy_direct(&config.mcp.legacy_direct)
+            .await;
         // Start enabled servers in the background; sync tools once done.
         let mgr = Arc::clone(&mcp_manager);
         let mcp_for_sync = Arc::clone(&live_mcp);
@@ -3931,7 +3934,7 @@ pub async fn prepare_gateway(
         live_mcp
             .set_tool_registry(Arc::clone(&shared_tool_registry))
             .await;
-        crate::mcp_service::sync_mcp_tools(live_mcp.manager(), &shared_tool_registry).await;
+        live_mcp.sync_tools_if_ready().await;
 
         // Log registered tools for debugging.
         let schemas = shared_tool_registry.read().await.list_schemas();

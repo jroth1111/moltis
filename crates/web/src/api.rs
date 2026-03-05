@@ -17,6 +17,9 @@ use {
 use crate::templates::{build_nav_counts, onboarding_completed};
 
 const MCP_LIST_FAILED: &str = "MCP_LIST_FAILED";
+const MCP_SEARCH_FAILED: &str = "MCP_SEARCH_FAILED";
+const MCP_DESCRIBE_FAILED: &str = "MCP_DESCRIBE_FAILED";
+const MCP_LEGACY_DIRECT_STATUS_FAILED: &str = "MCP_LEGACY_DIRECT_STATUS_FAILED";
 const IMAGE_CACHE_DELETE_FAILED: &str = "IMAGE_CACHE_DELETE_FAILED";
 const IMAGE_CACHE_PRUNE_FAILED: &str = "IMAGE_CACHE_PRUNE_FAILED";
 const SANDBOX_CHECK_PACKAGES_FAILED: &str = "SANDBOX_CHECK_PACKAGES_FAILED";
@@ -170,6 +173,67 @@ pub async fn api_mcp_handler(State(state): State<AppState>) -> impl IntoResponse
         Err(e) => api_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             MCP_LIST_FAILED,
+            e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct McpSearchQuery {
+    pub query: Option<String>,
+    pub server: Option<String>,
+    pub limit: Option<u64>,
+}
+
+pub async fn api_mcp_tools_search_handler(
+    State(state): State<AppState>,
+    Query(query): Query<McpSearchQuery>,
+) -> impl IntoResponse {
+    let payload = serde_json::json!({
+        "query": query.query.unwrap_or_default(),
+        "server": query.server,
+        "limit": query.limit.unwrap_or(25),
+    });
+    match state.gateway.services.mcp.search_tools(payload).await {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            MCP_SEARCH_FAILED,
+            e.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct McpDescribeQuery {
+    pub server: String,
+    pub tool: String,
+}
+
+pub async fn api_mcp_tools_describe_handler(
+    State(state): State<AppState>,
+    Query(query): Query<McpDescribeQuery>,
+) -> impl IntoResponse {
+    let payload = serde_json::json!({
+        "server": query.server,
+        "tool": query.tool,
+    });
+    match state.gateway.services.mcp.describe_tool(payload).await {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            MCP_DESCRIBE_FAILED,
+            e.to_string(),
+        ),
+    }
+}
+
+pub async fn api_mcp_legacy_direct_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.gateway.services.mcp.legacy_direct_status().await {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            MCP_LEGACY_DIRECT_STATUS_FAILED,
             e.to_string(),
         ),
     }

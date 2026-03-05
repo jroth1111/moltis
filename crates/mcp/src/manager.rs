@@ -14,7 +14,7 @@ use crate::{
     registry::{McpOAuthConfig, McpRegistry, McpServerConfig, TransportType},
     tool_bridge::McpToolBridge,
     traits::McpClientTrait,
-    types::{McpManagerError, McpToolDef, McpTransportError},
+    types::{McpManagerError, McpToolDef, McpTransportError, ToolsCallResult},
 };
 
 /// Status of a managed MCP server.
@@ -51,6 +51,14 @@ pub struct McpManagerInner {
 /// Manages the lifecycle of multiple MCP server connections.
 pub struct McpManager {
     pub inner: RwLock<McpManagerInner>,
+}
+
+/// A compact MCP tool descriptor for search/browse workflows.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpToolSummary {
+    pub server: String,
+    pub name: String,
+    pub description: String,
 }
 
 impl McpManager {
@@ -407,6 +415,97 @@ impl McpManager {
         self.inner.read().await.tools.get(name).cloned()
     }
 
+    /// Search tools across running servers by name/description.
+    pub async fn search_tools(
+        &self,
+        query: &str,
+        server: Option<&str>,
+        limit: usize,
+    ) -> Vec<McpToolSummary> {
+        let q = query.trim().to_lowercase();
+        let max = limit.clamp(1, 200);
+        let inner = self.inner.read().await;
+
+        let mut scored: Vec<(i32, McpToolSummary)> = Vec::new();
+        for (server_name, tools) in &inner.tools {
+            if let Some(filter_server) = server
+                && filter_server != server_name
+            {
+                continue;
+            }
+            for tool in tools {
+                let desc = tool.description.as_deref().unwrap_or("");
+                let mut score = 0i32;
+                if q.is_empty() {
+                    score = 1;
+                } else {
+                    let name_l = tool.name.to_lowercase();
+                    let desc_l = desc.to_lowercase();
+                    if name_l == q {
+                        score += 1_000;
+                    }
+                    if name_l.starts_with(&q) {
+                        score += 250;
+                    }
+                    if name_l.contains(&q) {
+                        score += 100;
+                    }
+                    if desc_l.contains(&q) {
+                        score += 25;
+                    }
+                }
+                if score > 0 {
+                    scored.push((
+                        score,
+                        McpToolSummary {
+                            server: server_name.clone(),
+                            name: tool.name.clone(),
+                            description: desc.to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+
+        scored.sort_by(|(score_a, tool_a), (score_b, tool_b)| {
+            score_b
+                .cmp(score_a)
+                .then_with(|| tool_a.server.cmp(&tool_b.server))
+                .then_with(|| tool_a.name.cmp(&tool_b.name))
+        });
+        scored
+            .into_iter()
+            .take(max)
+            .map(|(_, summary)| summary)
+            .collect()
+    }
+
+    /// Return the full schema for a specific server tool.
+    pub async fn describe_tool(&self, server: &str, tool: &str) -> Option<McpToolDef> {
+        let inner = self.inner.read().await;
+        let tools = inner.tools.get(server)?;
+        tools.iter().find(|t| t.name == tool).cloned()
+    }
+
+    /// Call a tool by `(server, tool)` reference.
+    pub async fn call_server_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolsCallResult> {
+        let client = {
+            let inner = self.inner.read().await;
+            inner.clients.get(server).cloned().ok_or_else(|| {
+                McpManagerError::ServerNotFound {
+                    server: server.to_string(),
+                }
+            })?
+        };
+        let c = client.read().await;
+        c.call_tool(tool, arguments).await
+    }
+
     // ── Registry operations ─────────────────────────────────────────
 
     /// Add a server to the registry and optionally start it.
@@ -602,6 +701,82 @@ mod tests {
         assert!(matches!(
             err,
             Error::Manager(McpManagerError::OAuthStateNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_ranks_name_matches() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "filesystem".to_string(),
+                vec![
+                    McpToolDef {
+                        name: "read_file".to_string(),
+                        description: Some("Read file contents".to_string()),
+                        input_schema: serde_json::json!({ "type": "object" }),
+                    },
+                    McpToolDef {
+                        name: "write_file".to_string(),
+                        description: Some("Write file contents".to_string()),
+                        input_schema: serde_json::json!({ "type": "object" }),
+                    },
+                ],
+            );
+            inner.tools.insert(
+                "github".to_string(),
+                vec![McpToolDef {
+                    name: "search_code".to_string(),
+                    description: Some("Search source code".to_string()),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                }],
+            );
+        }
+
+        let results = mgr.search_tools("read", None, 10).await;
+        assert!(!results.is_empty());
+        assert_eq!(results[0].server, "filesystem");
+        assert_eq!(results[0].name, "read_file");
+    }
+
+    #[tokio::test]
+    async fn test_describe_tool_returns_schema() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "filesystem".to_string(),
+                vec![McpToolDef {
+                    name: "read_file".to_string(),
+                    description: Some("Read file contents".to_string()),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } }
+                    }),
+                }],
+            );
+        }
+
+        let described = mgr.describe_tool("filesystem", "read_file").await;
+        assert!(described.is_some());
+        let Some(tool) = described else {
+            panic!("expected tool to be present");
+        };
+        assert_eq!(tool.name, "read_file");
+        assert_eq!(tool.input_schema["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn test_call_server_tool_missing_server() {
+        let mgr = McpManager::new(McpRegistry::new());
+        let err = mgr
+            .call_server_tool("missing", "tool", serde_json::json!({}))
+            .await
+            .expect_err("missing server should fail");
+        assert!(matches!(
+            err,
+            Error::Manager(McpManagerError::ServerNotFound { .. })
         ));
     }
 }

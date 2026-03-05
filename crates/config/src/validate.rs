@@ -320,6 +320,26 @@ fn build_schema_map() -> KnownKeys {
         ]))
     };
 
+    let mcp_code = || {
+        Struct(HashMap::from([
+            ("enabled", Leaf),
+            ("timeout_ms", Leaf),
+            ("max_steps", Leaf),
+            ("max_tool_calls", Leaf),
+            ("max_stdout_bytes", Leaf),
+            ("max_result_bytes", Leaf),
+            ("tool_summary_cache_ttl_secs", Leaf),
+        ]))
+    };
+
+    let mcp_legacy_direct = || {
+        Struct(HashMap::from([
+            ("enabled", Leaf),
+            ("ttl_minutes", Leaf),
+            ("allow_servers", Leaf),
+        ]))
+    };
+
     let shell_hook_entry = || {
         Struct(HashMap::from([
             ("name", Leaf),
@@ -447,10 +467,11 @@ fn build_schema_map() -> KnownKeys {
         ),
         (
             "mcp",
-            Struct(HashMap::from([(
-                "servers",
-                Map(Box::new(mcp_server_entry())),
-            )])),
+            Struct(HashMap::from([
+                ("servers", Map(Box::new(mcp_server_entry()))),
+                ("code", mcp_code()),
+                ("legacy_direct", mcp_legacy_direct()),
+            ])),
         ),
         (
             "channels",

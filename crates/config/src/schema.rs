@@ -1359,6 +1359,68 @@ pub struct McpConfig {
     /// Configured MCP servers, keyed by server name.
     #[serde(default)]
     pub servers: HashMap<String, McpServerEntry>,
+    /// Code-execution settings for MCP workflows.
+    #[serde(default)]
+    pub code: McpCodeConfig,
+    /// Emergency legacy direct-tool bridge settings.
+    #[serde(default)]
+    pub legacy_direct: McpLegacyDirectConfig,
+}
+
+/// Code execution settings for MCP-driven workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpCodeConfig {
+    /// Enable MCP code execution mode.
+    pub enabled: bool,
+    /// Max wall-clock time per code execution run.
+    pub timeout_ms: u64,
+    /// Max steps permitted in a single program.
+    pub max_steps: usize,
+    /// Max MCP tool calls permitted in a single run.
+    pub max_tool_calls: usize,
+    /// Max stdout bytes captured from a code run.
+    pub max_stdout_bytes: usize,
+    /// Max serialized result bytes returned to the model.
+    pub max_result_bytes: usize,
+    /// Tool summary cache TTL used by search/describe.
+    pub tool_summary_cache_ttl_secs: u64,
+}
+
+impl Default for McpCodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_ms: 45_000,
+            max_steps: 32,
+            max_tool_calls: 64,
+            max_stdout_bytes: 64 * 1024,
+            max_result_bytes: 128 * 1024,
+            tool_summary_cache_ttl_secs: 300,
+        }
+    }
+}
+
+/// Emergency switch for legacy direct MCP bridge registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpLegacyDirectConfig {
+    /// Whether legacy direct MCP bridges are enabled at startup.
+    pub enabled: bool,
+    /// Time-to-live for emergency enablement in minutes.
+    pub ttl_minutes: u64,
+    /// Optional allowlist of server names when direct mode is enabled.
+    pub allow_servers: Vec<String>,
+}
+
+impl Default for McpLegacyDirectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_minutes: 15,
+            allow_servers: Vec::new(),
+        }
+    }
 }
 
 /// Configuration for a single MCP server.
@@ -3293,6 +3355,59 @@ tool_mode = "native"
         assert_eq!(
             config.providers.get("anthropic").unwrap().tool_mode,
             ToolMode::Native
+        );
+    }
+
+    #[test]
+    fn mcp_code_config_defaults_are_sane() {
+        let cfg = McpCodeConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.timeout_ms >= 1_000);
+        assert!(cfg.max_steps > 0);
+        assert!(cfg.max_tool_calls >= cfg.max_steps);
+        assert!(cfg.max_stdout_bytes > 0);
+        assert!(cfg.max_result_bytes > 0);
+        assert!(cfg.tool_summary_cache_ttl_secs > 0);
+    }
+
+    #[test]
+    fn mcp_legacy_direct_defaults_to_disabled() {
+        let cfg = McpLegacyDirectConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.ttl_minutes, 15);
+        assert!(cfg.allow_servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_config_parses_code_and_legacy_direct() {
+        let toml_str = r#"
+[mcp.code]
+enabled = true
+timeout_ms = 120000
+max_steps = 12
+max_tool_calls = 24
+max_stdout_bytes = 8192
+max_result_bytes = 16384
+tool_summary_cache_ttl_secs = 60
+
+[mcp.legacy_direct]
+enabled = true
+ttl_minutes = 30
+allow_servers = ["filesystem", "github"]
+"#;
+        let config: MoltisConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.mcp.code.enabled);
+        assert_eq!(config.mcp.code.timeout_ms, 120_000);
+        assert_eq!(config.mcp.code.max_steps, 12);
+        assert_eq!(config.mcp.code.max_tool_calls, 24);
+        assert_eq!(config.mcp.code.max_stdout_bytes, 8_192);
+        assert_eq!(config.mcp.code.max_result_bytes, 16_384);
+        assert_eq!(config.mcp.code.tool_summary_cache_ttl_secs, 60);
+        assert!(config.mcp.legacy_direct.enabled);
+        assert_eq!(config.mcp.legacy_direct.ttl_minutes, 30);
+        assert_eq!(
+            config.mcp.legacy_direct.allow_servers,
+            vec!["filesystem".to_string(), "github".to_string()]
         );
     }
 }

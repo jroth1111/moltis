@@ -492,6 +492,22 @@ auto_load = []                    # Skills to always load without explicit activ
 # url = "http://localhost:8080/mcp"
 # enabled = true
 
+# Code-only MCP execution settings.
+[mcp.code]
+enabled = true                   # Force MCP workflows through the code executor
+timeout_ms = 45000              # Max runtime per code execution request
+max_steps = 32                  # Max orchestration steps
+max_tool_calls = 64             # Max MCP tool calls in one run
+max_stdout_bytes = 65536        # Max stdout bytes retained from execution
+max_result_bytes = 131072       # Max serialized result bytes returned to model
+tool_summary_cache_ttl_secs = 300 # Cached tools metadata TTL
+
+# Emergency legacy direct MCP bridge (disabled by default).
+[mcp.legacy_direct]
+enabled = false                 # Manual emergency only; do not enable in normal operation
+ttl_minutes = 15                # Expiry window when enabled manually
+allow_servers = []              # Optional server-name allowlist when enabled
+
 # ══════════════════════════════════════════════════════════════════════════════
 # METRICS
 # ══════════════════════════════════════════════════════════════════════════════

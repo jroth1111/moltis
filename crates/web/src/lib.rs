@@ -60,6 +60,18 @@ fn build_api_routes() -> Router<AppState> {
         .route("/api/skills", get(api::api_skills_handler))
         .route("/api/skills/search", get(api::api_skills_search_handler))
         .route("/api/mcp", get(api::api_mcp_handler))
+        .route(
+            "/api/mcp/tools/search",
+            get(api::api_mcp_tools_search_handler),
+        )
+        .route(
+            "/api/mcp/tools/describe",
+            get(api::api_mcp_tools_describe_handler),
+        )
+        .route(
+            "/api/mcp/legacy-direct",
+            get(api::api_mcp_legacy_direct_handler),
+        )
         .route("/api/hooks", get(api::api_hooks_handler))
         .route(
             "/api/images/cached",
