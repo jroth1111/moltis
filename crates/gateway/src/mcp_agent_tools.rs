@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use {
@@ -11,6 +12,7 @@ use {
     moltis_mcp::types::{McpToolDef, ToolContent, ToolsCallResult},
     serde::Deserialize,
     serde_json::Value,
+    tokio::time::timeout,
 };
 
 #[derive(Deserialize)]
@@ -181,6 +183,103 @@ fn parse_detail_level(raw: Option<&str>) -> Result<ToolDetailLevel> {
     }
 }
 
+fn normalize_selector(selector: &str) -> Option<String> {
+    let trimmed = selector.trim();
+    let mut parts = trimmed.split("::");
+    let server = parts.next()?.trim();
+    let tool = parts.next()?.trim();
+    if parts.next().is_some() || server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(format!("{server}::{tool}"))
+}
+
+fn redact_tokenized_text<F>(input: &str, replacement: &str, mut should_redact: F) -> String
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut output = String::with_capacity(input.len());
+    let mut token = String::new();
+
+    let mut flush = |token: &mut String, output: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        if should_redact(token.as_str()) {
+            output.push_str(replacement);
+        } else {
+            output.push_str(token);
+        }
+        token.clear();
+    };
+
+    for ch in input.chars() {
+        if ch.is_whitespace() {
+            flush(&mut token, &mut output);
+            output.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    flush(&mut token, &mut output);
+
+    output
+}
+
+fn is_email_like(token: &str) -> bool {
+    let candidate = token.trim_matches(|c: char| c.is_ascii_punctuation());
+    let mut parts = candidate.split('@');
+    let local = parts.next().unwrap_or_default();
+    let domain = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return false;
+    }
+    !local.is_empty()
+        && domain.contains('.')
+        && domain
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+}
+
+fn is_ssn_like(token: &str) -> bool {
+    let candidate = token.trim_matches(|c: char| c.is_ascii_punctuation());
+    let digits: String = candidate.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 9 {
+        return false;
+    }
+    candidate.len() == 11
+        && candidate.chars().nth(3) == Some('-')
+        && candidate.chars().nth(6) == Some('-')
+}
+
+fn is_phone_like(token: &str) -> bool {
+    let candidate = token.trim_matches(|c: char| c.is_ascii_punctuation());
+    let digits = candidate.chars().filter(|c| c.is_ascii_digit()).count();
+    digits >= 10
+        && candidate.chars().all(|c| {
+            c.is_ascii_digit() || c == '+' || c == '-' || c == '(' || c == ')' || c == '.'
+        })
+}
+
+fn redact_pii_text(input: &str) -> String {
+    let with_ssn = redact_tokenized_text(input, "[REDACTED_SSN]", is_ssn_like);
+    let with_email = redact_tokenized_text(&with_ssn, "[REDACTED_EMAIL]", is_email_like);
+    redact_tokenized_text(&with_email, "[REDACTED_PHONE]", is_phone_like)
+}
+
+fn redact_pii_value(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(redact_pii_text(s)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_pii_value).collect()),
+        Value::Object(obj) => Value::Object(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), redact_pii_value(v)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
 pub struct McpSearchToolsTool {
     manager: Arc<moltis_mcp::McpManager>,
 }
@@ -314,6 +413,13 @@ impl AgentTool for McpDescribeToolTool {
 
 pub struct McpCodeExecTool {
     manager: Arc<moltis_mcp::McpManager>,
+    enabled: bool,
+    timeout_ms: u64,
+    allowed_servers: HashSet<String>,
+    denied_servers: HashSet<String>,
+    allowed_tools: HashSet<String>,
+    denied_tools: HashSet<String>,
+    redact_pii: bool,
     max_steps: usize,
     max_tool_calls: usize,
     max_result_bytes: usize,
@@ -324,12 +430,157 @@ impl McpCodeExecTool {
         manager: Arc<moltis_mcp::McpManager>,
         cfg: &moltis_config::schema::McpCodeConfig,
     ) -> Self {
+        let normalize_set = |items: &[String]| -> HashSet<String> {
+            items
+                .iter()
+                .filter_map(|entry| normalize_selector(entry))
+                .collect()
+        };
+
         Self {
             manager,
+            enabled: cfg.enabled,
+            timeout_ms: cfg.timeout_ms.max(1_000),
+            allowed_servers: cfg
+                .allow_servers
+                .iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect(),
+            denied_servers: cfg
+                .deny_servers
+                .iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect(),
+            allowed_tools: normalize_set(&cfg.allow_tools),
+            denied_tools: normalize_set(&cfg.deny_tools),
+            redact_pii: cfg.redact_pii,
             max_steps: cfg.max_steps.max(1),
             max_tool_calls: cfg.max_tool_calls.max(1),
             max_result_bytes: cfg.max_result_bytes.max(1_024),
         }
+    }
+
+    fn is_tool_allowed_by_policy(&self, server: &str, tool: &str) -> Result<()> {
+        let selector = format!("{server}::{tool}");
+
+        if self.denied_servers.contains(server) {
+            return Err(anyhow!(
+                "MCP server '{server}' is blocked by mcp.code.deny_servers"
+            ));
+        }
+        if self.denied_tools.contains(&selector) {
+            return Err(anyhow!(
+                "MCP tool '{selector}' is blocked by mcp.code.deny_tools"
+            ));
+        }
+        if !self.allowed_servers.is_empty() && !self.allowed_servers.contains(server) {
+            return Err(anyhow!(
+                "MCP server '{server}' is not in mcp.code.allow_servers"
+            ));
+        }
+        if !self.allowed_tools.is_empty() && !self.allowed_tools.contains(&selector) {
+            return Err(anyhow!(
+                "MCP tool '{selector}' is not in mcp.code.allow_tools"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn execute_program(
+        &self,
+        program: &Program,
+        selected_tools: &HashSet<String>,
+        effective_max_steps: usize,
+        effective_max_tool_calls: usize,
+    ) -> Result<(Value, Vec<Value>, usize)> {
+        if program.steps.is_empty() {
+            return Err(anyhow!("program must include at least one step"));
+        }
+
+        if program.steps.len() > effective_max_steps {
+            return Err(anyhow!(
+                "program has {} steps, max allowed is {}",
+                program.steps.len(),
+                effective_max_steps
+            ));
+        }
+
+        let mut outputs: HashMap<String, Value> = HashMap::new();
+        let mut summaries = Vec::with_capacity(program.steps.len());
+        let mut tool_calls = 0usize;
+
+        for step in &program.steps {
+            tool_calls = tool_calls.saturating_add(1);
+            if tool_calls > effective_max_tool_calls {
+                return Err(anyhow!(
+                    "tool call budget exceeded: {} > {}",
+                    tool_calls,
+                    effective_max_tool_calls
+                ));
+            }
+
+            if outputs.contains_key(&step.id) {
+                return Err(anyhow!("duplicate step id '{}'", step.id));
+            }
+
+            self.is_tool_allowed_by_policy(&step.server, &step.tool)?;
+
+            let selector = format!("{}::{}", step.server, step.tool);
+            if !selected_tools.is_empty() && !selected_tools.contains(&selector) {
+                return Err(anyhow!(
+                    "step '{}' is not in selected_tools allowlist: {}",
+                    step.id,
+                    selector
+                ));
+            }
+
+            let resolved_args = resolve_refs(&step.arguments, &outputs)?;
+            let called = self
+                .manager
+                .call_server_tool(&step.server, &step.tool, resolved_args)
+                .await?;
+            let flattened = flatten_tool_result(called)?;
+            outputs.insert(step.id.clone(), flattened);
+            summaries.push(serde_json::json!({
+                "id": step.id,
+                "server": step.server,
+                "tool": step.tool,
+            }));
+        }
+
+        let mut final_result = if let Some(return_step) = &program.return_step {
+            outputs
+                .get(return_step)
+                .cloned()
+                .ok_or_else(|| anyhow!("return_step '{}' not found", return_step))?
+        } else {
+            let last_id = &program
+                .steps
+                .last()
+                .ok_or_else(|| anyhow!("program must include at least one step"))?
+                .id;
+            outputs
+                .get(last_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("last step '{}' result missing", last_id))?
+        };
+
+        if self.redact_pii {
+            final_result = redact_pii_value(&final_result);
+        }
+
+        let serialized = serde_json::to_vec(&final_result)?;
+        if serialized.len() > self.max_result_bytes {
+            return Err(anyhow!(
+                "result exceeds max_result_bytes: {} > {}",
+                serialized.len(),
+                self.max_result_bytes
+            ));
+        }
+
+        Ok((final_result, summaries, tool_calls))
     }
 }
 
@@ -410,6 +661,12 @@ impl AgentTool for McpCodeExecTool {
             ));
         }
 
+        if !self.enabled {
+            return Err(anyhow!(
+                "mcp_code_exec is disabled by config (mcp.code.enabled = false)"
+            ));
+        }
+
         let program = parse_program(&params)?;
         let selected_tools = parse_selected_tools(&params);
 
@@ -427,84 +684,23 @@ impl AgentTool for McpCodeExecTool {
             .unwrap_or(self.max_tool_calls)
             .clamp(1, self.max_tool_calls);
 
-        if program.steps.is_empty() {
-            return Err(anyhow!("program must include at least one step"));
-        }
-
-        if program.steps.len() > effective_max_steps {
-            return Err(anyhow!(
-                "program has {} steps, max allowed is {}",
-                program.steps.len(),
-                effective_max_steps
-            ));
-        }
-
-        let mut outputs: HashMap<String, Value> = HashMap::new();
-        let mut summaries = Vec::with_capacity(program.steps.len());
-        let mut tool_calls = 0usize;
-
-        for step in &program.steps {
-            tool_calls = tool_calls.saturating_add(1);
-            if tool_calls > effective_max_tool_calls {
-                return Err(anyhow!(
-                    "tool call budget exceeded: {} > {}",
-                    tool_calls,
-                    effective_max_tool_calls
-                ));
-            }
-
-            if outputs.contains_key(&step.id) {
-                return Err(anyhow!("duplicate step id '{}'", step.id));
-            }
-
-            let selector = format!("{}::{}", step.server, step.tool);
-            if !selected_tools.is_empty() && !selected_tools.contains(&selector) {
-                return Err(anyhow!(
-                    "step '{}' is not in selected_tools allowlist: {}",
-                    step.id,
-                    selector
-                ));
-            }
-
-            let resolved_args = resolve_refs(&step.arguments, &outputs)?;
-            let called = self
-                .manager
-                .call_server_tool(&step.server, &step.tool, resolved_args)
-                .await?;
-            let flattened = flatten_tool_result(called)?;
-            outputs.insert(step.id.clone(), flattened);
-            summaries.push(serde_json::json!({
-                "id": step.id,
-                "server": step.server,
-                "tool": step.tool,
-            }));
-        }
-
-        let final_result = if let Some(return_step) = &program.return_step {
-            outputs
-                .get(return_step)
-                .cloned()
-                .ok_or_else(|| anyhow!("return_step '{}' not found", return_step))?
-        } else {
-            let last_id = &program
-                .steps
-                .last()
-                .ok_or_else(|| anyhow!("program must include at least one step"))?
-                .id;
-            outputs
-                .get(last_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("last step '{}' result missing", last_id))?
-        };
-
-        let serialized = serde_json::to_vec(&final_result)?;
-        if serialized.len() > self.max_result_bytes {
-            return Err(anyhow!(
-                "result exceeds max_result_bytes: {} > {}",
-                serialized.len(),
-                self.max_result_bytes
-            ));
-        }
+        let timeout_duration = Duration::from_millis(self.timeout_ms);
+        let (final_result, summaries, tool_calls) = timeout(
+            timeout_duration,
+            self.execute_program(
+                &program,
+                &selected_tools,
+                effective_max_steps,
+                effective_max_tool_calls,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "mcp_code_exec timed out after {} ms",
+                timeout_duration.as_millis()
+            )
+        })??;
 
         Ok(serde_json::json!({
             "result": final_result,
@@ -538,5 +734,41 @@ mod tests {
         let parsed = parse_program(&params).expect("parse program");
         assert_eq!(parsed.steps.len(), 1);
         assert_eq!(parsed.steps[0].id, "s1");
+    }
+
+    #[test]
+    fn normalize_selector_requires_server_and_tool() {
+        assert_eq!(
+            normalize_selector("filesystem::read_file"),
+            Some("filesystem::read_file".to_string())
+        );
+        assert_eq!(normalize_selector("filesystem"), None);
+        assert_eq!(normalize_selector("filesystem::"), None);
+        assert_eq!(normalize_selector("::read_file"), None);
+    }
+
+    #[test]
+    fn redact_pii_text_masks_common_patterns() {
+        let input = "email alice@example.com phone +1-415-555-1212 ssn 123-45-6789";
+        let redacted = redact_pii_text(input);
+        assert!(!redacted.contains("alice@example.com"));
+        assert!(!redacted.contains("+1-415-555-1212"));
+        assert!(!redacted.contains("123-45-6789"));
+        assert!(redacted.contains("[REDACTED_EMAIL]"));
+        assert!(redacted.contains("[REDACTED_PHONE]"));
+        assert!(redacted.contains("[REDACTED_SSN]"));
+    }
+
+    #[test]
+    fn redact_pii_value_masks_nested_strings() {
+        let input = serde_json::json!({
+            "primary": "alice@example.com",
+            "nested": ["123-45-6789", {"phone": "(415)5551212"}],
+        });
+        let redacted = redact_pii_value(&input);
+        let rendered = serde_json::to_string(&redacted).expect("serialize");
+        assert!(!rendered.contains("alice@example.com"));
+        assert!(!rendered.contains("123-45-6789"));
+        assert!(!rendered.contains("(415)5551212"));
     }
 }
