@@ -15,6 +15,7 @@ use {
             page::CaptureScreenshotFormat,
         },
     },
+    serde_json,
     tokio::time::{Duration, sleep, timeout},
     tracing::{debug, info, warn},
 };
@@ -517,10 +518,7 @@ impl BrowserManager {
                 challenge_type,
                 diagnostics.challenge_markers,
             );
-        Ok((
-            active_sid,
-            response,
-        ))
+        Ok((active_sid, response))
     }
 
     async fn collect_navigation_diagnostics(&self, page: &Page) -> NavigationDiagnostics {
@@ -635,6 +633,8 @@ impl BrowserManager {
             patchright_title_len = probe.title_len,
             patchright_body_text_len = probe.body_text_len,
             patchright_cookie_count = probe.cookies.len(),
+            patchright_local_storage_count = probe.local_storage.len(),
+            patchright_session_storage_count = probe.session_storage.len(),
             "patchright probe completed"
         );
 
@@ -692,6 +692,31 @@ impl BrowserManager {
             return None;
         }
 
+        // Inject localStorage items via JavaScript
+        if !probe.local_storage.is_empty() {
+            let storage_json =
+                serde_json::to_string(&probe.local_storage).unwrap_or_else(|_| "[]".to_string());
+            let inject_script = format!(
+                r#"(function() {{
+                    try {{
+                        const items = {items};
+                        for (const item of items) {{
+                            try {{
+                                localStorage.setItem(item.key, item.value);
+                            }} catch (e) {{}}
+                        }}
+                    }} catch (e) {{}}
+                }})()"#,
+                items = storage_json
+            );
+            let _ = page.evaluate(inject_script.as_str()).await;
+            debug!(
+                url = url,
+                local_storage_count = probe.local_storage.len(),
+                "injected patchright localStorage items"
+            );
+        }
+
         if let Err(e) = page.reload().await {
             warn!(
                 url = url,
@@ -703,7 +728,13 @@ impl BrowserManager {
             return None;
         }
 
+        // Allow page to settle after reload before checking challenge state.
+        // This gives JS time to process the injected cookies and for any
+        // client-side challenge handlers to initialize.
+        sleep(Duration::from_millis(500)).await;
         let _ = page.wait_for_navigation().await;
+        sleep(Duration::from_millis(300)).await;
+
         let refreshed = self.wait_for_challenge_resolution_if_needed(page).await;
 
         if refreshed.challenge_type.is_none() {
@@ -2141,8 +2172,14 @@ mod tests {
     #[test]
     fn patchright_challenge_allowlist_matches_case_insensitively() {
         let allow = vec!["KASADA".to_string(), "imperva".to_string()];
-        assert!(is_patchright_challenge_allowed(ChallengeType::Kasada, &allow));
-        assert!(is_patchright_challenge_allowed(ChallengeType::Imperva, &allow));
+        assert!(is_patchright_challenge_allowed(
+            ChallengeType::Kasada,
+            &allow
+        ));
+        assert!(is_patchright_challenge_allowed(
+            ChallengeType::Imperva,
+            &allow
+        ));
         assert!(!is_patchright_challenge_allowed(
             ChallengeType::Cloudflare,
             &allow
@@ -2209,9 +2246,7 @@ mod tests {
             Some(ChallengeType::Kasada)
         ));
         assert!(!should_attempt_virtual_display_patchright_retry(
-            true,
-            true,
-            None
+            true, true, None
         ));
     }
 
