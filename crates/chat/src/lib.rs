@@ -11332,6 +11332,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_empty_history_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        let runtime = Arc::new(MockChatRuntime::new());
+        let state: Arc<dyn ChatRuntime> = runtime;
+        let providers = Arc::new(RwLock::new(ProviderRegistry::empty()));
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+
+        let chat = LiveChatService::new(providers, disabled, state, store, metadata);
+
+        let err = chat
+            .compact(serde_json::json!({}))
+            .await
+            .expect_err("chat.compact should fail for empty history");
+        assert!(
+            err.to_string().contains("nothing to compact"),
+            "unexpected compact error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_sh_bypasses_provider_and_executes_directly() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
