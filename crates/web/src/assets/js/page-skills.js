@@ -21,6 +21,11 @@ var toasts = signal([]);
 var toastId = 0;
 var installProgresses = signal([]);
 var installProgressId = 0;
+var evalRuns = signal([]);
+var evalProgresses = signal([]);
+var selectedEvalTargetKey = signal("");
+var selectedEvalRunId = signal("");
+var selectedEvalRunDetail = signal(null);
 
 // Lazy prefetch: starts on first navigation to /skills, not at module load
 var prefetchPromise = null;
@@ -46,6 +51,17 @@ var skillRepoMap = computed(() => {
 	});
 	return map;
 });
+
+var evalTargets = computed(() =>
+	enabledSkills.value
+		.filter((skill) => skill?.name && skill?.source)
+		.map((skill) => ({
+			key: `${skill.source}::${skill.name}`,
+			name: skill.name,
+			source: skill.source,
+			description: skill.description || "",
+		})),
+);
 
 // ── Helpers ──────────────────────────────────────────────────
 function showToast(message, type) {
@@ -93,19 +109,120 @@ function stopInstallProgress(id, ok) {
 	installProgresses.value = installProgresses.value.filter((p) => p.id !== id);
 }
 
-function fetchAll() {
-	loading.value = true;
-	fetch("/api/skills")
+function startEvalProgress(source, skill, id) {
+	if (!id) id = `eval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	if (evalProgresses.value.some((p) => p.id === id)) return id;
+	evalProgresses.value = evalProgresses.value.concat([
+		{ id: id, source: source || "", skill: skill || "", state: "running" },
+	]);
+	return id;
+}
+
+function stopEvalProgress(id, ok) {
+	void ok;
+	evalProgresses.value = evalProgresses.value.filter((p) => p.id !== id);
+}
+
+function fetchEvalRuns() {
+	return fetch("/api/skills/evals")
 		.then((r) => r.json())
 		.then((data) => {
-			if (data.skills) enabledSkills.value = data.skills;
-			if (data.repos) repos.value = data.repos;
-			loading.value = false;
-			updateNavCount("skills", (data.skills || []).length);
+			evalRuns.value = data.runs || [];
+			if (selectedEvalRunId.value && !evalRuns.value.some((run) => run.id === selectedEvalRunId.value)) {
+				selectedEvalRunId.value = "";
+				selectedEvalRunDetail.value = null;
+			}
 		})
 		.catch(() => {
+			evalRuns.value = [];
+		});
+}
+
+function fetchAll() {
+	loading.value = true;
+	return Promise.all([
+		fetch("/api/skills")
+			.then((r) => r.json())
+			.then((data) => {
+				if (data.skills) enabledSkills.value = data.skills;
+				if (data.repos) repos.value = data.repos;
+				updateNavCount("skills", (data.skills || []).length);
+			}),
+		fetchEvalRuns(),
+	])
+		.catch(() => null)
+		.finally(() => {
 			loading.value = false;
 		});
+}
+
+function runSelectedEval(target) {
+	if (!(target?.source && target.name)) return Promise.resolve();
+	if (!S.connected) {
+		showToast("Not connected to gateway.", "error");
+		return Promise.resolve();
+	}
+	var opId = `skills-eval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	startEvalProgress(target.source, target.name, opId);
+	return sendRpc("skills.evals.run", {
+		source: target.source,
+		skill: target.name,
+		rounds: 5,
+		op_id: opId,
+	})
+		.then((res) => {
+			if (!res?.ok) {
+				showToast(`Eval failed: ${res?.error || "unknown error"}`, "error");
+				stopEvalProgress(opId, false);
+				return;
+			}
+			var payload = res.payload || {};
+			selectedEvalRunId.value = payload.id || "";
+			selectedEvalRunDetail.value = payload;
+			showToast(`Eval complete for ${target.name}`, "success");
+			stopEvalProgress(opId, true);
+			fetchEvalRuns();
+		})
+		.catch(() => {
+			showToast("Eval failed: transport error", "error");
+			stopEvalProgress(opId, false);
+		});
+}
+
+function loadEvalDetail(id) {
+	if (!id) return Promise.resolve();
+	selectedEvalRunId.value = id;
+	return fetch(`/api/skills/evals/${encodeURIComponent(id)}`)
+		.then((r) => r.json())
+		.then((run) => {
+			selectedEvalRunDetail.value = run;
+		})
+		.catch(() => {
+			showToast("Failed to load eval detail.", "error");
+		});
+}
+
+function handleEvalProgress(payload) {
+	var opId = payload?.op_id;
+	if (!opId) return;
+	var source = payload?.source || "";
+	var skill = payload?.skill || "";
+	if (payload?.phase === "start" || payload?.phase === "scoring") {
+		startEvalProgress(source, skill, opId);
+		return;
+	}
+	if (payload?.phase === "done") {
+		stopEvalProgress(opId, true);
+		fetchEvalRuns();
+		if (payload?.eval_id) {
+			loadEvalDetail(payload.eval_id);
+		}
+		return;
+	}
+	if (payload?.phase === "error") {
+		stopEvalProgress(opId, false);
+		showToast(`Eval failed: ${payload?.error || "unknown error"}`, "error");
+	}
 }
 
 function doInstall(source) {
@@ -167,6 +284,21 @@ function InstallProgressBar() {
 			) => html`<div key=${p.id} style="border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;background:var(--surface);font-size:.78rem;color:var(--muted)">
 				<div><strong style="color:var(--text-strong)">Installing ${p.source}...</strong></div>
 				<div style="margin-top:3px">This may take a while (download + scan).</div>
+    </div>`,
+		)}
+  </div>`;
+}
+
+function EvalProgressBar() {
+	var items = evalProgresses.value;
+	if (!items.length) return null;
+	return html`<div style="display:flex;flex-direction:column;gap:8px">
+    ${items.map(
+			(
+				p,
+			) => html`<div key=${p.id} style="border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;background:var(--surface);font-size:.78rem;color:var(--muted)">
+				<div><strong style="color:var(--text-strong)">Benchmarking ${p.skill || "skill"} (${p.source})...</strong></div>
+				<div style="margin-top:3px">Running with-skill vs baseline scoring.</div>
     </div>`,
 		)}
   </div>`;
@@ -391,7 +523,7 @@ function SkillDetail(props) {
 			} else {
 				showToast(`Failed: ${r?.error || "unknown error"}`, "error");
 			}
-			});
+		});
 	}
 
 	function doUnquarantine() {
@@ -470,20 +602,20 @@ function SkillDetail(props) {
 			? "Unquarantining..."
 			: needsTrust && !d.enabled
 				? "Trusting..."
-			: isDisc && d.enabled
-				? "Deleting..."
-				: "Loading..."
+				: isDisc && d.enabled
+					? "Deleting..."
+					: "Loading..."
 		: isProtected
 			? "Protected"
 			: isQuarantined
 				? "Unquarantine"
 				: needsTrust && !d.enabled
 					? "Trust"
-				: isDisc && d.enabled
-					? "Delete"
-					: d.enabled
-						? "Disable"
-						: "Enable";
+					: isDisc && d.enabled
+						? "Delete"
+						: d.enabled
+							? "Disable"
+							: "Enable";
 
 	return html`<div ref=${panelRef} class="skills-detail-panel" style="display:block">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
@@ -716,6 +848,160 @@ function ReposSection() {
   </div>`;
 }
 
+function formatPercent(value) {
+	if (typeof value !== "number" || Number.isNaN(value)) return "0.0%";
+	return `${(value * 100).toFixed(1)}%`;
+}
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: benchmark panel rendering has multiple conditional states
+function SkillEvalsSection() {
+	var targets = evalTargets.value;
+	var runs = evalRuns.value || [];
+	if (targets.length > 0 && !targets.some((target) => target.key === selectedEvalTargetKey.value)) {
+		selectedEvalTargetKey.value = targets[0].key;
+	}
+	var selectedTarget = targets.find((target) => target.key === selectedEvalTargetKey.value) || targets[0] || null;
+	var selectedRun = selectedEvalRunDetail.value;
+	var hasActiveEval = evalProgresses.value.length > 0;
+
+	return html`<div class="skills-section">
+    <h3 class="skills-section-title">Skill Evals</h3>
+    <p style="margin:0 0 8px;color:var(--muted);font-size:.78rem">
+      Compare each skill against a no-skill baseline using deterministic assertions (trigger quality, workflow clarity, safety, validation, examples, dependencies).
+    </p>
+    ${
+			targets.length === 0 &&
+			html`<div style="padding:12px;color:var(--muted);font-size:.82rem">Enable at least one skill to run benchmarks.</div>`
+		}
+    ${
+			targets.length > 0 &&
+			html`<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+        ${targets.slice(0, 20).map(
+					(target) => html`<button
+            key=${target.key}
+            class="provider-btn provider-btn-sm ${selectedEvalTargetKey.value === target.key ? "" : "provider-btn-secondary"}"
+            onClick=${() => {
+							selectedEvalTargetKey.value = target.key;
+						}}
+            style=${
+							selectedEvalTargetKey.value === target.key
+								? {}
+								: {
+										opacity: 0.9,
+									}
+						}
+          >
+            <span style="font-family:var(--font-mono)">${target.name}</span>
+            <span style="margin-left:6px;font-size:.65rem;opacity:.8">${target.source}</span>
+          </button>`,
+				)}
+      </div>`
+		}
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <button
+        class="provider-btn provider-btn-sm"
+        disabled=${!selectedTarget || hasActiveEval}
+        onClick=${() => {
+					if (selectedTarget) runSelectedEval(selectedTarget);
+				}}
+      >${hasActiveEval ? "Benchmarking..." : "Run Benchmark"}</button>
+      ${
+				selectedTarget &&
+				html`<span style="font-size:.74rem;color:var(--muted)">Target: <code>${selectedTarget.name}</code> from <code>${selectedTarget.source}</code></span>`
+			}
+    </div>
+    ${
+			runs.length === 0 &&
+			html`<div style="padding:12px;color:var(--muted);font-size:.82rem">No benchmark runs yet.</div>`
+		}
+    ${
+			runs.length > 0 &&
+			html`<div class="skills-table-wrap">
+        <table style="width:100%;border-collapse:collapse;font-size:.8rem">
+          <thead>
+            <tr style="border-bottom:1px solid var(--border);background:var(--surface)">
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">Skill</th>
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">With</th>
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">Without</th>
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">Delta</th>
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">When</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${runs.slice(0, 20).map(
+							(run) => html`<tr
+                key=${run.id}
+                style="border-bottom:1px solid var(--border);cursor:pointer;background:${
+									selectedEvalRunId.value === run.id ? "var(--bg-hover)" : "transparent"
+								}"
+                onClick=${() => {
+									loadEvalDetail(run.id);
+								}}
+              >
+                <td style="padding:8px 10px">
+                  <div style="font-family:var(--font-mono);color:var(--text-strong)">${run.skill_name || "\u2014"}</div>
+                  <div style="font-size:.68rem;color:var(--muted)">${run.source || ""}</div>
+                </td>
+                <td style="padding:8px 10px;color:var(--text)">${formatPercent(run.with_skill_pass_rate)}</td>
+                <td style="padding:8px 10px;color:var(--text)">${formatPercent(run.without_skill_pass_rate)}</td>
+                <td style="padding:8px 10px;color:${Number(run.pass_rate_delta || 0) >= 0 ? "var(--success, #4a4)" : "var(--error, #e55)"}">${formatPercent(run.pass_rate_delta || 0)}</td>
+                <td style="padding:8px 10px;color:var(--muted)">${new Date(run.created_at_ms || 0).toLocaleString()}</td>
+              </tr>`,
+						)}
+          </tbody>
+        </table>
+      </div>`
+		}
+    ${
+			selectedRun &&
+			html`<div style="margin-top:10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface2);padding:10px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px">
+          <strong style="font-size:.82rem;color:var(--text-strong)">Eval ${selectedRun.id}</strong>
+          <button class="provider-btn provider-btn-secondary provider-btn-sm" onClick=${() => {
+						selectedEvalRunId.value = "";
+						selectedEvalRunDetail.value = null;
+					}}>Close</button>
+        </div>
+        <div style="font-size:.76rem;color:var(--muted);margin-bottom:8px">
+          Pass delta: <strong style="color:${Number(selectedRun?.benchmark?.run_summary?.pass_rate_delta || 0) >= 0 ? "var(--success, #4a4)" : "var(--error, #e55)"}">${formatPercent(selectedRun?.benchmark?.run_summary?.pass_rate_delta || 0)}</strong>
+        </div>
+        ${
+					selectedRun?.benchmark?.notes?.length > 0 &&
+					html`<div style="margin-bottom:8px">
+            ${selectedRun.benchmark.notes.map(
+							(note, idx) =>
+								html`<div key=${idx} style="font-size:.76rem;color:var(--text);margin-bottom:4px">\u2022 ${note}</div>`,
+						)}
+          </div>`
+				}
+        ${
+					selectedRun?.benchmark?.assertions?.length > 0 &&
+					html`<div class="skills-table-wrap">
+            <table style="width:100%;border-collapse:collapse;font-size:.76rem">
+              <thead>
+                <tr style="border-bottom:1px solid var(--border);background:var(--surface)">
+                  <th style="text-align:left;padding:6px 8px;color:var(--muted)">Assertion</th>
+                  <th style="text-align:left;padding:6px 8px;color:var(--muted)">With</th>
+                  <th style="text-align:left;padding:6px 8px;color:var(--muted)">Without</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${selectedRun.benchmark.assertions.map(
+									(assertion) => html`<tr key=${assertion.id} style="border-bottom:1px solid var(--border)">
+                    <td style="padding:6px 8px;color:var(--text)">${assertion.label}</td>
+                    <td style="padding:6px 8px;color:${assertion.with_skill?.passed ? "var(--success, #4a4)" : "var(--error, #e55)"}">${assertion.with_skill?.passed ? "pass" : "fail"}</td>
+                    <td style="padding:6px 8px;color:${assertion.without_skill?.passed ? "var(--success, #4a4)" : "var(--error, #e55)"}">${assertion.without_skill?.passed ? "pass" : "fail"}</td>
+                  </tr>`,
+								)}
+              </tbody>
+            </table>
+          </div>`
+				}
+      </div>`
+		}
+  </div>`;
+}
+
 function SourceBadge(props) {
 	var src = props.source || "";
 	// Discovered skills have source types like "personal", "project".
@@ -869,7 +1155,7 @@ function SkillsPage() {
 			fetchAll();
 		});
 
-		var off = onEvent("skills.install.progress", (payload) => {
+		var offInstall = onEvent("skills.install.progress", (payload) => {
 			var opId = payload?.op_id;
 			if (!opId) return;
 			var source = payload?.source || "repository";
@@ -886,7 +1172,12 @@ function SkillsPage() {
 			}
 		});
 
-		return off;
+		var offEval = onEvent("skills.evals.progress", handleEvalProgress);
+
+		return () => {
+			if (typeof offInstall === "function") offInstall();
+			if (typeof offEval === "function") offEval();
+		};
 	}, []);
 
 	return html`
@@ -900,8 +1191,10 @@ function SkillsPage() {
       <${SecurityWarning} />
       <${InstallBox} />
       <${InstallProgressBar} />
+      <${EvalProgressBar} />
       <${FeaturedSection} />
       <${ReposSection} />
+      <${SkillEvalsSection} />
       ${loading.value && enabledSkills.value.length === 0 && repos.value.length === 0 && html`<div style="padding:24px;text-align:center;color:var(--muted);font-size:.85rem">Loading skills\u2026</div>`}
       <${EnabledSkillsTable} />
     </div>

@@ -2,6 +2,24 @@ const { expect, test } = require("@playwright/test");
 const { navigateAndWait, watchPageErrors } = require("../helpers");
 
 async function mockSkillsApi(page, fixture) {
+	await page.route("**/api/skills/evals/*", (route) => {
+		var url = new URL(route.request().url());
+		var id = url.pathname.split("/").pop();
+		var byId = fixture.evalRunDetailById || {};
+		var detail = byId[id] || fixture.evalRunDetail || {};
+		return route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify(detail),
+		});
+	});
+	await page.route("**/api/skills/evals", (route) => {
+		return route.fulfill({
+			status: 200,
+			contentType: "application/json",
+			body: JSON.stringify({ runs: fixture.evalRuns || [] }),
+		});
+	});
 	await page.route("**/api/skills/search**", (route) => {
 		return route.fulfill({
 			status: 200,
@@ -38,11 +56,10 @@ async function installSkillsRpcMock(page, responses) {
 
 					var mocked = mockResponses[frame.method];
 					if (mocked) {
-						var responseFrame = Object.assign(
-							{ type: "res", id: frame.id, ok: true, payload: {} },
-							mocked,
-							{ id: frame.id, type: "res" },
-						);
+						var responseFrame = Object.assign({ type: "res", id: frame.id, ok: true, payload: {} }, mocked, {
+							id: frame.id,
+							type: "res",
+						});
 						setTimeout(() => {
 							this.dispatchEvent(
 								new MessageEvent("message", {
@@ -198,17 +215,11 @@ test.describe("Skills page", () => {
 
 		await expect
 			.poll(() =>
-				page.evaluate(() =>
-					(window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.unquarantine"),
-				),
+				page.evaluate(() => (window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.unquarantine")),
 			)
 			.toBe(true);
 		await expect
-			.poll(() =>
-				page.evaluate(() =>
-					(window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.enable"),
-				),
-			)
+			.poll(() => page.evaluate(() => (window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.enable")))
 			.toBe(false);
 	});
 
@@ -293,18 +304,101 @@ test.describe("Skills page", () => {
 		await openSkillDetail(page, "Safe Skill");
 		await page.getByRole("button", { name: "Enable", exact: true }).first().click();
 		await expect
-			.poll(() =>
-				page.evaluate(() =>
-					(window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.enable"),
-				),
-			)
+			.poll(() => page.evaluate(() => (window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.enable")))
 			.toBe(true);
 		await expect
 			.poll(() =>
-				page.evaluate(() =>
-					(window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.unquarantine"),
-				),
+				page.evaluate(() => (window.__skillsRpcCalls || []).some((c) => c.method === "skills.skill.unquarantine")),
 			)
 			.toBe(false);
+	});
+
+	test("skill eval benchmark can be started from skills page", async ({ page }) => {
+		await mockSkillsApi(page, {
+			enabledSkills: [
+				{
+					name: "skill-creator",
+					description: "Create and improve skills",
+					source: "anthropics/skills",
+					enabled: true,
+				},
+			],
+			repos: [],
+			evalRuns: [],
+		});
+		await installSkillsRpcMock(page, {
+			"skills.evals.run": {
+				ok: true,
+				payload: {
+					id: "eval-123",
+					skill_name: "skill-creator",
+					source: "anthropics/skills",
+					status: "completed",
+					benchmark: {
+						run_summary: {
+							with_skill_pass_rate: 0.86,
+							without_skill_pass_rate: 0.43,
+							pass_rate_delta: 0.43,
+						},
+						assertions: [],
+						notes: ["With-skill pass rate is +43.0% higher than baseline."],
+					},
+				},
+			},
+		});
+
+		await navigateAndWait(page, "/skills");
+		await expect(page.getByRole("heading", { name: "Skill Evals", exact: true })).toBeVisible();
+		await page
+			.getByRole("button", { name: /skill-creator/i })
+			.first()
+			.click();
+		await page.getByRole("button", { name: "Run Benchmark", exact: true }).click();
+
+		await expect
+			.poll(() => page.evaluate(() => (window.__skillsRpcCalls || []).some((c) => c.method === "skills.evals.run")))
+			.toBe(true);
+	});
+
+	test("skill eval row loads benchmark detail panel", async ({ page }) => {
+		await mockSkillsApi(page, {
+			enabledSkills: [],
+			repos: [],
+			evalRuns: [
+				{
+					id: "eval-xyz",
+					skill_name: "skill-creator",
+					source: "anthropics/skills",
+					with_skill_pass_rate: 0.8,
+					without_skill_pass_rate: 0.4,
+					pass_rate_delta: 0.4,
+					created_at_ms: 1762300000000,
+				},
+			],
+			evalRunDetailById: {
+				"eval-xyz": {
+					id: "eval-xyz",
+					benchmark: {
+						run_summary: {
+							pass_rate_delta: 0.4,
+						},
+						notes: ["With-skill pass rate is +40.0% higher than baseline."],
+						assertions: [
+							{
+								id: "workflow_steps",
+								label: "Workflow is stepwise and executable",
+								with_skill: { passed: true },
+								without_skill: { passed: false },
+							},
+						],
+					},
+				},
+			},
+		});
+
+		await navigateAndWait(page, "/skills");
+		await page.locator("tbody tr").filter({ hasText: "skill-creator" }).first().click();
+		await expect(page.getByText("Eval eval-xyz", { exact: false })).toBeVisible();
+		await expect(page.getByText("Workflow is stepwise and executable", { exact: true })).toBeVisible();
 	});
 });
