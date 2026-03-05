@@ -13,6 +13,7 @@ use {
 
 use {
     moltis_agents::tool_registry::{AgentTool, ToolRegistry},
+    moltis_mcp::ToolDetailLevel,
     moltis_mcp::tool_bridge::{McpAgentTool, McpToolBridge},
 };
 
@@ -225,6 +226,25 @@ fn parse_server_config(
         url,
         oauth,
     })
+}
+
+fn parse_tool_detail_level(params: &Value) -> Result<ToolDetailLevel, ServiceError> {
+    let raw = params
+        .get("detail_level")
+        .or_else(|| params.get("detailLevel"))
+        .and_then(Value::as_str)
+        .unwrap_or("summary")
+        .trim()
+        .to_ascii_lowercase();
+
+    match raw.as_str() {
+        "name" => Ok(ToolDetailLevel::Name),
+        "summary" => Ok(ToolDetailLevel::Summary),
+        "full" => Ok(ToolDetailLevel::Full),
+        other => Err(ServiceError::message(format!(
+            "invalid detail level '{other}', expected one of: name, summary, full"
+        ))),
+    }
 }
 
 // ── LiveMcpService ──────────────────────────────────────────────────────────
@@ -596,7 +616,11 @@ impl McpService for LiveMcpService {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(25);
-        let tools = self.manager.search_tools(query, server, limit).await;
+        let detail_level = parse_tool_detail_level(&params)?;
+        let tools = self
+            .manager
+            .search_tools(query, server, limit, detail_level)
+            .await;
         Ok(serde_json::json!({ "tools": tools }))
     }
 

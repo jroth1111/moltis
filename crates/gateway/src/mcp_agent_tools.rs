@@ -7,6 +7,7 @@ use {
     anyhow::{Result, anyhow},
     async_trait::async_trait,
     moltis_agents::tool_registry::{AgentTool, ToolEffectClass},
+    moltis_mcp::ToolDetailLevel,
     moltis_mcp::types::{McpToolDef, ToolContent, ToolsCallResult},
     serde::Deserialize,
     serde_json::Value,
@@ -169,6 +170,17 @@ fn parse_selected_tools(params: &Value) -> HashSet<String> {
         .collect()
 }
 
+fn parse_detail_level(raw: Option<&str>) -> Result<ToolDetailLevel> {
+    match raw.unwrap_or("summary").trim().to_ascii_lowercase().as_str() {
+        "name" => Ok(ToolDetailLevel::Name),
+        "summary" => Ok(ToolDetailLevel::Summary),
+        "full" => Ok(ToolDetailLevel::Full),
+        other => Err(anyhow!(
+            "invalid detail_level '{other}', expected one of: name, summary, full"
+        )),
+    }
+}
+
 pub struct McpSearchToolsTool {
     manager: Arc<moltis_mcp::McpManager>,
 }
@@ -209,6 +221,11 @@ impl AgentTool for McpSearchToolsTool {
                     "type": "integer",
                     "description": "Max tool summaries to return (default 25, max 200)",
                     "default": 25
+                },
+                "detail_level": {
+                    "type": "string",
+                    "description": "Summary detail level: name, summary, or full",
+                    "default": "summary"
                 }
             }
         })
@@ -226,7 +243,12 @@ impl AgentTool for McpSearchToolsTool {
             .map(|v| v as usize)
             .unwrap_or(25)
             .clamp(1, 200);
-        let tools = self.manager.search_tools(query, server, limit).await;
+        let detail_level =
+            parse_detail_level(params.get("detail_level").and_then(Value::as_str))?;
+        let tools = self
+            .manager
+            .search_tools(query, server, limit, detail_level)
+            .await;
         Ok(serde_json::json!({ "tools": tools }))
     }
 }

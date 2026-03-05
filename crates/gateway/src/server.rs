@@ -1447,7 +1447,12 @@ pub async fn prepare_gateway(
             }
         }
         mcp_configured_count = merged.servers.values().filter(|s| s.enabled).count();
-        let mcp_manager = Arc::new(moltis_mcp::McpManager::new(merged));
+        let mcp_manager = Arc::new(moltis_mcp::McpManager::new_with_options(
+            merged,
+            moltis_mcp::McpManagerOptions {
+                tool_summary_cache_ttl_secs: config.mcp.code.tool_summary_cache_ttl_secs,
+            },
+        ));
         live_mcp = Arc::new(crate::mcp_service::LiveMcpService::new(Arc::clone(
             &mcp_manager,
         )));

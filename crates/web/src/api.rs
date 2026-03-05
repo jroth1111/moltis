@@ -183,6 +183,8 @@ pub struct McpSearchQuery {
     pub query: Option<String>,
     pub server: Option<String>,
     pub limit: Option<u64>,
+    #[serde(rename = "detailLevel")]
+    pub detail_level: Option<String>,
 }
 
 pub async fn api_mcp_tools_search_handler(
@@ -193,6 +195,7 @@ pub async fn api_mcp_tools_search_handler(
         "query": query.query.unwrap_or_default(),
         "server": query.server,
         "limit": query.limit.unwrap_or(25),
+        "detailLevel": query.detail_level.unwrap_or_else(|| "summary".to_string()),
     });
     match state.gateway.services.mcp.search_tools(payload).await {
         Ok(val) => Json(val).into_response(),
