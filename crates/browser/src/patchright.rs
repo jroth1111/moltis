@@ -53,13 +53,18 @@ struct PatchrightProbeOutput {
 pub async fn run_patchright_probe(
     url: &str,
     config: &PatchrightFallbackConfig,
+    headless: bool,
+    display: Option<&str>,
 ) -> Result<PatchrightProbe, Error> {
     let mut cmd = Command::new(config.python_binary.trim());
-    cmd.kill_on_drop(true)
-        .arg("-c")
+    cmd.kill_on_drop(true);
+    if let Some(display) = display {
+        cmd.env("DISPLAY", display);
+    }
+    cmd.arg("-c")
         .arg(PATCHRIGHT_PROBE_PY)
         .arg(url)
-        .arg(if config.headless { "1" } else { "0" })
+        .arg(if headless { "1" } else { "0" })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

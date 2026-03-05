@@ -22,12 +22,13 @@ use {
 use crate::{
     challenge::ChallengeType,
     error::Error,
-    patchright::run_patchright_probe,
+    patchright::{PatchrightProbe, run_patchright_probe},
     pool::BrowserPool,
     snapshot::{
         extract_snapshot, find_element_by_ref, focus_element_by_ref, scroll_element_into_view,
     },
     types::{BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest, BrowserResponse},
+    virtual_display::VirtualDisplay,
 };
 
 const NAV_DIAGNOSTICS_JS: &str = r#"
@@ -90,6 +91,14 @@ fn should_attempt_patchright_fallback(
         Some(kind) => is_patchright_challenge_allowed(kind, &config.challenge_types),
         None => false,
     }
+}
+
+fn should_attempt_virtual_display_patchright_retry(
+    fallback_headless: bool,
+    virtual_display_enabled: bool,
+    challenge_type: Option<ChallengeType>,
+) -> bool {
+    fallback_headless && virtual_display_enabled && challenge_type.is_some()
 }
 
 /// Extract session_id or return an error for actions that require an existing session.
@@ -610,43 +619,18 @@ impl BrowserManager {
         diagnostics
     }
 
-    async fn retry_with_patchright_if_needed(
+    async fn apply_patchright_probe(
         &self,
         page: &Page,
-        diagnostics: NavigationDiagnostics,
+        probe: &PatchrightProbe,
         url: &str,
-        sandbox: bool,
-    ) -> NavigationDiagnostics {
-        if !should_attempt_patchright_fallback(
-            diagnostics.challenge_type,
-            sandbox,
-            url,
-            &self.config.patchright_fallback,
-        ) {
-            return diagnostics;
-        }
-
-        let challenge_name = diagnostics.challenge_type.map(ChallengeType::as_str);
-        info!(
-            url = url,
-            challenge_type = ?challenge_name,
-            "attempting patchright fallback for challenge page"
-        );
-
-        let probe = match run_patchright_probe(url, &self.config.patchright_fallback).await {
-            Ok(probe) => probe,
-            Err(e) => {
-                warn!(
-                    url = url,
-                    challenge_type = ?challenge_name,
-                    error = %e,
-                    "patchright fallback failed"
-                );
-                return diagnostics;
-            },
-        };
+        challenge_name: Option<&str>,
+        attempt: &str,
+    ) -> Option<NavigationDiagnostics> {
         debug!(
             url = url,
+            initial_challenge_type = ?challenge_name,
+            attempt = attempt,
             patchright_final_url = probe.final_url,
             patchright_title_len = probe.title_len,
             patchright_body_text_len = probe.body_text_len,
@@ -690,30 +674,33 @@ impl BrowserManager {
         if cookie_params.is_empty() {
             warn!(
                 url = url,
-                challenge_type = ?challenge_name,
+                initial_challenge_type = ?challenge_name,
+                attempt = attempt,
                 "patchright fallback returned no transferable cookies"
             );
-            return diagnostics;
+            return None;
         }
 
         if let Err(e) = page.execute(SetCookiesParams::new(cookie_params)).await {
             warn!(
                 url = url,
-                challenge_type = ?challenge_name,
+                initial_challenge_type = ?challenge_name,
+                attempt = attempt,
                 error = %e,
                 "failed to inject patchright cookies into active session"
             );
-            return diagnostics;
+            return None;
         }
 
         if let Err(e) = page.reload().await {
             warn!(
                 url = url,
-                challenge_type = ?challenge_name,
+                initial_challenge_type = ?challenge_name,
+                attempt = attempt,
                 error = %e,
                 "failed to reload after patchright cookie injection"
             );
-            return diagnostics;
+            return None;
         }
 
         let _ = page.wait_for_navigation().await;
@@ -722,6 +709,7 @@ impl BrowserManager {
         if refreshed.challenge_type.is_none() {
             info!(
                 original_url = url,
+                attempt = attempt,
                 patchright_final_url = probe.final_url,
                 title_len = refreshed.title_len,
                 body_text_len = refreshed.body_text_len,
@@ -730,6 +718,7 @@ impl BrowserManager {
         } else {
             warn!(
                 original_url = url,
+                attempt = attempt,
                 patchright_final_url = probe.final_url,
                 challenge_type = refreshed.challenge_type.map(ChallengeType::as_str),
                 title_len = refreshed.title_len,
@@ -738,7 +727,116 @@ impl BrowserManager {
             );
         }
 
-        refreshed
+        Some(refreshed)
+    }
+
+    async fn retry_with_patchright_if_needed(
+        &self,
+        page: &Page,
+        diagnostics: NavigationDiagnostics,
+        url: &str,
+        sandbox: bool,
+    ) -> NavigationDiagnostics {
+        if !should_attempt_patchright_fallback(
+            diagnostics.challenge_type,
+            sandbox,
+            url,
+            &self.config.patchright_fallback,
+        ) {
+            return diagnostics;
+        }
+
+        let challenge_name = diagnostics.challenge_type.map(ChallengeType::as_str);
+        info!(
+            url = url,
+            challenge_type = ?challenge_name,
+            "attempting patchright fallback for challenge page"
+        );
+
+        let mut best = diagnostics;
+        let fallback = &self.config.patchright_fallback;
+
+        match run_patchright_probe(url, fallback, fallback.headless, None).await {
+            Ok(probe) => {
+                if let Some(refreshed) = self
+                    .apply_patchright_probe(page, &probe, url, challenge_name, "primary")
+                    .await
+                {
+                    best = refreshed;
+                }
+            },
+            Err(e) => {
+                warn!(
+                    url = url,
+                    challenge_type = ?challenge_name,
+                    error = %e,
+                    "patchright fallback failed"
+                );
+            },
+        }
+
+        if !should_attempt_virtual_display_patchright_retry(
+            fallback.headless,
+            self.config.virtual_display.enabled,
+            best.challenge_type,
+        ) {
+            return best;
+        }
+
+        info!(
+            url = url,
+            challenge_type = ?challenge_name,
+            "attempting secondary patchright fallback with virtual-display headful mode"
+        );
+
+        let virtual_display = match VirtualDisplay::start(&self.config.virtual_display) {
+            Ok(Some(display)) => display,
+            Ok(None) => {
+                warn!(
+                    url = url,
+                    challenge_type = ?challenge_name,
+                    "virtual display unavailable; skipping headful patchright retry"
+                );
+                return best;
+            },
+            Err(e) => {
+                warn!(
+                    url = url,
+                    challenge_type = ?challenge_name,
+                    error = %e,
+                    "failed to start virtual display for headful patchright retry"
+                );
+                return best;
+            },
+        };
+
+        let display = virtual_display.display().to_string();
+        match run_patchright_probe(url, fallback, false, Some(display.as_str())).await {
+            Ok(probe) => {
+                if let Some(refreshed) = self
+                    .apply_patchright_probe(
+                        page,
+                        &probe,
+                        url,
+                        challenge_name,
+                        "virtual_display_headful",
+                    )
+                    .await
+                {
+                    best = refreshed;
+                }
+            },
+            Err(e) => {
+                warn!(
+                    url = url,
+                    challenge_type = ?challenge_name,
+                    error = %e,
+                    "virtual-display headful patchright retry failed"
+                );
+            },
+        }
+
+        best
     }
 
     /// Take a screenshot of the page.
@@ -2090,6 +2188,30 @@ mod tests {
             false,
             "https://shop.example.com/",
             &cfg
+        ));
+    }
+
+    #[test]
+    fn virtual_display_patchright_retry_requires_challenge_and_headless_primary() {
+        assert!(should_attempt_virtual_display_patchright_retry(
+            true,
+            true,
+            Some(ChallengeType::Kasada)
+        ));
+        assert!(!should_attempt_virtual_display_patchright_retry(
+            false,
+            true,
+            Some(ChallengeType::Kasada)
+        ));
+        assert!(!should_attempt_virtual_display_patchright_retry(
+            true,
+            false,
+            Some(ChallengeType::Kasada)
+        ));
+        assert!(!should_attempt_virtual_display_patchright_retry(
+            true,
+            true,
+            None
         ));
     }
 
