@@ -14,11 +14,12 @@ use {
             page::CaptureScreenshotFormat,
         },
     },
-    tokio::time::{Duration, timeout},
+    tokio::time::{Duration, sleep, timeout},
     tracing::{debug, info, warn},
 };
 
 use crate::{
+    challenge::ChallengeType,
     error::Error,
     pool::BrowserPool,
     snapshot::{
@@ -26,6 +27,29 @@ use crate::{
     },
     types::{BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest, BrowserResponse},
 };
+
+const NAV_DIAGNOSTICS_JS: &str = r#"
+(() => {
+    const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+    return {
+        title_len: (document.title || '').trim().length,
+        body_text_len: text.length
+    };
+})()
+"#;
+
+const CHALLENGE_WAIT_MAX_SECONDS: usize = 30;
+const CHALLENGE_STABLE_READ_THRESHOLD: usize = 20;
+
+#[derive(Debug, Clone)]
+struct NavigationDiagnostics {
+    final_url: String,
+    title_len: usize,
+    body_text_len: usize,
+    html_len: usize,
+    challenge_type: Option<ChallengeType>,
+    challenge_markers: Vec<String>,
+}
 
 /// Extract session_id or return an error for actions that require an existing session.
 fn require_session(session_id: Option<&str>, action: &str) -> Result<String, Error> {
@@ -364,19 +388,21 @@ impl BrowserManager {
             .get_or_create(session_id, sandbox, browser)
             .await?;
         let page = self.pool.get_page(&sid).await?;
+        let mut active_sid = sid;
+        let mut active_page = page;
 
         #[cfg(feature = "metrics")]
         let nav_start = Instant::now();
 
         // Try navigation, retry with fresh session if connection is dead
-        if let Err(e) = page.goto(url).await {
+        if let Err(e) = active_page.goto(url).await {
             let nav_err = Error::NavigationFailed(e.to_string());
             if nav_err.is_connection_error() {
                 warn!(
-                    session_id = sid,
+                    session_id = active_sid,
                     "browser connection dead, closing session and retrying"
                 );
-                let _ = self.pool.close_session(&sid).await;
+                let _ = self.pool.close_session(&active_sid).await;
                 // Retry with a fresh session (use same sandbox mode)
                 let new_sid = self.pool.get_or_create(None, sandbox, browser).await?;
                 let new_page = self.pool.get_page(&new_sid).await?;
@@ -384,24 +410,19 @@ impl BrowserManager {
                     .goto(url)
                     .await
                     .map_err(|e| Error::NavigationFailed(e.to_string()))?;
-                // Continue with the new session
-                let _ = new_page.wait_for_navigation().await;
-                let current_url = new_page.url().await.ok().flatten().unwrap_or_default();
-                info!(
-                    session_id = new_sid,
-                    url = current_url,
-                    "navigated to URL (after retry)"
-                );
-                return Ok((
-                    new_sid.clone(),
-                    BrowserResponse::success(new_sid, 0, sandbox).with_url(current_url),
-                ));
+                active_sid = new_sid;
+                active_page = new_page;
             }
-            return Err(nav_err);
+            if !nav_err.is_connection_error() {
+                return Err(nav_err);
+            }
         }
 
-        // Wait for network idle
-        let _ = page.wait_for_navigation().await;
+        // Wait for post-navigation lifecycle signals.
+        let _ = active_page.wait_for_navigation().await;
+        let diagnostics = self
+            .wait_for_challenge_resolution_if_needed(&active_page)
+            .await;
 
         #[cfg(feature = "metrics")]
         {
@@ -409,14 +430,135 @@ impl BrowserManager {
                 .record(nav_start.elapsed().as_secs_f64());
         }
 
-        let current_url = page.url().await.ok().flatten().unwrap_or_default();
+        let current_url = diagnostics.final_url.clone();
+        let challenge_type = diagnostics
+            .challenge_type
+            .map(|kind| kind.as_str().to_string());
 
-        info!(session_id = sid, url = current_url, "navigated to URL");
+        if let Some(ref kind) = challenge_type {
+            warn!(
+                session_id = active_sid,
+                url = current_url,
+                challenge_type = kind,
+                markers = ?diagnostics.challenge_markers,
+                title_len = diagnostics.title_len,
+                body_text_len = diagnostics.body_text_len,
+                "navigated to challenge/interstitial page"
+            );
+        } else {
+            info!(
+                session_id = active_sid,
+                url = current_url,
+                title_len = diagnostics.title_len,
+                body_text_len = diagnostics.body_text_len,
+                "navigated to URL"
+            );
+        }
 
+        let response = BrowserResponse::success(active_sid.clone(), 0, sandbox)
+            .with_url(current_url.clone())
+            .with_navigation_diagnostics(
+                current_url,
+                diagnostics.title_len,
+                diagnostics.body_text_len,
+                challenge_type,
+                diagnostics.challenge_markers,
+            );
         Ok((
-            sid.clone(),
-            BrowserResponse::success(sid, 0, sandbox).with_url(current_url),
+            active_sid,
+            response,
         ))
+    }
+
+    async fn collect_navigation_diagnostics(&self, page: &Page) -> NavigationDiagnostics {
+        let final_url = page.url().await.ok().flatten().unwrap_or_default();
+        let metrics: serde_json::Value = page
+            .evaluate(NAV_DIAGNOSTICS_JS)
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let title_len = metrics
+            .get("title_len")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(0);
+        let body_text_len = metrics
+            .get("body_text_len")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(0);
+        let html = page.content().await.unwrap_or_default();
+        let html_len = html.len();
+        let detection = crate::challenge::detect_challenge(&html);
+        let challenge_markers = detection
+            .markers
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        NavigationDiagnostics {
+            final_url,
+            title_len,
+            body_text_len,
+            html_len,
+            challenge_type: detection.challenge_type,
+            challenge_markers,
+        }
+    }
+
+    fn should_wait_for_challenge_resolution(diagnostics: &NavigationDiagnostics) -> bool {
+        diagnostics.challenge_type.is_some()
+            || (diagnostics.title_len == 0
+                && diagnostics.body_text_len == 0
+                && diagnostics.html_len > 0)
+    }
+
+    async fn wait_for_challenge_resolution_if_needed(&self, page: &Page) -> NavigationDiagnostics {
+        let mut diagnostics = self.collect_navigation_diagnostics(page).await;
+        if !Self::should_wait_for_challenge_resolution(&diagnostics) {
+            return diagnostics;
+        }
+
+        debug!(
+            challenge_type = diagnostics.challenge_type.map(ChallengeType::as_str),
+            title_len = diagnostics.title_len,
+            body_text_len = diagnostics.body_text_len,
+            html_len = diagnostics.html_len,
+            "starting adaptive challenge-resolution wait loop"
+        );
+
+        let mut previous_challenge_len: Option<usize> = None;
+        let mut stable_challenge_reads = 0usize;
+
+        for _ in 0..CHALLENGE_WAIT_MAX_SECONDS {
+            sleep(Duration::from_secs(1)).await;
+            let next = self.collect_navigation_diagnostics(page).await;
+            let still_waiting = Self::should_wait_for_challenge_resolution(&next);
+            let is_challenge = next.challenge_type.is_some();
+
+            if is_challenge {
+                if previous_challenge_len == Some(next.html_len) {
+                    stable_challenge_reads += 1;
+                } else {
+                    stable_challenge_reads = 0;
+                }
+                previous_challenge_len = Some(next.html_len);
+            } else {
+                stable_challenge_reads = 0;
+                previous_challenge_len = None;
+            }
+
+            diagnostics = next;
+
+            if !still_waiting {
+                break;
+            }
+            if is_challenge && stable_challenge_reads >= CHALLENGE_STABLE_READ_THRESHOLD {
+                break;
+            }
+        }
+
+        diagnostics
     }
 
     /// Take a screenshot of the page.
@@ -540,7 +682,7 @@ impl BrowserManager {
         scroll_element_into_view(&page, ref_).await?;
 
         // Small delay for scroll to complete
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         // Find element center
         let (x, y) = find_element_by_ref(&page, ref_).await?;
@@ -724,7 +866,7 @@ impl BrowserManager {
                 return Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)));
             }
 
-            tokio::time::sleep(interval).await;
+            sleep(interval).await;
         }
 
         Err(Error::Timeout(format!(
@@ -899,7 +1041,7 @@ impl BrowserManager {
         let sid = require_session(session_id, "double_click")?;
         let page = self.pool.get_page(&sid).await?;
         scroll_element_into_view(&page, ref_).await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         let (x, y) = find_element_by_ref(&page, ref_).await?;
 
         // Move to element (behavioral or instant) then fire the double-click events

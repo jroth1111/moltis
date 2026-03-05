@@ -30,6 +30,7 @@
 //! ```
 
 pub mod actions;
+pub mod challenge;
 pub mod container;
 pub mod detect;
 pub mod emulation;

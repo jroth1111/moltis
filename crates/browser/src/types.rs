@@ -594,9 +594,29 @@ pub struct BrowserResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 
+    /// Final URL after navigation resolution/redirects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_url: Option<String>,
+
     /// Page title (for get_title, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+
+    /// Title length captured during navigation diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_len: Option<u64>,
+
+    /// Body text length captured during navigation diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_text_len: Option<u64>,
+
+    /// Classified challenge type for challenge/interstitial pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_type: Option<String>,
+
+    /// Matched challenge markers found in page HTML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_markers: Option<Vec<String>>,
 
     /// Duration of the action in milliseconds.
     pub duration_ms: u64,
@@ -614,7 +634,12 @@ impl BrowserResponse {
             snapshot: None,
             result: None,
             url: None,
+            final_url: None,
             title: None,
+            title_len: None,
+            body_text_len: None,
+            challenge_type: None,
+            challenge_markers: None,
             duration_ms,
         }
     }
@@ -630,7 +655,12 @@ impl BrowserResponse {
             snapshot: None,
             result: None,
             url: None,
+            final_url: None,
             title: None,
+            title_len: None,
+            body_text_len: None,
+            challenge_type: None,
+            challenge_markers: None,
             duration_ms,
         }
     }
@@ -658,6 +688,26 @@ impl BrowserResponse {
 
     pub fn with_title(mut self, title: String) -> Self {
         self.title = Some(title);
+        self
+    }
+
+    pub fn with_navigation_diagnostics(
+        mut self,
+        final_url: String,
+        title_len: usize,
+        body_text_len: usize,
+        challenge_type: Option<String>,
+        challenge_markers: Vec<String>,
+    ) -> Self {
+        self.final_url = Some(final_url);
+        self.title_len = Some(title_len as u64);
+        self.body_text_len = Some(body_text_len as u64);
+        self.challenge_type = challenge_type;
+        self.challenge_markers = if challenge_markers.is_empty() {
+            None
+        } else {
+            Some(challenge_markers)
+        };
         self
     }
 }
