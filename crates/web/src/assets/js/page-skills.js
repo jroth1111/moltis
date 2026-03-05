@@ -319,7 +319,7 @@ function SecurityWarning() {
 	}
 
 	return html`<div class="skills-warn">
-    <div class="skills-warn-title">\u26a0\ufe0f Skills run code on your machine \u2014 treat every skill as untrusted</div>
+    <div class="skills-warn-title">\u26a0\ufe0f Skills run code on your machine \u2014 keep skills pending until validated</div>
     <div>Skills are community-authored instructions that the AI agent follows <strong>with your full system privileges</strong>. Popularity or download count does not mean a skill is safe. A malicious skill can instruct the agent to:</div>
     <ul style="margin:6px 0 6px 18px;padding:0">
       ${threats.map((t) => html`<li>${t}</li>`)}
@@ -412,8 +412,10 @@ function isQuarantinedSkill(d) {
 
 function trustBadge(d) {
 	if (isQuarantinedSkill(d)) return null;
-	if (d.trusted === false)
-		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">untrusted</span>`;
+	if (d.status === "failed_validation")
+		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">failed validation</span>`;
+	if (d.trusted === false || d.status === "pending")
+		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">pending</span>`;
 	return null;
 }
 
@@ -507,12 +509,25 @@ function SkillDetail(props) {
 
 	var isDisc = d.source === "personal" || d.source === "project";
 	var isQuarantined = isQuarantinedSkill(d);
-	var needsTrust = !isDisc && d.trusted === false;
+	var needsValidation = !isDisc && d.trusted === false;
 	var isProtected = isDisc && d.protected === true;
 	var quarantineReason = d.quarantine_reason || "integrity checks failed";
 
 	function doToggle() {
 		actionBusy.value = true;
+		if (isDisc && d.enabled) {
+			sendRpc("skills.skill.delete", { source: props.repoSource, skill: d.name }).then((r) => {
+				actionBusy.value = false;
+				if (r?.deleted) {
+					onClose();
+					fetchAll();
+					props.onReload?.();
+				} else {
+					showToast(`Delete failed: ${r?.error || "unknown error"}`, "error");
+				}
+			});
+			return;
+		}
 		var method = d.enabled ? "skills.skill.disable" : "skills.skill.enable";
 		sendRpc(method, { source: props.repoSource, skill: d.name }).then((r) => {
 			actionBusy.value = false;
@@ -535,7 +550,7 @@ function SkillDetail(props) {
 		}).then((r) => {
 			actionBusy.value = false;
 			if (r?.ok) {
-				showToast(`Unquarantined ${d.name}. Review, trust, then enable.`, "success");
+				showToast(`Unquarantined ${d.name}. Revalidate, then enable.`, "success");
 				fetchAll();
 				props.onReload?.();
 			} else {
@@ -544,16 +559,20 @@ function SkillDetail(props) {
 		});
 	}
 
-	function doTrustOnly() {
+	function doRevalidate() {
 		actionBusy.value = true;
-		sendRpc("skills.skill.trust", { source: props.repoSource, skill: d.name }).then((res) => {
+		sendRpc("skills.skill.revalidate", { source: props.repoSource, skill: d.name }).then((res) => {
 			actionBusy.value = false;
 			if (res?.ok) {
-				showToast(`Trusted ${d.name}. Enable it when ready.`, "success");
+				if (res?.passed === true) {
+					showToast(`Validated ${d.name}. Enable it when ready.`, "success");
+				} else {
+					showToast(`Validation failed for ${d.name}. Review benchmark details.`, "error");
+				}
 				fetchAll();
 				props.onReload?.();
 			} else {
-				showToast(`Trust failed: ${res?.error || "unknown error"}`, "error");
+				showToast(`Validation failed: ${res?.error || "unknown error"}`, "error");
 			}
 		});
 	}
@@ -567,7 +586,7 @@ function SkillDetail(props) {
 		}
 		if (isQuarantined) {
 			requestConfirm(
-				`Unquarantine skill "${d.name}"?\n\nReason: ${quarantineReason}\n\nAfter unquarantine, you still need to trust and enable it separately.`,
+				`Unquarantine skill "${d.name}"?\n\nReason: ${quarantineReason}\n\nAfter unquarantine, you still need to revalidate and enable it separately.`,
 				{
 					confirmLabel: "Unquarantine",
 					danger: true,
@@ -577,11 +596,11 @@ function SkillDetail(props) {
 			});
 			return;
 		}
-		if (!d.enabled && needsTrust) {
-			requestConfirm(`Trust skill "${d.name}" from ${props.repoSource}?`, {
-				confirmLabel: "Trust",
+		if (!d.enabled && needsValidation) {
+			requestConfirm(`Revalidate skill "${d.name}" from ${props.repoSource}?`, {
+				confirmLabel: "Revalidate",
 			}).then((yes) => {
-				if (yes) doTrustOnly();
+				if (yes) doRevalidate();
 			});
 			return;
 		}
@@ -600,8 +619,8 @@ function SkillDetail(props) {
 	var actionLabel = actionBusy.value
 		? isQuarantined
 			? "Unquarantining..."
-			: needsTrust && !d.enabled
-				? "Trusting..."
+			: needsValidation && !d.enabled
+				? "Validating..."
 				: isDisc && d.enabled
 					? "Deleting..."
 					: "Loading..."
@@ -609,8 +628,8 @@ function SkillDetail(props) {
 			? "Protected"
 			: isQuarantined
 				? "Unquarantine"
-				: needsTrust && !d.enabled
-					? "Trust"
+				: needsValidation && !d.enabled
+					? "Revalidate"
 					: isDisc && d.enabled
 						? "Delete"
 						: d.enabled
@@ -653,11 +672,11 @@ function SkillDetail(props) {
 				isQuarantined &&
 				html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--error, #e55);background:color-mix(in srgb, var(--error, #e55) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)">
 	      <strong style="color:var(--error, #e55)">Quarantined:</strong> ${quarantineReason}.<br />
-	      This skill is fail-closed and cannot be enabled until you explicitly unquarantine, review, trust, and enable it.
+	      This skill is fail-closed and cannot be enabled until you explicitly unquarantine, review, revalidate, and enable it.
 	    </div>`
 			}
-	    ${d.commit_age_days != null && d.commit_age_days <= 14 && html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--warning, #c77d00);background:color-mix(in srgb, var(--warning, #c77d00) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)"><strong style="color:var(--warning, #c77d00)">Recent commit warning:</strong> This skill was updated ${d.commit_age_days} day${d.commit_age_days === 1 ? "" : "s"} ago. Treat recent updates as high risk and review diffs before trusting/enabling.</div>`}
-    ${d.drifted && html`<div style="margin:0 0 8px;font-size:.75rem;color:var(--warning, #c77d00)">Source changed since last trust; review updates before enabling again.</div>`}
+	    ${d.commit_age_days != null && d.commit_age_days <= 14 && html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--warning, #c77d00);background:color-mix(in srgb, var(--warning, #c77d00) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)"><strong style="color:var(--warning, #c77d00)">Recent commit warning:</strong> This skill was updated ${d.commit_age_days} day${d.commit_age_days === 1 ? "" : "s"} ago. Treat recent updates as high risk and review diffs before revalidating/enabling.</div>`}
+    ${d.drifted && html`<div style="margin:0 0 8px;font-size:.75rem;color:var(--warning, #c77d00)">Source changed since last validation; revalidate before enabling again.</div>`}
     ${d.description && html`<p style="margin:0 0 8px;font-size:.82rem;color:var(--text)">${d.description}</p>`}
     <${MissingDepsSection} detail=${d} onReload=${props.onReload} />
     ${d.compatibility && html`<div style="margin-bottom:8px;font-size:.75rem;color:var(--muted);font-style:italic">${d.compatibility}</div>`}
@@ -801,7 +820,8 @@ function RepoCard(props) {
 	              <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;margin-left:8px">
 	                ${skill.enabled && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--accent);color:#fff;font-weight:500">enabled</span>`}
 	                ${(skill.quarantined === true || skill.status === "quarantined") && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">quarantined</span>`}
-	                ${skill.trusted === false && skill.quarantined !== true && skill.status !== "quarantined" && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">untrusted</span>`}
+	                ${skill.status === "failed_validation" && skill.quarantined !== true && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">failed validation</span>`}
+	                ${skill.trusted === false && skill.quarantined !== true && skill.status !== "quarantined" && skill.status !== "failed_validation" && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">pending</span>`}
 	                ${skill.drifted && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">source changed</span>`}
 	                ${skill.eligible === false && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">blocked</span>`}
 	              </div>

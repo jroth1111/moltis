@@ -61,22 +61,21 @@ export default {
 	// ── Skill detail panel ──────────────────────────────────
 	protected: "受保护",
 	protectedCannotDelete: "技能 {{name}} 受保护，无法从 UI 删除",
-	trustAndEnable: "信任并启用",
-	trust: "信任",
-	trusting: "信任中...",
+	trustAndEnable: "验证并启用",
+	trust: "重新验证",
+	trusting: "验证中...",
 	unquarantine: "解除隔离",
 	unquarantining: "解除隔离中...",
-	trustSkillConfirm: '信任来自 {{source}} 的技能 "{{name}}"？',
+	trustSkillConfirm: '重新验证来自 {{source}} 的技能 "{{name}}"？',
 	unquarantineConfirm:
-		'解除技能 "{{name}}" 的隔离？\n\n原因：{{reason}}\n\n解除隔离后，你仍需要单独信任并启用该技能。',
-	unquarantinedSuccess: "已解除 {{name}} 的隔离。请审查后再信任并启用。",
-	trustedSuccess: "已信任 {{name}}。准备好后可单独启用。",
-	trustFailed: "信任失败：{{error}}",
+		'解除技能 "{{name}}" 的隔离？\n\n原因：{{reason}}\n\n解除隔离后，你仍需要单独重新验证并启用该技能。',
+	unquarantinedSuccess: "已解除 {{name}} 的隔离。请审查后重新验证并启用。",
+	trustedSuccess: "已验证 {{name}}。准备好后可启用。",
+	trustFailed: "验证失败：{{error}}",
 	failedToLoad: "加载失败：{{error}}",
 	skillMdSource: "SKILL.md 源代码",
 	quarantinedBannerTitle: "已隔离：",
-	quarantinedBannerBody:
-		"此技能采用故障关闭策略，在你明确解除隔离、审查、信任并启用之前无法运行。",
+	quarantinedBannerBody: "此技能采用故障关闭策略，在你明确解除隔离、审查、重新验证并启用之前无法运行。",
 
 	// ── Metadata ────────────────────────────────────────────
 	author: "作者：{{name}}",
@@ -89,7 +88,7 @@ export default {
 	blocked: "已阻止",
 	eligible: "符合条件",
 	noDeps: "无依赖声明",
-	untrusted: "不受信任",
+	untrusted: "待验证",
 	quarantined: "已隔离",
 	enabled: "已启用",
 
@@ -102,13 +101,13 @@ export default {
 
 	// ── Commit warning ──────────────────────────────────────
 	recentCommitWarning: "近期提交警告：",
-	recentCommitMessage: "此技能在 {{days}} 天前更新。将近期更新视为高风险，在信任/启用前请审查差异。",
+	recentCommitMessage: "此技能在 {{days}} 天前更新。将近期更新视为高风险，在重新验证/启用前请审查差异。",
 
 	// ── Drift warning ───────────────────────────────────────
-	driftWarning: "自上次信任以来源已变更；请在再次启用前审查更新。",
+	driftWarning: "自上次验证以来源已变更；请在再次启用前审查更新。",
 
 	// ── Security warning ────────────────────────────────────
-	securityTitle: "\u26a0\ufe0f 技能在你的机器上运行代码 \u2014 将每个技能视为不受信任的",
+	securityTitle: "\u26a0\ufe0f 技能在你的机器上运行代码 \u2014 将每个技能保持为待验证状态，直到验证通过",
 	securityIntro:
 		"技能是社区编写的指令，AI 代理以 <strong>你的完整系统权限</strong> 执行。流行度或下载量并不意味着技能是安全的。恶意技能可以指示代理：",
 	threat1: "在你的机器上执行任意 shell 命令（安装恶意软件、挖矿程序、后门）",

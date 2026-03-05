@@ -192,8 +192,9 @@ where
     fn status_label(status: moltis_skills::types::SkillStatus) -> &'static str {
         match status {
             moltis_skills::types::SkillStatus::Trusted => "trusted",
-            moltis_skills::types::SkillStatus::Untrusted => "untrusted",
+            moltis_skills::types::SkillStatus::Pending => "pending",
             moltis_skills::types::SkillStatus::Quarantined => "quarantined",
+            moltis_skills::types::SkillStatus::FailedValidation => "failed_validation",
         }
     }
 

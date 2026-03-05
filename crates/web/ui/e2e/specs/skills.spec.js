@@ -223,7 +223,7 @@ test.describe("Skills page", () => {
 			.toBe(false);
 	});
 
-	test("untrusted non-quarantined skill requires separate trust then enable", async ({ page }) => {
+	test("pending non-quarantined skill requires revalidate before enable", async ({ page }) => {
 		await mockSkillsApi(page, {
 			repos: [
 				{
@@ -238,9 +238,9 @@ test.describe("Skills page", () => {
 				{
 					name: "safe-skill",
 					display_name: "Safe Skill",
-					description: "Untrusted fixture",
+					description: "Pending fixture",
 					trusted: false,
-					status: "untrusted",
+					status: "pending",
 					quarantined: false,
 					enabled: false,
 					eligible: true,
@@ -254,9 +254,9 @@ test.describe("Skills page", () => {
 					name: "safe-skill",
 					display_name: "Safe Skill",
 					source: "owner/repo",
-					description: "Untrusted detail fixture",
+					description: "Pending detail fixture",
 					trusted: false,
-					status: "untrusted",
+					status: "pending",
 					quarantined: false,
 					enabled: false,
 					eligible: true,
@@ -264,9 +264,9 @@ test.describe("Skills page", () => {
 					body_html: "<p>fixture</p>",
 				},
 			},
-			"skills.skill.trust": {
+			"skills.skill.revalidate": {
 				ok: true,
-				payload: { ok: true },
+				payload: { ok: true, passed: true },
 			},
 			"skills.skill.enable": {
 				ok: true,
@@ -278,22 +278,22 @@ test.describe("Skills page", () => {
 		await expandRepo(page, "owner/repo");
 		await openSkillDetail(page, "Safe Skill");
 
-		await page.getByRole("button", { name: "Trust", exact: true }).first().click();
-		await expect(page.locator(".modal-overlay")).toContainText('Trust skill "safe-skill" from owner/repo?');
-		await page.locator(".modal-overlay").getByRole("button", { name: "Trust", exact: true }).click();
+		await page.getByRole("button", { name: "Revalidate", exact: true }).first().click();
+		await expect(page.locator(".modal-overlay")).toContainText('Revalidate skill "safe-skill" from owner/repo?');
+		await page.locator(".modal-overlay").getByRole("button", { name: "Revalidate", exact: true }).click();
 
 		await expect
 			.poll(() =>
 				page.evaluate(() => {
 					var methods = (window.__skillsRpcCalls || []).map((c) => c.method);
-					var trustIndex = methods.indexOf("skills.skill.trust");
+					var trustIndex = methods.indexOf("skills.skill.revalidate");
 					var enableIndex = methods.indexOf("skills.skill.enable");
 					return trustIndex >= 0 && enableIndex === -1;
 				}),
 			)
 			.toBe(true);
 
-		// Refresh detail after trust mock and enable explicitly as a second action.
+		// Refresh detail after revalidate mock and enable explicitly as a second action.
 		await page
 			.evaluate(() => {
 				window.__skillsRpcCalls = [];
