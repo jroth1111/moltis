@@ -6,14 +6,95 @@
 
 use std::path::Path;
 
-use crate::manifest::ManifestStore;
+use serde::Deserialize;
+
+use crate::{
+    formats::PluginFormat,
+    manifest::ManifestStore,
+    types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
+};
+
+#[derive(Debug, Deserialize)]
+struct SkillsManifestV1 {
+    #[allow(dead_code)]
+    version: u32,
+    #[serde(default)]
+    repos: Vec<RepoEntryV1>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoEntryV1 {
+    source: String,
+    repo_name: String,
+    installed_at_ms: u64,
+    #[serde(default)]
+    commit_sha: Option<String>,
+    #[serde(default)]
+    format: PluginFormat,
+    #[serde(default)]
+    skills: Vec<SkillStateV1>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillStateV1 {
+    name: String,
+    relative_path: String,
+    #[serde(default)]
+    trusted: bool,
+    #[serde(default)]
+    enabled: bool,
+}
+
+/// Parse and migrate a v1 manifest payload into v2.
+///
+/// Returns `Ok(Some(_))` when migration is needed, `Ok(None)` when payload is
+/// already v2+.
+pub fn migrate_manifest_v1_to_v2(raw_json: &str) -> anyhow::Result<Option<SkillsManifest>> {
+    let value: serde_json::Value = serde_json::from_str(raw_json)?;
+    let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+    if version >= 2 {
+        return Ok(None);
+    }
+
+    let legacy: SkillsManifestV1 = serde_json::from_value(value)?;
+    let repos = legacy
+        .repos
+        .into_iter()
+        .map(|repo| RepoEntry {
+            source: repo.source,
+            repo_name: repo.repo_name,
+            installed_at_ms: repo.installed_at_ms,
+            commit_sha: repo.commit_sha,
+            format: repo.format,
+            skills: repo
+                .skills
+                .into_iter()
+                .map(|skill| SkillState {
+                    name: skill.name,
+                    relative_path: skill.relative_path,
+                    status: if skill.trusted {
+                        SkillStatus::Trusted
+                    } else {
+                        SkillStatus::Untrusted
+                    },
+                    quarantine_reason: None,
+                    last_audited_ms: None,
+                    content_hash: None,
+                    trusted_hash: None,
+                    enabled: skill.enabled,
+                })
+                .collect(),
+        })
+        .collect();
+
+    Ok(Some(SkillsManifest { version: 2, repos }))
+}
 
 /// Migrate plugins data into the unified skills system.
 ///
 /// - Merges repos from `plugins-manifest.json` into `skills-manifest.json`
 /// - Moves directories from `installed-plugins/` to `installed-skills/`
-/// - Preserves all fields: `trusted`, `trusted_at_ms`, `trusted_commit_sha`, `enabled`,
-///   `commit_sha`, `format`, `relative_path`
+/// - Preserves all fields: `status`, `enabled`, `commit_sha`, `format`, `relative_path`
 /// - Skips entries already in skills manifest (idempotent)
 /// - Deletes old manifest + empty old dir after successful migration
 ///
@@ -116,7 +197,7 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
 mod tests {
     use crate::{
         formats::PluginFormat,
-        types::{RepoEntry, SkillState, SkillsManifest},
+        types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
     };
 
     use super::*;
@@ -128,7 +209,7 @@ mod tests {
 
         // Set up plugins manifest.
         let plugins_manifest = SkillsManifest {
-            version: 1,
+            version: 2,
             repos: vec![RepoEntry {
                 source: "anthropics/claude-plugins-official".into(),
                 repo_name: "anthropics-claude-plugins-official".into(),
@@ -138,9 +219,11 @@ mod tests {
                 skills: vec![SkillState {
                     name: "pr-review-toolkit:code-reviewer".into(),
                     relative_path: "anthropics-claude-plugins-official".into(),
-                    trusted: false,
-                    trusted_at_ms: None,
-                    trusted_commit_sha: None,
+                    status: SkillStatus::Untrusted,
+                    quarantine_reason: None,
+                    last_audited_ms: None,
+                    content_hash: None,
+                    trusted_hash: None,
                     enabled: true,
                 }],
             }],
@@ -171,7 +254,7 @@ mod tests {
         assert_eq!(repo.source, "anthropics/claude-plugins-official");
         assert_eq!(repo.commit_sha.as_deref(), Some("abc123def456"));
         assert_eq!(repo.format, PluginFormat::ClaudeCode);
-        assert!(!repo.skills[0].trusted);
+        assert_eq!(repo.skills[0].status, SkillStatus::Untrusted);
         assert!(repo.skills[0].enabled);
 
         // Verify directory moved.
@@ -206,16 +289,18 @@ mod tests {
             skills: vec![SkillState {
                 name: "plugin:skill".into(),
                 relative_path: "owner-repo".into(),
-                trusted: true,
-                trusted_at_ms: None,
-                trusted_commit_sha: None,
+                status: SkillStatus::Trusted,
+                quarantine_reason: None,
+                last_audited_ms: None,
+                content_hash: None,
+                trusted_hash: None,
                 enabled: true,
             }],
         };
 
         // Plugins manifest has the repo.
         let plugins_manifest = SkillsManifest {
-            version: 1,
+            version: 2,
             repos: vec![repo.clone()],
         };
         let plugins_store = ManifestStore::new(data_dir.join("plugins-manifest.json"));
@@ -259,5 +344,50 @@ mod tests {
         // Old files cleaned up.
         assert!(!data_dir.join("plugins-manifest.json").exists());
         assert!(!data_dir.join("installed-plugins").exists());
+    }
+
+    #[test]
+    fn test_migrate_manifest_v1_to_v2_maps_trust() {
+        let raw = r#"{
+            "version": 1,
+            "repos": [
+                {
+                    "source": "owner/repo",
+                    "repo_name": "owner-repo",
+                    "installed_at_ms": 42,
+                    "commit_sha": "abc",
+                    "format": "skill",
+                    "skills": [
+                        {
+                            "name": "safe",
+                            "relative_path": "owner-repo/skills/safe",
+                            "trusted": true,
+                            "enabled": true
+                        },
+                        {
+                            "name": "new",
+                            "relative_path": "owner-repo/skills/new",
+                            "trusted": false,
+                            "enabled": false
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let migrated = migrate_manifest_v1_to_v2(raw).unwrap().unwrap();
+        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.repos.len(), 1);
+        assert_eq!(migrated.repos[0].skills.len(), 2);
+        assert_eq!(migrated.repos[0].skills[0].status, SkillStatus::Trusted);
+        assert_eq!(migrated.repos[0].skills[1].status, SkillStatus::Untrusted);
+        assert!(migrated.repos[0].skills[0].quarantine_reason.is_none());
+        assert!(migrated.repos[0].skills[0].content_hash.is_none());
+    }
+
+    #[test]
+    fn test_migrate_manifest_v1_to_v2_noop_for_v2() {
+        let raw = r#"{"version":2,"repos":[]}"#;
+        assert!(migrate_manifest_v1_to_v2(raw).unwrap().is_none());
     }
 }

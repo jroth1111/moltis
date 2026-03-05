@@ -5,6 +5,7 @@ repository.workspace = true
 version.workspace    = true
 
 [dependencies]
+ammonia               = { workspace = true }
 anyhow                 = { workspace = true }
 async-graphql          = { optional = true, workspace = true }
 async-graphql-axum     = { optional = true, workspace = true }

@@ -4,9 +4,12 @@
 //! and markdown instructions, following the Agent Skills open standard.
 
 pub mod attenuation;
+pub mod archive_audit;
+pub mod audit;
 pub mod discover;
 pub mod formats;
 pub mod install;
+pub mod integrity;
 pub mod manifest;
 pub mod migration;
 pub mod parse;

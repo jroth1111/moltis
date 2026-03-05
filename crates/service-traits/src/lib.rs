@@ -600,6 +600,7 @@ pub trait SkillsService: Send + Sync {
     async fn skill_enable(&self, params: Value) -> ServiceResult;
     async fn skill_disable(&self, params: Value) -> ServiceResult;
     async fn skill_trust(&self, params: Value) -> ServiceResult;
+    async fn skill_unquarantine(&self, params: Value) -> ServiceResult;
     async fn skill_detail(&self, params: Value) -> ServiceResult;
     async fn install_dep(&self, params: Value) -> ServiceResult;
     async fn security_status(&self) -> ServiceResult;
@@ -662,6 +663,10 @@ impl SkillsService for NoopSkillsStub {
     }
 
     async fn skill_trust(&self, _params: Value) -> ServiceResult {
+        Err("skills service not configured".into())
+    }
+
+    async fn skill_unquarantine(&self, _params: Value) -> ServiceResult {
         Err("skills service not configured".into())
     }
 

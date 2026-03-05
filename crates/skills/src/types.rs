@@ -6,7 +6,21 @@ use crate::formats::PluginFormat;
 
 // ── Skills manifest ──────────────────────────────────────────────────────────
 
-/// Top-level manifest tracking installed repos and per-skill enabled state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillStatus {
+    Trusted,
+    Untrusted,
+    Quarantined,
+}
+
+impl SkillStatus {
+    pub fn is_trusted(self) -> bool {
+        matches!(self, Self::Trusted)
+    }
+}
+
+/// Top-level manifest tracking installed repos and per-skill status/enabled state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillsManifest {
     pub version: u32,
@@ -17,7 +31,7 @@ pub struct SkillsManifest {
 impl Default for SkillsManifest {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             repos: Vec::new(),
         }
     }
@@ -50,22 +64,16 @@ impl SkillsManifest {
         false
     }
 
-    pub fn set_skill_trusted(&mut self, source: &str, skill_name: &str, trusted: bool) -> bool {
-        self.set_skill_trusted_with_provenance(source, skill_name, trusted, None, None)
-    }
-
-    pub fn set_skill_trusted_with_provenance(
+    pub fn set_skill_status(
         &mut self,
         source: &str,
         skill_name: &str,
-        trusted: bool,
-        trusted_at_ms: Option<u64>,
-        trusted_commit_sha: Option<String>,
+        status: SkillStatus,
     ) -> bool {
         if let Some(repo) = self.find_repo_mut(source)
             && let Some(skill) = repo.skills.iter_mut().find(|s| s.name == skill_name)
         {
-            skill.set_trust_with_provenance(trusted, trusted_at_ms, trusted_commit_sha);
+            skill.status = status;
             return true;
         }
         false
@@ -85,39 +93,26 @@ pub struct RepoEntry {
     pub skills: Vec<SkillState>,
 }
 
-/// Per-skill enabled state within a repo.
+/// Per-skill state within a repo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillState {
     pub name: String,
     pub relative_path: String,
-    #[serde(default = "default_trusted")]
-    pub trusted: bool,
+    pub status: SkillStatus,
     #[serde(default)]
-    pub trusted_at_ms: Option<u64>,
+    pub quarantine_reason: Option<String>,
     #[serde(default)]
-    pub trusted_commit_sha: Option<String>,
+    pub last_audited_ms: Option<u64>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub trusted_hash: Option<String>,
     pub enabled: bool,
 }
 
-fn default_trusted() -> bool {
-    false
-}
-
 impl SkillState {
-    pub fn set_trust_with_provenance(
-        &mut self,
-        trusted: bool,
-        trusted_at_ms: Option<u64>,
-        trusted_commit_sha: Option<String>,
-    ) {
-        self.trusted = trusted;
-        if trusted {
-            self.trusted_at_ms = trusted_at_ms;
-            self.trusted_commit_sha = trusted_commit_sha;
-        } else {
-            self.trusted_at_ms = None;
-            self.trusted_commit_sha = None;
-        }
+    pub fn is_trusted(&self) -> bool {
+        self.status.is_trusted()
     }
 }
 
@@ -127,54 +122,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skill_state_defaults_untrusted_when_trusted_missing() {
+    fn skill_state_defaults_to_untrusted() {
         let parsed: SkillState = serde_json::from_str(
-            r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":true}"#,
+            r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":true,"status":"untrusted"}"#,
         )
         .unwrap();
-        assert!(!parsed.trusted);
-        assert!(parsed.trusted_at_ms.is_none());
-        assert!(parsed.trusted_commit_sha.is_none());
+        assert_eq!(parsed.status, SkillStatus::Untrusted);
+        assert!(!parsed.is_trusted());
     }
 
     #[test]
-    fn set_skill_trusted_with_provenance_round_trip() {
-        let mut manifest = SkillsManifest {
-            version: 1,
-            repos: vec![RepoEntry {
-                source: "owner/repo".into(),
-                repo_name: "owner-repo".into(),
-                installed_at_ms: 1,
-                commit_sha: Some("abcdef".into()),
-                format: PluginFormat::default(),
-                skills: vec![SkillState {
-                    name: "demo".into(),
-                    relative_path: "owner-repo".into(),
-                    trusted: false,
-                    trusted_at_ms: None,
-                    trusted_commit_sha: None,
-                    enabled: false,
-                }],
-            }],
-        };
+    fn skill_state_missing_status_is_rejected() {
+        let err = serde_json::from_str::<SkillState>(
+            r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":false}"#,
+        )
+        .expect_err("manifest v2 skill state must include status");
+        assert!(err.to_string().contains("missing field `status`"));
+    }
 
-        assert!(manifest.set_skill_trusted_with_provenance(
-            "owner/repo",
-            "demo",
-            true,
-            Some(1234),
-            Some("abcdef".into())
-        ));
-        let skill = &manifest.repos[0].skills[0];
-        assert!(skill.trusted);
-        assert_eq!(skill.trusted_at_ms, Some(1234));
-        assert_eq!(skill.trusted_commit_sha.as_deref(), Some("abcdef"));
-
-        assert!(manifest.set_skill_trusted("owner/repo", "demo", false));
-        let skill = &manifest.repos[0].skills[0];
-        assert!(!skill.trusted);
-        assert!(skill.trusted_at_ms.is_none());
-        assert!(skill.trusted_commit_sha.is_none());
+    #[test]
+    fn skill_source_default_trust_mapping() {
+        assert_eq!(SkillSource::Project.default_trust(), SkillTrust::Trusted);
+        assert_eq!(SkillSource::Personal.default_trust(), SkillTrust::Trusted);
+        assert_eq!(SkillSource::Plugin.default_trust(), SkillTrust::Installed);
+        assert_eq!(SkillSource::Registry.default_trust(), SkillTrust::Installed);
     }
 }
 
@@ -192,6 +163,16 @@ pub enum SkillSource {
     Plugin,
     /// Installed from a registry (e.g. skills.sh).
     Registry,
+}
+
+impl SkillSource {
+    /// Returns the default trust level for skills from this source.
+    pub fn default_trust(&self) -> SkillTrust {
+        match self {
+            Self::Project | Self::Personal => SkillTrust::Trusted,
+            Self::Plugin | Self::Registry => SkillTrust::Installed,
+        }
+    }
 }
 
 /// Lightweight metadata parsed from SKILL.md frontmatter.

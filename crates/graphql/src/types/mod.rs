@@ -528,6 +528,8 @@ pub struct SkillInfo {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub license: Option<String>,
@@ -542,6 +544,22 @@ pub struct SkillInfo {
     pub eligible: Option<bool>,
     #[serde(default)]
     pub missing_bins: Option<Vec<String>>,
+    #[serde(default)]
+    pub trusted: Option<bool>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub quarantined: Option<bool>,
+    #[serde(default)]
+    pub quarantine_reason: Option<String>,
+    #[serde(default)]
+    pub last_audited_ms: Option<u64>,
+    #[serde(default)]
+    pub integrity_ok: Option<bool>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub drifted: Option<bool>,
 }
 
 #[derive(Debug, SimpleObject, Deserialize)]
@@ -559,6 +577,8 @@ pub struct SkillRepo {
     pub skill_count: Option<u64>,
     #[serde(default)]
     pub enabled_count: Option<u64>,
+    #[serde(default)]
+    pub quarantined_count: Option<u64>,
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -960,8 +980,14 @@ pub struct SecurityScanResult {
     #[graphql(name = "results")]
     #[serde(default)]
     pub results: Option<Json>,
-    #[serde(default)]
+    #[serde(default, alias = "installed_skills_dir")]
     pub installed_skills_dir: Option<String>,
+    #[serde(default, alias = "enforced_quarantines")]
+    pub enforced_quarantines: Option<u64>,
+    #[serde(default, alias = "affected_skills")]
+    pub affected_skills: Option<Json>,
+    #[serde(default)]
+    pub reasons: Option<Vec<String>>,
 }
 
 // ── Memory Config ───────────────────────────────────────────────────────────

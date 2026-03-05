@@ -44,6 +44,7 @@ export default {
 	searchSkillsIn: "在 {{source}} 中搜索技能\u2026",
 	orphanedRepoHint: "孤立仓库：重新安装以恢复元数据",
 	noMatchingSkills: "没有匹配的技能。",
+	quarantinedCount: "{{count}} 个已隔离",
 
 	// ── Enabled skills table ────────────────────────────────
 	enabledTitle: "已启用技能",
@@ -61,10 +62,21 @@ export default {
 	protected: "受保护",
 	protectedCannotDelete: "技能 {{name}} 受保护，无法从 UI 删除",
 	trustAndEnable: "信任并启用",
+	trust: "信任",
+	trusting: "信任中...",
+	unquarantine: "解除隔离",
+	unquarantining: "解除隔离中...",
 	trustSkillConfirm: '信任来自 {{source}} 的技能 "{{name}}"？',
+	unquarantineConfirm:
+		'解除技能 "{{name}}" 的隔离？\n\n原因：{{reason}}\n\n解除隔离后，你仍需要单独信任并启用该技能。',
+	unquarantinedSuccess: "已解除 {{name}} 的隔离。请审查后再信任并启用。",
+	trustedSuccess: "已信任 {{name}}。准备好后可单独启用。",
 	trustFailed: "信任失败：{{error}}",
 	failedToLoad: "加载失败：{{error}}",
 	skillMdSource: "SKILL.md 源代码",
+	quarantinedBannerTitle: "已隔离：",
+	quarantinedBannerBody:
+		"此技能采用故障关闭策略，在你明确解除隔离、审查、信任并启用之前无法运行。",
 
 	// ── Metadata ────────────────────────────────────────────
 	author: "作者：{{name}}",
@@ -78,6 +90,7 @@ export default {
 	eligible: "符合条件",
 	noDeps: "无依赖声明",
 	untrusted: "不受信任",
+	quarantined: "已隔离",
 	enabled: "已启用",
 
 	// ── Missing deps ────────────────────────────────────────

@@ -649,29 +649,53 @@ impl SkillsMutation {
         from_service(s.skills.emergency_disable().await)
     }
 
-    async fn trust(&self, ctx: &Context<'_>, name: String) -> Result<BoolResult> {
+    async fn trust(&self, ctx: &Context<'_>, source: String, skill: String) -> Result<BoolResult> {
         let s = services!(ctx);
         from_service(
             s.skills
-                .skill_trust(serde_json::json!({ "name": name }))
+                .skill_trust(serde_json::json!({ "source": source, "skill": skill }))
                 .await,
         )
     }
 
-    async fn enable(&self, ctx: &Context<'_>, name: String) -> Result<BoolResult> {
+    async fn enable(&self, ctx: &Context<'_>, source: String, skill: String) -> Result<BoolResult> {
         let s = services!(ctx);
         from_service(
             s.skills
-                .skill_enable(serde_json::json!({ "name": name }))
+                .skill_enable(serde_json::json!({ "source": source, "skill": skill }))
                 .await,
         )
     }
 
-    async fn disable(&self, ctx: &Context<'_>, name: String) -> Result<BoolResult> {
+    async fn disable(
+        &self,
+        ctx: &Context<'_>,
+        source: String,
+        skill: String,
+    ) -> Result<BoolResult> {
         let s = services!(ctx);
         from_service(
             s.skills
-                .skill_disable(serde_json::json!({ "name": name }))
+                .skill_disable(serde_json::json!({ "source": source, "skill": skill }))
+                .await,
+        )
+    }
+
+    async fn unquarantine(
+        &self,
+        ctx: &Context<'_>,
+        source: String,
+        skill: String,
+        confirm: bool,
+    ) -> Result<BoolResult> {
+        let s = services!(ctx);
+        from_service(
+            s.skills
+                .skill_unquarantine(serde_json::json!({
+                    "source": source,
+                    "skill": skill,
+                    "confirm": confirm
+                }))
                 .await,
         )
     }

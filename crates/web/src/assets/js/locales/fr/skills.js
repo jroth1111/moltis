@@ -44,6 +44,7 @@ export default {
 	searchSkillsIn: "Search skills in {{source}}\u2026",
 	orphanedRepoHint: "Orphaned repo: reinstall to restore metadata",
 	noMatchingSkills: "No matching skills.",
+	quarantinedCount: "{{count}} quarantined",
 
 	// ── Enabled skills table ────────────────────────────────
 	enabledTitle: "Enabled Skills",
@@ -61,10 +62,21 @@ export default {
 	protected: "Protected",
 	protectedCannotDelete: "Skill {{name}} is protected and cannot be deleted from UI",
 	trustAndEnable: "Trust & Enable",
+	trust: "Trust",
+	trusting: "Trusting...",
+	unquarantine: "Unquarantine",
+	unquarantining: "Unquarantining...",
 	trustSkillConfirm: 'Trust skill "{{name}}" from {{source}}?',
+	unquarantineConfirm:
+		'Unquarantine skill "{{name}}"?\n\nReason: {{reason}}\n\nAfter unquarantine, you still need to trust and enable it separately.',
+	unquarantinedSuccess: "Unquarantined {{name}}. Review, trust, then enable.",
+	trustedSuccess: "Trusted {{name}}. Enable it when ready.",
 	trustFailed: "Trust failed: {{error}}",
 	failedToLoad: "Failed to load: {{error}}",
 	skillMdSource: "SKILL.md source",
+	quarantinedBannerTitle: "Quarantined:",
+	quarantinedBannerBody:
+		"This skill is fail-closed and cannot be enabled until you explicitly unquarantine, review, trust, and enable it.",
 
 	// ── Metadata ────────────────────────────────────────────
 	author: "Author: {{name}}",
@@ -78,6 +90,7 @@ export default {
 	eligible: "eligible",
 	noDeps: "no deps declared",
 	untrusted: "untrusted",
+	quarantined: "quarantined",
 	enabled: "enabled",
 
 	// ── Missing deps ────────────────────────────────────────
