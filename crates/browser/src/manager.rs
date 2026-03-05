@@ -715,19 +715,76 @@ impl BrowserManager {
                 body_text_len = refreshed.body_text_len,
                 "patchright fallback resolved challenge"
             );
-        } else {
+            return Some(refreshed);
+        }
+
+        // Challenge persists after cookie transfer - try direct HTML injection
+        warn!(
+            original_url = url,
+            attempt = attempt,
+            patchright_final_url = probe.final_url,
+            challenge_type = refreshed.challenge_type.map(ChallengeType::as_str),
+            title_len = refreshed.title_len,
+            body_text_len = refreshed.body_text_len,
+            "patchright cookie transfer did not clear challenge, attempting direct HTML injection"
+        );
+
+        // If patchright returned HTML content, inject it directly
+        if let Some(html) = &probe.html {
+            debug!(
+                original_url = url,
+                attempt = attempt,
+                html_len = html.len(),
+                "injecting patchright HTML directly into page"
+            );
+
+            // Use document.open/write/close to replace page content
+            let inject_js = format!(
+                r#"(function() {{
+                    const newHtml = {};
+                    document.open();
+                    document.write(newHtml);
+                    document.close();
+                }})()"#,
+                serde_json::to_string(html).unwrap_or_else(|_| "null".to_string())
+            );
+
+            if let Err(e) = page.evaluate(inject_js.as_str()).await {
+                warn!(
+                    original_url = url,
+                    attempt = attempt,
+                    error = %e,
+                    "failed to inject patchright HTML"
+                );
+                return None;
+            }
+
+            // Wait for page to settle
+            sleep(Duration::from_millis(500)).await;
+
+            let injected = self.collect_navigation_diagnostics(page).await;
+
+            if injected.challenge_type.is_none() {
+                info!(
+                    original_url = url,
+                    attempt = attempt,
+                    patchright_final_url = probe.final_url,
+                    title_len = injected.title_len,
+                    body_text_len = injected.body_text_len,
+                    "direct HTML injection resolved challenge"
+                );
+                return Some(injected);
+            }
+
             warn!(
                 original_url = url,
                 attempt = attempt,
-                patchright_final_url = probe.final_url,
-                challenge_type = refreshed.challenge_type.map(ChallengeType::as_str),
-                title_len = refreshed.title_len,
-                body_text_len = refreshed.body_text_len,
-                "patchright fallback did not clear challenge"
+                challenge_type = injected.challenge_type.map(ChallengeType::as_str),
+                "direct HTML injection did not resolve challenge"
             );
         }
 
-        Some(refreshed)
+        None
     }
 
     async fn retry_with_patchright_if_needed(
