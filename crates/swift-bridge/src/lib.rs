@@ -566,6 +566,15 @@ struct MemoryConfigResponse {
     disable_rag: bool,
     llm_reranking: bool,
     session_export: bool,
+    auto_extract: bool,
+    auto_extract_min_chars: usize,
+    auto_extract_debounce_ms: u64,
+    auto_extract_max_facts: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_extract_model_id: Option<String>,
+    auto_reconcile: bool,
+    auto_reconcile_min_interval_secs: u64,
+    auto_reconcile_similarity_threshold: f32,
     qmd_feature_enabled: bool,
 }
 
@@ -581,6 +590,22 @@ struct MemoryConfigUpdateRequest {
     disable_rag: Option<bool>,
     #[serde(default)]
     session_export: Option<bool>,
+    #[serde(default)]
+    auto_extract: Option<bool>,
+    #[serde(default)]
+    auto_extract_min_chars: Option<usize>,
+    #[serde(default)]
+    auto_extract_debounce_ms: Option<u64>,
+    #[serde(default)]
+    auto_extract_max_facts: Option<usize>,
+    #[serde(default)]
+    auto_extract_model_id: Option<String>,
+    #[serde(default)]
+    auto_reconcile: Option<bool>,
+    #[serde(default)]
+    auto_reconcile_min_interval_secs: Option<u64>,
+    #[serde(default)]
+    auto_reconcile_similarity_threshold: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2383,6 +2408,14 @@ pub extern "C" fn moltis_memory_config_get() -> *mut c_char {
             disable_rag: memory.disable_rag,
             llm_reranking: memory.llm_reranking,
             session_export: memory.session_export,
+            auto_extract: memory.auto_extract,
+            auto_extract_min_chars: memory.auto_extract_min_chars,
+            auto_extract_debounce_ms: memory.auto_extract_debounce_ms,
+            auto_extract_max_facts: memory.auto_extract_max_facts,
+            auto_extract_model_id: memory.auto_extract_model_id,
+            auto_reconcile: memory.auto_reconcile,
+            auto_reconcile_min_interval_secs: memory.auto_reconcile_min_interval_secs,
+            auto_reconcile_similarity_threshold: memory.auto_reconcile_similarity_threshold,
             qmd_feature_enabled: cfg!(feature = "qmd"),
         };
         encode_json(&response)
@@ -2413,10 +2446,38 @@ pub extern "C" fn moltis_memory_config_update(request_json: *const c_char) -> *m
             .unwrap_or_else(|| current.citations.unwrap_or_else(|| "auto".to_owned()));
         let llm_reranking = request.llm_reranking.unwrap_or(current.llm_reranking);
         let session_export = request.session_export.unwrap_or(current.session_export);
+        let auto_extract = request.auto_extract.unwrap_or(current.auto_extract);
+        let auto_extract_min_chars = request
+            .auto_extract_min_chars
+            .unwrap_or(current.auto_extract_min_chars);
+        let auto_extract_debounce_ms = request
+            .auto_extract_debounce_ms
+            .unwrap_or(current.auto_extract_debounce_ms);
+        let auto_extract_max_facts = request
+            .auto_extract_max_facts
+            .unwrap_or(current.auto_extract_max_facts);
+        let auto_extract_model_id = if request.auto_extract_model_id.is_some() {
+            request
+                .auto_extract_model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        } else {
+            current.auto_extract_model_id.clone()
+        };
+        let auto_reconcile = request.auto_reconcile.unwrap_or(current.auto_reconcile);
+        let auto_reconcile_min_interval_secs = request
+            .auto_reconcile_min_interval_secs
+            .unwrap_or(current.auto_reconcile_min_interval_secs);
+        let auto_reconcile_similarity_threshold = request
+            .auto_reconcile_similarity_threshold
+            .unwrap_or(current.auto_reconcile_similarity_threshold);
         let mut disable_rag = current.disable_rag;
 
         let backend_value = backend.clone();
         let citations_value = citations.clone();
+        let auto_extract_model_id_value = auto_extract_model_id.clone();
 
         if let Err(error) = moltis_config::update_config(|cfg| {
             cfg.memory.backend = Some(backend_value.clone());
@@ -2426,6 +2487,14 @@ pub extern "C" fn moltis_memory_config_update(request_json: *const c_char) -> *m
                 cfg.memory.disable_rag = value;
             }
             cfg.memory.session_export = session_export;
+            cfg.memory.auto_extract = auto_extract;
+            cfg.memory.auto_extract_min_chars = auto_extract_min_chars;
+            cfg.memory.auto_extract_debounce_ms = auto_extract_debounce_ms;
+            cfg.memory.auto_extract_max_facts = auto_extract_max_facts;
+            cfg.memory.auto_extract_model_id = auto_extract_model_id_value.clone();
+            cfg.memory.auto_reconcile = auto_reconcile;
+            cfg.memory.auto_reconcile_min_interval_secs = auto_reconcile_min_interval_secs;
+            cfg.memory.auto_reconcile_similarity_threshold = auto_reconcile_similarity_threshold;
             disable_rag = cfg.memory.disable_rag;
         }) {
             record_error("moltis_memory_config_update", "save_failed");
@@ -2438,6 +2507,14 @@ pub extern "C" fn moltis_memory_config_update(request_json: *const c_char) -> *m
             disable_rag,
             llm_reranking,
             session_export,
+            auto_extract,
+            auto_extract_min_chars,
+            auto_extract_debounce_ms,
+            auto_extract_max_facts,
+            auto_extract_model_id,
+            auto_reconcile,
+            auto_reconcile_min_interval_secs,
+            auto_reconcile_similarity_threshold,
             qmd_feature_enabled: cfg!(feature = "qmd"),
         };
         encode_json(&response)
@@ -4095,6 +4172,27 @@ mod tests {
                 .is_some(),
             "memory_config_get should return llm_reranking"
         );
+        assert!(
+            payload
+                .get("auto_extract")
+                .and_then(Value::as_bool)
+                .is_some(),
+            "memory_config_get should return auto_extract"
+        );
+        assert!(
+            payload
+                .get("auto_extract_min_chars")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "memory_config_get should return auto_extract_min_chars"
+        );
+        assert!(
+            payload
+                .get("auto_reconcile")
+                .and_then(Value::as_bool)
+                .is_some(),
+            "memory_config_get should return auto_reconcile"
+        );
     }
 
     #[test]
@@ -4115,7 +4213,15 @@ mod tests {
             "backend": "builtin",
             "citations": "auto",
             "llm_reranking": false,
-            "session_export": false
+            "session_export": false,
+            "auto_extract": true,
+            "auto_extract_min_chars": 160,
+            "auto_extract_debounce_ms": 45000,
+            "auto_extract_max_facts": 12,
+            "auto_extract_model_id": "openai::gpt-4.1-mini",
+            "auto_reconcile": true,
+            "auto_reconcile_min_interval_secs": 1200,
+            "auto_reconcile_similarity_threshold": 0.9
         })
         .to_string();
         let c_request = CString::new(request).unwrap_or_else(|e| panic!("{e}"));
@@ -4128,6 +4234,16 @@ mod tests {
         assert_eq!(
             payload.get("citations").and_then(Value::as_str),
             Some("auto")
+        );
+        assert_eq!(
+            payload.get("auto_extract").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload
+                .get("auto_extract_min_chars")
+                .and_then(Value::as_u64),
+            Some(160)
         );
     }
 

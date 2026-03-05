@@ -2680,6 +2680,7 @@ pub async fn prepare_gateway(
         Some(&session_store),
         Some(Arc::new(db_pool.clone())),
         Some(Arc::clone(&estop_flag)),
+        config.memory.session_export,
     )
     .await;
 
@@ -6080,6 +6081,7 @@ pub(crate) async fn discover_and_build_hooks(
     session_store: Option<&Arc<SessionStore>>,
     db_pool: Option<Arc<sqlx::SqlitePool>>,
     estop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    memory_session_export_enabled: bool,
 ) -> (
     Option<Arc<moltis_common::hooks::HookRegistry>>,
     Vec<crate::state::DiscoveredHookInfo>,
@@ -6191,7 +6193,7 @@ pub(crate) async fn discover_and_build_hooks(
         registry.register(Arc::new(logger));
 
         // session-memory: save conversation to memory on /new or /reset.
-        if let Some(store) = session_store {
+        if memory_session_export_enabled && let Some(store) = session_store {
             let memory_hook = SessionMemoryHook::new(data.clone(), Arc::clone(store));
             registry.register(Arc::new(memory_hook));
         }
@@ -6220,6 +6222,7 @@ pub(crate) async fn discover_and_build_hooks(
     }
 
     for (name, description, events, source_file) in builtin_hook_metadata() {
+        let enabled = name != "session-memory" || memory_session_export_enabled;
         info_list.push(crate::state::DiscoveredHookInfo {
             name: name.to_string(),
             description: description.to_string(),
@@ -6234,7 +6237,7 @@ pub(crate) async fn discover_and_build_hooks(
             missing_os: false,
             missing_bins: vec![],
             missing_env: vec![],
-            enabled: true,
+            enabled,
             body: String::new(),
             body_html: format!(
                 "<p><em>Built-in hook implemented in Rust.</em></p><p>{}</p>",
@@ -6326,7 +6329,7 @@ mod tests {
         let session_store = Arc::new(SessionStore::new(sessions_dir));
 
         let (registry, info) =
-            discover_and_build_hooks(&HashSet::new(), Some(&session_store), None, None).await;
+            discover_and_build_hooks(&HashSet::new(), Some(&session_store), None, None, true).await;
         let registry = registry.expect("expected hook registry to be created");
         let handler_names = registry.handler_names();
 
@@ -6345,6 +6348,26 @@ mod tests {
         assert!(
             info.iter()
                 .any(|h| h.name == "session-memory" && h.source == "builtin")
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_hooks_disables_session_memory_when_session_export_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session_store = Arc::new(SessionStore::new(sessions_dir));
+
+        let (registry, info) =
+            discover_and_build_hooks(&HashSet::new(), Some(&session_store), None, None, false)
+                .await;
+        let registry = registry.expect("expected hook registry to be created");
+        let handler_names = registry.handler_names();
+
+        assert!(!handler_names.iter().any(|n| n == "session-memory"));
+        assert!(
+            info.iter()
+                .any(|h| h.name == "session-memory" && h.source == "builtin" && !h.enabled)
         );
     }
 

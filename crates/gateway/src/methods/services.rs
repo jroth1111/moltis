@@ -115,6 +115,141 @@ fn parse_agent_id_param(params: &serde_json::Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[derive(Clone, Debug, Default)]
+struct MemoryConfigUpdateRequest {
+    backend: Option<String>,
+    citations: Option<String>,
+    llm_reranking: Option<bool>,
+    disable_rag: Option<bool>,
+    session_export: Option<bool>,
+    auto_extract: Option<bool>,
+    auto_extract_min_chars: Option<usize>,
+    auto_extract_debounce_ms: Option<u64>,
+    auto_extract_max_facts: Option<usize>,
+    auto_extract_model_id: Option<Option<String>>,
+    auto_reconcile: Option<bool>,
+    auto_reconcile_min_interval_secs: Option<u64>,
+    auto_reconcile_similarity_threshold: Option<f32>,
+}
+
+fn parse_memory_config_update_request(params: &serde_json::Value) -> MemoryConfigUpdateRequest {
+    let auto_extract_model_id = if params.get("auto_extract_model_id").is_some() {
+        Some(
+            params
+                .get("auto_extract_model_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        )
+    } else {
+        None
+    };
+
+    MemoryConfigUpdateRequest {
+        backend: params
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        citations: params
+            .get("citations")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        llm_reranking: params.get("llm_reranking").and_then(|v| v.as_bool()),
+        disable_rag: params.get("disable_rag").and_then(|v| v.as_bool()),
+        session_export: params.get("session_export").and_then(|v| v.as_bool()),
+        auto_extract: params.get("auto_extract").and_then(|v| v.as_bool()),
+        auto_extract_min_chars: params
+            .get("auto_extract_min_chars")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize),
+        auto_extract_debounce_ms: params
+            .get("auto_extract_debounce_ms")
+            .and_then(|v| v.as_u64()),
+        auto_extract_max_facts: params
+            .get("auto_extract_max_facts")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize),
+        auto_extract_model_id,
+        auto_reconcile: params.get("auto_reconcile").and_then(|v| v.as_bool()),
+        auto_reconcile_min_interval_secs: params
+            .get("auto_reconcile_min_interval_secs")
+            .and_then(|v| v.as_u64()),
+        auto_reconcile_similarity_threshold: params
+            .get("auto_reconcile_similarity_threshold")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
+    }
+}
+
+fn apply_memory_config_update(
+    memory: &mut moltis_config::schema::MemoryEmbeddingConfig,
+    update: &MemoryConfigUpdateRequest,
+) {
+    if let Some(backend) = &update.backend {
+        memory.backend = Some(backend.clone());
+    }
+    if let Some(citations) = &update.citations {
+        memory.citations = Some(citations.clone());
+    }
+    if let Some(llm_reranking) = update.llm_reranking {
+        memory.llm_reranking = llm_reranking;
+    }
+    if let Some(disable_rag) = update.disable_rag {
+        memory.disable_rag = disable_rag;
+    }
+    if let Some(session_export) = update.session_export {
+        memory.session_export = session_export;
+    }
+    if let Some(auto_extract) = update.auto_extract {
+        memory.auto_extract = auto_extract;
+    }
+    if let Some(auto_extract_min_chars) = update.auto_extract_min_chars {
+        memory.auto_extract_min_chars = auto_extract_min_chars;
+    }
+    if let Some(auto_extract_debounce_ms) = update.auto_extract_debounce_ms {
+        memory.auto_extract_debounce_ms = auto_extract_debounce_ms;
+    }
+    if let Some(auto_extract_max_facts) = update.auto_extract_max_facts {
+        memory.auto_extract_max_facts = auto_extract_max_facts;
+    }
+    if let Some(auto_extract_model_id) = &update.auto_extract_model_id {
+        memory.auto_extract_model_id = auto_extract_model_id.clone();
+    }
+    if let Some(auto_reconcile) = update.auto_reconcile {
+        memory.auto_reconcile = auto_reconcile;
+    }
+    if let Some(auto_reconcile_min_interval_secs) = update.auto_reconcile_min_interval_secs {
+        memory.auto_reconcile_min_interval_secs = auto_reconcile_min_interval_secs;
+    }
+    if let Some(auto_reconcile_similarity_threshold) = update.auto_reconcile_similarity_threshold {
+        memory.auto_reconcile_similarity_threshold = auto_reconcile_similarity_threshold;
+    }
+}
+
+fn memory_config_response(memory: &moltis_config::schema::MemoryEmbeddingConfig) -> serde_json::Value {
+    serde_json::json!({
+        "backend": memory.backend.as_deref().unwrap_or("builtin"),
+        "citations": memory.citations.as_deref().unwrap_or("auto"),
+        "disable_rag": memory.disable_rag,
+        "llm_reranking": memory.llm_reranking,
+        "session_export": memory.session_export,
+        "auto_extract": memory.auto_extract,
+        "auto_extract_min_chars": memory.auto_extract_min_chars,
+        "auto_extract_debounce_ms": memory.auto_extract_debounce_ms,
+        "auto_extract_max_facts": memory.auto_extract_max_facts,
+        "auto_extract_model_id": memory.auto_extract_model_id,
+        "auto_reconcile": memory.auto_reconcile,
+        "auto_reconcile_min_interval_secs": memory.auto_reconcile_min_interval_secs,
+        "auto_reconcile_similarity_threshold": memory.auto_reconcile_similarity_threshold,
+        "qmd_feature_enabled": cfg!(feature = "qmd"),
+    })
+}
+
 async fn resolve_requested_agent_id(
     ctx: &MethodContext,
     params: &serde_json::Value,
@@ -4176,15 +4311,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
             Box::pin(async move {
                 // Read memory config from the config file
                 let config = moltis_config::discover_and_load();
-                let memory = &config.memory;
-                Ok(serde_json::json!({
-                    "backend": memory.backend.as_deref().unwrap_or("builtin"),
-                    "citations": memory.citations.as_deref().unwrap_or("auto"),
-                    "disable_rag": memory.disable_rag,
-                    "llm_reranking": memory.llm_reranking,
-                    "session_export": memory.session_export,
-                    "qmd_feature_enabled": cfg!(feature = "qmd"),
-                }))
+                Ok(memory_config_response(&config.memory))
             })
         }),
     );
@@ -4193,53 +4320,18 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "memory.config.update",
         Box::new(|ctx| {
             Box::pin(async move {
-                let backend = ctx
-                    .params
-                    .get("backend")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("builtin");
-                let citations = ctx
-                    .params
-                    .get("citations")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("auto");
-                let llm_reranking = ctx
-                    .params
-                    .get("llm_reranking")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let disable_rag = ctx.params.get("disable_rag").and_then(|v| v.as_bool());
-                let session_export = ctx
-                    .params
-                    .get("session_export")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let update = parse_memory_config_update_request(&ctx.params);
 
                 // Persist to moltis.toml so the config survives restarts.
-                let backend_str = backend.to_string();
-                let citations_str = citations.to_string();
-                let mut effective_disable_rag =
-                    moltis_config::discover_and_load().memory.disable_rag;
+                let mut effective_memory = moltis_config::discover_and_load().memory;
                 if let Err(e) = moltis_config::update_config(|cfg| {
-                    cfg.memory.backend = Some(backend_str.clone());
-                    cfg.memory.citations = Some(citations_str.clone());
-                    cfg.memory.llm_reranking = llm_reranking;
-                    if let Some(value) = disable_rag {
-                        cfg.memory.disable_rag = value;
-                    }
-                    cfg.memory.session_export = session_export;
-                    effective_disable_rag = cfg.memory.disable_rag;
+                    apply_memory_config_update(&mut cfg.memory, &update);
+                    effective_memory = cfg.memory.clone();
                 }) {
                     tracing::warn!(error = %e, "failed to persist memory config");
                 }
 
-                Ok(serde_json::json!({
-                    "backend": backend,
-                    "citations": citations,
-                    "disable_rag": effective_disable_rag,
-                    "llm_reranking": llm_reranking,
-                    "session_export": session_export,
-                }))
+                Ok(memory_config_response(&effective_memory))
             })
         }),
     );
@@ -4540,8 +4632,15 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 async fn reload_hooks(state: &Arc<crate::state::GatewayState>) {
     let disabled = state.inner.read().await.disabled_hooks.clone();
     let session_store = state.services.session_store.as_ref();
-    let (new_registry, new_info) =
-        crate::server::discover_and_build_hooks(&disabled, session_store, None, None).await;
+    let memory_session_export_enabled = moltis_config::discover_and_load().memory.session_export;
+    let (new_registry, new_info) = crate::server::discover_and_build_hooks(
+        &disabled,
+        session_store,
+        None,
+        None,
+        memory_session_export_enabled,
+    )
+    .await;
 
     {
         let mut inner = state.inner.write().await;
@@ -4566,5 +4665,64 @@ async fn persist_disabled_hooks(state: &Arc<crate::state::GatewayState>) {
     let json = serde_json::to_string_pretty(&disabled).unwrap_or_default();
     if let Err(e) = std::fs::write(&path, json) {
         warn!("failed to persist disabled hooks: {e}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use serde_json::json;
+
+    use super::{apply_memory_config_update, parse_memory_config_update_request};
+
+    #[test]
+    fn memory_update_preserves_omitted_booleans() {
+        let mut memory = moltis_config::schema::MemoryEmbeddingConfig {
+            llm_reranking: true,
+            session_export: true,
+            ..Default::default()
+        };
+        let update = parse_memory_config_update_request(&json!({
+            "disable_rag": true,
+        }));
+
+        apply_memory_config_update(&mut memory, &update);
+
+        assert!(memory.llm_reranking);
+        assert!(memory.session_export);
+        assert!(memory.disable_rag);
+    }
+
+    #[test]
+    fn memory_update_applies_explicit_booleans() {
+        let mut memory = moltis_config::schema::MemoryEmbeddingConfig {
+            llm_reranking: true,
+            session_export: true,
+            ..Default::default()
+        };
+        let update = parse_memory_config_update_request(&json!({
+            "llm_reranking": false,
+            "session_export": false,
+        }));
+
+        apply_memory_config_update(&mut memory, &update);
+
+        assert!(!memory.llm_reranking);
+        assert!(!memory.session_export);
+    }
+
+    #[test]
+    fn memory_update_clears_model_id_when_present_with_null() {
+        let mut memory = moltis_config::schema::MemoryEmbeddingConfig {
+            auto_extract_model_id: Some("openai::gpt-4.1-mini".to_string()),
+            ..Default::default()
+        };
+        let update = parse_memory_config_update_request(&json!({
+            "auto_extract_model_id": serde_json::Value::Null,
+        }));
+
+        apply_memory_config_update(&mut memory, &update);
+
+        assert_eq!(memory.auto_extract_model_id, None);
     }
 }

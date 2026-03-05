@@ -1006,6 +1006,22 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub session_export: Option<bool>,
     #[serde(default)]
+    pub auto_extract: Option<bool>,
+    #[serde(default)]
+    pub auto_extract_min_chars: Option<u64>,
+    #[serde(default)]
+    pub auto_extract_debounce_ms: Option<u64>,
+    #[serde(default)]
+    pub auto_extract_max_facts: Option<u64>,
+    #[serde(default)]
+    pub auto_extract_model_id: Option<String>,
+    #[serde(default)]
+    pub auto_reconcile: Option<bool>,
+    #[serde(default)]
+    pub auto_reconcile_min_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub auto_reconcile_similarity_threshold: Option<f64>,
+    #[serde(default)]
     pub qmd_feature_enabled: Option<bool>,
 }
 

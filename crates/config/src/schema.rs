@@ -961,7 +961,7 @@ impl Default for TailscaleConfig {
 ///
 /// Controls which embedding provider the memory system uses.
 /// If not configured, the system auto-detects from available providers.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryEmbeddingConfig {
     /// Memory backend: "builtin" (default) or "qmd" for QMD sidecar.
@@ -993,9 +993,79 @@ pub struct MemoryEmbeddingConfig {
     /// Enable session export to memory for cross-run recall.
     #[serde(default)]
     pub session_export: bool,
+    /// Enable automatic post-turn memory extraction.
+    #[serde(default)]
+    pub auto_extract: bool,
+    /// Minimum combined turn content length to trigger auto extraction.
+    #[serde(default = "default_memory_auto_extract_min_chars")]
+    pub auto_extract_min_chars: usize,
+    /// Debounce window for auto extraction in milliseconds.
+    #[serde(default = "default_memory_auto_extract_debounce_ms")]
+    pub auto_extract_debounce_ms: u64,
+    /// Maximum number of facts to persist per extraction run.
+    #[serde(default = "default_memory_auto_extract_max_facts")]
+    pub auto_extract_max_facts: usize,
+    /// Optional explicit model ID for auto extraction.
+    pub auto_extract_model_id: Option<String>,
+    /// Enable periodic memory reconciliation for auto-extracted facts.
+    #[serde(default)]
+    pub auto_reconcile: bool,
+    /// Minimum interval between reconcile runs in seconds.
+    #[serde(default = "default_memory_auto_reconcile_min_interval_secs")]
+    pub auto_reconcile_min_interval_secs: u64,
+    /// Similarity threshold used to skip obvious duplicate facts.
+    #[serde(default = "default_memory_auto_reconcile_similarity_threshold")]
+    pub auto_reconcile_similarity_threshold: f32,
     /// QMD-specific configuration (only used when backend = "qmd").
     #[serde(default)]
     pub qmd: QmdConfig,
+}
+
+impl Default for MemoryEmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            provider: None,
+            disable_rag: false,
+            base_url: None,
+            model: None,
+            api_key: None,
+            citations: None,
+            llm_reranking: false,
+            search_merge_strategy: None,
+            session_export: false,
+            auto_extract: false,
+            auto_extract_min_chars: default_memory_auto_extract_min_chars(),
+            auto_extract_debounce_ms: default_memory_auto_extract_debounce_ms(),
+            auto_extract_max_facts: default_memory_auto_extract_max_facts(),
+            auto_extract_model_id: None,
+            auto_reconcile: false,
+            auto_reconcile_min_interval_secs: default_memory_auto_reconcile_min_interval_secs(),
+            auto_reconcile_similarity_threshold: default_memory_auto_reconcile_similarity_threshold(
+            ),
+            qmd: QmdConfig::default(),
+        }
+    }
+}
+
+fn default_memory_auto_extract_min_chars() -> usize {
+    120
+}
+
+fn default_memory_auto_extract_debounce_ms() -> u64 {
+    30_000
+}
+
+fn default_memory_auto_extract_max_facts() -> usize {
+    8
+}
+
+fn default_memory_auto_reconcile_min_interval_secs() -> u64 {
+    900
+}
+
+fn default_memory_auto_reconcile_similarity_threshold() -> f32 {
+    0.95
 }
 
 /// QMD backend configuration.

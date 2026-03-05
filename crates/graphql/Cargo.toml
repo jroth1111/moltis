@@ -8,6 +8,7 @@ version.workspace    = true
 async-graphql         = { workspace = true }
 async-stream          = { workspace = true }
 async-trait           = { workspace = true }
+moltis-config         = { workspace = true }
 moltis-service-traits = { workspace = true }
 serde                 = { workspace = true }
 serde_json            = { workspace = true }
@@ -18,6 +19,10 @@ tokio-stream          = { workspace = true }
 [dev-dependencies]
 bytes = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+default = []
+qmd = []
 
 [lints]
 workspace = true
