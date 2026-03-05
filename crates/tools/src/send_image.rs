@@ -193,12 +193,13 @@ fn mime_from_extension(ext: &str) -> Option<&'static str> {
 #[async_trait]
 impl AgentTool for SendImageTool {
     fn name(&self) -> &str {
-        "send_image"
+        crate::tool_names::SEND_IMAGE
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["files"]
     }
+
 
     fn description(&self) -> &str {
         "Send a local image file to the current conversation's channel (e.g. Telegram). \

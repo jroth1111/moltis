@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use {
-    sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions},
+    sqlx::{Row, Sqlite, SqlitePool, Transaction, sqlite::SqliteConnectOptions},
     time::OffsetDateTime,
 };
 
@@ -62,8 +62,23 @@ impl TaskStore {
         spec: TaskSpec,
         blocked_by: Vec<TaskId>,
     ) -> Result<Task, TransitionError> {
+        self.create_with_id(list_id, TaskId::new(), spec, blocked_by)
+            .await
+    }
+
+    /// Create a task using a caller-provided ID.
+    ///
+    /// This is used by dispatch to reserve intent state (slot claim) and then
+    /// materialize the corresponding shift task deterministically.
+    pub async fn create_with_id(
+        &self,
+        list_id: &str,
+        id: TaskId,
+        spec: TaskSpec,
+        blocked_by: Vec<TaskId>,
+    ) -> Result<Task, TransitionError> {
         let task = Task {
-            id: TaskId::new(),
+            id,
             list_id: list_id.to_string(),
             spec,
             runtime: TaskRuntime::default(),
@@ -83,10 +98,24 @@ impl TaskStore {
             .map_err(|e| TransitionError::Other(e.to_string()))?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let version = task.runtime.version as i64;
+        let is_intent: i64 = if task.spec.is_intent {
+            1
+        } else {
+            0
+        };
+        let parent_task = task.spec.parent_task.as_ref().map(|id| id.0.as_str());
+        let principal_json = task
+            .spec
+            .principal
+            .as_ref()
+            .map(|p| serde_json::to_string(p).map_err(|e| TransitionError::Other(e.to_string())))
+            .transpose()?;
+        let state_name = task.runtime.state.name();
 
         sqlx::query(
-            "INSERT INTO tasks (id, list_id, spec_json, runtime_json, blocked_by, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO tasks (id, list_id, spec_json, runtime_json, blocked_by, version, \
+             created_at, updated_at, is_intent, parent_task, principal_json, state_name) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&task.id.0)
         .bind(&task.list_id)
@@ -96,6 +125,10 @@ impl TaskStore {
         .bind(version)
         .bind(now)
         .bind(now)
+        .bind(is_intent)
+        .bind(parent_task)
+        .bind(principal_json.as_deref())
+        .bind(state_name)
         .execute(&self.pool)
         .await
         .map_err(TransitionError::Storage)?;
@@ -219,14 +252,16 @@ impl TaskStore {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let new_version = updated.runtime.version as i64;
         let old_version = from_version as i64;
+        let state_name = updated.runtime.state.name();
 
         let rows_affected = sqlx::query(
-            "UPDATE tasks SET runtime_json = ?, version = ?, updated_at = ? \
+            "UPDATE tasks SET runtime_json = ?, version = ?, updated_at = ?, state_name = ? \
              WHERE list_id = ? AND id = ? AND version = ?",
         )
         .bind(&runtime_json)
         .bind(new_version)
         .bind(now)
+        .bind(state_name)
         .bind(&updated.list_id)
         .bind(&updated.id.0)
         .bind(old_version)
@@ -334,10 +369,200 @@ impl TaskStore {
         &self.log
     }
 
-    /// Return the underlying pool (test-only accessor).
-    #[cfg(test)]
-    fn pool(&self) -> &SqlitePool {
+    /// Return the underlying SQLite pool.
+    ///
+    /// Used by the dispatch layer for cross-store transactional finalization
+    /// (intent_state + task_outputs share the same pool).
+    pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Begin an explicit transaction on the shared pool.
+    pub async fn begin_tx(&self) -> Result<Transaction<'_, Sqlite>, TransitionError> {
+        self.pool.begin().await.map_err(TransitionError::Storage)
+    }
+
+    /// Read a single task using an existing transaction.
+    pub async fn get_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        list_id: &str,
+        task_id: &str,
+    ) -> Result<Option<Task>, TransitionError> {
+        let row = sqlx::query(
+            "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
+             FROM tasks WHERE list_id = ? AND id = ?",
+        )
+        .bind(list_id)
+        .bind(task_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        row.map(|r| {
+            Self::row_to_task(
+                r.get::<String, _>("id"),
+                r.get::<String, _>("list_id"),
+                r.get::<String, _>("spec_json"),
+                r.get::<String, _>("runtime_json"),
+                r.get::<String, _>("blocked_by"),
+                r.get::<i64, _>("version"),
+            )
+        })
+        .transpose()
+    }
+
+    /// Apply a transition within an existing transaction (no auto-commit).
+    ///
+    /// The caller is responsible for committing the transaction. This enables
+    /// atomic multi-table operations (e.g. finalize shift + update intent state).
+    pub async fn apply_transition_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        list_id: &str,
+        task_id: &str,
+        expected_version: Option<u64>,
+        event: &TransitionEvent,
+    ) -> Result<Task, TransitionError> {
+        let current = Self::get_tx(tx, list_id, task_id)
+            .await?
+            .ok_or_else(|| TransitionError::NotFound(task_id.to_string()))?;
+
+        if let Some(expected) = expected_version
+            && current.runtime.version != expected
+        {
+            return Err(TransitionError::VersionConflict {
+                expected,
+                actual: current.runtime.version,
+            });
+        }
+
+        let from_state = current.runtime.state.name();
+        let from_version = current.runtime.version;
+        let updated = apply(current, event)?;
+
+        let runtime_json = serde_json::to_string(&updated.runtime)
+            .map_err(|e| TransitionError::Other(e.to_string()))?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let new_version = updated.runtime.version as i64;
+        let old_version = from_version as i64;
+        let to_state = updated.runtime.state.name();
+
+        let rows_affected = sqlx::query(
+            "UPDATE tasks SET runtime_json = ?, version = ?, updated_at = ?, state_name = ? \
+             WHERE list_id = ? AND id = ? AND version = ?",
+        )
+        .bind(&runtime_json)
+        .bind(new_version)
+        .bind(now)
+        .bind(to_state)
+        .bind(&updated.list_id)
+        .bind(&updated.id.0)
+        .bind(old_version)
+        .execute(&mut **tx)
+        .await
+        .map_err(TransitionError::Storage)?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(TransitionError::VersionConflict {
+                expected: from_version,
+                actual: from_version + 1,
+            });
+        }
+
+        let event_type = event_type_name(event);
+        sqlx::query(
+            "INSERT INTO task_events (task_id, list_id, event_type, from_state, to_state, agent_id, detail, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&updated.id.0)
+        .bind(&updated.list_id)
+        .bind(event_type)
+        .bind(from_state)
+        .bind(to_state)
+        .bind(updated.runtime.owner.as_deref())
+        .bind(None::<&str>)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        Ok(updated)
+    }
+
+    /// Check whether any child task (parent_task = intent_id) is in a
+    /// non-terminal state. Used as a guard before creating new shifts.
+    pub async fn has_non_terminal_child(&self, intent_id: &str) -> Result<bool, TransitionError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM tasks \
+             WHERE parent_task = ? \
+             AND state_name NOT IN ('Completed', 'Failed', 'Canceled')",
+        )
+        .bind(intent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        let count: i64 = row.get("cnt");
+        Ok(count > 0)
+    }
+
+    /// List intent tasks in actionable states (Pending or Active).
+    ///
+    /// Used by the dispatch loop to find intents that need a new shift or
+    /// are currently being executed.
+    pub async fn list_actionable_intents(&self) -> Result<Vec<Task>, TransitionError> {
+        let rows = sqlx::query(
+            "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
+             FROM tasks \
+             WHERE is_intent = 1 AND state_name IN ('Pending', 'Active') \
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        rows.into_iter()
+            .map(|r| {
+                Self::row_to_task(
+                    r.get::<String, _>("id"),
+                    r.get::<String, _>("list_id"),
+                    r.get::<String, _>("spec_json"),
+                    r.get::<String, _>("runtime_json"),
+                    r.get::<String, _>("blocked_by"),
+                    r.get::<i64, _>("version"),
+                )
+            })
+            .collect()
+    }
+
+    /// List child shift tasks for a given intent.
+    pub async fn list_shifts_for_intent(
+        &self,
+        intent_id: &str,
+    ) -> Result<Vec<Task>, TransitionError> {
+        let rows = sqlx::query(
+            "SELECT id, list_id, spec_json, runtime_json, blocked_by, version \
+             FROM tasks \
+             WHERE parent_task = ? \
+             ORDER BY created_at ASC",
+        )
+        .bind(intent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        rows.into_iter()
+            .map(|r| {
+                Self::row_to_task(
+                    r.get::<String, _>("id"),
+                    r.get::<String, _>("list_id"),
+                    r.get::<String, _>("spec_json"),
+                    r.get::<String, _>("runtime_json"),
+                    r.get::<String, _>("blocked_by"),
+                    r.get::<i64, _>("version"),
+                )
+            })
+            .collect()
     }
 
     /// List tasks in `Retrying` state whose `retry_after` has passed.
@@ -538,7 +763,118 @@ impl TaskStore {
         Ok(reclaimed)
     }
 
+    /// Return all distinct `list_id` values present in the tasks table.
+    ///
+    /// Used by background sweeps that need to iterate every active list without
+    /// a known list-id set.
+    pub async fn list_all_list_ids(&self) -> Result<Vec<String>, TransitionError> {
+        let rows = sqlx::query("SELECT DISTINCT list_id FROM tasks ORDER BY list_id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TransitionError::Storage)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("list_id"))
+            .collect())
+    }
+
+    /// Count shifts (non-intent child tasks) currently in the `Active` state
+    /// across all lists.
+    ///
+    /// Used by the dispatch loop to enforce `max_concurrent_shifts`.
+    pub async fn count_active_shifts(&self) -> Result<usize, TransitionError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM tasks \
+             WHERE parent_task IS NOT NULL AND state_name = 'Active'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TransitionError::Storage)?;
+
+        Ok(row.get::<i64, _>("cnt") as usize)
+    }
+
+    /// Validate `state_name` denormalized column against the authoritative
+    /// `runtime_json` for every task.  Repairs mismatches in-place and returns
+    /// the number of rows corrected.
+    ///
+    /// Processes tasks in batches of 200.  Rows with unparseable `runtime_json`
+    /// are skipped and logged at `warn!`.
+    pub async fn denorm_integrity_sweep(&self) -> Result<usize, TransitionError> {
+        let rows = sqlx::query("SELECT id, list_id, runtime_json, state_name FROM tasks")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TransitionError::Storage)?;
+
+        let mut repaired = 0usize;
+
+        for row in rows {
+            let id: String = row.get("id");
+            let list_id: String = row.get("list_id");
+            let runtime_json: String = row.get("runtime_json");
+            let stored_name: String = row.get("state_name");
+
+            let runtime: TaskRuntime = match serde_json::from_str(&runtime_json) {
+                Ok(r) => r,
+                Err(e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        list_id = %list_id,
+                        task_id = %id,
+                        error = %e,
+                        "denorm sweep: unparseable runtime_json — skipping"
+                    );
+                    let _ = e;
+                    continue;
+                },
+            };
+
+            let derived_name = runtime.state.name();
+            if stored_name == derived_name {
+                continue;
+            }
+
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                list_id = %list_id,
+                task_id = %id,
+                stored = %stored_name,
+                correct = %derived_name,
+                "denorm sweep: repairing state_name mismatch"
+            );
+            #[cfg(feature = "metrics")]
+            moltis_metrics::counter!("tasks.denorm_repair").increment(1);
+
+            sqlx::query("UPDATE tasks SET state_name = ? WHERE list_id = ? AND id = ?")
+                .bind(derived_name)
+                .bind(&list_id)
+                .bind(&id)
+                .execute(&self.pool)
+                .await
+                .map_err(TransitionError::Storage)?;
+
+            repaired += 1;
+        }
+
+        Ok(repaired)
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Public alias of `row_to_task` for use by sibling modules (e.g. sweeps
+    /// in `intent_state`). Prefer the private form inside this module.
+    #[doc(hidden)]
+    pub fn row_to_task_pub(
+        id: String,
+        list_id: String,
+        spec_json: String,
+        runtime_json: String,
+        blocked_by: String,
+        version: i64,
+    ) -> Result<Task, TransitionError> {
+        Self::row_to_task(id, list_id, spec_json, runtime_json, blocked_by, version)
+    }
 
     fn row_to_task(
         id: String,
@@ -612,6 +948,25 @@ mod tests {
             .expect("exists");
         assert_eq!(fetched.id, task.id);
         assert_eq!(fetched.spec.subject, "test task");
+    }
+
+    #[tokio::test]
+    async fn create_with_id_preserves_provided_id() {
+        let (store, _dir) = test_store().await;
+        let spec = TaskSpec::new("named task", "");
+        let provided = TaskId::new();
+        let task = store
+            .create_with_id("list1", provided.clone(), spec, vec![])
+            .await
+            .expect("create with id");
+        assert_eq!(task.id, provided);
+
+        let fetched = store
+            .get("list1", &provided.0)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.id, provided);
     }
 
     #[tokio::test]
@@ -1094,5 +1449,427 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert_eq!(final_task.runtime.state, RuntimeState::Pending);
+    }
+
+    // ── Dispatch column tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn insert_writes_denormalized_columns() {
+        use crate::types::TaskPrincipal;
+
+        let (store, _dir) = test_store().await;
+        let mut spec = TaskSpec::new("intent-task", "find restaurants");
+        spec.is_intent = true;
+        spec.principal = Some(TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "biz-1".into(),
+        });
+
+        let task = store.create("list1", spec, vec![]).await.expect("create");
+
+        // Verify denormalized columns directly via SQL.
+        let row = sqlx::query(
+            "SELECT is_intent, parent_task, principal_json, state_name \
+             FROM tasks WHERE list_id = ? AND id = ?",
+        )
+        .bind("list1")
+        .bind(&task.id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch row");
+
+        let is_intent: i64 = row.get("is_intent");
+        let parent_task: Option<String> = row.get("parent_task");
+        let principal_json: Option<String> = row.get("principal_json");
+        let state_name: String = row.get("state_name");
+
+        assert_eq!(is_intent, 1);
+        assert!(parent_task.is_none());
+        assert!(principal_json.is_some());
+        assert_eq!(state_name, "Pending");
+
+        // Verify principal round-trips.
+        let p: TaskPrincipal =
+            serde_json::from_str(principal_json.as_ref().unwrap()).expect("deserialize");
+        assert_eq!(p.channel, "whatsapp");
+    }
+
+    #[tokio::test]
+    async fn insert_non_intent_defaults() {
+        let (store, _dir) = test_store().await;
+        let spec = TaskSpec::new("normal task", "");
+        let task = store.create("list1", spec, vec![]).await.expect("create");
+
+        let row = sqlx::query(
+            "SELECT is_intent, parent_task, principal_json, state_name \
+             FROM tasks WHERE list_id = ? AND id = ?",
+        )
+        .bind("list1")
+        .bind(&task.id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch row");
+
+        let is_intent: i64 = row.get("is_intent");
+        let parent_task: Option<String> = row.get("parent_task");
+        let principal_json: Option<String> = row.get("principal_json");
+
+        assert_eq!(is_intent, 0);
+        assert!(parent_task.is_none());
+        assert!(principal_json.is_none());
+    }
+
+    #[tokio::test]
+    async fn transition_updates_state_name_column() {
+        let (store, _dir) = test_store().await;
+        let spec = TaskSpec::new("track-state", "");
+        let task = store.create("list1", spec, vec![]).await.expect("create");
+
+        // Verify initial state_name.
+        let row = sqlx::query("SELECT state_name FROM tasks WHERE list_id = ? AND id = ?")
+            .bind("list1")
+            .bind(&task.id.0)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch");
+        let state_name: String = row.get("state_name");
+        assert_eq!(state_name, "Pending");
+
+        // Claim → Active.
+        store
+            .apply_transition(
+                "list1",
+                &task.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim");
+
+        let row = sqlx::query("SELECT state_name FROM tasks WHERE list_id = ? AND id = ?")
+            .bind("list1")
+            .bind(&task.id.0)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch");
+        let state_name: String = row.get("state_name");
+        assert_eq!(state_name, "Active");
+
+        // Complete → Terminal(Completed).
+        store
+            .apply_transition("list1", &task.id.0, None, &TransitionEvent::Complete)
+            .await
+            .expect("complete");
+
+        let row = sqlx::query("SELECT state_name FROM tasks WHERE list_id = ? AND id = ?")
+            .bind("list1")
+            .bind(&task.id.0)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch");
+        let state_name: String = row.get("state_name");
+        assert_eq!(state_name, "Completed");
+    }
+
+    #[tokio::test]
+    async fn insert_with_parent_task() {
+        use crate::types::TaskId;
+
+        let (store, _dir) = test_store().await;
+        let mut spec = TaskSpec::new("shift-1", "");
+        let parent_id = TaskId::new();
+        spec.parent_task = Some(parent_id.clone());
+
+        let task = store.create("list1", spec, vec![]).await.expect("create");
+
+        let row = sqlx::query("SELECT parent_task FROM tasks WHERE list_id = ? AND id = ?")
+            .bind("list1")
+            .bind(&task.id.0)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch");
+        let pt: Option<String> = row.get("parent_task");
+        assert_eq!(pt, Some(parent_id.0));
+    }
+
+    // ── Dispatch query tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_actionable_intents_filters_correctly() {
+        let (store, _dir) = test_store().await;
+
+        // Normal task (not intent) — should not appear.
+        store
+            .create("list1", TaskSpec::new("normal", ""), vec![])
+            .await
+            .expect("create normal");
+
+        // Intent task (Pending) — should appear.
+        let mut spec = TaskSpec::new("intent-1", "");
+        spec.is_intent = true;
+        store
+            .create("list1", spec, vec![])
+            .await
+            .expect("create intent-1");
+
+        // Intent task (Active) — should appear.
+        let mut spec = TaskSpec::new("intent-2", "");
+        spec.is_intent = true;
+        let t = store
+            .create("list1", spec, vec![])
+            .await
+            .expect("create intent-2");
+        store
+            .apply_transition(
+                "list1",
+                &t.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim intent-2");
+
+        // Intent task (Completed) — should NOT appear.
+        let mut spec = TaskSpec::new("intent-done", "");
+        spec.is_intent = true;
+        let t = store
+            .create("list1", spec, vec![])
+            .await
+            .expect("create intent-done");
+        store
+            .apply_transition(
+                "list1",
+                &t.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim intent-done");
+        store
+            .apply_transition("list1", &t.id.0, None, &TransitionEvent::Complete)
+            .await
+            .expect("complete intent-done");
+
+        let intents = store.list_actionable_intents().await.expect("list intents");
+        assert_eq!(intents.len(), 2);
+        let subjects: Vec<&str> = intents.iter().map(|t| t.spec.subject.as_str()).collect();
+        assert!(subjects.contains(&"intent-1"));
+        assert!(subjects.contains(&"intent-2"));
+    }
+
+    #[tokio::test]
+    async fn has_non_terminal_child_detects_active_shift() {
+        let (store, _dir) = test_store().await;
+
+        // Create intent.
+        let mut intent_spec = TaskSpec::new("intent", "");
+        intent_spec.is_intent = true;
+        let intent = store
+            .create("list1", intent_spec, vec![])
+            .await
+            .expect("create intent");
+
+        // No children yet.
+        assert!(
+            !store
+                .has_non_terminal_child(&intent.id.0)
+                .await
+                .expect("check")
+        );
+
+        // Create a shift child in Pending state.
+        let mut shift_spec = TaskSpec::new("shift-1", "");
+        shift_spec.parent_task = Some(intent.id.clone());
+        let shift = store
+            .create("list1", shift_spec, vec![])
+            .await
+            .expect("create shift");
+
+        // Now has a non-terminal child.
+        assert!(
+            store
+                .has_non_terminal_child(&intent.id.0)
+                .await
+                .expect("check")
+        );
+
+        // Claim → Active.
+        store
+            .apply_transition(
+                "list1",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "agent".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim shift");
+
+        assert!(
+            store
+                .has_non_terminal_child(&intent.id.0)
+                .await
+                .expect("check active")
+        );
+
+        // Complete the shift.
+        store
+            .apply_transition("list1", &shift.id.0, None, &TransitionEvent::Complete)
+            .await
+            .expect("complete shift");
+
+        // All children terminal — guard should pass.
+        assert!(
+            !store
+                .has_non_terminal_child(&intent.id.0)
+                .await
+                .expect("check completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_shifts_for_intent_returns_children() {
+        let (store, _dir) = test_store().await;
+
+        let mut intent_spec = TaskSpec::new("intent", "");
+        intent_spec.is_intent = true;
+        let intent = store
+            .create("list1", intent_spec, vec![])
+            .await
+            .expect("create intent");
+
+        // Create two child shifts.
+        for i in 0..2 {
+            let mut spec = TaskSpec::new(format!("shift-{i}"), "");
+            spec.parent_task = Some(intent.id.clone());
+            store
+                .create("list1", spec, vec![])
+                .await
+                .expect("create shift");
+        }
+
+        // Unrelated task (no parent).
+        store
+            .create("list1", TaskSpec::new("unrelated", ""), vec![])
+            .await
+            .expect("create unrelated");
+
+        let shifts = store
+            .list_shifts_for_intent(&intent.id.0)
+            .await
+            .expect("list shifts");
+        assert_eq!(shifts.len(), 2);
+        assert!(
+            shifts
+                .iter()
+                .all(|s| s.spec.parent_task.as_ref().unwrap() == &intent.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_transition_tx_within_transaction() {
+        let (store, _dir) = test_store().await;
+        let spec = TaskSpec::new("tx-test", "");
+        let task = store.create("list1", spec, vec![]).await.expect("create");
+
+        // Begin a transaction and apply Claim within it.
+        let mut tx = store.begin_tx().await.expect("begin tx");
+
+        let claimed = TaskStore::apply_transition_tx(
+            &mut tx,
+            "list1",
+            &task.id.0,
+            None,
+            &TransitionEvent::Claim {
+                owner: "tx-agent".into(),
+                lease_duration_secs: None,
+            },
+        )
+        .await
+        .expect("claim in tx");
+
+        assert!(claimed.runtime.state.is_active());
+        assert_eq!(claimed.runtime.version, 1);
+
+        // Before commit, the non-transactional read should still see Pending.
+        let before_commit = store
+            .get("list1", &task.id.0)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            before_commit.runtime.state,
+            RuntimeState::Pending,
+            "uncommitted tx should not be visible outside"
+        );
+
+        // Commit.
+        tx.commit().await.expect("commit");
+
+        // After commit, the change is visible.
+        let after_commit = store
+            .get("list1", &task.id.0)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(after_commit.runtime.state.is_active());
+
+        // state_name column should also be updated.
+        let row = sqlx::query("SELECT state_name FROM tasks WHERE list_id = ? AND id = ?")
+            .bind("list1")
+            .bind(&task.id.0)
+            .fetch_one(store.pool())
+            .await
+            .expect("fetch");
+        let state_name: String = row.get("state_name");
+        assert_eq!(state_name, "Active");
+    }
+
+    #[tokio::test]
+    async fn apply_transition_tx_rollback_on_drop() {
+        let (store, _dir) = test_store().await;
+        let spec = TaskSpec::new("rollback-test", "");
+        let task = store.create("list1", spec, vec![]).await.expect("create");
+
+        {
+            let mut tx = store.begin_tx().await.expect("begin tx");
+            TaskStore::apply_transition_tx(
+                &mut tx,
+                "list1",
+                &task.id.0,
+                None,
+                &TransitionEvent::Claim {
+                    owner: "doomed".into(),
+                    lease_duration_secs: None,
+                },
+            )
+            .await
+            .expect("claim in tx");
+
+            // Drop tx without committing — implicit rollback.
+        }
+
+        let task = store
+            .get("list1", &task.id.0)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            task.runtime.state,
+            RuntimeState::Pending,
+            "rolled-back tx should leave task unchanged"
+        );
     }
 }

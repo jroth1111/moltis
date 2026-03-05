@@ -232,12 +232,13 @@ impl AgentTool for SessionsHistoryTool {
 #[async_trait]
 impl AgentTool for SessionsSendTool {
     fn name(&self) -> &str {
-        "sessions_send"
+        crate::tool_names::SESSIONS_SEND
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["session"]
     }
+
 
     fn description(&self) -> &str {
         "Send a message to another session. Optionally wait for the target session's reply."

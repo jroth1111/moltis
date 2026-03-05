@@ -13,6 +13,7 @@ use {
 };
 
 use crate::error::Error;
+use crate::tool_names::SESSION_STATE;
 
 /// Agent tool exposing per-session key-value state operations.
 pub struct SessionStateTool {
@@ -28,12 +29,13 @@ impl SessionStateTool {
 #[async_trait]
 impl AgentTool for SessionStateTool {
     fn name(&self) -> &str {
-        "session_state"
+        SESSION_STATE
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["session"]
     }
+
 
     fn description(&self) -> &str {
         "Persist and retrieve key-value state scoped to the current session and a namespace. \

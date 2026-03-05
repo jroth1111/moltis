@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 #[cfg(feature = "wasm")]
 use crate::Result;
+#[cfg(feature = "wasm")]
+use crate::tool_names::WEB_FETCH;
 #[cfg(all(feature = "wasm", debug_assertions))]
 use crate::error::Context;
 
@@ -65,7 +67,7 @@ pub fn calc_component_bytes() -> Result<Cow<'static, [u8]>> {
 pub fn web_fetch_component_bytes() -> Result<Cow<'static, [u8]>> {
     #[cfg(debug_assertions)]
     {
-        load_component_debug_bytes("moltis_wasm_web_fetch.wasm", "web_fetch")
+        load_component_debug_bytes("moltis_wasm_web_fetch.wasm", WEB_FETCH)
     }
 
     #[cfg(not(debug_assertions))]

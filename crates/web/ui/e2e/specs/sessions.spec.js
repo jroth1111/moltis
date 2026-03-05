@@ -538,9 +538,7 @@ test.describe("Session management", () => {
 		// so we should navigate away from the current session URL.
 		// switchSession uses history.replaceState (no navigation event),
 		// so poll the URL rather than using waitForURL which waits for "load".
-		await expect
-			.poll(() => page.url(), { timeout: 10_000 })
-			.not.toBe(sessionUrl);
+		await expect.poll(() => page.url(), { timeout: 10_000 }).not.toBe(sessionUrl);
 
 		expect(pageErrors).toEqual([]);
 	});
@@ -602,6 +600,32 @@ test.describe("Session management", () => {
 		});
 
 		await expect(page.locator(".msg.system").filter({ hasText: "Sandbox disabled" })).toBeVisible({ timeout: 5_000 });
+
+		expect(pageErrors).toEqual([]);
+	});
+
+	test("session recovery event shows detailed system notice for active session", async ({ page }) => {
+		const pageErrors = await navigateAndWait(page, "/chats/main");
+		await waitForWsConnected(page);
+
+		await expectRpcOk(page, "system-event", {
+			event: "session.recovered",
+			payload: {
+				sessionKey: "main",
+				removedMalformedLines: 2,
+				injectedToolResults: 1,
+				appendedAssistantMessages: 1,
+				replayAttempted: false,
+				replayBlockedReason: "rate_limit",
+			},
+		});
+
+		await expect(
+			page.locator(".msg.system").filter({
+				hasText:
+					"Session recovered: 2 malformed line(s) removed, 1 tool result(s) recovered, assistant recovery message appended, replay skipped (rate_limit).",
+			}),
+		).toBeVisible({ timeout: 5_000 });
 
 		expect(pageErrors).toEqual([]);
 	});

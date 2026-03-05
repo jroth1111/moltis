@@ -7,6 +7,7 @@ use std::{
 use {async_trait::async_trait, tracing::debug, url::Url};
 
 use crate::error::Error;
+use crate::tool_names::WEB_FETCH;
 
 use {
     crate::ssrf::ssrf_check, moltis_agents::tool_registry::AgentTool,
@@ -359,12 +360,13 @@ fn truncate_at_char_boundary(s: &str, max: usize) -> String {
 #[async_trait]
 impl AgentTool for WebFetchTool {
     fn name(&self) -> &str {
-        "web_fetch"
+        WEB_FETCH
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["web"]
     }
+
 
     fn description(&self) -> &str {
         "Fetch a web page URL and extract its content as readable text or markdown. \
@@ -455,7 +457,7 @@ mod tests {
     #[test]
     fn test_tool_name_and_schema() {
         let tool = default_tool();
-        assert_eq!(tool.name(), "web_fetch");
+        assert_eq!(tool.name(), WEB_FETCH);
         let schema = tool.parameters_schema();
         assert_eq!(schema["required"][0], "url");
     }

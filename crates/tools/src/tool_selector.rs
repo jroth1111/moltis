@@ -9,7 +9,8 @@
 use std::collections::HashSet;
 
 use moltis_agents::tool_registry::{ToolRegistry, ToolSource};
-
+#[cfg(test)]
+use crate::tool_names::WEB_FETCH;
 /// Static keyword→category mapping. Each entry maps a lowercase keyword
 /// (or phrase) to the tool categories it implies.
 const KEYWORD_CATEGORIES: &[(&str, &[&str])] = &[
@@ -198,7 +199,7 @@ mod tests {
             cats: &["code", "files"],
         }));
         reg.register(Box::new(FakeTool {
-            name: "web_fetch",
+            name: WEB_FETCH,
             cats: &["web"],
         }));
         reg.register(Box::new(FakeTool {
@@ -243,7 +244,7 @@ mod tests {
     fn test_web_keywords_select_web_tools() {
         let reg = test_registry();
         let filtered = select_tools_for_task("search the web for rust docs", &reg);
-        assert!(filtered.get("web_fetch").is_some());
+        assert!(filtered.get(WEB_FETCH).is_some());
         assert!(filtered.get("web_search").is_some());
         assert!(
             filtered.get("mcp_server_tool").is_some(),
@@ -261,7 +262,7 @@ mod tests {
         assert!(filtered.get("exec").is_some());
         assert!(filtered.get("create_skill").is_none());
         assert!(filtered.get("delete_skill").is_none());
-        assert!(filtered.get("web_fetch").is_none());
+        assert!(filtered.get(WEB_FETCH).is_none());
         assert!(filtered.get("mcp_custom").is_none());
         assert!(filtered.get("mcp_server_tool").is_some());
     }
@@ -271,7 +272,7 @@ mod tests {
         let reg = test_registry();
         let filtered = select_tools_for_task("hello world", &reg);
         assert!(filtered.get("exec").is_some());
-        assert!(filtered.get("web_fetch").is_some());
+        assert!(filtered.get(WEB_FETCH).is_some());
         assert!(filtered.get("sessions_list").is_some());
         assert!(filtered.get("sessions_delete").is_some());
         assert!(filtered.get("create_skill").is_some());
@@ -285,7 +286,7 @@ mod tests {
     fn test_multiple_keyword_overlap_gives_union() {
         let reg = test_registry();
         let filtered = select_tools_for_task("search the web and write code", &reg);
-        assert!(filtered.get("web_fetch").is_some());
+        assert!(filtered.get(WEB_FETCH).is_some());
         assert!(filtered.get("web_search").is_some());
         assert!(filtered.get("exec").is_some());
         assert!(filtered.get("mcp_custom").is_none());
@@ -298,7 +299,7 @@ mod tests {
         let filtered = select_tools_for_task("show my session profile fields", &reg);
         // "profile" should not match keyword "file" and enable code/file tools.
         assert!(filtered.get("exec").is_none());
-        assert!(filtered.get("web_fetch").is_none());
+        assert!(filtered.get(WEB_FETCH).is_none());
         assert!(filtered.get("sessions_list").is_some());
         assert!(filtered.get("cron").is_none());
         assert!(filtered.get("mcp_server_tool").is_some());

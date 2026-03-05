@@ -177,6 +177,85 @@ impl HandoffContext {
     }
 }
 
+// ── Autonomy tier ────────────────────────────────────────────────────────────
+
+/// Autonomy tier for outloop (dispatch-managed) execution.
+///
+/// Tools are annotated with a tier; during dispatch, tools above the intent's
+/// tier are structurally removed from the agent's tool registry.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+// Variants are ordered: Auto(0) < Confirm(1) < Approve(2).
+pub enum AutonomyTier {
+    /// Read-only tools (web_fetch, search, file read, memory read).
+    #[default]
+    Auto = 0,
+    /// Local-write tools (file write, sandbox exec, memory write).
+    Confirm = 1,
+    /// External-write tools (git push, message send, API calls).
+    Approve = 2,
+}
+
+impl std::fmt::Display for AutonomyTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Auto => "auto",
+            Self::Confirm => "confirm",
+            Self::Approve => "approve",
+        };
+        f.write_str(s)
+    }
+}
+
+// ── Task principal ───────────────────────────────────────────────────────────
+
+/// Identity context for a task — who initiated it, where to notify.
+///
+/// Used for notification routing, autonomy policy resolution, and `list_id`
+/// derivation. Never used as a session key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskPrincipal {
+    /// Channel that originated the intent ("whatsapp", "web", "cron").
+    pub channel: String,
+    /// Sender identity within the channel (phone number, user ID, "system").
+    /// Stored in `principal_json`; the derived `list_id` uses a hashed form.
+    pub sender: String,
+    /// Account/bot identifier for multi-account channels.
+    /// E.g. WhatsApp business account ID, Telegram bot token prefix.
+    /// Empty string for single-account channels.
+    #[serde(default)]
+    pub account_id: String,
+}
+
+impl TaskPrincipal {
+    /// Derive a canonical, stable, PII-safe list_id.
+    ///
+    /// Uses BLAKE3 (stable across Rust versions, unlike `DefaultHasher`) truncated
+    /// to 128 bits. Channel is included raw (low cardinality, useful for queries).
+    /// Sender is hashed for PII safety.
+    #[must_use]
+    pub fn canonical_list_id(&self) -> String {
+        let channel = self
+            .channel
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(32)
+            .collect::<String>();
+        let account = self
+            .account_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(32)
+            .collect::<String>();
+        let input = format!("{channel}:{account}:{}", self.sender);
+        let hash = blake3::hash(input.as_bytes());
+        let truncated = &hash.to_hex()[..32]; // 128 bits
+        format!("v1:{channel}:{truncated}")
+    }
+}
+
 // ── Task Spec (immutable) ─────────────────────────────────────────────────────
 
 /// Immutable task intent — set at creation time, never changed.
@@ -196,6 +275,20 @@ pub struct TaskSpec {
     /// When this task was created.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Whether this task is a dispatch-managed intent (long-running, multi-shift).
+    /// Only tasks with `is_intent = true` are picked up by the dispatch loop.
+    #[serde(default)]
+    pub is_intent: bool,
+    /// Maximum autonomy level granted to shift agents for this intent.
+    /// The dispatch loop strips tools above this tier from each shift's registry.
+    #[serde(default)]
+    pub autonomy_tier: AutonomyTier,
+    /// Identity context: who initiated this task, where to send notifications.
+    #[serde(default)]
+    pub principal: Option<TaskPrincipal>,
+    /// Parent intent task ID (for shift→intent relationship).
+    #[serde(default)]
+    pub parent_task: Option<TaskId>,
 }
 
 fn default_priority() -> u8 {
@@ -214,6 +307,10 @@ impl TaskSpec {
             priority: default_priority(),
             max_attempts: default_max_attempts(),
             created_at: OffsetDateTime::now_utc(),
+            is_intent: false,
+            autonomy_tier: AutonomyTier::default(),
+            principal: None,
+            parent_task: None,
         }
     }
 }
@@ -365,5 +462,181 @@ mod tests {
         let task = Task::new("default", spec);
         assert_eq!(task.state_name(), "Pending");
         assert!(!task.is_terminal());
+    }
+
+    // ── AutonomyTier tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn autonomy_tier_ordering() {
+        assert!(AutonomyTier::Auto < AutonomyTier::Confirm);
+        assert!(AutonomyTier::Confirm < AutonomyTier::Approve);
+        assert!(AutonomyTier::Auto < AutonomyTier::Approve);
+    }
+
+    #[test]
+    fn autonomy_tier_default_is_auto() {
+        assert_eq!(AutonomyTier::default(), AutonomyTier::Auto);
+    }
+
+    #[test]
+    fn autonomy_tier_display() {
+        assert_eq!(AutonomyTier::Auto.to_string(), "auto");
+        assert_eq!(AutonomyTier::Confirm.to_string(), "confirm");
+        assert_eq!(AutonomyTier::Approve.to_string(), "approve");
+    }
+
+    #[test]
+    fn autonomy_tier_serde_roundtrip() {
+        let tier = AutonomyTier::Confirm;
+        let json = serde_json::to_string(&tier).unwrap();
+        assert_eq!(json, "\"confirm\"");
+        let back: AutonomyTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tier);
+    }
+
+    // ── TaskPrincipal tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn task_principal_serde_roundtrip() {
+        let p = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "biz-123".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: TaskPrincipal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn task_principal_account_id_defaults_empty() {
+        let json = r#"{"channel":"web","sender":"user42"}"#;
+        let p: TaskPrincipal = serde_json::from_str(json).unwrap();
+        assert_eq!(p.account_id, "");
+    }
+
+    #[test]
+    fn canonical_list_id_is_stable() {
+        let p = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "".into(),
+        };
+        let id1 = p.canonical_list_id();
+        let id2 = p.canonical_list_id();
+        assert_eq!(id1, id2, "must be deterministic");
+    }
+
+    #[test]
+    fn canonical_list_id_hides_sender() {
+        let p = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "".into(),
+        };
+        let id = p.canonical_list_id();
+        assert!(
+            !id.contains("+15551234567"),
+            "sender must be hashed, not plaintext"
+        );
+        assert!(
+            id.starts_with("v1:whatsapp:"),
+            "must include version and channel prefix"
+        );
+    }
+
+    #[test]
+    fn canonical_list_id_sanitizes_channel() {
+        let p = TaskPrincipal {
+            channel: "evil/../path".into(),
+            sender: "user".into(),
+            account_id: "".into(),
+        };
+        let id = p.canonical_list_id();
+        assert!(!id.contains('/'), "slashes must be stripped from channel");
+        assert!(!id.contains('.'), "dots must be stripped from channel");
+    }
+
+    #[test]
+    fn canonical_list_id_differs_by_account() {
+        let p1 = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "acct-A".into(),
+        };
+        let p2 = TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "acct-B".into(),
+        };
+        assert_ne!(
+            p1.canonical_list_id(),
+            p2.canonical_list_id(),
+            "different accounts must produce different list IDs"
+        );
+    }
+
+    #[test]
+    fn canonical_list_id_differs_by_sender() {
+        let p1 = TaskPrincipal {
+            channel: "web".into(),
+            sender: "alice".into(),
+            account_id: "".into(),
+        };
+        let p2 = TaskPrincipal {
+            channel: "web".into(),
+            sender: "bob".into(),
+            account_id: "".into(),
+        };
+        assert_ne!(p1.canonical_list_id(), p2.canonical_list_id());
+    }
+
+    // ── TaskSpec dispatch fields ────────────────────────────────────────────
+
+    #[test]
+    fn task_spec_new_defaults() {
+        let spec = TaskSpec::new("test", "desc");
+        assert!(!spec.is_intent, "is_intent defaults false");
+        assert_eq!(
+            spec.autonomy_tier,
+            AutonomyTier::Auto,
+            "autonomy_tier defaults Auto"
+        );
+        assert!(spec.principal.is_none(), "principal defaults None");
+        assert!(spec.parent_task.is_none(), "parent_task defaults None");
+    }
+
+    #[test]
+    fn task_spec_serde_backward_compat() {
+        // JSON without the new fields should deserialize with defaults.
+        let json = r#"{
+            "subject": "old task",
+            "description": "",
+            "priority": 2,
+            "max_attempts": 3,
+            "created_at": "2026-03-04T00:00:00Z"
+        }"#;
+        let spec: TaskSpec = serde_json::from_str(json).unwrap();
+        assert!(!spec.is_intent);
+        assert_eq!(spec.autonomy_tier, AutonomyTier::Auto);
+        assert!(spec.principal.is_none());
+        assert!(spec.parent_task.is_none());
+    }
+
+    #[test]
+    fn task_spec_serde_with_dispatch_fields() {
+        let mut spec = TaskSpec::new("intent task", "find restaurants");
+        spec.is_intent = true;
+        spec.principal = Some(TaskPrincipal {
+            channel: "whatsapp".into(),
+            sender: "+15551234567".into(),
+            account_id: "biz-1".into(),
+        });
+        spec.parent_task = None;
+
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: TaskSpec = serde_json::from_str(&json).unwrap();
+        assert!(back.is_intent);
+        assert_eq!(back.principal.as_ref().unwrap().channel, "whatsapp");
     }
 }

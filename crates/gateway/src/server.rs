@@ -1797,6 +1797,11 @@ pub async fn prepare_gateway(
     let deferred_state: Arc<tokio::sync::OnceCell<Arc<GatewayState>>> =
         Arc::new(tokio::sync::OnceCell::new());
 
+    // Deferred task store: populated after TaskListTool is created below.
+    // Used by the cron CreateTask callback, which is constructed before the store.
+    let deferred_task_store: Arc<tokio::sync::OnceCell<Arc<moltis_tasks::TaskStore>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+
     services =
         services.with_onboarding(Arc::new(crate::onboarding::GatewayOnboardingService::new(
             live_onboarding,
@@ -2055,6 +2060,63 @@ pub async fn prepare_gateway(
         window_ms: config.cron.rate_limit_window_secs * 1000,
     };
 
+    // Build the CreateTask callback for cron jobs that create dispatch-managed tasks.
+    // Uses the deferred task store (populated after TaskListTool is initialised below).
+    let deferred_ts_for_cron = Arc::clone(&deferred_task_store);
+    let on_create_task: moltis_cron::service::CreateTaskFn =
+        Arc::new(move |req: moltis_cron::service::CreateTaskRequest| {
+            let deferred = Arc::clone(&deferred_ts_for_cron);
+            Box::pin(async move {
+                let store = deferred.get().ok_or_else(|| {
+                    moltis_cron::Error::message(
+                        "task store not yet initialized; CreateTask cron job fired too early",
+                    )
+                })?;
+                let tier: moltis_tasks::AutonomyTier = match req.autonomy_tier.trim() {
+                    "auto" => moltis_tasks::AutonomyTier::Auto,
+                    "confirm" => moltis_tasks::AutonomyTier::Confirm,
+                    "approve" => moltis_tasks::AutonomyTier::Approve,
+                    other => {
+                        return Err(moltis_cron::Error::message(format!(
+                            "invalid createTask autonomy_tier `{other}`"
+                        )));
+                    },
+                };
+                let principal = req
+                    .principal_json
+                    .as_deref()
+                    .map(serde_json::from_str::<moltis_tasks::TaskPrincipal>)
+                    .transpose()
+                    .map_err(|e| moltis_cron::Error::message(format!("invalid principal_json: {e}")))?;
+                let resolved_list_id = if req.list_id.trim().is_empty() || req.list_id == "default" {
+                    principal
+                        .as_ref()
+                        .map(moltis_tasks::TaskPrincipal::canonical_list_id)
+                        .unwrap_or_else(|| "default".to_string())
+                } else {
+                    req.list_id.trim().to_string()
+                };
+                let mut spec = moltis_tasks::TaskSpec::new(req.subject, req.description);
+                spec.is_intent = req.is_intent;
+                spec.autonomy_tier = tier;
+                spec.principal = principal;
+                let mut seen = HashSet::new();
+                let blocked_by = req
+                    .blocked_by
+                    .into_iter()
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| !id.is_empty())
+                    .filter(|id| seen.insert(id.clone()))
+                    .map(moltis_tasks::TaskId::from)
+                    .collect::<Vec<_>>();
+                let task = store
+                    .create(&resolved_list_id, spec, blocked_by)
+                    .await
+                    .map_err(|e| moltis_cron::Error::message(e.to_string()))?;
+                Ok(moltis_cron::service::CreateTaskResult { task_id: task.id.0 })
+            })
+        });
+
     let cron_service = moltis_cron::service::CronService::with_events_queue(
         cron_store,
         on_system_event,
@@ -2062,6 +2124,7 @@ pub async fn prepare_gateway(
         Some(on_cron_notify),
         rate_limit_config,
         events_queue,
+        Some(on_create_task),
     );
 
     // Wire cron into gateway services.
@@ -3460,6 +3523,8 @@ pub async fn prepare_gateway(
             .await?
             .with_max_attempts_override(config.tasks.max_attempts_override);
         let task_store = task_list_tool.store();
+        // Populate the deferred store so cron CreateTask jobs can use it.
+        deferred_task_store.set(Arc::clone(&task_store)).ok();
         tool_registry.register(Box::new(task_list_tool));
 
         // Background: promote overdue Retrying tasks back to Pending.
@@ -3505,6 +3570,112 @@ pub async fn prepare_gateway(
                     }
                 }
             });
+        }
+        // Background: stale-slot sweep — clears dangling active_shift_id pointers.
+        {
+            let store_for_sweep = Arc::clone(&task_store);
+            tokio::spawn(async move {
+                let intent_store =
+                    moltis_tasks::IntentStore::from_pool(store_for_sweep.pool().clone());
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match moltis_tasks::IntentStore::stale_slot_sweep(
+                        &intent_store,
+                        &store_for_sweep,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "stale-slot sweep cleared dangling shift refs")
+                        },
+                        Ok(_) => {},
+                        Err(e) => tracing::warn!(error = %e, "stale-slot sweep failed"),
+                    }
+                }
+            });
+        }
+        // Background: stale-intent sweep — escalates idle Active intents with no pending shifts.
+        {
+            let store_for_sweep = Arc::clone(&task_store);
+            let idle_timeout = config.tasks.intent_idle_timeout_secs;
+            tokio::spawn(async move {
+                let intent_store =
+                    moltis_tasks::IntentStore::from_pool(store_for_sweep.pool().clone());
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match moltis_tasks::IntentStore::stale_intent_sweep(
+                        &intent_store,
+                        &store_for_sweep,
+                        idle_timeout,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "stale-intent sweep escalated idle intents")
+                        },
+                        Ok(_) => {},
+                        Err(e) => tracing::warn!(error = %e, "stale-intent sweep failed"),
+                    }
+                }
+            });
+        }
+        // Background: denorm integrity sweep — repairs state_name vs runtime_json drift.
+        {
+            let store_for_sweep = Arc::clone(&task_store);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    match store_for_sweep.denorm_integrity_sweep().await {
+                        Ok(n) if n > 0 => info!(count = n, "denorm integrity sweep repaired tasks"),
+                        Ok(_) => {},
+                        Err(e) => tracing::warn!(error = %e, "denorm integrity sweep failed"),
+                    }
+                }
+            });
+        }
+        // Background: output retention sweep — TTL-prune task_outputs older than configured limit.
+        {
+            let store_for_sweep = Arc::clone(&task_store);
+            let retention_secs = config.tasks.output_retention_secs;
+            tokio::spawn(async move {
+                let output_store =
+                    moltis_tasks::OutputStore::from_pool(store_for_sweep.pool().clone());
+                // Run once at startup, then every 6 hours.
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let cutoff = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(retention_secs);
+                    match output_store.delete_older_than(cutoff as i64).await {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "output retention sweep pruned old shift outputs")
+                        },
+                        Ok(_) => {},
+                        Err(e) => tracing::warn!(error = %e, "output retention sweep failed"),
+                    }
+                }
+            });
+        }
+        // Background: intent dispatch loop — drives multi-shift agent execution.
+        {
+            let state_for_dispatch = Arc::clone(&state);
+            let store_for_dispatch = Arc::clone(&task_store);
+            let dispatch_config = config.tasks.clone();
+            tokio::spawn(crate::dispatch::run_dispatch_loop(
+                state_for_dispatch,
+                store_for_dispatch,
+                dispatch_config,
+            ));
         }
 
         // Register built-in voice tools for explicit TTS/STT calls in agents.

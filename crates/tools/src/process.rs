@@ -355,12 +355,13 @@ impl ProcessTool {
 #[async_trait]
 impl AgentTool for ProcessTool {
     fn name(&self) -> &str {
-        "process"
+        crate::tool_names::PROCESS
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["code"]
     }
+
 
     fn description(&self) -> &str {
         "Manage interactive terminal processes (TUI apps, REPLs, long-running commands) \

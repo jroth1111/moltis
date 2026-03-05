@@ -824,6 +824,46 @@ pub struct TasksConfig {
     /// How often (secs) the background sweep reclaims zombie tasks. Default: 60.
     #[serde(default = "default_task_zombie_poll_secs")]
     pub zombie_poll_interval_secs: u64,
+    /// How often (secs) the dispatch loop scans for actionable intents. Default: 5.
+    #[serde(default = "default_task_dispatch_poll_secs")]
+    pub dispatch_poll_interval_secs: u64,
+    /// Token budget for intents (None = unlimited). Default: None.
+    #[serde(default)]
+    pub intent_token_budget: Option<u64>,
+    /// Number of consecutive no-progress shifts before escalating. Default: 3.
+    #[serde(default = "default_task_spin_threshold")]
+    pub intent_spin_threshold: u32,
+
+    // ── Dispatch loop ──────────────────────────────────────────────────────────
+    /// Enable the intent dispatch loop. Default: false (opt-in, prevents
+    /// accidental dispatch on servers not configured for it).
+    #[serde(default)]
+    pub dispatch_enabled: bool,
+    /// Maximum shifts running concurrently across all intents. Default: 4.
+    #[serde(default = "default_max_concurrent_shifts")]
+    pub max_concurrent_shifts: usize,
+    /// Minimum seconds between the end of one shift and the start of the next
+    /// for the same intent. Prevents thrashing on fast-failing shifts.
+    /// Default: 30.
+    #[serde(default = "default_shift_cooldown_secs")]
+    pub shift_cooldown_secs: u64,
+    /// Default autonomy tier for intents ("auto" | "confirm" | "approve").
+    /// Applied when `TaskSpec.autonomy_tier` is the crate default.
+    /// Default: "auto".
+    #[serde(default = "default_autonomy_tier_str")]
+    pub default_autonomy_tier: String,
+    /// Seconds of inactivity before an idle Active intent is escalated to
+    /// AwaitingHuman by the stale-intent sweep. Default: 86400 (24 h).
+    #[serde(default = "default_intent_idle_timeout_secs")]
+    pub intent_idle_timeout_secs: u64,
+    /// Seconds before dispatch-managed sessions (`dispatch:intent:*`) are
+    /// pruned by the session-cleanup sweep. Default: 604800 (7 days).
+    #[serde(default = "default_dispatch_session_retention_secs")]
+    pub dispatch_session_retention_secs: u64,
+    /// Seconds before rows in `task_outputs` are deleted by the TTL sweep.
+    /// Default: 2592000 (30 days).
+    #[serde(default = "default_output_retention_secs")]
+    pub output_retention_secs: u64,
 }
 
 fn default_task_retry_poll_secs() -> u64 {
@@ -842,6 +882,38 @@ fn default_task_zombie_poll_secs() -> u64 {
     60
 }
 
+fn default_task_dispatch_poll_secs() -> u64 {
+    5
+}
+
+fn default_task_spin_threshold() -> u32 {
+    3
+}
+
+fn default_max_concurrent_shifts() -> usize {
+    4
+}
+
+fn default_shift_cooldown_secs() -> u64 {
+    30
+}
+
+fn default_autonomy_tier_str() -> String {
+    "auto".to_string()
+}
+
+fn default_intent_idle_timeout_secs() -> u64 {
+    86_400
+}
+
+fn default_dispatch_session_retention_secs() -> u64 {
+    604_800
+}
+
+fn default_output_retention_secs() -> u64 {
+    2_592_000
+}
+
 impl Default for TasksConfig {
     fn default() -> Self {
         Self {
@@ -850,6 +922,16 @@ impl Default for TasksConfig {
             lease_duration_secs: default_task_lease_duration_secs(),
             lease_heartbeat_interval_secs: default_task_lease_heartbeat_secs(),
             zombie_poll_interval_secs: default_task_zombie_poll_secs(),
+            dispatch_poll_interval_secs: default_task_dispatch_poll_secs(),
+            intent_token_budget: None,
+            intent_spin_threshold: default_task_spin_threshold(),
+            dispatch_enabled: false,
+            max_concurrent_shifts: default_max_concurrent_shifts(),
+            shift_cooldown_secs: default_shift_cooldown_secs(),
+            default_autonomy_tier: default_autonomy_tier_str(),
+            intent_idle_timeout_secs: default_intent_idle_timeout_secs(),
+            dispatch_session_retention_secs: default_dispatch_session_retention_secs(),
+            output_retention_secs: default_output_retention_secs(),
         }
     }
 }

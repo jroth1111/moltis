@@ -26,6 +26,7 @@ pub mod channel_store;
 pub mod chat;
 pub mod chat_error;
 pub mod cron;
+pub mod dispatch;
 pub mod env_routes;
 #[cfg(feature = "graphql")]
 pub mod graphql_routes;

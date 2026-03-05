@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+
+use crate::tool_names::WEB_FETCH;
 #[cfg(feature = "wasm")]
 use std::mem::size_of;
 
@@ -36,7 +38,7 @@ impl Default for WasmToolLimits {
             },
         );
         overrides.insert(
-            "web_fetch".to_string(),
+            WEB_FETCH.to_string(),
             ToolLimitOverride {
                 fuel: Some(10_000_000),
                 memory: Some(32 * MB),

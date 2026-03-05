@@ -28,8 +28,8 @@ use {
     },
     moltis_agents::tool_registry::AgentTool,
     moltis_tasks::{
-        FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskSpec, TaskStore,
-        TerminalState, TransitionEvent,
+        AutonomyTier, FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskSpec,
+        TaskPrincipal, TaskStore, TerminalState, TransitionEvent,
     },
 };
 
@@ -155,6 +155,16 @@ fn parse_failure_class(s: &str) -> crate::Result<FailureClass> {
     }
 }
 
+/// Parse an `AutonomyTier` from a tool parameter string.
+fn parse_autonomy_tier(s: &str) -> crate::Result<AutonomyTier> {
+    match s {
+        "auto" => Ok(AutonomyTier::Auto),
+        "confirm" => Ok(AutonomyTier::Confirm),
+        "approve" => Ok(AutonomyTier::Approve),
+        other => Err(Error::message(format!("unknown autonomy_tier: {other}"))),
+    }
+}
+
 /// Parse a `HandoffContext` from JSON parameter.
 fn parse_handoff(params: &serde_json::Value) -> HandoffContext {
     let h = params.get("handoff");
@@ -192,12 +202,13 @@ fn parse_handoff(params: &serde_json::Value) -> HandoffContext {
 #[async_trait]
 impl AgentTool for TaskListTool {
     fn name(&self) -> &str {
-        "task_list"
+        crate::tool_names::TASK_LIST
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["orchestration"]
     }
+
 
     fn description(&self) -> &str {
         "Manage a shared task list for coordinated multi-agent execution. \
@@ -276,6 +287,29 @@ impl AgentTool for TaskListTool {
                 "active_form": {
                     "type": "string",
                     "description": "Present continuous form shown in spinner (e.g. 'Running tests')."
+                },
+                "is_intent": {
+                    "type": "boolean",
+                    "description": "Mark this as a dispatch-managed intent task (long-running, multi-shift). Default: false."
+                },
+                "autonomy_tier": {
+                    "type": "string",
+                    "enum": ["auto", "confirm", "approve"],
+                    "description": "Maximum autonomy tier for shift agents. Only applies when is_intent is true. Default: auto."
+                },
+                "parent_task": {
+                    "type": "string",
+                    "description": "Optional parent intent task ID for shift tasks."
+                },
+                "principal": {
+                    "type": "object",
+                    "description": "Optional execution identity for autonomous dispatch.",
+                    "properties": {
+                        "channel": { "type": "string" },
+                        "sender": { "type": "string" },
+                        "account_id": { "type": "string" }
+                    },
+                    "required": ["channel", "sender"]
                 }
             },
             "required": ["action"]
@@ -284,7 +318,8 @@ impl AgentTool for TaskListTool {
 
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let action = require_str(&params, "action")?;
-        let list_id = str_param_any(&params, &["list_id", "listId"]).unwrap_or("default");
+        let list_id_input = str_param_any(&params, &["list_id", "listId"]).map(str::to_string);
+        let list_id = list_id_input.as_deref().unwrap_or("default");
         let expected_version = params.get("expected_version").and_then(|v| v.as_u64());
 
         match action {
@@ -304,18 +339,62 @@ impl AgentTool for TaskListTool {
                     })
                     .unwrap_or_default();
 
+                let is_intent = params
+                    .get("is_intent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let autonomy_tier = str_param(&params, "autonomy_tier")
+                    .map(parse_autonomy_tier)
+                    .transpose()?
+                    .unwrap_or_default();
+                let dispatch_autonomy_tier = str_param(&params, "_dispatch_autonomy_tier")
+                    .map(parse_autonomy_tier)
+                    .transpose()?;
+                if is_intent
+                    && let Some(caller_tier) = dispatch_autonomy_tier
+                    && autonomy_tier > caller_tier
+                {
+                    return Err(Error::message(format!(
+                        "autonomy_tier `{autonomy_tier}` exceeds dispatch caller tier `{caller_tier}`"
+                    ))
+                    .into());
+                }
+                let parent_task = str_param_any(&params, &["parent_task", "parentTask"])
+                    .map(TaskId::from);
+                let principal = params
+                    .get("principal")
+                    .cloned()
+                    .map(serde_json::from_value::<TaskPrincipal>)
+                    .transpose()
+                    .map_err(|e| Error::message(format!("invalid principal: {e}")))?;
+
                 let mut spec = TaskSpec::new(subject, description);
+                spec.is_intent = is_intent;
+                spec.autonomy_tier = autonomy_tier;
+                spec.parent_task = parent_task;
+                spec.principal = principal.clone();
                 if let Some(af) = active_form {
-                    // Store active_form in description suffix for compat (tooling layer ignores it).
-                    let _ = af; // Stored in spec description extension if needed later.
+                    // active_form is a UI hint; not stored in the spec currently.
+                    let _ = af;
                 }
                 if let Some(override_max) = self.max_attempts_override.filter(|&v| v > 0) {
                     spec.max_attempts = override_max;
                 }
 
+                let resolved_list_id = if list_id_input.as_deref().is_none()
+                    || list_id_input.as_deref() == Some("default")
+                {
+                    principal
+                        .as_ref()
+                        .map(TaskPrincipal::canonical_list_id)
+                        .unwrap_or_else(|| list_id.to_string())
+                } else {
+                    list_id.to_string()
+                };
+
                 let task = self
                     .store
-                    .create(list_id, spec, blocked_by)
+                    .create(&resolved_list_id, spec, blocked_by)
                     .await
                     .map_err(anyhow::Error::from)?;
                 Ok(json!({ "ok": true, "task": task_view(&task) }))
@@ -797,6 +876,156 @@ mod tests {
             .await
             .unwrap();
         assert!(history["events"].as_array().unwrap().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn create_intent_task_sets_is_intent_and_tier() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({
+                "action": "create",
+                "subject": "intent task",
+                "description": "do something",
+                "is_intent": true,
+                "autonomy_tier": "confirm"
+            }))
+            .await
+            .unwrap();
+        let id = result["task"]["id"].as_str().unwrap().to_string();
+
+        // Fetch the stored task and inspect the spec via the store directly.
+        let store = t.store();
+        let task = store.get("default", &id).await.unwrap().unwrap();
+        assert!(task.spec.is_intent);
+        assert_eq!(task.spec.autonomy_tier, AutonomyTier::Confirm);
+    }
+
+    #[tokio::test]
+    async fn create_task_without_intent_flag_defaults_to_non_intent() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({ "action": "create", "subject": "plain task" }))
+            .await
+            .unwrap();
+        let id = result["task"]["id"].as_str().unwrap().to_string();
+
+        let store = t.store();
+        let task = store.get("default", &id).await.unwrap().unwrap();
+        assert!(!task.spec.is_intent);
+        assert_eq!(task.spec.autonomy_tier, AutonomyTier::Auto);
+    }
+
+    #[tokio::test]
+    async fn create_with_principal_derives_canonical_list_id() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({
+                "action": "create",
+                "subject": "principal task",
+                "principal": {
+                    "channel": "whatsapp",
+                    "sender": "+15551234567",
+                    "account_id": "biz-1"
+                }
+            }))
+            .await
+            .unwrap();
+
+        let list_id = result["task"]["list_id"].as_str().unwrap();
+        assert!(list_id.starts_with("v1:whatsapp:"));
+
+        let id = result["task"]["id"].as_str().unwrap().to_string();
+        let store = t.store();
+        let task = store.get(list_id, &id).await.unwrap().unwrap();
+        let principal = task.spec.principal.expect("principal must be set");
+        assert_eq!(principal.channel, "whatsapp");
+        assert_eq!(principal.sender, "+15551234567");
+        assert_eq!(principal.account_id, "biz-1");
+    }
+
+    #[tokio::test]
+    async fn create_with_parent_and_principal_persists_relationship() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+
+        let parent = t
+            .execute(json!({
+                "action": "create",
+                "subject": "intent root",
+                "list_id": "custom-list",
+                "is_intent": true
+            }))
+            .await
+            .unwrap();
+        let parent_id = parent["task"]["id"].as_str().unwrap().to_string();
+
+        let child = t
+            .execute(json!({
+                "action": "create",
+                "subject": "shift child",
+                "list_id": "custom-list",
+                "parent_task": parent_id,
+                "principal": {
+                    "channel": "web",
+                    "sender": "alice"
+                }
+            }))
+            .await
+            .unwrap();
+        let child_id = child["task"]["id"].as_str().unwrap().to_string();
+
+        let store = t.store();
+        let task = store.get("custom-list", &child_id).await.unwrap().unwrap();
+        assert_eq!(task.spec.parent_task.as_ref().map(|id| id.0.as_str()), Some(parent_id.as_str()));
+        assert_eq!(
+            task.spec.principal.as_ref().map(|p| p.channel.as_str()),
+            Some("web")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_unknown_autonomy_tier() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({
+                "action": "create",
+                "subject": "bad tier",
+                "autonomy_tier": "supercharge"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown autonomy_tier")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_intent_rejects_tier_above_dispatch_caller_tier() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let result = t
+            .execute(json!({
+                "action": "create",
+                "subject": "escalated intent",
+                "is_intent": true,
+                "autonomy_tier": "approve",
+                "_dispatch_autonomy_tier": "auto",
+            }))
+            .await;
+        assert!(result.is_err(), "create should fail when requested tier exceeds caller tier");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds dispatch caller tier")
+        );
     }
 
     #[tokio::test]

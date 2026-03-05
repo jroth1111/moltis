@@ -261,12 +261,13 @@ impl ExecTool {
 #[async_trait]
 impl AgentTool for ExecTool {
     fn name(&self) -> &str {
-        "exec"
+        crate::tool_names::EXEC
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["code", "files"]
     }
+
 
     fn description(&self) -> &str {
         "Execute a shell command on the server. Returns stdout, stderr, and exit code."

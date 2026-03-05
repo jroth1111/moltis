@@ -73,12 +73,13 @@ impl SessionsDeleteTool {
 #[async_trait]
 impl AgentTool for SessionsCreateTool {
     fn name(&self) -> &str {
-        "sessions_create"
+        crate::tool_names::SESSIONS_CREATE
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["session"]
     }
+
 
     fn description(&self) -> &str {
         "Create a new chat session or resolve an existing one. \
@@ -146,12 +147,13 @@ impl AgentTool for SessionsCreateTool {
 #[async_trait]
 impl AgentTool for SessionsDeleteTool {
     fn name(&self) -> &str {
-        "sessions_delete"
+        crate::tool_names::SESSIONS_DELETE
     }
 
     fn categories(&self) -> &'static [&'static str] {
         &["session", "destructive"]
     }
+
 
     fn description(&self) -> &str {
         "Delete a chat session and its history by key. \

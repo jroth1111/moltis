@@ -45,6 +45,33 @@ pub type SystemEventFn = Arc<dyn Fn(String) + Send + Sync>;
 /// Callback for notifying about cron job changes.
 pub type NotifyFn = Arc<dyn Fn(CronNotification) + Send + Sync>;
 
+/// Parameters passed to the create-task callback.
+#[derive(Debug, Clone)]
+pub struct CreateTaskRequest {
+    pub list_id: String,
+    pub subject: String,
+    pub description: String,
+    pub is_intent: bool,
+    /// Autonomy tier string: "auto" | "confirm" | "approve".
+    pub autonomy_tier: String,
+    pub principal_json: Option<String>,
+    pub blocked_by: Vec<String>,
+}
+
+/// Result returned by the create-task callback.
+#[derive(Debug, Clone)]
+pub struct CreateTaskResult {
+    /// The newly created task ID.
+    pub task_id: String,
+}
+
+/// Callback for creating a new dispatch-managed task in the task store.
+pub type CreateTaskFn = Arc<
+    dyn Fn(CreateTaskRequest) -> Pin<Box<dyn Future<Output = Result<CreateTaskResult>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Rate limiting configuration for cron job creation.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
@@ -124,6 +151,7 @@ pub struct CronService {
     on_system_event: SystemEventFn,
     on_agent_turn: AgentTurnFn,
     on_notify: Option<NotifyFn>,
+    on_create_task: Option<CreateTaskFn>,
     rate_limiter: Mutex<RateLimiter>,
     events_queue: Arc<SystemEventsQueue>,
 }
@@ -184,13 +212,15 @@ impl CronService {
             on_notify,
             rate_limit_config,
             SystemEventsQueue::new(),
+            None,
         )
     }
 
     /// Create a new cron service with a pre-created events queue.
     ///
     /// Use this when the queue must be shared with closures created before
-    /// the service (e.g. the `on_agent_turn` callback).
+    /// the service (e.g. the `on_agent_turn` callback). Pass `on_create_task`
+    /// to wire the `CreateTask` cron payload into the task store.
     pub fn with_events_queue(
         store: Arc<dyn CronStore>,
         on_system_event: SystemEventFn,
@@ -198,6 +228,7 @@ impl CronService {
         on_notify: Option<NotifyFn>,
         rate_limit_config: RateLimitConfig,
         events_queue: Arc<SystemEventsQueue>,
+        on_create_task: Option<CreateTaskFn>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -208,6 +239,7 @@ impl CronService {
             on_system_event,
             on_agent_turn,
             on_notify,
+            on_create_task,
             rate_limiter: Mutex::new(RateLimiter::new(rate_limit_config)),
             events_queue,
         })
@@ -566,6 +598,37 @@ impl CronService {
                 };
                 (self.on_agent_turn)(req).await
             },
+            CronPayload::CreateTask {
+                list_id,
+                subject,
+                description,
+                is_intent,
+                autonomy_tier,
+                principal_json,
+                blocked_by,
+            } => {
+                if let Some(ref on_create) = self.on_create_task {
+                    let req = CreateTaskRequest {
+                        list_id: list_id.clone(),
+                        subject: subject.clone(),
+                        description: description.clone(),
+                        is_intent: *is_intent,
+                        autonomy_tier: autonomy_tier.clone(),
+                        principal_json: principal_json.clone(),
+                        blocked_by: blocked_by.clone(),
+                    };
+                    on_create(req).await.map(|r| AgentTurnResult {
+                        output: format!("task created: {}", r.task_id),
+                        input_tokens: None,
+                        output_tokens: None,
+                    })
+                } else {
+                    Err(Error::message(format!(
+                        "CreateTask payload received but no on_create_task callback is configured (job: {})",
+                        job.id
+                    )))
+                }
+            },
         };
 
         let finished = now_ms();
@@ -712,6 +775,46 @@ fn validate_job_spec(job: &CronJob) -> Result<()> {
             ));
         },
         _ => {},
+    }
+    if let CronPayload::CreateTask {
+        list_id,
+        subject,
+        autonomy_tier,
+        principal_json,
+        blocked_by,
+        ..
+    } = &job.payload
+    {
+        if list_id.trim().is_empty() {
+            return Err(Error::message("createTask payload requires non-empty list_id"));
+        }
+        if subject.trim().is_empty() {
+            return Err(Error::message("createTask payload requires non-empty subject"));
+        }
+        match autonomy_tier.trim() {
+            "auto" | "confirm" | "approve" => {},
+            other => {
+                return Err(Error::message(format!(
+                    "createTask payload has invalid autonomy_tier `{other}` (expected auto|confirm|approve)"
+                )));
+            },
+        }
+        if let Some(raw_principal) = principal_json {
+            let trimmed = raw_principal.trim();
+            if trimmed.is_empty() {
+                return Err(Error::message(
+                    "createTask payload principal_json must not be empty when provided",
+                ));
+            }
+            serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {
+                Error::message(format!("createTask payload principal_json is invalid JSON: {e}"))
+            })?;
+        }
+        if blocked_by.iter().any(|id| id.trim().is_empty()) {
+            return Err(Error::message(
+                "createTask payload blocked_by entries must be non-empty strings",
+            ));
+        }
     }
     if let CronPayload::AgentTurn {
         deliver: true,
@@ -1590,5 +1693,204 @@ mod tests {
                 .to_string()
                 .contains("deliver=true requires")
         );
+    }
+
+    // ── CreateTask payload tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_task_payload_serde_roundtrip() {
+        let p = CronPayload::CreateTask {
+            list_id: "releases".into(),
+            subject: "Ship release".into(),
+            description: "Tag v1.2.3 and push".into(),
+            is_intent: true,
+            autonomy_tier: "confirm".into(),
+            principal_json: Some("{\"channel\":\"web\",\"sender\":\"alice\"}".into()),
+            blocked_by: vec!["a".into(), "b".into()],
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("createTask"), "tag not present: {json}");
+        let back: CronPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[tokio::test]
+    async fn create_task_payload_defaults_autonomy_tier() {
+        // autonomy_tier should default to "auto" when omitted.
+        let json = r#"{"kind":"createTask","list_id":"default","subject":"hello","description":""}"#;
+        let p: CronPayload = serde_json::from_str(json).unwrap();
+        match p {
+            CronPayload::CreateTask { autonomy_tier, .. } => {
+                assert_eq!(autonomy_tier, "auto");
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_create_task_calls_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = Arc::new(InMemoryStore::new());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = Arc::clone(&call_count);
+
+        let on_create: CreateTaskFn = Arc::new(move |req: CreateTaskRequest| {
+            let c = Arc::clone(&cc);
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(CreateTaskResult {
+                    task_id: format!("task-{}", req.subject),
+                })
+            })
+        });
+
+        let svc = CronService::with_events_queue(
+            store.clone(),
+            noop_system_event(),
+            noop_agent_turn(),
+            None,
+            RateLimitConfig::default(),
+            SystemEventsQueue::new(),
+            Some(on_create),
+        );
+
+        // Schedule a CreateTask job due immediately.
+        let job = svc
+            .add(CronJobCreate {
+                id: None,
+                name: "make-task".into(),
+                schedule: CronSchedule::At { at_ms: 1 },
+                payload: CronPayload::CreateTask {
+                    list_id: "default".into(),
+                    subject: "do-work".into(),
+                    description: "".into(),
+                    is_intent: false,
+                    autonomy_tier: "auto".into(),
+                    principal_json: None,
+                    blocked_by: vec![],
+                },
+                session_target: SessionTarget::Isolated,
+                delete_after_run: true,
+                enabled: true,
+                system: false,
+                sandbox: CronSandboxConfig::default(),
+                wake_mode: CronWakeMode::default(),
+            })
+            .await
+            .unwrap();
+
+        svc.run(&job.id, true).await.unwrap();
+        // Allow the spawned task to complete.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_create_task_without_callback_records_error_run() {
+        // Without a callback, the job should fail fast and record an Error run.
+        let store = Arc::new(InMemoryStore::new());
+        let svc = make_svc(store.clone(), noop_system_event(), noop_agent_turn());
+
+        let job = svc
+            .add(CronJobCreate {
+                id: None,
+                name: "unconfigured-create".into(),
+                schedule: CronSchedule::At { at_ms: 1 },
+                payload: CronPayload::CreateTask {
+                    list_id: "default".into(),
+                    subject: "work".into(),
+                    description: "".into(),
+                    is_intent: false,
+                    autonomy_tier: "auto".into(),
+                    principal_json: None,
+                    blocked_by: vec![],
+                },
+                session_target: SessionTarget::Isolated,
+                delete_after_run: false,
+                enabled: true,
+                system: false,
+                sandbox: CronSandboxConfig::default(),
+                wake_mode: CronWakeMode::default(),
+            })
+            .await
+            .unwrap();
+
+        svc.run(&job.id, true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Job must be recorded as Error when callback is missing.
+        let runs = svc.runs(&job.id, 10).await.unwrap();
+        assert!(!runs.is_empty());
+        assert_eq!(runs[0].status, RunStatus::Error);
+        assert!(
+            runs[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("no on_create_task callback"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_payload_rejects_invalid_autonomy_tier() {
+        let store = Arc::new(InMemoryStore::new());
+        let svc = make_svc(store, noop_system_event(), noop_agent_turn());
+        let err = svc
+            .add(CronJobCreate {
+                id: None,
+                name: "bad-tier".into(),
+                schedule: CronSchedule::At { at_ms: 1 },
+                payload: CronPayload::CreateTask {
+                    list_id: "default".into(),
+                    subject: "work".into(),
+                    description: "".into(),
+                    is_intent: true,
+                    autonomy_tier: "root".into(),
+                    principal_json: None,
+                    blocked_by: vec![],
+                },
+                session_target: SessionTarget::Isolated,
+                delete_after_run: false,
+                enabled: true,
+                system: false,
+                sandbox: CronSandboxConfig::default(),
+                wake_mode: CronWakeMode::default(),
+            })
+            .await
+            .expect_err("invalid tier must be rejected");
+
+        assert!(err.to_string().contains("invalid autonomy_tier"));
+    }
+
+    #[tokio::test]
+    async fn create_task_payload_rejects_invalid_principal_json() {
+        let store = Arc::new(InMemoryStore::new());
+        let svc = make_svc(store, noop_system_event(), noop_agent_turn());
+        let err = svc
+            .add(CronJobCreate {
+                id: None,
+                name: "bad-principal-json".into(),
+                schedule: CronSchedule::At { at_ms: 1 },
+                payload: CronPayload::CreateTask {
+                    list_id: "default".into(),
+                    subject: "work".into(),
+                    description: "".into(),
+                    is_intent: true,
+                    autonomy_tier: "auto".into(),
+                    principal_json: Some("{not-json}".into()),
+                    blocked_by: vec![],
+                },
+                session_target: SessionTarget::Isolated,
+                delete_after_run: false,
+                enabled: true,
+                system: false,
+                sandbox: CronSandboxConfig::default(),
+                wake_mode: CronWakeMode::default(),
+            })
+            .await
+            .expect_err("invalid principal_json must be rejected");
+
+        assert!(err.to_string().contains("principal_json is invalid JSON"));
     }
 }

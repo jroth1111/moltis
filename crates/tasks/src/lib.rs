@@ -17,6 +17,8 @@
 pub mod errors;
 pub mod event_log;
 pub mod guards;
+pub mod intent_state;
+pub mod output_store;
 pub mod recovery;
 pub mod state;
 pub mod store;
@@ -27,9 +29,14 @@ pub mod types;
 pub use {
     errors::TransitionError,
     event_log::EventLog,
+    intent_state::{IntentState, IntentStore, ObjectiveSnapshot},
+    output_store::{OutputStore, ShiftOutput},
     recovery::{RecoveryPhase, classify_recovery},
     state::{RuntimeState, TerminalState},
     store::TaskStore,
     transitions::{TransitionEvent, apply},
-    types::{FailureClass, HandoffContext, Task, TaskId, TaskRuntime, TaskSpec},
+    types::{
+        AutonomyTier, FailureClass, HandoffContext, Task, TaskId, TaskPrincipal, TaskRuntime,
+        TaskSpec,
+    },
 };
