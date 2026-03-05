@@ -17,7 +17,10 @@
 pub mod args;
 pub mod behavior;
 
-use chromiumoxide::{Page, cdp::browser_protocol::network::SetExtraHttpHeadersParams};
+use chromiumoxide::{
+    Page,
+    cdp::browser_protocol::network::{Headers, SetExtraHttpHeadersParams},
+};
 
 use crate::{error::Error, types::StealthConfig};
 
@@ -212,8 +215,8 @@ pub async fn apply_stealth_headers(page: &Page, config: &StealthConfig) -> Resul
         serde_json::Value::String(infer_sec_ch_platform(&user_agent).to_string()),
     );
 
-    page.execute(SetExtraHttpHeadersParams::new(serde_json::Value::Object(
-        headers,
+    page.execute(SetExtraHttpHeadersParams::new(Headers::new(
+        serde_json::Value::Object(headers),
     )))
     .await
     .map_err(|e| Error::Cdp(format!("failed to set stealth headers: {e}")))?;
