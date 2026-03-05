@@ -854,7 +854,7 @@ function McpPage() {
 	        <div class="skills-warn-title">\u26a0\ufe0f Review MCP trust boundaries before enabling</div>
 	        <div>Local stdio servers run with <strong>your full system privileges</strong>. A malicious or compromised local server can read files, exfiltrate credentials, or execute commands.</div>
 	        <div class="mt-1">Remote SSE servers can receive your tool inputs and act in linked external systems. Use trusted hosts and only scopes you intend to grant.</div>
-	        <div class="mt-1">Each enabled server also adds tool definitions to chat context and consumes tokens, enable only what you actively need.</div>
+	        <div class="mt-1">Code-only mode discovers tool schemas on demand. Direct tool-definition context expansion only occurs if legacy direct bridge is enabled.</div>
 	      </div>
       <${InstallBox} />
       <${FeaturedSection} />
