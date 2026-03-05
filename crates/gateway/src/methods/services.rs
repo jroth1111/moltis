@@ -231,7 +231,9 @@ fn apply_memory_config_update(
     }
 }
 
-fn memory_config_response(memory: &moltis_config::schema::MemoryEmbeddingConfig) -> serde_json::Value {
+fn memory_config_response(
+    memory: &moltis_config::schema::MemoryEmbeddingConfig,
+) -> serde_json::Value {
     serde_json::json!({
         "backend": memory.backend.as_deref().unwrap_or("builtin"),
         "citations": memory.citations.as_deref().unwrap_or("auto"),
@@ -2814,6 +2816,129 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .install_dep(ctx.params.clone())
                     .await
                     .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "skills.evals.list",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .skills
+                    .evals_list()
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "skills.evals.get",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .skills
+                    .evals_get(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "skills.evals.run",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                let source = ctx
+                    .params
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let skill = ctx
+                    .params
+                    .get("skill")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let op_id = ctx
+                    .params
+                    .get("op_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(ctx.request_id.as_str())
+                    .to_string();
+
+                broadcast_raw(
+                    &ctx.state,
+                    "skills.evals.progress",
+                    serde_json::json!({
+                        "phase": "start",
+                        "source": source,
+                        "skill": skill,
+                        "op_id": op_id,
+                    }),
+                    BroadcastOpts::default(),
+                )
+                .await;
+
+                broadcast_raw(
+                    &ctx.state,
+                    "skills.evals.progress",
+                    serde_json::json!({
+                        "phase": "scoring",
+                        "source": source,
+                        "skill": skill,
+                        "op_id": op_id,
+                    }),
+                    BroadcastOpts::default(),
+                )
+                .await;
+
+                match ctx
+                    .state
+                    .services
+                    .skills
+                    .evals_run(ctx.params.clone())
+                    .await
+                {
+                    Ok(payload) => {
+                        let eval_id = payload
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        broadcast_raw(
+                            &ctx.state,
+                            "skills.evals.progress",
+                            serde_json::json!({
+                                "phase": "done",
+                                "source": source,
+                                "skill": skill,
+                                "op_id": op_id,
+                                "eval_id": eval_id,
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                        Ok(payload)
+                    },
+                    Err(e) => {
+                        broadcast_raw(
+                            &ctx.state,
+                            "skills.evals.progress",
+                            serde_json::json!({
+                                "phase": "error",
+                                "source": source,
+                                "skill": skill,
+                                "op_id": op_id,
+                                "error": e.to_string(),
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                        Err(ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))
+                    },
+                }
             })
         }),
     );

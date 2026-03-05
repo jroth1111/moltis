@@ -17,6 +17,9 @@ use {
 use crate::templates::{build_nav_counts, onboarding_completed};
 
 const MCP_LIST_FAILED: &str = "MCP_LIST_FAILED";
+const SKILLS_EVALS_LIST_FAILED: &str = "SKILLS_EVALS_LIST_FAILED";
+const SKILLS_EVAL_GET_FAILED: &str = "SKILLS_EVAL_GET_FAILED";
+const SKILLS_EVAL_RUN_FAILED: &str = "SKILLS_EVAL_RUN_FAILED";
 const IMAGE_CACHE_DELETE_FAILED: &str = "IMAGE_CACHE_DELETE_FAILED";
 const IMAGE_CACHE_PRUNE_FAILED: &str = "IMAGE_CACHE_PRUNE_FAILED";
 const SANDBOX_CHECK_PACKAGES_FAILED: &str = "SANDBOX_CHECK_PACKAGES_FAILED";
@@ -326,6 +329,51 @@ pub async fn api_skills_search_handler(
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
     api_search_handler(repos, &source, &query).await
+}
+
+pub async fn api_skills_evals_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.gateway.services.skills.evals_list().await {
+        Ok(val) => Json(serde_json::json!({ "runs": val })).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SKILLS_EVALS_LIST_FAILED,
+            e.to_string(),
+        ),
+    }
+}
+
+pub async fn api_skills_eval_detail_handler(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state
+        .gateway
+        .services
+        .skills
+        .evals_get(serde_json::json!({ "id": id }))
+        .await
+    {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SKILLS_EVAL_GET_FAILED,
+            e.to_string(),
+        ),
+    }
+}
+
+pub async fn api_skills_eval_run_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match state.gateway.services.skills.evals_run(payload).await {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SKILLS_EVAL_RUN_FAILED,
+            e.to_string(),
+        ),
+    }
 }
 
 // ── Images ───────────────────────────────────────────────────────────────────

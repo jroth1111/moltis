@@ -595,6 +595,35 @@ pub struct SkillRepo {
     pub format: Option<String>,
 }
 
+#[derive(Debug, SimpleObject, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillEvalRunInfo {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub skill_name: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub created_at_ms: Option<u64>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub with_skill_pass_rate: Option<f64>,
+    #[serde(default)]
+    pub without_skill_pass_rate: Option<f64>,
+    #[serde(default)]
+    pub pass_rate_delta: Option<f64>,
+    #[serde(default)]
+    pub with_skill_avg_duration_ms: Option<f64>,
+    #[serde(default)]
+    pub without_skill_avg_duration_ms: Option<f64>,
+    #[serde(default)]
+    pub with_skill_avg_tokens: Option<f64>,
+    #[serde(default)]
+    pub without_skill_avg_tokens: Option<f64>,
+}
+
 // ── MCP ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, SimpleObject, Deserialize)]

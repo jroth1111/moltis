@@ -10,6 +10,7 @@ pub use moltis_service_traits::*;
 
 use {
     async_trait::async_trait,
+    serde::Deserialize,
     serde_json::Value,
     std::{
         collections::{HashMap, HashSet},
@@ -95,7 +96,10 @@ async fn run_mcp_scan(installed_dir: &Path) -> anyhow::Result<Value> {
 }
 
 fn is_protected_discovered_skill(name: &str) -> bool {
-    matches!(name, "template-skill" | "template" | "tmux" | "skill-creator")
+    matches!(
+        name,
+        "template-skill" | "template" | "tmux" | "skill-creator"
+    )
 }
 
 fn commit_url_for_source(source: &str, sha: &str) -> Option<String> {
@@ -159,6 +163,80 @@ fn skill_status_label(status: moltis_skills::types::SkillStatus) -> &'static str
         moltis_skills::types::SkillStatus::Untrusted => "untrusted",
         moltis_skills::types::SkillStatus::Quarantined => "quarantined",
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillDetailForEval {
+    name: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    body: String,
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    compatibility: Option<String>,
+    #[serde(default)]
+    requires: Option<moltis_skills::types::SkillRequirements>,
+}
+
+fn skill_eval_store() -> Result<moltis_skills::evals::SkillEvalStore, ServiceError> {
+    let path =
+        moltis_skills::evals::SkillEvalStore::default_path().map_err(ServiceError::message)?;
+    Ok(moltis_skills::evals::SkillEvalStore::new(path))
+}
+
+fn parse_eval_rounds(params: &Value) -> Result<Option<u32>, ServiceError> {
+    let Some(value) = params.get("rounds") else {
+        return Ok(None);
+    };
+    let rounds = value
+        .as_u64()
+        .ok_or_else(|| ServiceError::message("'rounds' must be an integer"))?;
+    if !(1..=20).contains(&rounds) {
+        return Err(ServiceError::message("'rounds' must be in range 1..=20"));
+    }
+    Ok(Some(rounds as u32))
+}
+
+fn skill_eval_input_from_detail(
+    source: &str,
+    detail: Value,
+) -> Result<moltis_skills::evals::SkillEvalInput, ServiceError> {
+    let detail: SkillDetailForEval =
+        serde_json::from_value(detail).map_err(ServiceError::message)?;
+    if detail.body.trim().is_empty() {
+        return Err(ServiceError::message(
+            "skill body is empty; cannot evaluate",
+        ));
+    }
+    Ok(moltis_skills::evals::SkillEvalInput {
+        name: detail.name,
+        source: detail.source.unwrap_or_else(|| source.to_string()),
+        description: detail.description.unwrap_or_default(),
+        body: detail.body,
+        allowed_tools: detail.allowed_tools,
+        compatibility: detail.compatibility,
+        requires: detail.requires.unwrap_or_default(),
+    })
+}
+
+fn skill_eval_summary_json(run: &moltis_skills::evals::SkillEvalRun) -> Value {
+    serde_json::json!({
+        "id": run.id,
+        "skill_name": run.skill_name,
+        "source": run.source,
+        "created_at_ms": run.created_at_ms,
+        "status": run.status,
+        "with_skill_pass_rate": run.benchmark.run_summary.with_skill_pass_rate,
+        "without_skill_pass_rate": run.benchmark.run_summary.without_skill_pass_rate,
+        "pass_rate_delta": run.benchmark.run_summary.pass_rate_delta,
+        "with_skill_avg_duration_ms": run.benchmark.run_summary.with_skill_avg_duration_ms,
+        "without_skill_avg_duration_ms": run.benchmark.run_summary.without_skill_avg_duration_ms,
+        "with_skill_avg_tokens": run.benchmark.run_summary.with_skill_avg_tokens,
+        "without_skill_avg_tokens": run.benchmark.run_summary.without_skill_avg_tokens,
+    })
 }
 
 fn risky_install_pattern(command: &str) -> Option<&'static str> {
@@ -1001,6 +1079,61 @@ impl SkillsService for NoopSkillsService {
             "affected_skills": enforcement.affected_skills,
             "reasons": enforcement.reasons,
         }))
+    }
+
+    async fn evals_list(&self) -> ServiceResult {
+        let store = skill_eval_store()?;
+        let log = store.load().map_err(ServiceError::message)?;
+        let runs: Vec<_> = log.runs.iter().map(skill_eval_summary_json).collect();
+        Ok(serde_json::json!(runs))
+    }
+
+    async fn evals_get(&self, params: Value) -> ServiceResult {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServiceError::message("missing 'id' parameter"))?;
+        let store = skill_eval_store()?;
+        let log = store.load().map_err(ServiceError::message)?;
+        let run = log
+            .runs
+            .into_iter()
+            .find(|run| run.id == id)
+            .ok_or_else(|| ServiceError::message(format!("eval run '{id}' not found")))?;
+        serde_json::to_value(run).map_err(ServiceError::message)
+    }
+
+    async fn evals_run(&self, params: Value) -> ServiceResult {
+        let source = params
+            .get("source")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServiceError::message("missing 'source' parameter"))?;
+        let skill = params
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServiceError::message("missing 'skill' parameter"))?;
+        let rounds = parse_eval_rounds(&params)?;
+
+        let detail = self
+            .skill_detail(serde_json::json!({ "source": source, "skill": skill }))
+            .await?;
+        let eval_input = skill_eval_input_from_detail(source, detail)?;
+        let run = moltis_skills::evals::run_skill_eval(&eval_input, rounds);
+        let store = skill_eval_store()?;
+        store.append(run.clone()).map_err(ServiceError::message)?;
+
+        security_audit(
+            "skills.evals.run",
+            serde_json::json!({
+                "source": source,
+                "skill": skill,
+                "rounds": rounds.unwrap_or(5),
+                "eval_id": run.id,
+                "pass_rate_delta": run.benchmark.run_summary.pass_rate_delta,
+            }),
+        );
+
+        serde_json::to_value(run).map_err(ServiceError::message)
     }
 }
 
