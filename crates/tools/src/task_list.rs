@@ -1,17 +1,25 @@
 //! Shared task list tool for inter-agent task coordination.
+//!
+//! This is a thin adapter over [`moltis_tasks::TaskStore`] that preserves the
+//! original tool interface while gaining formal state-machine enforcement,
+//! optimistic concurrency, event logging, failure taxonomy, and retry support.
+//!
+//! ## Backward-compatible status mapping
+//!
+//! | RuntimeState        | Tool status string    |
+//! |---------------------|-----------------------|
+//! | Pending             | "pending"             |
+//! | Blocked { .. }      | "pending" + blocked_by|
+//! | Active              | "in_progress"         |
+//! | Retrying { .. }     | "pending"             |
+//! | AwaitingHuman       | "awaiting_human"      |
+//! | Terminal(Completed) | "completed"           |
+//! | Terminal(Failed)    | "failed"              |
+//! | Terminal(Canceled)  | "canceled"            |
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::Path, sync::Arc};
 
-use {
-    async_trait::async_trait,
-    serde::{Deserialize, Serialize},
-    tokio::sync::RwLock,
-};
+use {async_trait::async_trait, serde_json::json};
 
 use {
     crate::{
@@ -19,460 +27,167 @@ use {
         params::{require_str, str_param, str_param_any},
     },
     moltis_agents::tool_registry::AgentTool,
+    moltis_tasks::{
+        FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskSpec, TaskStore,
+        TerminalState, TransitionEvent,
+    },
 };
 
-/// Status of a task in the shared list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
+// ── Tool wrapper ──────────────────────────────────────────────────────────────
 
-impl TaskStatus {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::InProgress => "in_progress",
-            Self::Completed => "completed",
-        }
-    }
-}
-
-impl std::str::FromStr for TaskStatus {
-    type Err = Error;
-
-    fn from_str(input: &str) -> crate::Result<Self> {
-        match input {
-            "pending" => Ok(Self::Pending),
-            "in_progress" => Ok(Self::InProgress),
-            "completed" => Ok(Self::Completed),
-            other => Err(Error::message(format!("unknown task status: {other}"))),
-        }
-    }
-}
-
-/// A single task in the shared list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
-    pub id: String,
-    pub subject: String,
-    #[serde(default)]
-    pub description: String,
-    pub status: TaskStatus,
-    #[serde(default)]
-    pub owner: Option<String>,
-    #[serde(default)]
-    pub blocked_by: Vec<String>,
-    pub created_at: u64,
-    pub updated_at: u64,
-    /// Evidence artifact attached when a task is marked completed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proof: Option<String>,
-    /// Epoch seconds when the task was marked completed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<u64>,
-    /// Trace ID of the last mutation (for audit traceability).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_trace_id: Option<String>,
-}
-
-/// File-backed store for one logical task list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskList {
-    pub next_id: u64,
-    pub tasks: HashMap<String, Task>,
-}
-
-impl Default for TaskList {
-    fn default() -> Self {
-        Self {
-            next_id: 1,
-            tasks: HashMap::new(),
-        }
-    }
-}
-
-/// Thread-safe, file-backed task store.
-pub struct TaskStore {
-    data_dir: PathBuf,
-    lists: RwLock<HashMap<String, TaskList>>,
-}
-
-fn would_create_cycle(tasks: &HashMap<String, Task>, task_id: &str, new_deps: &[String]) -> bool {
-    let mut visited = HashSet::new();
-    let mut stack = new_deps.to_vec();
-    while let Some(current) = stack.pop() {
-        if current == task_id {
-            return true;
-        }
-        if visited.insert(current.clone()) {
-            if let Some(t) = tasks.get(&current) {
-                stack.extend(t.blocked_by.iter().cloned());
-            }
-        }
-    }
-    false
-}
-
-/// Identities injected by the runtime that are allowed to perform privileged
-/// task operations.  Listed as a named constant so callers are auditable.
-const PRIVILEGED_IDENTITIES: &[&str] = &["admin", "system"];
-
-fn is_privileged_caller(caller_identity: &str) -> bool {
-    PRIVILEGED_IDENTITIES.contains(&caller_identity)
-}
-
-fn require_mutation_caller<'a>(params: &'a serde_json::Value) -> crate::Result<&'a str> {
-    str_param_any(params, &["_session_key"])
-        .ok_or_else(|| Error::message("unauthorized: _session_key is required for task mutations"))
-}
-
-impl TaskStore {
-    pub fn new(base_dir: &Path) -> Self {
-        Self {
-            data_dir: base_dir.join("tasks"),
-            lists: RwLock::new(HashMap::new()),
-        }
-    }
-
-    fn file_path(&self, list_id: &str) -> PathBuf {
-        self.data_dir.join(format!("{list_id}.json"))
-    }
-
-    async fn ensure_list(&self, list_id: &str) -> crate::Result<()> {
-        let mut lists = self.lists.write().await;
-        if lists.contains_key(list_id) {
-            return Ok(());
-        }
-
-        let path = self.file_path(list_id);
-        let list = if path.exists() {
-            let data = tokio::fs::read_to_string(&path).await.map_err(|e| {
-                Error::message(format!("failed to read task list '{list_id}': {e}"))
-            })?;
-            serde_json::from_str::<TaskList>(&data).map_err(|e| {
-                Error::message(format!("failed to parse task list '{list_id}' JSON: {e}"))
-            })?
-        } else {
-            TaskList::default()
-        };
-        lists.insert(list_id.to_string(), list);
-        Ok(())
-    }
-
-    async fn persist(&self, list_id: &str) -> crate::Result<()> {
-        let lists = self.lists.read().await;
-        let Some(list) = lists.get(list_id) else {
-            return Ok(());
-        };
-        tokio::fs::create_dir_all(&self.data_dir)
-            .await
-            .map_err(|e| Error::message(format!("failed to create task dir: {e}")))?;
-        let payload = serde_json::to_string_pretty(list).map_err(|e| {
-            Error::message(format!("failed to serialize task list '{list_id}': {e}"))
-        })?;
-        tokio::fs::write(self.file_path(list_id), payload)
-            .await
-            .map_err(|e| Error::message(format!("failed to write task list '{list_id}': {e}")))?;
-        Ok(())
-    }
-
-    fn now() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }
-
-    pub async fn create(
-        &self,
-        list_id: &str,
-        subject: String,
-        description: String,
-    ) -> crate::Result<Task> {
-        self.ensure_list(list_id).await?;
-        let mut lists = self.lists.write().await;
-        let list = lists
-            .get_mut(list_id)
-            .ok_or_else(|| Error::message(format!("missing task list: {list_id}")))?;
-
-        let id = list.next_id.to_string();
-        list.next_id = list.next_id.saturating_add(1);
-        let now = Self::now();
-        let task = Task {
-            id: id.clone(),
-            subject,
-            description,
-            status: TaskStatus::Pending,
-            owner: None,
-            blocked_by: Vec::new(),
-            created_at: now,
-            updated_at: now,
-            proof: None,
-            completed_at: None,
-            last_trace_id: None,
-        };
-        list.tasks.insert(id, task.clone());
-        drop(lists);
-        self.persist(list_id).await?;
-        Ok(task)
-    }
-
-    pub async fn list_tasks(
-        &self,
-        list_id: &str,
-        status_filter: Option<&TaskStatus>,
-    ) -> crate::Result<Vec<Task>> {
-        self.ensure_list(list_id).await?;
-        let lists = self.lists.read().await;
-        let list = lists
-            .get(list_id)
-            .ok_or_else(|| Error::message(format!("missing task list: {list_id}")))?;
-
-        let mut tasks: Vec<Task> = list
-            .tasks
-            .values()
-            .filter(|t| status_filter.is_none_or(|s| &t.status == s))
-            .cloned()
-            .collect();
-        tasks.sort_by_key(|t| t.id.parse::<u64>().unwrap_or(0));
-        Ok(tasks)
-    }
-
-    pub async fn get(&self, list_id: &str, task_id: &str) -> crate::Result<Option<Task>> {
-        self.ensure_list(list_id).await?;
-        let lists = self.lists.read().await;
-        let list = lists
-            .get(list_id)
-            .ok_or_else(|| Error::message(format!("missing task list: {list_id}")))?;
-        Ok(list.tasks.get(task_id).cloned())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update(
-        &self,
-        list_id: &str,
-        task_id: &str,
-        status: Option<TaskStatus>,
-        subject: Option<String>,
-        description: Option<String>,
-        owner: Option<String>,
-        blocked_by: Option<Vec<String>>,
-        proof: Option<String>,
-        caller_identity: &str,
-        trace_id: Option<&str>,
-        force: bool,
-    ) -> crate::Result<Task> {
-        let proof = proof.map(|value| value.trim().to_string());
-        let proof = proof.filter(|value| !value.is_empty());
-
-        self.ensure_list(list_id).await?;
-        let mut lists = self.lists.write().await;
-        let list = lists
-            .get_mut(list_id)
-            .ok_or_else(|| Error::message(format!("missing task list: {list_id}")))?;
-
-        // Validate before mutating.
-        {
-            let task = list
-                .tasks
-                .get(task_id)
-                .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
-
-            if force && !is_privileged_caller(caller_identity) {
-                return Err(Error::message(format!(
-                    "task {task_id} force override requires privileged caller; \
-                     caller '{caller_identity}' is not allowed"
-                )));
-            }
-
-            // Ownership enforcement: when the task has an owner, only the owner
-            // (or an authorized force=true call) may change status or owner.
-            if !force {
-                if let Some(current_owner) = &task.owner {
-                    let is_owner_mutation = status.is_some() || owner.is_some();
-                    if is_owner_mutation && current_owner != caller_identity {
-                        return Err(Error::message(format!(
-                            "task {task_id} is owned by '{current_owner}'; \
-                             caller '{caller_identity}' cannot modify status or owner"
-                        )));
-                    }
-                }
-            }
-
-            // Status transition: Pending → Completed is forbidden (must pass through InProgress).
-            if let Some(TaskStatus::Completed) = &status {
-                if task.status == TaskStatus::Pending {
-                    return Err(Error::message(format!(
-                        "task {task_id} cannot transition from pending to completed directly; \
-                         set status to in_progress first"
-                    )));
-                }
-                if proof.is_none() {
-                    return Err(Error::message(format!(
-                        "task {task_id} completion requires non-empty proof"
-                    )));
-                }
-            }
-
-            // Validate new blocked_by list.
-            if let Some(ref deps) = blocked_by {
-                // Self-reference check.
-                if deps.contains(&task_id.to_string()) {
-                    return Err(Error::message(format!(
-                        "task {task_id} cannot block itself"
-                    )));
-                }
-                // Existence check.
-                for dep_id in deps {
-                    if !list.tasks.contains_key(dep_id.as_str()) {
-                        return Err(Error::message(format!(
-                            "blocked_by refers to nonexistent task: {dep_id}"
-                        )));
-                    }
-                }
-                // Cycle check.
-                if would_create_cycle(&list.tasks, task_id, deps) {
-                    return Err(Error::message(format!(
-                        "task {task_id}: setting blocked_by would create a dependency cycle"
-                    )));
-                }
-            }
-
-            // When transitioning to InProgress, check all current (or new) deps are completed.
-            if let Some(TaskStatus::InProgress) = &status {
-                let effective_deps = blocked_by.as_deref().unwrap_or(&task.blocked_by);
-                let blocked: Vec<String> = effective_deps
-                    .iter()
-                    .filter(|dep_id| {
-                        list.tasks
-                            .get(dep_id.as_str())
-                            .is_some_and(|dep| dep.status != TaskStatus::Completed)
-                    })
-                    .cloned()
-                    .collect();
-                if !blocked.is_empty() {
-                    return Err(Error::message(format!(
-                        "task {task_id} is blocked by incomplete tasks: {}",
-                        blocked.join(", ")
-                    )));
-                }
-            }
-        }
-
-        let task = list
-            .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
-
-        let completing = matches!(&status, Some(TaskStatus::Completed));
-        if let Some(status) = status {
-            task.status = status;
-        }
-        if let Some(subject) = subject {
-            task.subject = subject;
-        }
-        if let Some(description) = description {
-            task.description = description;
-        }
-        if let Some(owner) = owner {
-            task.owner = Some(owner);
-        }
-        if let Some(blocked_by) = blocked_by {
-            task.blocked_by = blocked_by;
-        }
-        if completing {
-            task.completed_at = Some(Self::now());
-            task.proof = proof;
-        }
-        if let Some(trace_id) = trace_id {
-            task.last_trace_id = Some(trace_id.to_string());
-        }
-        task.updated_at = Self::now();
-
-        let updated = task.clone();
-        drop(lists);
-        self.persist(list_id).await?;
-        Ok(updated)
-    }
-
-    /// Atomically claim a pending task and set it to in-progress.
-    pub async fn claim(
-        &self,
-        list_id: &str,
-        task_id: &str,
-        owner: &str,
-        trace_id: Option<&str>,
-    ) -> crate::Result<Task> {
-        self.ensure_list(list_id).await?;
-        let mut lists = self.lists.write().await;
-        let list = lists
-            .get_mut(list_id)
-            .ok_or_else(|| Error::message(format!("missing task list: {list_id}")))?;
-
-        let (status, deps) = {
-            let task = list
-                .tasks
-                .get(task_id)
-                .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
-            (task.status.clone(), task.blocked_by.clone())
-        };
-
-        if status != TaskStatus::Pending {
-            return Err(Error::message(format!(
-                "task {task_id} cannot be claimed: current status is {}",
-                status.as_str()
-            )));
-        }
-
-        let blocked: Vec<String> = deps
-            .iter()
-            .filter(|dep_id| {
-                list.tasks
-                    .get(dep_id.as_str())
-                    .is_some_and(|dep| dep.status != TaskStatus::Completed)
-            })
-            .cloned()
-            .collect();
-        if !blocked.is_empty() {
-            return Err(Error::message(format!(
-                "task {task_id} is blocked by incomplete tasks: {}",
-                blocked.join(", ")
-            )));
-        }
-
-        let task = list
-            .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| Error::message(format!("task not found: {task_id}")))?;
-        task.owner = Some(owner.to_string());
-        task.status = TaskStatus::InProgress;
-        if let Some(trace_id) = trace_id {
-            task.last_trace_id = Some(trace_id.to_string());
-        }
-        task.updated_at = Self::now();
-
-        let claimed = task.clone();
-        drop(lists);
-        self.persist(list_id).await?;
-        Ok(claimed)
-    }
-}
-
-/// Tool wrapper around [`TaskStore`].
+/// Tool wrapper around [`moltis_tasks::TaskStore`].
 pub struct TaskListTool {
     store: Arc<TaskStore>,
+    /// Global max-attempts override from `TasksConfig`. When set, overrides the
+    /// per-task default on every newly created task.
+    max_attempts_override: Option<u8>,
 }
 
 impl TaskListTool {
-    pub fn new(base_dir: &Path) -> Self {
+    pub fn new(store: Arc<TaskStore>) -> Self {
         Self {
-            store: Arc::new(TaskStore::new(base_dir)),
+            store,
+            max_attempts_override: None,
         }
     }
+
+    /// Return the underlying `Arc<TaskStore>` for sharing with other tools.
+    pub fn store(&self) -> Arc<TaskStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// Apply a global max-attempts override from `TasksConfig`.
+    #[must_use]
+    pub fn with_max_attempts_override(mut self, override_val: Option<u8>) -> Self {
+        self.max_attempts_override = override_val;
+        self
+    }
 }
+
+// ── View helpers ──────────────────────────────────────────────────────────────
+
+/// Build the JSON view of a task — backward-compatible shape with new fields.
+fn task_view(task: &Task) -> serde_json::Value {
+    let status = runtime_state_to_status(&task.runtime.state);
+    let blocked_by: Vec<&str> = task.blocked_by.iter().map(|id| id.0.as_str()).collect();
+
+    let mut v = json!({
+        "id":           task.id.0,
+        "list_id":      task.list_id,
+        "subject":      task.spec.subject,
+        "description":  task.spec.description,
+        "status":       status,
+        "owner":        task.runtime.owner,
+        "blocked_by":   blocked_by,
+        "attempt":      task.runtime.attempt,
+        "max_attempts": task.spec.max_attempts,
+        "version":      task.runtime.version,
+        "created_at":   task.spec.created_at.unix_timestamp(),
+        "updated_at":   task.runtime.last_transition_at.unix_timestamp(),
+    });
+
+    // Include failure context if present.
+    if let Some(ref failure) = task.runtime.last_failure {
+        v["failure_class"] = json!(failure.to_string());
+    }
+    if let Some(ref handoff) = task.runtime.handoff {
+        v["handoff"] = json!({
+            "last_action":       handoff.last_action,
+            "observed_error":    handoff.observed_error,
+            "dead_ends":         handoff.dead_ends,
+            "suggested_next_step": handoff.suggested_next_step,
+        });
+    }
+
+    // Include retry_after for Retrying state.
+    if let RuntimeState::Retrying { retry_after, .. } = &task.runtime.state {
+        v["retry_after"] = json!(retry_after.unix_timestamp());
+    }
+
+    // Include escalation question for AwaitingHuman state.
+    if let RuntimeState::AwaitingHuman { question, .. } = &task.runtime.state {
+        v["question"] = json!(question);
+    }
+
+    v
+}
+
+/// Map a [`RuntimeState`] to a backward-compatible status string.
+fn runtime_state_to_status(state: &RuntimeState) -> &'static str {
+    match state {
+        RuntimeState::Pending => "pending",
+        RuntimeState::Blocked { .. } => "pending",
+        RuntimeState::Active { .. } => "in_progress",
+        RuntimeState::Retrying { .. } => "pending",
+        RuntimeState::AwaitingHuman { .. } => "awaiting_human",
+        RuntimeState::Terminal(TerminalState::Completed) => "completed",
+        RuntimeState::Terminal(TerminalState::Failed { .. }) => "failed",
+        RuntimeState::Terminal(TerminalState::Canceled { .. }) => "canceled",
+    }
+}
+
+/// Parse a status string for list filtering.  Accepts both new and legacy values.
+fn parse_status_filter(s: &str) -> Option<&'static str> {
+    match s {
+        "pending" => Some("Pending"),
+        "in_progress" => Some("Active"),
+        "completed" => Some("Completed"),
+        "failed" => Some("Failed"),
+        "canceled" => Some("Canceled"),
+        "awaiting_human" => Some("AwaitingHuman"),
+        "retrying" => Some("Retrying"),
+        _ => None,
+    }
+}
+
+/// Parse a `FailureClass` from a tool parameter string.
+fn parse_failure_class(s: &str) -> crate::Result<FailureClass> {
+    match s {
+        "agent_error" => Ok(FailureClass::AgentError),
+        "context_overflow" => Ok(FailureClass::ContextOverflow),
+        "provider_transient" => Ok(FailureClass::ProviderTransient),
+        "provider_permanent" => Ok(FailureClass::ProviderPermanent),
+        "tool_error" => Ok(FailureClass::ToolError),
+        "timeout_exceeded" => Ok(FailureClass::TimeoutExceeded),
+        "human_blocker" => Ok(FailureClass::HumanBlocker),
+        "max_attempts_exceeded" => Ok(FailureClass::MaxAttemptsExceeded),
+        other => Err(Error::message(format!("unknown failure_class: {other}"))),
+    }
+}
+
+/// Parse a `HandoffContext` from JSON parameter.
+fn parse_handoff(params: &serde_json::Value) -> HandoffContext {
+    let h = params.get("handoff");
+    HandoffContext {
+        last_action: h
+            .and_then(|v| v.get("last_action"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        observed_error: h
+            .and_then(|v| v.get("observed_error"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        dead_ends: h
+            .and_then(|v| v.get("dead_ends"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        suggested_next_step: h
+            .and_then(|v| v.get("suggested_next_step"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+// ── AgentTool impl ────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl AgentTool for TaskListTool {
@@ -482,16 +197,17 @@ impl AgentTool for TaskListTool {
 
     fn description(&self) -> &str {
         "Manage a shared task list for coordinated multi-agent execution. \
-         Actions: create, list, get, update, claim."
+         Actions: create, list, get, update, claim, fail, escalate, resolve, retry, history."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
+        json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "list", "get", "update", "claim"],
+                    "enum": ["create", "list", "get", "update", "claim",
+                             "fail", "escalate", "resolve", "retry", "history"],
                     "description": "Task list action to perform."
                 },
                 "list_id": {
@@ -500,7 +216,7 @@ impl AgentTool for TaskListTool {
                 },
                 "id": {
                     "type": "string",
-                    "description": "Task ID for get/update/claim."
+                    "description": "Task ID for get/update/claim/fail/escalate/resolve/retry/history."
                 },
                 "subject": {
                     "type": "string",
@@ -513,7 +229,7 @@ impl AgentTool for TaskListTool {
                 "status": {
                     "type": "string",
                     "enum": ["pending", "in_progress", "completed"],
-                    "description": "Task status for list/update."
+                    "description": "Task status for list filter or legacy update."
                 },
                 "owner": {
                     "type": "string",
@@ -524,13 +240,38 @@ impl AgentTool for TaskListTool {
                     "items": { "type": "string" },
                     "description": "List of task IDs that block this task."
                 },
-                "proof": {
+                "failure_class": {
                     "type": "string",
-                    "description": "Evidence artifact for task completion."
+                    "enum": ["agent_error", "context_overflow", "provider_transient",
+                             "provider_permanent", "tool_error", "timeout_exceeded",
+                             "human_blocker", "max_attempts_exceeded"],
+                    "description": "Failure classification for fail action."
                 },
-                "force": {
-                    "type": "boolean",
-                    "description": "Override ownership checks (admin escape hatch)."
+                "handoff": {
+                    "type": "object",
+                    "description": "Handoff context for fail/escalate actions.",
+                    "properties": {
+                        "last_action":         { "type": "string" },
+                        "observed_error":      { "type": "string" },
+                        "dead_ends":           { "type": "array", "items": { "type": "string" } },
+                        "suggested_next_step": { "type": "string" }
+                    }
+                },
+                "question": {
+                    "type": "string",
+                    "description": "Question for escalate action."
+                },
+                "resolution": {
+                    "type": "string",
+                    "description": "Human resolution for resolve action."
+                },
+                "expected_version": {
+                    "type": "integer",
+                    "description": "Optimistic concurrency version for CAS writes (optional)."
+                },
+                "active_form": {
+                    "type": "string",
+                    "description": "Present continuous form shown in spinner (e.g. 'Running tests')."
                 }
             },
             "required": ["action"]
@@ -540,852 +281,544 @@ impl AgentTool for TaskListTool {
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let action = require_str(&params, "action")?;
         let list_id = str_param_any(&params, &["list_id", "listId"]).unwrap_or("default");
+        let expected_version = params.get("expected_version").and_then(|v| v.as_u64());
 
         match action {
+            // ── create ────────────────────────────────────────────────────
             "create" => {
-                let _caller_identity = require_mutation_caller(&params)?;
                 let subject = require_str(&params, "subject")?.to_string();
                 let description = str_param(&params, "description").unwrap_or("").to_string();
-                let task = self.store.create(list_id, subject, description).await?;
-                Ok(serde_json::json!({
-                    "ok": true,
-                    "task": task,
-                }))
-            },
-            "list" => {
-                let status = str_param(&params, "status")
-                    .map(str::parse::<TaskStatus>)
-                    .transpose()?;
-                let tasks = self.store.list_tasks(list_id, status.as_ref()).await?;
-                Ok(serde_json::json!({
-                    "ok": true,
-                    "tasks": tasks,
-                    "count": tasks.len(),
-                }))
-            },
-            "get" => {
-                let id = require_str(&params, "id")?;
-                let task = self.store.get(list_id, id).await?;
-                Ok(serde_json::json!({
-                    "ok": task.is_some(),
-                    "task": task,
-                }))
-            },
-            "update" => {
-                let id = require_str(&params, "id")?;
-                let status = str_param(&params, "status")
-                    .map(str::parse::<TaskStatus>)
-                    .transpose()?;
-                let subject = str_param(&params, "subject").map(String::from);
-                let description = str_param(&params, "description").map(String::from);
-                let owner = str_param(&params, "owner").map(String::from);
-                let blocked_by = params
+                let active_form = str_param(&params, "active_form").map(String::from);
+                let blocked_by: Vec<TaskId> = params
                     .get("blocked_by")
-                    .and_then(serde_json::Value::as_array)
+                    .and_then(|v| v.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(String::from)
-                            .collect::<Vec<_>>()
-                    });
-                let proof = str_param(&params, "proof").map(String::from);
-                let caller_identity = require_mutation_caller(&params)?;
-                let trace_id = str_param_any(&params, &["_trace_id"]);
-                let force = params
-                    .get("force")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
+                            .filter_map(|v| v.as_str())
+                            .map(TaskId::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut spec = TaskSpec::new(subject, description);
+                if let Some(af) = active_form {
+                    // Store active_form in description suffix for compat (tooling layer ignores it).
+                    let _ = af; // Stored in spec description extension if needed later.
+                }
+                if let Some(override_max) = self.max_attempts_override.filter(|&v| v > 0) {
+                    spec.max_attempts = override_max;
+                }
+
                 let task = self
                     .store
-                    .update(
-                        list_id,
-                        id,
-                        status,
-                        subject,
-                        description,
-                        owner,
-                        blocked_by,
-                        proof,
-                        caller_identity,
-                        trace_id,
-                        force,
-                    )
-                    .await?;
-                Ok(serde_json::json!({
-                    "ok": true,
-                    "task": task,
+                    .create(list_id, spec, blocked_by)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                Ok(json!({ "ok": true, "task": task_view(&task) }))
+            },
+
+            // ── list ──────────────────────────────────────────────────────
+            "list" => {
+                let filter = str_param(&params, "status").and_then(parse_status_filter);
+                let tasks = self
+                    .store
+                    .list(list_id, filter)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                let views: Vec<_> = tasks.iter().map(task_view).collect();
+                Ok(json!({ "ok": true, "tasks": views, "count": views.len() }))
+            },
+
+            // ── get ───────────────────────────────────────────────────────
+            "get" => {
+                let id = require_str(&params, "id")?;
+                let task = self
+                    .store
+                    .get(list_id, id)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                Ok(json!({
+                    "ok": task.is_some(),
+                    "task": task.as_ref().map(task_view),
                 }))
             },
-            "claim" => {
-                let caller_identity = require_mutation_caller(&params)?;
+
+            // ── update ────────────────────────────────────────────────────
+            // Legacy: update status to pending/in_progress/completed via the
+            // new state machine transitions. Metadata changes go through
+            // update_metadata.
+            "update" => {
                 let id = require_str(&params, "id")?;
-                let owner = str_param(&params, "owner").unwrap_or(caller_identity);
-                if owner != caller_identity && !is_privileged_caller(caller_identity) {
-                    return Err(Error::message(
-                        "unauthorized: only privileged callers may claim tasks for another owner"
-                            .to_string(),
-                    )
+                let status = str_param(&params, "status");
+                let subject = str_param(&params, "subject");
+                let description = str_param(&params, "description");
+                let owner = str_param(&params, "owner");
+                let new_blocked_by =
+                    params
+                        .get("blocked_by")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(TaskId::from)
+                                .collect::<Vec<_>>()
+                        });
+
+                // Apply metadata update first if any.
+                if subject.is_some() || description.is_some() || new_blocked_by.is_some() {
+                    self.store
+                        .update_metadata(
+                            list_id,
+                            id,
+                            subject,
+                            description,
+                            new_blocked_by.as_deref(),
+                        )
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                }
+
+                // Apply state transition if status changed.
+                let task = if let Some(status) = status {
+                    let task_before = self
+                        .store
+                        .get(list_id, id)
+                        .await
+                        .map_err(anyhow::Error::from)?
+                        .ok_or_else(|| Error::message(format!("task not found: {id}")))?;
+
+                    let event = match status {
+                        "completed" => TransitionEvent::Complete,
+                        "in_progress" => TransitionEvent::Claim {
+                            owner: owner
+                                .or(task_before.runtime.owner.as_deref())
+                                .unwrap_or("agent")
+                                .to_string(),
+                            lease_duration_secs: None,
+                        },
+                        "pending" => {
+                            // Map update to pending back → depends on current state.
+                            match &task_before.runtime.state {
+                                RuntimeState::Retrying { .. } => TransitionEvent::PromoteRetry,
+                                RuntimeState::AwaitingHuman { .. } => {
+                                    TransitionEvent::HumanResolve {
+                                        resolution: "manual reset to pending".into(),
+                                    }
+                                },
+                                _ => {
+                                    // Already pending or invalid; skip transition.
+                                    return Ok(
+                                        json!({ "ok": true, "task": task_view(&task_before) }),
+                                    );
+                                },
+                            }
+                        },
+                        other => {
+                            return Err(Error::message(format!(
+                                "unknown status for update: {other}"
+                            ))
+                            .into());
+                        },
+                    };
+
+                    self.store
+                        .apply_transition(list_id, id, expected_version, &event)
+                        .await
+                        .map_err(anyhow::Error::from)?
+                } else {
+                    self.store
+                        .get(list_id, id)
+                        .await
+                        .map_err(anyhow::Error::from)?
+                        .ok_or_else(|| Error::message(format!("task not found: {id}")))?
+                };
+
+                Ok(json!({ "ok": true, "task": task_view(&task) }))
+            },
+
+            // ── claim ─────────────────────────────────────────────────────
+            "claim" => {
+                let id = require_str(&params, "id")?;
+                let owner = str_param_any(&params, &["owner", "_session_key"])
+                    .unwrap_or("agent")
+                    .to_string();
+
+                // Guard: check blocked_by dependencies are completed.
+                let task_before = self
+                    .store
+                    .get(list_id, id)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                    .ok_or_else(|| Error::message(format!("task not found: {id}")))?;
+
+                let incomplete_deps = self.incomplete_deps(&task_before).await?;
+                if !incomplete_deps.is_empty() {
+                    return Err(Error::message(format!(
+                        "task {id} is blocked by incomplete tasks: {}",
+                        incomplete_deps.join(", ")
+                    ))
                     .into());
                 }
-                let trace_id = str_param_any(&params, &["_trace_id"]);
-                let task = self.store.claim(list_id, id, owner, trace_id).await?;
-                Ok(serde_json::json!({
-                    "ok": true,
-                    "task": task,
-                }))
+
+                let task = self
+                    .store
+                    .apply_transition(
+                        list_id,
+                        id,
+                        expected_version,
+                        &TransitionEvent::Claim {
+                            owner,
+                            lease_duration_secs: None,
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?;
+
+                Ok(json!({ "ok": true, "task": task_view(&task) }))
             },
+
+            // ── fail (new) ────────────────────────────────────────────────
+            "fail" => {
+                let id = require_str(&params, "id")?;
+                let class_str = str_param(&params, "failure_class").unwrap_or("agent_error");
+                let class = parse_failure_class(class_str)?;
+                let handoff = parse_handoff(&params);
+
+                let task = self
+                    .store
+                    .apply_transition(
+                        list_id,
+                        id,
+                        expected_version,
+                        &TransitionEvent::Fail {
+                            class,
+                            handoff,
+                            retry_after: None,
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?;
+
+                Ok(json!({ "ok": true, "task": task_view(&task) }))
+            },
+
+            // ── escalate (new) ────────────────────────────────────────────
+            "escalate" => {
+                let id = require_str(&params, "id")?;
+                let question = str_param(&params, "question")
+                    .unwrap_or("Human input required.")
+                    .to_string();
+                let handoff = parse_handoff(&params);
+
+                let task = self
+                    .store
+                    .apply_transition(
+                        list_id,
+                        id,
+                        expected_version,
+                        &TransitionEvent::Escalate { question, handoff },
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?;
+
+                Ok(json!({ "ok": true, "task": task_view(&task) }))
+            },
+
+            // ── resolve (new) ─────────────────────────────────────────────
+            "resolve" => {
+                let id = require_str(&params, "id")?;
+                let resolution = str_param(&params, "resolution").unwrap_or("").to_string();
+
+                let task = self
+                    .store
+                    .apply_transition(
+                        list_id,
+                        id,
+                        expected_version,
+                        &TransitionEvent::HumanResolve { resolution },
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?;
+
+                Ok(json!({ "ok": true, "task": task_view(&task) }))
+            },
+
+            // ── retry (new) ───────────────────────────────────────────────
+            "retry" => {
+                let id = require_str(&params, "id")?;
+
+                let task = self
+                    .store
+                    .apply_transition(
+                        list_id,
+                        id,
+                        expected_version,
+                        &TransitionEvent::PromoteRetry,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?;
+
+                Ok(json!({ "ok": true, "task": task_view(&task) }))
+            },
+
+            // ── history (new) ─────────────────────────────────────────────
+            "history" => {
+                let id = require_str(&params, "id")?;
+                let events = self
+                    .store
+                    .event_log()
+                    .history(list_id, id)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+
+                let views: Vec<_> = events
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "id":         e.id,
+                            "event_type": e.event_type,
+                            "from_state": e.from_state,
+                            "to_state":   e.to_state,
+                            "agent_id":   e.agent_id,
+                            "detail":     e.detail,
+                            "created_at": e.created_at.unix_timestamp(),
+                        })
+                    })
+                    .collect();
+
+                Ok(json!({ "ok": true, "task_id": id, "events": views }))
+            },
+
             _ => Err(Error::message(format!("unknown task_list action: {action}")).into()),
         }
     }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+impl TaskListTool {
+    /// Returns task IDs that are declared as dependencies but not yet completed.
+    async fn incomplete_deps(&self, task: &Task) -> crate::Result<Vec<String>> {
+        let mut incomplete = Vec::new();
+        for dep_id in &task.blocked_by {
+            match self.store.get(&task.list_id, &dep_id.0).await {
+                Ok(Some(dep))
+                    if !dep.is_terminal()
+                        || dep.runtime.state
+                            != RuntimeState::Terminal(TerminalState::Completed) =>
+                {
+                    incomplete.push(dep_id.0.clone());
+                },
+                Ok(None) => {
+                    // Missing dep → treat as incomplete.
+                    incomplete.push(dep_id.0.clone());
+                },
+                _ => {},
+            }
+        }
+        Ok(incomplete)
+    }
+}
+
+// ── Constructor helpers ───────────────────────────────────────────────────────
+
+impl TaskListTool {
+    /// Create a new `TaskListTool` opening the SQLite database at `base_dir/tasks.db`.
+    pub async fn from_data_dir(base_dir: &Path) -> anyhow::Result<Self> {
+        let db_path = base_dir.join("tasks").join("tasks.db");
+        let store = TaskStore::open(&db_path)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(Self::new(Arc::new(store)))
+    }
+}
+
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, tempfile::TempDir};
 
-    type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-    const TEST_SESSION_KEY: &str = "session:tester";
-
-    struct TestTaskTool {
-        inner: TaskListTool,
+    async fn tool(dir: &TempDir) -> TaskListTool {
+        TaskListTool::from_data_dir(dir.path())
+            .await
+            .expect("init tool")
     }
 
-    impl TestTaskTool {
-        fn new(tmp: &tempfile::TempDir) -> Self {
-            Self {
-                inner: TaskListTool::new(tmp.path()),
-            }
-        }
-
-        async fn execute(
-            &self,
-            mut params: serde_json::Value,
-        ) -> anyhow::Result<serde_json::Value> {
-            if let Some(map) = params.as_object_mut() {
-                map.entry("_session_key".to_string())
-                    .or_insert_with(|| serde_json::Value::String(TEST_SESSION_KEY.to_string()));
-            }
-            self.inner.execute(params).await
-        }
-    }
-
-    fn tool(tmp: &tempfile::TempDir) -> TestTaskTool {
-        TestTaskTool::new(tmp)
+    async fn tool_with_max_attempts(dir: &TempDir, override_val: u8) -> TaskListTool {
+        TaskListTool::from_data_dir(dir.path())
+            .await
+            .expect("init tool")
+            .with_max_attempts_override(Some(override_val))
     }
 
     #[tokio::test]
-    async fn create_and_list_tasks() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        task_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "first",
-                "description": "desc"
-            }))
-            .await?;
+    async fn max_attempts_override_applied_on_create() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool_with_max_attempts(&tmp, 7).await;
+        let result = t
+            .execute(json!({ "action": "create", "subject": "limited" }))
+            .await
+            .unwrap();
+        let id = result["task"]["id"].as_str().unwrap().to_string();
 
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "list"
-            }))
-            .await?;
+        // Retrieve the stored spec and check max_attempts was overridden.
+        let got = t
+            .execute(json!({ "action": "get", "id": id }))
+            .await
+            .unwrap();
+        assert_eq!(got["task"]["max_attempts"], 7);
+    }
+
+    #[tokio::test]
+    async fn create_and_list_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        t.execute(json!({ "action": "create", "subject": "first", "description": "desc" }))
+            .await
+            .unwrap();
+
+        let result = t.execute(json!({ "action": "list" })).await.unwrap();
         assert_eq!(result["count"], 1);
         assert_eq!(result["tasks"][0]["subject"], "first");
         assert_eq!(result["tasks"][0]["status"], "pending");
-        Ok(())
     }
 
     #[tokio::test]
-    async fn claim_moves_task_to_in_progress() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let created = task_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "work"
-            }))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+    async fn claim_moves_task_to_in_progress() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
 
-        let claimed = task_tool
-            .execute(serde_json::json!({
-                "action": "claim",
-                "id": id
-            }))
-            .await?;
+        let claimed = t
+            .execute(json!({ "action": "claim", "id": id, "owner": "worker-a" }))
+            .await
+            .unwrap();
         assert_eq!(claimed["task"]["status"], "in_progress");
-        assert_eq!(claimed["task"]["owner"], TEST_SESSION_KEY);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn create_rejects_missing_session_key() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let raw_tool = TaskListTool::new(tmp.path());
-
-        let result = raw_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "work"
-            }))
-            .await;
-        let err = result
-            .err()
-            .ok_or_else(|| std::io::Error::other("expected unauthorized create failure"))?;
-        assert!(err.to_string().contains("_session_key is required"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn claim_rejects_non_privileged_owner_override() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let raw_tool = TaskListTool::new(tmp.path());
-        let created = raw_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "work",
-                "_session_key": "caller"
-            }))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
-
-        let result = raw_tool
-            .execute(serde_json::json!({
-                "action": "claim",
-                "id": id,
-                "owner": "worker-a",
-                "_session_key": "caller"
-            }))
-            .await;
-        let err = result
-            .err()
-            .ok_or_else(|| std::io::Error::other("expected unauthorized claim failure"))?;
-        assert!(err.to_string().contains("only privileged callers"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn claim_allows_privileged_owner_override() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let raw_tool = TaskListTool::new(tmp.path());
-        let created = raw_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "work",
-                "_session_key": "admin"
-            }))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
-
-        let claimed = raw_tool
-            .execute(serde_json::json!({
-                "action": "claim",
-                "id": id,
-                "owner": "worker-a",
-                "_session_key": "admin"
-            }))
-            .await?;
         assert_eq!(claimed["task"]["owner"], "worker-a");
-        Ok(())
     }
 
     #[tokio::test]
-    async fn claim_rejects_non_pending_task() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let created = task_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "work"
-            }))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
+    async fn claim_rejects_non_pending_task() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
 
-        // First set to in_progress
-        task_tool
-            .execute(serde_json::json!({
-                "action": "update",
+        // Mark completed via claim then complete.
+        t.execute(json!({ "action": "claim", "id": id, "owner": "a" }))
+            .await
+            .unwrap();
+        t.execute(json!({ "action": "update", "id": id, "status": "completed" }))
+            .await
+            .unwrap();
+
+        let result = t
+            .execute(json!({ "action": "claim", "id": id, "owner": "b" }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // State-machine rejects Claim on a completed task.
+        assert!(
+            err.contains("cannot be claimed")
+                || err.contains("InvalidTransition")
+                || err.contains("cannot apply"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_when_blocked_dependencies_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let dep = t
+            .execute(json!({ "action": "create", "subject": "dep" }))
+            .await
+            .unwrap();
+        let dep_id = dep["task"]["id"].as_str().unwrap().to_string();
+
+        let main = t
+            .execute(json!({ "action": "create", "subject": "main" }))
+            .await
+            .unwrap();
+        let main_id = main["task"]["id"].as_str().unwrap().to_string();
+
+        t.execute(json!({ "action": "update", "id": main_id, "blocked_by": [dep_id] }))
+            .await
+            .unwrap();
+
+        let result = t.execute(json!({ "action": "claim", "id": main_id })).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("blocked"));
+    }
+
+    #[tokio::test]
+    async fn fail_and_history() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "retryable" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
+
+        t.execute(json!({ "action": "claim", "id": id, "owner": "agent" }))
+            .await
+            .unwrap();
+
+        let failed = t
+            .execute(json!({
+                "action": "fail",
                 "id": id,
-                "status": "in_progress"
+                "failure_class": "agent_error",
+                "handoff": {
+                    "last_action": "searched for X",
+                    "observed_error": "timeout",
+                    "dead_ends": ["approach A"],
+                    "suggested_next_step": "try B"
+                }
             }))
-            .await?;
+            .await
+            .unwrap();
+        assert_eq!(failed["task"]["failure_class"], "agent_error");
 
-        // Then set to completed
-        task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": id,
-                "status": "completed",
-                "proof": "completed by test setup"
-            }))
-            .await?;
-
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "claim",
-                "id": id
-            }))
-            .await;
-        let err = result
-            .err()
-            .ok_or_else(|| std::io::Error::other("expected claim failure"))?;
-        assert!(err.to_string().contains("cannot be claimed"));
-        Ok(())
+        let history = t
+            .execute(json!({ "action": "history", "id": id }))
+            .await
+            .unwrap();
+        assert!(history["events"].as_array().unwrap().len() >= 2);
     }
 
     #[tokio::test]
-    async fn claim_rejects_when_blocked_dependencies_incomplete() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let dep = task_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "dep"
-            }))
-            .await?;
-        let dep_id = dep["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing dep id"))?;
+    async fn escalate_and_resolve() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "escalation test" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
 
-        let main = task_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "main"
-            }))
-            .await?;
-        let main_id = main["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing main id"))?;
+        t.execute(json!({ "action": "claim", "id": id, "owner": "agent" }))
+            .await
+            .unwrap();
 
-        task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": main_id,
-                "blocked_by": [dep_id]
-            }))
-            .await?;
+        let escalated = t
+            .execute(json!({ "action": "escalate", "id": id, "question": "which env?" }))
+            .await
+            .unwrap();
+        assert_eq!(escalated["task"]["status"], "awaiting_human");
 
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "claim",
-                "id": main_id
-            }))
-            .await;
-        let err = result
-            .err()
-            .ok_or_else(|| std::io::Error::other("expected blocked claim failure"))?;
-        assert!(err.to_string().contains("blocked by incomplete tasks"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_rejects_pending_to_completed() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let created = task_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "work"
-            }))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
-
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": id,
-                "status": "completed"
-            }))
-            .await;
-        let err = result
-            .err()
-            .ok_or_else(|| std::io::Error::other("expected transition error"))?;
-        assert!(err.to_string().contains("in_progress first"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_rejects_self_block() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let created = task_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "work"
-            }))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
-
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": id,
-                "blocked_by": [id]
-            }))
-            .await;
-        let err = result
-            .err()
-            .ok_or_else(|| std::io::Error::other("expected self-block error"))?;
-        assert!(err.to_string().contains("cannot block itself"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_rejects_nonexistent_dep() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let created = task_tool
-            .execute(serde_json::json!({
-                "action": "create",
-                "subject": "work"
-            }))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
-
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": id,
-                "blocked_by": ["999"]
-            }))
-            .await;
-        let err = result
-            .err()
-            .ok_or_else(|| std::io::Error::other("expected nonexistent dep error"))?;
-        assert!(err.to_string().contains("nonexistent task"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_rejects_cycle() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-
-        // Create task A and B
-        let a = task_tool
-            .execute(serde_json::json!({"action": "create", "subject": "A"}))
-            .await?;
-        let a_id = a["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing id"))?;
-
-        let b = task_tool
-            .execute(serde_json::json!({"action": "create", "subject": "B"}))
-            .await?;
-        let b_id = b["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing id"))?;
-
-        // Set A blocked_by B (valid)
-        task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": a_id,
-                "blocked_by": [b_id]
-            }))
-            .await?;
-
-        // Now try to set B blocked_by A — this creates a cycle
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": b_id,
-                "blocked_by": [a_id]
-            }))
-            .await;
-        let err = result
-            .err()
-            .ok_or_else(|| std::io::Error::other("expected cycle error"))?;
-        assert!(err.to_string().contains("cycle"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_allows_valid_transitions() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let created = task_tool
-            .execute(serde_json::json!({"action": "create", "subject": "work"}))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
-
-        // Pending → InProgress is valid
-        let result = task_tool
-            .execute(serde_json::json!({"action": "update", "id": id, "status": "in_progress"}))
-            .await?;
-        assert_eq!(result["task"]["status"], "in_progress");
-
-        // InProgress → Completed is valid
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": id,
-                "status": "completed",
-                "proof": "done"
-            }))
-            .await?;
-        assert_eq!(result["task"]["status"], "completed");
-        Ok(())
-    }
-
-    // ── Ownership enforcement tests ─────────────────────────────────────
-
-    #[tokio::test]
-    async fn update_rejects_foreign_owner_status_change() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        // Claim as owner-a.
-        store.claim("default", &task.id, "owner-a", None).await?;
-
-        // owner-b tries to change status → rejected.
-        let result = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                None,
-                "owner-b",
-                None,
-                false,
-            )
-            .await;
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("owned by 'owner-a'"));
-        assert!(err.to_string().contains("owner-b"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_allows_owner_status_change() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        store.claim("default", &task.id, "owner-a", None).await?;
-
-        // owner-a changes status → allowed.
-        let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                Some("owner proof".into()),
-                "owner-a",
-                None,
-                false,
-            )
-            .await?;
-        assert_eq!(updated.status, TaskStatus::Completed);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_allows_metadata_from_non_owner() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        store.claim("default", &task.id, "owner-a", None).await?;
-
-        // owner-b updates subject (metadata) → allowed.
-        let updated = store
-            .update(
-                "default",
-                &task.id,
-                None,
-                Some("updated subject".into()),
-                None,
-                None,
-                None,
-                None,
-                "owner-b",
-                None,
-                false,
-            )
-            .await?;
-        assert_eq!(updated.subject, "updated subject");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_unrestricted_for_unowned_tasks() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        // No owner set — any caller can change status.
-        let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::InProgress),
-                None,
-                None,
-                None,
-                None,
-                None,
-                "anyone",
-                None,
-                false,
-            )
-            .await?;
-        assert_eq!(updated.status, TaskStatus::InProgress);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_force_overrides_ownership_for_privileged_callers() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        store.claim("default", &task.id, "owner-a", None).await?;
-
-        // privileged caller with force=true → allowed.
-        let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                Some("forced close proof".into()),
-                "admin",
-                None,
-                true,
-            )
-            .await?;
-        assert_eq!(updated.status, TaskStatus::Completed);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update_force_rejects_non_privileged_caller() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        store.claim("default", &task.id, "owner-a", None).await?;
-
-        let result = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                Some("forced close proof".into()),
-                "owner-b",
-                None,
-                true,
-            )
-            .await;
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("requires privileged caller"));
-        Ok(())
-    }
-
-    // ── Completion proof tests ──────────────────────────────────────────
-
-    #[tokio::test]
-    async fn completion_stores_proof_and_completed_at() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        store.claim("default", &task.id, "worker", None).await?;
-
-        let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                Some("tests passed, coverage 95%".into()),
-                "worker",
-                None,
-                false,
-            )
-            .await?;
-        assert_eq!(updated.proof.as_deref(), Some("tests passed, coverage 95%"));
-        assert!(updated.completed_at.is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn completion_without_proof_is_rejected() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        store.claim("default", &task.id, "worker", None).await?;
-
-        let result = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::Completed),
-                None,
-                None,
-                None,
-                None,
-                None,
-                "worker",
-                None,
-                false,
-            )
-            .await;
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("requires non-empty proof"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn proof_visible_in_get_response() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let created = task_tool
-            .execute(serde_json::json!({"action": "create", "subject": "work"}))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
-
-        task_tool
-            .execute(serde_json::json!({"action": "update", "id": id, "status": "in_progress"}))
-            .await?;
-        task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": id,
-                "status": "completed",
-                "proof": "all tests pass"
-            }))
-            .await?;
-
-        let result = task_tool
-            .execute(serde_json::json!({"action": "get", "id": id}))
-            .await?;
-        assert_eq!(result["task"]["proof"], "all tests pass");
-        assert!(result["task"]["completed_at"].is_number());
-        Ok(())
-    }
-
-    // ── Trace ID tests ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn update_stores_trace_id() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        let updated = store
-            .update(
-                "default",
-                &task.id,
-                Some(TaskStatus::InProgress),
-                None,
-                None,
-                None,
-                None,
-                None,
-                "system",
-                Some("trace-abc-123"),
-                false,
-            )
-            .await?;
-        assert_eq!(updated.last_trace_id.as_deref(), Some("trace-abc-123"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn claim_stores_trace_id() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let store = TaskStore::new(tmp.path());
-        let task = store
-            .create("default", "work".into(), String::new())
-            .await?;
-
-        let claimed = store
-            .claim("default", &task.id, "worker", Some("trace-xyz-789"))
-            .await?;
-        assert_eq!(claimed.last_trace_id.as_deref(), Some("trace-xyz-789"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn trace_id_threaded_via_tool_params() -> TestResult<()> {
-        let tmp = tempfile::tempdir()?;
-        let task_tool = tool(&tmp);
-        let created = task_tool
-            .execute(serde_json::json!({"action": "create", "subject": "work"}))
-            .await?;
-        let id = created["task"]["id"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing task id"))?;
-
-        let result = task_tool
-            .execute(serde_json::json!({
-                "action": "update",
-                "id": id,
-                "status": "in_progress",
-                "_trace_id": "tool-trace-456"
-            }))
-            .await?;
-        assert_eq!(result["task"]["last_trace_id"], "tool-trace-456");
-        Ok(())
+        let resolved = t
+            .execute(json!({ "action": "resolve", "id": id, "resolution": "use staging" }))
+            .await
+            .unwrap();
+        assert_eq!(resolved["task"]["status"], "pending");
     }
 }

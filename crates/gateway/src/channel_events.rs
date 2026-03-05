@@ -1739,9 +1739,11 @@ fn format_model_list(
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use serde_json::{Value, json};
-    use tokio::sync::Mutex;
+    use {
+        async_trait::async_trait,
+        serde_json::{Value, json},
+        tokio::sync::Mutex,
+    };
 
     use {
         super::*,

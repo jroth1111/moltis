@@ -206,6 +206,7 @@ pub struct MoltisConfig {
     pub heartbeat: HeartbeatConfig,
     pub voice: VoiceConfig,
     pub cron: CronConfig,
+    pub tasks: TasksConfig,
     pub caldav: CalDavConfig,
     /// Environment variables injected into the Moltis process at startup.
     /// Useful for API keys in Docker where you can't easily set env vars.
@@ -796,6 +797,56 @@ impl Default for ActiveHoursConfig {
             start: "08:00".into(),
             end: "24:00".into(),
             timezone: "local".into(),
+        }
+    }
+}
+
+/// Task orchestration configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TasksConfig {
+    /// Interval in seconds between retry-promotion polls. Default: 30.
+    #[serde(default = "default_task_retry_poll_secs")]
+    pub retry_poll_interval_secs: u64,
+    /// Global override for max automatic retry attempts (0 = use per-task setting).
+    #[serde(default)]
+    pub max_attempts_override: Option<u8>,
+    /// Lease duration (secs) set by spawn_agent before running the sub-agent loop.
+    /// Default: 3600 (1 hour).
+    #[serde(default = "default_task_lease_duration_secs")]
+    pub lease_duration_secs: u64,
+    /// How often (secs) spawn_agent renews the lease during a run. Default: 120.
+    #[serde(default = "default_task_lease_heartbeat_secs")]
+    pub lease_heartbeat_interval_secs: u64,
+    /// How often (secs) the background sweep reclaims zombie tasks. Default: 60.
+    #[serde(default = "default_task_zombie_poll_secs")]
+    pub zombie_poll_interval_secs: u64,
+}
+
+fn default_task_retry_poll_secs() -> u64 {
+    30
+}
+
+fn default_task_lease_duration_secs() -> u64 {
+    3600
+}
+
+fn default_task_lease_heartbeat_secs() -> u64 {
+    120
+}
+
+fn default_task_zombie_poll_secs() -> u64 {
+    60
+}
+
+impl Default for TasksConfig {
+    fn default() -> Self {
+        Self {
+            retry_poll_interval_secs: default_task_retry_poll_secs(),
+            max_attempts_override: None,
+            lease_duration_secs: default_task_lease_duration_secs(),
+            lease_heartbeat_interval_secs: default_task_lease_heartbeat_secs(),
+            zombie_poll_interval_secs: default_task_zombie_poll_secs(),
         }
     }
 }

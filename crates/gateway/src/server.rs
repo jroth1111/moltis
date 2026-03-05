@@ -3435,9 +3435,56 @@ pub async fn prepare_gateway(
         ));
 
         // Register shared task coordination tool for multi-agent workflows.
-        tool_registry.register(Box::new(moltis_tools::task_list::TaskListTool::new(
-            &data_dir,
-        )));
+        let task_list_tool = moltis_tools::task_list::TaskListTool::from_data_dir(&data_dir)
+            .await?
+            .with_max_attempts_override(config.tasks.max_attempts_override);
+        let task_store = task_list_tool.store();
+        tool_registry.register(Box::new(task_list_tool));
+
+        // Background: promote overdue Retrying tasks back to Pending.
+        {
+            let store_for_retry = Arc::clone(&task_store);
+            let poll_secs = config.tasks.retry_poll_interval_secs;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(1)));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    match store_for_retry.promote_due_retries_all().await {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "promoted overdue retrying tasks to pending")
+                        },
+                        Ok(_) => {},
+                        Err(e) => {
+                            tracing::warn!(error = %e, "retry promotion sweep failed")
+                        },
+                    }
+                }
+            });
+        }
+        // Background: reclaim Active tasks with expired leases (zombie agents).
+        {
+            let store_for_zombie = Arc::clone(&task_store);
+            let poll_secs = config.tasks.zombie_poll_interval_secs;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(poll_secs.max(1)));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    match store_for_zombie.expire_zombie_leases_all().await {
+                        Ok(n) if n > 0 => {
+                            info!(count = n, "reclaimed zombie tasks with expired leases")
+                        },
+                        Ok(_) => {},
+                        Err(e) => {
+                            tracing::warn!(error = %e, "zombie lease sweep failed")
+                        },
+                    }
+                }
+            });
+        }
 
         // Register built-in voice tools for explicit TTS/STT calls in agents.
         tool_registry.register(Box::new(crate::voice_agent_tools::SpeakTool::new(
@@ -3538,7 +3585,9 @@ pub async fn prepare_gateway(
                 base_tools,
             )
             .with_on_event(on_spawn_event)
-            .with_agents_config(agents_config);
+            .with_agents_config(agents_config)
+            .with_task_store(Arc::clone(&task_store))
+            .with_tasks_config(config.tasks.clone());
             tool_registry.register(Box::new(spawn_tool));
         }
 
@@ -6001,23 +6050,25 @@ pub(crate) async fn discover_and_build_hooks(
     Option<Arc<moltis_common::hooks::HookRegistry>>,
     Vec<crate::state::DiscoveredHookInfo>,
 ) {
-    use moltis_plugins::{
-        bundled::{
-            boot_md::BootMdHook,
-            circuit_breaker::CircuitBreakerHook,
-            command_logger::CommandLoggerHook,
-            cost_guard::{CostGuardHook, CostTrackerHook},
-            estop::EstopHook,
-            leak_detector::LeakDetectorHook,
-            prompt_guard::PromptGuardHook,
-            screenshot_resolver::ScreenshotResolverHook,
-            session_memory::SessionMemoryHook,
+    use {
+        moltis_plugins::{
+            bundled::{
+                boot_md::BootMdHook,
+                circuit_breaker::CircuitBreakerHook,
+                command_logger::CommandLoggerHook,
+                cost_guard::{CostGuardHook, CostTrackerHook},
+                estop::EstopHook,
+                leak_detector::LeakDetectorHook,
+                prompt_guard::PromptGuardHook,
+                screenshot_resolver::ScreenshotResolverHook,
+                session_memory::SessionMemoryHook,
+            },
+            hook_discovery::{FsHookDiscoverer, HookDiscoverer, HookSource},
+            hook_eligibility::check_hook_eligibility,
+            shell_hook::ShellHookHandler,
         },
-        hook_discovery::{FsHookDiscoverer, HookDiscoverer, HookSource},
-        hook_eligibility::check_hook_eligibility,
-        shell_hook::ShellHookHandler,
+        moltis_tinder::FunnelGuardHook,
     };
-    use moltis_tinder::FunnelGuardHook;
 
     let db_pool = db_pool.or_else(|| HOOK_DB_POOL.get().cloned());
     let estop_flag = estop_flag.or_else(|| HOOK_ESTOP_FLAG.get().cloned());

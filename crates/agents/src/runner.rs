@@ -42,6 +42,26 @@ fn resolve_agent_max_iterations(configured: usize) -> usize {
     configured
 }
 
+/// Classify an error message into a typed [`moltis_tasks::FailureClass`].
+///
+/// Wraps the `classify` module's pattern-matching so callers (e.g. `spawn_agent`)
+/// can translate a provider error into the task-recovery taxonomy without
+/// duplicating the pattern lists.
+#[must_use]
+pub fn classify_error(msg: &str) -> moltis_tasks::FailureClass {
+    use crate::classify::ProviderErrorKind;
+    match classify_error_message(msg) {
+        ProviderErrorKind::BillingExhausted | ProviderErrorKind::NonRetryableRateLimit => {
+            moltis_tasks::FailureClass::ProviderPermanent
+        }
+        ProviderErrorKind::RateLimit
+        | ProviderErrorKind::ServerError
+        | ProviderErrorKind::Timeout => moltis_tasks::FailureClass::ProviderTransient,
+        ProviderErrorKind::ContextWindow => moltis_tasks::FailureClass::ContextOverflow,
+        _ => moltis_tasks::FailureClass::AgentError,
+    }
+}
+
 /// Base delay for non-rate-limit transient retries.
 const SERVER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -4521,6 +4541,32 @@ mod tests {
         assert_eq!(
             classify_error_message("quota exceeded"),
             ProviderErrorKind::BillingExhausted
+        );
+    }
+
+    #[test]
+    fn test_classify_error_maps_patterns_to_failure_class() {
+        use moltis_tasks::FailureClass;
+
+        assert_eq!(
+            classify_error("insufficient_quota"),
+            FailureClass::ProviderPermanent
+        );
+        assert_eq!(
+            classify_error("HTTP 429 Too Many Requests"),
+            FailureClass::ProviderTransient
+        );
+        assert_eq!(
+            classify_error("HTTP 500 Internal Server Error"),
+            FailureClass::ProviderTransient
+        );
+        assert_eq!(
+            classify_error("context_length_exceeded"),
+            FailureClass::ContextOverflow
+        );
+        assert_eq!(
+            classify_error("some unrecognised agent error"),
+            FailureClass::AgentError
         );
     }
 

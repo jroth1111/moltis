@@ -1,9 +1,11 @@
 //! Research phase: run a tool-calling loop *before* the main agent response
 //! to gather relevant context. Triggered by configurable rules.
 
-use anyhow::Result;
-use std::sync::Arc;
-use tracing::{debug, info};
+use {
+    anyhow::Result,
+    std::sync::Arc,
+    tracing::{debug, info},
+};
 
 use crate::model::{ChatMessage, LlmProvider};
 

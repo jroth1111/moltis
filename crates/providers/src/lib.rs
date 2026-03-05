@@ -2257,7 +2257,11 @@ impl ProviderRegistry {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3083,6 +3087,16 @@ mod tests {
                 ..Default::default()
             },
         );
+        // Disable oauth-discovered providers so stored credentials on the host
+        // machine don't affect the fallback-provider assertions below.
+        let disabled = moltis_config::schema::ProviderEntry {
+            enabled: false,
+            ..Default::default()
+        };
+        config
+            .providers
+            .insert("openai-codex".into(), disabled.clone());
+        config.providers.insert("github-copilot".into(), disabled);
 
         let reg = ProviderRegistry::from_env_with_config(&config);
         let openai_models: Vec<_> = reg

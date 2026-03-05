@@ -1,5 +1,4 @@
-use anyhow::Result;
-use tracing::debug;
+use {anyhow::Result, tracing::debug};
 
 /// Time-to-live for a session lock in milliseconds (5 minutes).
 const LOCK_TTL_MS: i64 = 5 * 60 * 1000;
