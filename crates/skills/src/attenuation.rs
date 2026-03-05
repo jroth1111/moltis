@@ -9,6 +9,15 @@ use crate::types::SkillTrust;
 /// without being able to exfiltrate data or run arbitrary code.
 const READ_ONLY_TOOLS: &[&str] = &["memory_search", "read_file", "list_directory", "echo"];
 
+/// Result of resolving `allowed_tools` specs against a runtime tool list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedToolsResolution<'a> {
+    /// Runtime tool names that matched at least one allowed-tools spec.
+    pub matched_tools: Vec<&'a str>,
+    /// Allowed-tools specs that did not match any runtime tool name.
+    pub unmatched_specs: Vec<String>,
+}
+
 fn strip_tool_wrapper(tool_spec: &str) -> &str {
     let trimmed = tool_spec.trim();
     if let Some(open_idx) = trimmed.find('(')
@@ -131,6 +140,56 @@ fn tool_matches_patterns(tool_name: &str, allowed_patterns: &HashSet<String>) ->
     allowed_patterns
         .iter()
         .any(|pattern| wildcard_match(pattern, &normalized_tool))
+}
+
+/// Resolve `allowed-tools` specs against runtime tool names.
+///
+/// Empty `allowed_specs` means no explicit skill-level restriction.
+#[must_use]
+pub fn resolve_allowed_tools<'a>(
+    allowed_specs: &[String],
+    all_tool_names: &[&'a str],
+) -> AllowedToolsResolution<'a> {
+    if allowed_specs.is_empty() {
+        return AllowedToolsResolution {
+            matched_tools: all_tool_names.to_vec(),
+            unmatched_specs: Vec::new(),
+        };
+    }
+
+    let spec_patterns: Vec<(&str, Vec<String>)> = allowed_specs
+        .iter()
+        .map(|spec| (spec.as_str(), expand_allowed_tool_patterns(spec)))
+        .collect();
+    let allowed_patterns: HashSet<String> = spec_patterns
+        .iter()
+        .flat_map(|(_, patterns)| patterns.iter().cloned())
+        .collect();
+
+    let matched_tools: Vec<&str> = all_tool_names
+        .iter()
+        .copied()
+        .filter(|name| tool_matches_patterns(name, &allowed_patterns))
+        .collect();
+
+    let unmatched_specs: Vec<String> = spec_patterns
+        .iter()
+        .filter_map(|(spec, patterns)| {
+            let has_match = patterns
+                .iter()
+                .any(|pattern| matched_tools.iter().any(|tool| wildcard_match(pattern, tool)));
+            if has_match {
+                None
+            } else {
+                Some((*spec).to_string())
+            }
+        })
+        .collect();
+
+    AllowedToolsResolution {
+        matched_tools,
+        unmatched_specs,
+    }
 }
 
 fn is_read_only_tool(tool_name: &str) -> bool {
@@ -302,6 +361,51 @@ mod tests {
         assert!(result.contains(&"web_fetch"));
         assert!(result.contains(&"web_search"));
         assert!(!result.contains(&"exec"));
+    }
+
+    #[test]
+    fn resolve_allowed_tools_matches_aliases_and_wrappers() {
+        let specs = vec![
+            "Bash(git:*)".to_string(),
+            "Read".to_string(),
+            "WebFetch".to_string(),
+        ];
+        let all = &[
+            "exec",
+            "read_file",
+            "list_directory",
+            "web_fetch",
+            "web_search",
+        ];
+
+        let resolved = resolve_allowed_tools(&specs, all);
+
+        assert_eq!(
+            resolved.matched_tools,
+            vec!["exec", "read_file", "list_directory", "web_fetch"]
+        );
+        assert!(resolved.unmatched_specs.is_empty());
+    }
+
+    #[test]
+    fn resolve_allowed_tools_tracks_unmatched_specs() {
+        let specs = vec!["web_search".to_string(), "Bash(git:*)".to_string()];
+        let all = &["exec", "read_file"];
+
+        let resolved = resolve_allowed_tools(&specs, all);
+
+        assert_eq!(resolved.matched_tools, vec!["exec"]);
+        assert_eq!(resolved.unmatched_specs, vec!["web_search".to_string()]);
+    }
+
+    #[test]
+    fn resolve_allowed_tools_empty_specs_is_unrestricted() {
+        let all = &["exec", "web_fetch"];
+
+        let resolved = resolve_allowed_tools(&[], all);
+
+        assert_eq!(resolved.matched_tools, all.to_vec());
+        assert!(resolved.unmatched_specs.is_empty());
     }
 
     #[test]
