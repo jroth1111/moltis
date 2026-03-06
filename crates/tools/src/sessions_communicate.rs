@@ -11,9 +11,11 @@ use {async_trait::async_trait, futures::future::BoxFuture, serde_json::Value, tr
 
 use {
     moltis_agents::tool_registry::AgentTool,
+    moltis_common::handoff::{
+        HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
+    },
     moltis_sessions::{
-        SessionResumeContext, metadata::SqliteSessionMetadata, state_store::SessionStateStore,
-        store::SessionStore,
+        metadata::SqliteSessionMetadata, state_store::SessionStateStore, store::SessionStore,
     },
 };
 
@@ -267,7 +269,7 @@ impl AgentTool for SessionsSendTool {
                 },
                 "resume_context": {
                     "type": "object",
-                    "description": "Optional structured resume context. If omitted, sessions_send attempts to load the latest stored resume context from the sender session."
+                    "description": "Optional structured handoff context. If omitted, sessions_send attempts to load the latest stored handoff context from the sender session."
                 }
             },
             "required": ["key", "message"]
@@ -304,7 +306,7 @@ impl AgentTool for SessionsSendTool {
 
         let explicit_resume_context = if let Some(value) = params.get("resume_context") {
             Some(
-                serde_json::from_value::<SessionResumeContext>(value.clone()).map_err(|error| {
+                serde_json::from_value::<HandoffContext>(value.clone()).map_err(|error| {
                     Error::message(format!("invalid resume_context payload: {error}"))
                 })?,
             )
@@ -315,7 +317,12 @@ impl AgentTool for SessionsSendTool {
         let resume_context = if let Some(resume_context) = explicit_resume_context {
             Some(resume_context)
         } else if let (Some(store), Some(source_key)) = (&self.state_store, source_session_key) {
-            store.get_handoff(&source_key).await.ok().flatten()
+            store
+                .get(&source_key, HANDOFF_NAMESPACE, HANDOFF_LATEST_KEY)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<HandoffContext>(&raw).ok())
         } else {
             None
         };
@@ -325,7 +332,23 @@ impl AgentTool for SessionsSendTool {
         if let Some(resume_context) = resume_context
             && let Some(store) = &self.state_store
         {
-            if let Err(error) = store.set_handoff(&key, &resume_context).await {
+            let serialized = match serde_json::to_string(&resume_context) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        session = %key,
+                        error = %error,
+                        "sessions_send: failed to serialize inbound resume context"
+                    );
+                    String::new()
+                },
+            };
+            if serialized.is_empty() {
+                // serialization failure already logged above
+            } else if let Err(error) = store
+                .set(&key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY, &serialized)
+                .await
+            {
                 warn!(
                     session = %key,
                     error = %error,
@@ -579,18 +602,22 @@ mod tests {
             .await?;
 
         let state_store = test_state_store().await?;
-        let mut handoff = SessionResumeContext::new(
-            Some("repair migration flow".into()),
-            Vec::new(),
-            Some("command timed out".into()),
-            None,
-            vec!["build uses stale cache".into()],
-        );
-        handoff.last_action = Some("attempted migration".into());
-        handoff.dead_ends.push("exec: build command timed out".into());
-        handoff.next_step_hint = Some("try a narrower query".into());
-        handoff.estimated_tokens = Some(900);
-        state_store.set_handoff("session:source", &handoff).await?;
+        let mut handoff = HandoffContext {
+            last_action: Some("attempted migration".into()),
+            observed_error: Some("command timed out".into()),
+            suggested_next_step: Some("try a narrower query".into()),
+            estimated_tokens: Some(900),
+            ..HandoffContext::default()
+        };
+        handoff.add_dead_end("exec", "build command timed out", "build command timed out");
+        state_store
+            .set(
+                "session:source",
+                HANDOFF_NAMESPACE,
+                HANDOFF_LATEST_KEY,
+                &serde_json::to_string(&handoff)?,
+            )
+            .await?;
 
         let send_fn: SendToSessionFn = Arc::new(move |req| {
             Box::pin(async move {
@@ -614,10 +641,14 @@ mod tests {
         assert_eq!(result["resumeContextPersisted"], true);
 
         let persisted = state_store
-            .get_handoff("session:target")
+            .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
             .await?
             .ok_or_else(|| std::io::Error::other("expected inbound resume context"))?;
-        assert_eq!(persisted.last_action.as_deref(), Some("attempted migration"));
+        let persisted: HandoffContext = serde_json::from_str(&persisted)?;
+        assert_eq!(
+            persisted.last_action.as_deref(),
+            Some("attempted migration")
+        );
         assert!(!persisted.dead_ends.is_empty());
         Ok(())
     }
@@ -630,20 +661,15 @@ mod tests {
             .await?;
 
         let state_store = test_state_store().await?;
-        let mut resume_context = SessionResumeContext::new(
-            Some("finish rollout".into()),
-            vec!["deploy production".into()],
-            None,
-            None,
-            vec!["staging is green".into()],
-        );
-        resume_context.last_action = Some("validated staging".into());
-        resume_context.dead_ends = vec!["deploy: previous canary failed".into()];
-        resume_context.next_step_hint = Some("deploy production carefully".into());
-        resume_context.estimated_tokens = Some(321);
-        let send_fn: SendToSessionFn = Arc::new(move |_req| {
-            Box::pin(async move { Ok(serde_json::json!({ "text": "ok" })) })
-        });
+        let mut resume_context = HandoffContext {
+            last_action: Some("validated staging".into()),
+            suggested_next_step: Some("deploy production carefully".into()),
+            estimated_tokens: Some(321),
+            ..HandoffContext::default()
+        };
+        resume_context.add_dead_end("deploy", "previous canary failed", "previous canary failed");
+        let send_fn: SendToSessionFn =
+            Arc::new(move |_req| Box::pin(async move { Ok(serde_json::json!({ "text": "ok" })) }));
         let tool =
             SessionsSendTool::new(metadata, send_fn).with_state_store(Arc::clone(&state_store));
 
@@ -659,13 +685,13 @@ mod tests {
         assert_eq!(result["resumeContextPersisted"], true);
 
         let persisted = state_store
-            .get_handoff("session:target")
+            .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
             .await?
             .ok_or_else(|| std::io::Error::other("expected inbound resume context"))?;
-        assert_eq!(persisted.last_goal.as_deref(), Some("finish rollout"));
-        assert_eq!(persisted.pending_tasks, vec!["deploy production"]);
+        let persisted: HandoffContext = serde_json::from_str(&persisted)?;
+        assert_eq!(persisted.last_action.as_deref(), Some("validated staging"));
         assert_eq!(
-            persisted.next_step_hint.as_deref(),
+            persisted.suggested_next_step.as_deref(),
             Some("deploy production carefully")
         );
         Ok(())
@@ -678,9 +704,8 @@ mod tests {
             .upsert("session:target", Some("Target".to_string()))
             .await?;
 
-        let send_fn: SendToSessionFn = Arc::new(move |_req| {
-            Box::pin(async move { Ok(serde_json::json!({ "text": "ok" })) })
-        });
+        let send_fn: SendToSessionFn =
+            Arc::new(move |_req| Box::pin(async move { Ok(serde_json::json!({ "text": "ok" })) }));
         let tool = SessionsSendTool::new(metadata, send_fn);
 
         let error = tool
