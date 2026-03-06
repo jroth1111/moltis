@@ -637,7 +637,6 @@ impl AgentTool for SpawnAgentTool {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(extra);
         }
-<<<<<<< HEAD
         if let Some(extra) = persona_suffix
             .as_deref()
             .map(str::trim)
