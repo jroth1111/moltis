@@ -1,23 +1,19 @@
 //! Integration tests for browser anti-detection against real websites.
 //!
-//! Tests navigation to target sites with challenge detection and content access validation.
-//! Run with: cargo test -p moltis-browser --test real_sites_test -- --nocapture
+//! Tests navigation to target sites with challenge detection and verifies that
+//! the returned session is still usable for follow-up actions.
 
 use std::time::Duration;
 
 use moltis_browser::{
-    BrowserManager,
-    types::{
-        BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest, PatchrightFallbackConfig,
-    },
+    BrowserBackendKind, BrowserManager, NavigationVerdict, ProtectionConfig,
+    types::{BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest},
 };
 use tokio::time::timeout;
 
-/// Target site configuration for anti-detection validation.
 struct TargetSite {
     name: &'static str,
     url: &'static str,
-    /// Minimum expected body text length (proxy for successful content access).
     min_body_text_len: usize,
 }
 
@@ -47,55 +43,41 @@ const TARGET_SITES: &[TargetSite] = &[
 fn base_test_config() -> BrowserConfig {
     let mut config = BrowserConfig::default();
     config.persist_profile = false;
-    config
-}
-
-/// Create a browser config with patchright fallback enabled for hard sites.
-fn config_with_patchright_fallback() -> BrowserConfig {
-    let mut config = base_test_config();
-    config.patchright_fallback = PatchrightFallbackConfig {
+    config.protection = ProtectionConfig {
         enabled: true,
         python_binary: "python3".to_string(),
         timeout_ms: 90_000,
-        headless: true,
-        challenge_types: vec!["kasada".to_string(), "imperva".to_string()],
-        domains: vec![],
         max_retries: 3,
+        ..ProtectionConfig::default()
     };
     config
 }
 
-fn config_for_site(site: &TargetSite) -> BrowserConfig {
-    match site.name {
-        "coles" | "realestate" => config_with_patchright_fallback(),
-        _ => base_test_config(),
-    }
-}
-
-/// Test result for a single target site.
 #[derive(Debug)]
 struct SiteTestResult {
     name: String,
     success: bool,
+    backend: BrowserBackendKind,
     challenge_type: Option<String>,
     title_len: u64,
     body_text_len: u64,
     final_url: String,
+    page_title: String,
+    snapshot_elements: usize,
     error: Option<String>,
 }
 
 impl std::fmt::Display for SiteTestResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status = if self.success {
-            "PASS"
-        } else {
-            "FAIL"
-        };
+        let status = if self.success { "PASS" } else { "FAIL" };
         writeln!(f, "=== {} [{}] ===", self.name, status)?;
+        writeln!(f, "  backend: {}", self.backend)?;
         writeln!(f, "  challenge_type: {:?}", self.challenge_type)?;
         writeln!(f, "  title_len: {}", self.title_len)?;
         writeln!(f, "  body_text_len: {}", self.body_text_len)?;
         writeln!(f, "  final_url: {}", self.final_url)?;
+        writeln!(f, "  page_title: {}", self.page_title)?;
+        writeln!(f, "  snapshot_elements: {}", self.snapshot_elements)?;
         if let Some(err) = &self.error {
             writeln!(f, "  error: {}", err)?;
         }
@@ -103,180 +85,164 @@ impl std::fmt::Display for SiteTestResult {
     }
 }
 
-async fn test_site(site: &TargetSite) -> SiteTestResult {
-    let manager = BrowserManager::new(config_for_site(site));
-    let request = BrowserRequest {
-        session_id: None,
-        action: BrowserAction::Navigate {
-            url: site.url.to_string(),
-        },
-        timeout_ms: 60_000,
+fn request(session_id: Option<String>, action: BrowserAction, timeout_ms: u64) -> BrowserRequest {
+    BrowserRequest {
+        session_id,
+        action,
+        timeout_ms,
         sandbox: Some(false),
         browser: Some(BrowserPreference::Auto),
-    };
+    }
+}
 
-    let response = manager.handle_request(request).await;
+async fn test_site(site: &TargetSite) -> SiteTestResult {
+    let manager = BrowserManager::new(base_test_config());
+
+    let navigate = manager
+        .handle_request(request(
+            None,
+            BrowserAction::Navigate {
+                url: site.url.to_string(),
+            },
+            60_000,
+        ))
+        .await;
+    let session_id = navigate.session_id.clone();
+
+    let snapshot = manager
+        .handle_request(request(
+            Some(session_id.clone()),
+            BrowserAction::Snapshot,
+            30_000,
+        ))
+        .await;
+    let title = manager
+        .handle_request(request(
+            Some(session_id.clone()),
+            BrowserAction::GetTitle,
+            30_000,
+        ))
+        .await;
+    let url = manager
+        .handle_request(request(Some(session_id), BrowserAction::GetUrl, 30_000))
+        .await;
+
     manager.shutdown().await;
+
+    let navigation = navigate.navigation.as_ref();
+    let challenge_type = navigation
+        .and_then(|nav| nav.challenge.as_ref())
+        .map(|challenge| challenge.challenge_type.as_str().to_string());
+    let title_len = navigation.map(|nav| nav.title_len).unwrap_or(0);
+    let body_text_len = navigation.map(|nav| nav.body_text_len).unwrap_or(0);
+    let final_url = navigation
+        .map(|nav| nav.final_url.clone())
+        .unwrap_or_default();
+    let snapshot_elements = snapshot
+        .snapshot
+        .as_ref()
+        .map(|dom| dom.elements.len())
+        .unwrap_or(0);
 
     SiteTestResult {
         name: site.name.to_string(),
-        success: response.success
-            && response.challenge_type.is_none()
-            && response.body_text_len.unwrap_or(0) as usize >= site.min_body_text_len,
-        challenge_type: response.challenge_type,
-        title_len: response.title_len.unwrap_or(0),
-        body_text_len: response.body_text_len.unwrap_or(0),
-        final_url: response.final_url.unwrap_or_default(),
-        error: response.error,
+        success: navigate.success
+            && navigation.map(|nav| nav.verdict) == Some(NavigationVerdict::Content)
+            && challenge_type.is_none()
+            && body_text_len as usize >= site.min_body_text_len
+            && snapshot.success
+            && snapshot.snapshot.is_some()
+            && snapshot_elements > 0
+            && title.success
+            && !title.title.clone().unwrap_or_default().is_empty()
+            && url.success
+            && !url.url.clone().unwrap_or_default().is_empty(),
+        backend: navigate.backend,
+        challenge_type,
+        title_len,
+        body_text_len,
+        final_url,
+        page_title: title.title.unwrap_or_default(),
+        snapshot_elements,
+        error: navigate.error.or(snapshot.error).or(title.error).or(url.error),
     }
+}
+
+async fn assert_site(site: &TargetSite, timeout_secs: u64) {
+    let result = timeout(Duration::from_secs(timeout_secs), test_site(site))
+        .await
+        .expect("test timed out");
+
+    println!("{}", result);
+
+    assert!(
+        result.success,
+        "{} navigation failed: {:?}",
+        site.url,
+        result.error
+    );
+    assert!(
+        result.challenge_type.is_none(),
+        "unexpected challenge: {:?}",
+        result.challenge_type
+    );
+    assert!(
+        result.body_text_len >= site.min_body_text_len as u64,
+        "body_text_len {} below minimum {}",
+        result.body_text_len,
+        site.min_body_text_len
+    );
+    assert!(
+        result.snapshot_elements > 0,
+        "snapshot returned no interactive elements"
+    );
+    assert!(!result.page_title.is_empty(), "title lookup returned empty");
+    assert!(!result.final_url.is_empty(), "final_url should not be empty");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_google_au_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
-
-    let site = &TARGET_SITES[0]; // google_au
-    let result = timeout(Duration::from_secs(90), test_site(site))
-        .await
-        .expect("test timed out");
-
-    println!("{}", result);
-
-    assert!(
-        result.success,
-        "google.com.au navigation failed: {:?}",
-        result.error
-    );
-    assert!(
-        result.challenge_type.is_none(),
-        "unexpected challenge: {:?}",
-        result.challenge_type
-    );
-    assert!(
-        result.body_text_len >= site.min_body_text_len as u64,
-        "body_text_len {} below minimum {}",
-        result.body_text_len,
-        site.min_body_text_len
-    );
+    assert_site(&TARGET_SITES[0], 90).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_woolworths_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
-
-    let site = &TARGET_SITES[1]; // woolworths
-    let result = timeout(Duration::from_secs(90), test_site(site))
-        .await
-        .expect("test timed out");
-
-    println!("{}", result);
-
-    assert!(
-        result.success,
-        "woolworths.com.au navigation failed: {:?}",
-        result.error
-    );
-    assert!(
-        result.challenge_type.is_none(),
-        "unexpected challenge: {:?}",
-        result.challenge_type
-    );
-    assert!(
-        result.body_text_len >= site.min_body_text_len as u64,
-        "body_text_len {} below minimum {}",
-        result.body_text_len,
-        site.min_body_text_len
-    );
+    assert_site(&TARGET_SITES[1], 90).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_coles_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
-
-    let site = &TARGET_SITES[2]; // coles
-    let result = timeout(Duration::from_secs(120), test_site(site))
-        .await
-        .expect("test timed out");
-
-    println!("{}", result);
-
-    assert!(
-        result.success,
-        "coles.com.au navigation failed: {:?}",
-        result.error
-    );
-    assert!(
-        result.challenge_type.is_none(),
-        "unexpected challenge: {:?}",
-        result.challenge_type
-    );
-    assert!(
-        result.body_text_len >= site.min_body_text_len as u64,
-        "body_text_len {} below minimum {}",
-        result.body_text_len,
-        site.min_body_text_len
-    );
+    assert_site(&TARGET_SITES[2], 120).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_realestate_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
-
-    let site = &TARGET_SITES[3]; // realestate
-    let result = timeout(Duration::from_secs(120), test_site(site))
-        .await
-        .expect("test timed out");
-
-    println!("{}", result);
-
-    assert!(
-        result.success,
-        "realestate.com.au navigation failed: {:?}",
-        result.error
-    );
-    assert!(
-        result.challenge_type.is_none(),
-        "unexpected challenge: {:?}",
-        result.challenge_type
-    );
-    assert!(
-        result.body_text_len >= site.min_body_text_len as u64,
-        "body_text_len {} below minimum {}",
-        result.body_text_len,
-        site.min_body_text_len
-    );
+    assert_site(&TARGET_SITES[3], 120).await;
 }
 
-/// Run all target sites and print a summary report.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_all_target_sites_summary() {
     let _ = tracing_subscriber::fmt::try_init();
     let mut results = Vec::new();
 
     for site in TARGET_SITES {
-        let site_timeout = match site.name {
-            "coles" | "realestate" => Duration::from_secs(120),
-            _ => Duration::from_secs(90),
+        let timeout_secs = match site.name {
+            "coles" | "realestate" => 120,
+            _ => 90,
         };
-        let result = timeout(site_timeout, test_site(site))
+        let result = timeout(Duration::from_secs(timeout_secs), test_site(site))
             .await
-            .expect("test timed out");
+            .expect("summary test timed out");
+        println!("{}", result);
         results.push(result);
     }
 
-    println!("\n=== ANTI-DETECTION TEST SUMMARY ===\n");
-
-    let mut pass_count = 0;
-    let mut fail_count = 0;
-
-    for result in &results {
-        println!("{}", result);
-        if result.success {
-            pass_count += 1;
-        } else {
-            fail_count += 1;
-        }
-    }
+    let pass_count = results.iter().filter(|result| result.success).count();
+    let fail_count = results.len() - pass_count;
 
     println!(
         "=== RESULTS: {} passed, {} failed ===\n",
