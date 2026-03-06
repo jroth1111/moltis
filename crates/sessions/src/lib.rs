@@ -20,6 +20,7 @@ pub use {
     integrity::IntegrityReport,
     key::SessionKey,
     message::{ContentBlock, MessageContent, PersistedMessage},
+    state_store::SessionResumeContext,
     store::{ReadResult, SearchResult},
 };
 

@@ -11,11 +11,9 @@ use {async_trait::async_trait, futures::future::BoxFuture, serde_json::Value, tr
 
 use {
     moltis_agents::tool_registry::AgentTool,
-    moltis_common::handoff::{
-        HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
-    },
     moltis_sessions::{
-        metadata::SqliteSessionMetadata, state_store::SessionStateStore, store::SessionStore,
+        SessionResumeContext, metadata::SqliteSessionMetadata, state_store::SessionStateStore,
+        store::SessionStore,
     },
 };
 
@@ -267,9 +265,9 @@ impl AgentTool for SessionsSendTool {
                     "type": "string",
                     "description": "Optional model override for the target session turn."
                 },
-                "handoff_context": {
+                "resume_context": {
                     "type": "object",
-                    "description": "Optional structured handoff context. If omitted, sessions_send attempts to load the latest handoff context from the sender session."
+                    "description": "Optional structured resume context. If omitted, sessions_send attempts to load the latest stored resume context from the sender session."
                 }
             },
             "required": ["key", "message"]
@@ -298,59 +296,40 @@ impl AgentTool for SessionsSendTool {
             message
         };
 
-        let explicit_handoff = if let Some(value) = params
-            .get("handoff_context")
-            .or_else(|| params.get("handoffContext"))
+        let explicit_resume_context = if let Some(value) = params
+            .get("resume_context")
+            .or_else(|| params.get("resumeContext"))
         {
             Some(
-                serde_json::from_value::<HandoffContext>(value.clone()).map_err(|error| {
-                    Error::message(format!("invalid handoff_context payload: {error}"))
+                serde_json::from_value::<SessionResumeContext>(value.clone()).map_err(|error| {
+                    Error::message(format!("invalid resume_context payload: {error}"))
                 })?,
             )
         } else {
             None
         };
 
-        let handoff = if explicit_handoff.is_some() {
-            explicit_handoff
+        let resume_context = if let Some(resume_context) = explicit_resume_context {
+            Some(resume_context)
         } else if let (Some(store), Some(source_key)) = (&self.state_store, source_session_key) {
-            store
-                .get(&source_key, HANDOFF_NAMESPACE, HANDOFF_LATEST_KEY)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|value| serde_json::from_str::<HandoffContext>(&value).ok())
+            store.get_handoff(&source_key).await.ok().flatten()
         } else {
             None
         };
 
-        let handoff_attached = handoff.is_some();
+        let handoff_attached = resume_context.is_some();
         let mut handoff_persisted = false;
-        if let Some(handoff_context) = handoff
+        if let Some(resume_context) = resume_context
             && let Some(store) = &self.state_store
         {
-            match serde_json::to_string(&handoff_context) {
-                Ok(serialized) => {
-                    if let Err(error) = store
-                        .set(&key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY, &serialized)
-                        .await
-                    {
-                        warn!(
-                            session = %key,
-                            error = %error,
-                            "sessions_send: failed to persist inbound handoff context"
-                        );
-                    } else {
-                        handoff_persisted = true;
-                    }
-                },
-                Err(error) => {
-                    warn!(
-                        session = %key,
-                        error = %error,
-                        "sessions_send: failed to serialize handoff context"
-                    );
-                },
+            if let Err(error) = store.set_handoff(&key, &resume_context).await {
+                warn!(
+                    session = %key,
+                    error = %error,
+                    "sessions_send: failed to persist inbound handoff context"
+                );
+            } else {
+                handoff_persisted = true;
             }
         }
 
@@ -597,18 +576,18 @@ mod tests {
             .await?;
 
         let state_store = test_state_store().await?;
-        let mut handoff = HandoffContext {
-            last_action: Some("attempted migration".into()),
-            observed_error: Some("command timed out".into()),
-            dead_ends: Vec::new(),
-            suggested_next_step: Some("try a narrower query".into()),
-            estimated_tokens: Some(900),
-        };
-        handoff.add_dead_end("exec", "timeout", "build command timed out");
-        let handoff_json = serde_json::to_string(&handoff)?;
-        state_store
-            .set("session:source", "handoff", "latest", &handoff_json)
-            .await?;
+        let mut handoff = SessionResumeContext::new(
+            Some("repair migration flow".into()),
+            Vec::new(),
+            Some("command timed out".into()),
+            None,
+            vec!["build uses stale cache".into()],
+        );
+        handoff.last_action = Some("attempted migration".into());
+        handoff.dead_ends.push("exec: build command timed out".into());
+        handoff.next_step_hint = Some("try a narrower query".into());
+        handoff.estimated_tokens = Some(900);
+        state_store.set_handoff("session:source", &handoff).await?;
 
         let send_fn: SendToSessionFn = Arc::new(move |req| {
             Box::pin(async move {
@@ -632,11 +611,60 @@ mod tests {
         assert_eq!(result["handoffPersisted"], true);
 
         let persisted = state_store
-            .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+            .get_handoff("session:target")
             .await?
             .ok_or_else(|| std::io::Error::other("expected inbound handoff"))?;
-        let parsed: HandoffContext = serde_json::from_str(&persisted)?;
-        assert!(!parsed.dead_ends.is_empty());
+        assert_eq!(persisted.last_action.as_deref(), Some("attempted migration"));
+        assert!(!persisted.dead_ends.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sessions_send_accepts_explicit_resume_context() -> TestResult<()> {
+        let metadata = Arc::new(SqliteSessionMetadata::new(test_pool().await?));
+        metadata
+            .upsert("session:target", Some("Target".to_string()))
+            .await?;
+
+        let state_store = test_state_store().await?;
+        let send_fn: SendToSessionFn = Arc::new(move |_req| {
+            Box::pin(async move { Ok(serde_json::json!({ "text": "ok" })) })
+        });
+        let tool =
+            SessionsSendTool::new(metadata, send_fn).with_state_store(Arc::clone(&state_store));
+
+        let result = tool
+            .execute(serde_json::json!({
+                "key": "session:target",
+                "message": "Continue the task",
+                "resume_context": {
+                    "last_goal": "finish rollout",
+                    "last_action": "validated staging",
+                    "pending_tasks": ["deploy production"],
+                    "last_error": null,
+                    "working_directory": null,
+                    "key_facts": ["staging is green"],
+                    "dead_ends": ["deploy: previous canary failed"],
+                    "next_step_hint": "deploy production carefully",
+                    "estimated_tokens": 321,
+                    "created_at": 1_234
+                }
+            }))
+            .await?;
+
+        assert_eq!(result["handoffAttached"], true);
+        assert_eq!(result["handoffPersisted"], true);
+
+        let persisted = state_store
+            .get_handoff("session:target")
+            .await?
+            .ok_or_else(|| std::io::Error::other("expected inbound handoff"))?;
+        assert_eq!(persisted.last_goal.as_deref(), Some("finish rollout"));
+        assert_eq!(persisted.pending_tasks, vec!["deploy production"]);
+        assert_eq!(
+            persisted.next_step_hint.as_deref(),
+            Some("deploy production carefully")
+        );
         Ok(())
     }
 

@@ -41,6 +41,7 @@ use {
         metadata::{SessionEntry, SqliteSessionMetadata},
         state_store::SessionStateStore,
         store::SessionStore,
+        SessionResumeContext,
     },
     moltis_skills::discover::SkillDiscoverer,
     moltis_tools::policy::effective_tool_policy,
@@ -62,9 +63,6 @@ use {
         retain_with_importance, summary_context_plan, trim_summary_to_budget,
     },
     history_context::{normalize_for_context_view, normalize_for_model_context},
-    moltis_common::handoff::{
-        HANDOFF_INBOUND_KEY, HANDOFF_LATEST_KEY, HANDOFF_NAMESPACE, HandoffContext,
-    },
     moltis_service_traits::{ChatService, ModelService, ServiceError, ServiceResult},
 };
 
@@ -3456,34 +3454,38 @@ fn suggested_next_step_for_error(error: &str) -> Option<String> {
     Some(step.to_string())
 }
 
+fn resume_goal_from_user_content(user_content: &UserContent) -> Option<String> {
+    let goal = match user_content {
+        UserContent::Text(text) => text.trim().to_string(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string(),
+    };
+    (!goal.is_empty()).then_some(goal)
+}
+
+fn current_resume_working_directory() -> Option<PathBuf> {
+    std::env::current_dir().ok()
+}
+
 async fn persist_handoff_context(
     state_store: Option<&Arc<SessionStateStore>>,
     session_key: &str,
-    handoff: &HandoffContext,
+    handoff: &SessionResumeContext,
 ) {
     let Some(store) = state_store else {
         return;
     };
 
-    let serialized = match serde_json::to_string(handoff) {
-        Ok(value) => value,
-        Err(error) => {
-            warn!(
-                session = %session_key,
-                error = %error,
-                "failed to serialize handoff context"
-            );
-            return;
-        },
-    };
-
     if let Err(error) = store
-        .set(
-            session_key,
-            HANDOFF_NAMESPACE,
-            HANDOFF_LATEST_KEY,
-            &serialized,
-        )
+        .set_handoff(session_key, handoff)
         .await
     {
         warn!(
@@ -3497,13 +3499,10 @@ async fn persist_handoff_context(
 async fn consume_inbound_handoff_context(
     state_store: Option<&Arc<SessionStateStore>>,
     session_key: &str,
-) -> Option<HandoffContext> {
+) -> Option<SessionResumeContext> {
     let store = state_store?;
 
-    let raw = match store
-        .get(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
-        .await
-    {
+    let handoff = match store.get_handoff(session_key).await {
         Ok(value) => value,
         Err(error) => {
             warn!(
@@ -3515,10 +3514,8 @@ async fn consume_inbound_handoff_context(
         },
     };
 
-    let raw = raw?;
-
     if let Err(error) = store
-        .delete(session_key, HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+        .clear_handoff(session_key)
         .await
     {
         warn!(
@@ -3528,32 +3525,18 @@ async fn consume_inbound_handoff_context(
         );
     }
 
-    match serde_json::from_str::<HandoffContext>(&raw) {
-        Ok(handoff) => Some(handoff),
-        Err(error) => {
-            warn!(
-                session = %session_key,
-                error = %error,
-                "invalid inbound handoff context payload"
-            );
-            None
-        },
-    }
+    handoff
 }
 
-fn append_handoff_constraints(system_prompt: &mut String, handoff: &HandoffContext) {
-    if handoff.last_action.is_none()
-        && handoff.observed_error.is_none()
-        && handoff.dead_ends.is_empty()
-        && handoff.suggested_next_step.is_none()
-        && handoff.estimated_tokens.is_none()
-    {
+fn append_handoff_constraints(system_prompt: &mut String, handoff: &SessionResumeContext) {
+    let summary = handoff.to_prompt_summary();
+    if summary.is_empty() {
         return;
     }
 
     system_prompt.push_str("\n\n[InterSessionHandoff]\n");
     system_prompt.push_str("Apply this context from a prior coordinating session.\n");
-    system_prompt.push_str(&handoff.to_message_block());
+    system_prompt.push_str(&summary);
     if !handoff.dead_ends.is_empty() {
         system_prompt.push_str(
             "\nTreat each do_not_retry item as a hard constraint unless the user explicitly overrides it.",
@@ -9029,21 +9012,25 @@ async fn run_with_tools(
                 "agent run complete"
             );
 
-            let handoff_context = HandoffContext {
-                last_action: Some(if tool_calls_made > 0 {
-                    format!("completed run with {tool_calls_made} tool calls")
-                } else {
-                    "completed run without tool calls".to_string()
-                }),
-                observed_error: None,
-                dead_ends: Vec::new(),
-                suggested_next_step: None,
-                estimated_tokens: Some(
-                    request_usage
-                        .input_tokens
-                        .saturating_add(request_usage.output_tokens),
-                ),
-            };
+            let mut handoff_context = SessionResumeContext::new(
+                resume_goal_from_user_content(user_content),
+                Vec::new(),
+                None,
+                current_resume_working_directory(),
+                Vec::new(),
+            );
+            handoff_context.last_action = Some(if tool_calls_made > 0 {
+                format!("completed run with {tool_calls_made} tool calls")
+            } else {
+                "completed run without tool calls".to_string()
+            });
+            handoff_context.next_step_hint =
+                Some("resume from the latest assistant output and verified tool results".into());
+            handoff_context.estimated_tokens = Some(
+                request_usage
+                    .input_tokens
+                    .saturating_add(request_usage.output_tokens),
+            );
             persist_handoff_context(state_store, session_key, &handoff_context).await;
 
             if let Some(ref hooks) = hook_registry {
@@ -9190,14 +9177,18 @@ async fn run_with_tools(
         Err(e) => {
             let error_str = e.to_string();
             warn!(run_id, error = %error_str, "agent run error");
-            let mut handoff_context = HandoffContext {
-                last_action: Some("agent run failed".to_string()),
-                observed_error: Some(error_str.clone()),
-                dead_ends: Vec::new(),
-                suggested_next_step: suggested_next_step_for_error(&error_str),
-                estimated_tokens: None,
-            };
-            handoff_context.add_dead_end("llm", &error_str, "provider call failed");
+            let mut handoff_context = SessionResumeContext::new(
+                resume_goal_from_user_content(user_content),
+                Vec::new(),
+                Some(error_str.clone()),
+                current_resume_working_directory(),
+                Vec::new(),
+            );
+            handoff_context.last_action = Some("agent run failed".to_string());
+            handoff_context.next_step_hint = suggested_next_step_for_error(&error_str);
+            handoff_context
+                .dead_ends
+                .push("llm: provider call failed".to_string());
             persist_handoff_context(state_store, session_key, &handoff_context).await;
 
             if let Some(ref hooks) = hook_registry {
@@ -11972,14 +11963,19 @@ mod tests {
     #[test]
     fn append_handoff_constraints_includes_do_not_retry_guidance() {
         let mut prompt = String::from("base prompt");
-        let mut handoff = HandoffContext {
-            last_action: Some("attempted migration".to_string()),
-            observed_error: Some("tool timeout".to_string()),
-            dead_ends: Vec::new(),
-            suggested_next_step: Some("retry with narrower scope".to_string()),
-            estimated_tokens: Some(512),
-        };
-        handoff.add_dead_end("exec", "timed out", "command exceeded timeout");
+        let mut handoff = SessionResumeContext::new(
+            Some("finish migration".to_string()),
+            Vec::new(),
+            Some("tool timeout".to_string()),
+            None,
+            Vec::new(),
+        );
+        handoff.last_action = Some("attempted migration".to_string());
+        handoff.next_step_hint = Some("retry with narrower scope".to_string());
+        handoff.estimated_tokens = Some(512);
+        handoff
+            .dead_ends
+            .push("exec: command exceeded timeout".to_string());
 
         append_handoff_constraints(&mut prompt, &handoff);
 
@@ -11993,21 +11989,18 @@ mod tests {
         let pool = sqlite_pool().await;
         let state_store = make_state_store(&pool).await;
 
-        let handoff = HandoffContext {
-            last_action: Some("completed dependency scan".to_string()),
-            observed_error: None,
-            dead_ends: Vec::new(),
-            suggested_next_step: Some("apply patch".to_string()),
-            estimated_tokens: Some(123),
-        };
-        let serialized = serde_json::to_string(&handoff).expect("serialize handoff");
+        let mut handoff = SessionResumeContext::new(
+            Some("repair browser session".to_string()),
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        );
+        handoff.last_action = Some("completed dependency scan".to_string());
+        handoff.next_step_hint = Some("apply patch".to_string());
+        handoff.estimated_tokens = Some(123);
         state_store
-            .set(
-                "session:target",
-                HANDOFF_NAMESPACE,
-                HANDOFF_INBOUND_KEY,
-                &serialized,
-            )
+            .set_handoff("session:target", &handoff)
             .await
             .expect("persist inbound handoff");
 
@@ -12020,7 +12013,7 @@ mod tests {
         );
 
         let after = state_store
-            .get("session:target", HANDOFF_NAMESPACE, HANDOFF_INBOUND_KEY)
+            .get_handoff("session:target")
             .await
             .expect("read inbound handoff after consume");
         assert!(
@@ -14691,6 +14684,7 @@ mod tests {
                 text: self.response_text.clone(),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 
@@ -14739,6 +14733,7 @@ mod tests {
                 text: Some(text),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 
@@ -14787,6 +14782,7 @@ mod tests {
                 text: Some(text),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 

@@ -48,6 +48,9 @@ impl From<StateRow> for StateEntry {
 pub struct SessionResumeContext {
     /// The primary goal the agent was working toward.
     pub last_goal: Option<String>,
+    /// The most recent action the agent completed or attempted.
+    #[serde(default)]
+    pub last_action: Option<String>,
     /// Tasks that were pending when the run ended.
     pub pending_tasks: Vec<String>,
     /// The last error encountered, if the run ended in error.
@@ -56,6 +59,15 @@ pub struct SessionResumeContext {
     pub working_directory: Option<PathBuf>,
     /// Key facts learned during the run that might be useful for continuation.
     pub key_facts: Vec<String>,
+    /// Approaches that should not be retried automatically.
+    #[serde(default)]
+    pub dead_ends: Vec<String>,
+    /// Suggested next step for the next run, if known.
+    #[serde(default)]
+    pub next_step_hint: Option<String>,
+    /// Estimated token cost of the prior run, if known.
+    #[serde(default)]
+    pub estimated_tokens: Option<u32>,
     /// Unix timestamp (milliseconds) when this context was created.
     pub created_at: i64,
 }
@@ -80,10 +92,14 @@ impl SessionResumeContext {
     ) -> Self {
         Self {
             last_goal,
+            last_action: None,
             pending_tasks,
             last_error,
             working_directory,
             key_facts,
+            dead_ends: Vec::new(),
+            next_step_hint: None,
+            estimated_tokens: None,
             created_at: now_ms(),
         }
     }
@@ -108,6 +124,10 @@ impl SessionResumeContext {
             parts.push(format!("Previous goal: {}", goal));
         }
 
+        if let Some(ref action) = self.last_action {
+            parts.push(format!("Recent action: {}", action));
+        }
+
         if !self.pending_tasks.is_empty() {
             parts.push(format!(
                 "Pending tasks:\n{}",
@@ -123,6 +143,21 @@ impl SessionResumeContext {
             parts.push(format!("Last error: {}", error));
         }
 
+        if !self.dead_ends.is_empty() {
+            parts.push(format!(
+                "do_not_retry:\n{}",
+                self.dead_ends
+                    .iter()
+                    .map(|entry| format!("- {entry}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+
+        if let Some(ref next_step_hint) = self.next_step_hint {
+            parts.push(format!("Suggested next step: {}", next_step_hint));
+        }
+
         if let Some(ref dir) = self.working_directory {
             parts.push(format!("Working directory: {}", dir.display()));
         }
@@ -136,6 +171,10 @@ impl SessionResumeContext {
                     .collect::<Vec<_>>()
                     .join("\n")
             ));
+        }
+
+        if let Some(estimated_tokens) = self.estimated_tokens {
+            parts.push(format!("Estimated prior tokens: {}", estimated_tokens));
         }
 
         if parts.is_empty() {
