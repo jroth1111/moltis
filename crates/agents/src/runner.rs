@@ -487,7 +487,7 @@ fn build_low_confidence_question(original_intent: &str, confidence: &ConfidenceM
         .map(|reason| format!(" ({reason})"))
         .unwrap_or_default();
     format!(
-        "I’m not confident enough to act on \"{}\"{} yet. What exact outcome should I focus on next?",
+        "I'm not confident enough to act on \"{}\"{} yet. What exact outcome should I focus on next?",
         trim_inline_text(original_intent, 160),
         reason
     )
