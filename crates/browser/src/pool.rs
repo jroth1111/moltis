@@ -757,11 +757,50 @@ impl BrowserPool {
         session_id: &str,
         transfer_state: SessionTransferState,
     ) -> Result<(), Error> {
-        if let Some(snapshot) = transfer_state.interception {
+        let SessionTransferState {
+            interception,
+            api_capture,
+            session_state,
+        } = transfer_state;
+        self.restore_runtime_transfer_state_to_chromium(session_id, interception, api_capture)
+            .await?;
+        if let Some(state) = session_state {
+            let page = self.get_active_page(session_id).await?;
+            crate::session_state::restore_state(&page, &state).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn prepare_transfer_state_for_chromium_retry(
+        &self,
+        session_id: &str,
+        transfer_state: SessionTransferState,
+    ) -> Result<Option<crate::session_state::SessionState>, Error> {
+        let SessionTransferState {
+            interception,
+            api_capture,
+            session_state,
+        } = transfer_state;
+        self.restore_runtime_transfer_state_to_chromium(session_id, interception, api_capture)
+            .await?;
+        if let Some(state) = session_state.as_ref() {
+            let page = self.get_active_page(session_id).await?;
+            crate::session_state::restore_cookies(&page, state).await?;
+        }
+        Ok(session_state)
+    }
+
+    async fn restore_runtime_transfer_state_to_chromium(
+        &self,
+        session_id: &str,
+        interception: Option<crate::network::InterceptionSnapshot>,
+        api_capture: Option<crate::api_capture::ApiCaptureSnapshot>,
+    ) -> Result<(), Error> {
+        if let Some(snapshot) = interception {
             self.restore_interception_snapshot(session_id, snapshot)
                 .await?;
         }
-        if let Some(snapshot) = transfer_state.api_capture {
+        if let Some(snapshot) = api_capture {
             self.restore_api_capture_snapshot(session_id, snapshot)
                 .await?;
         }
@@ -796,14 +835,17 @@ impl BrowserPool {
             api_capture,
             session_state,
         } = transfer_state;
-        if let Some(snapshot) = session_state.clone()
-            && let Err(error) = instance.session.restore_state(&snapshot).await
-        {
-            return Err((error, SessionTransferState {
-                interception,
-                api_capture,
-                session_state: Some(snapshot),
-            }));
+        if let Some(snapshot) = session_state.clone() {
+            if let Err(error) = instance.session.restore_state(&snapshot).await {
+                return Err((
+                    error,
+                    SessionTransferState {
+                        interception,
+                        api_capture,
+                        session_state: Some(snapshot),
+                    },
+                ));
+            }
         }
 
         if let Some(snapshot) = interception {
@@ -818,15 +860,18 @@ impl BrowserPool {
                     .enable_interception(url_patterns.clone(), extra_headers.clone())
                     .await
             {
-                return Err((error, SessionTransferState {
-                    interception: Some(crate::network::InterceptionSnapshot {
-                        enabled,
-                        url_patterns,
-                        extra_headers,
-                    }),
-                    api_capture,
-                    session_state: None,
-                }));
+                return Err((
+                    error,
+                    SessionTransferState {
+                        interception: Some(crate::network::InterceptionSnapshot {
+                            enabled,
+                            url_patterns,
+                            extra_headers,
+                        }),
+                        api_capture,
+                        session_state: None,
+                    },
+                ));
             }
             instance.interception.enabled = enabled;
             instance.interception.url_patterns = url_patterns;
@@ -837,11 +882,14 @@ impl BrowserPool {
 
         if let Some(snapshot) = api_capture {
             if let Err(error) = instance.session.start_api_capture(&snapshot.config).await {
-                return Err((error, SessionTransferState {
-                    interception: None,
-                    api_capture: Some(snapshot),
-                    session_state: None,
-                }));
+                return Err((
+                    error,
+                    SessionTransferState {
+                        interception: None,
+                        api_capture: Some(snapshot),
+                        session_state: None,
+                    },
+                ));
             }
             instance.api_capture = Some(PatchrightApiCaptureState {
                 handle: snapshot.handle,
@@ -1128,7 +1176,7 @@ impl BrowserPool {
                 };
                 let mut inst = request_instance.lock().await;
                 if let Some(recorder) = inst.api_capture.recorder.as_mut() {
-                    recorder.record_request(&event, fallback_request_body);
+                    recorder.record_request(&event, fallback_request_body).await;
                 }
             }
             debug!("requestWillBeSent event stream closed");
@@ -2786,15 +2834,17 @@ self.addEventListener('fetch', event => {
                 let instance = pool.get_patchright_session(&sid).await?;
                 let mut inst = instance.lock().await;
                 inst.session.goto(&format!("http://{addr}/page1")).await?;
-                assert!(inst
-                    .session
-                    .wait_selector("body[data-done='true']", 10_000)
-                    .await?);
+                assert!(
+                    inst.session
+                        .wait_selector("body[data-done='true']", 10_000)
+                        .await?
+                );
                 inst.session.goto(&format!("http://{addr}/page2")).await?;
-                assert!(inst
-                    .session
-                    .wait_selector("body[data-done='true']", 10_000)
-                    .await?);
+                assert!(
+                    inst.session
+                        .wait_selector("body[data-done='true']", 10_000)
+                        .await?
+                );
             }
 
             let catalog = pool
@@ -2890,6 +2940,82 @@ self.addEventListener('fetch', event => {
         assert_eq!(local.as_str(), Some("dark"));
         assert_eq!(session.as_str(), Some("ready"));
         assert_eq!(cookie, Value::Bool(true));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_transfer_state_for_chromium_retry_restores_browser_session_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let (addr, _state, server) = start_practical_server().await?;
+        let (pool, _profile_dir) = live_test_pool();
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            let page = pool.get_page(&sid).await?;
+            let url = format!("http://{addr}/page1");
+            page.goto(&url).await?;
+            wait_for_page_done(&page).await?;
+            page.evaluate(
+                r#"
+                    (() => {
+                        localStorage.setItem('handoff-theme', 'dark');
+                        sessionStorage.setItem('handoff-auth', 'ready');
+                        document.cookie = 'handoff=yes; path=/';
+                    })()
+                "#,
+            )
+            .await?;
+
+            let transfer_state = pool.take_transfer_state_from_chromium(&sid).await;
+            pool.close_session(&sid).await?;
+
+            let new_sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            let new_page = pool.get_page(&new_sid).await?;
+            let post_navigation_state = pool
+                .prepare_transfer_state_for_chromium_retry(&new_sid, transfer_state)
+                .await?;
+
+            new_page.goto(&url).await?;
+            wait_for_page_done(&new_page).await?;
+            if let Some(state) = post_navigation_state.as_ref() {
+                crate::session_state::restore_storage(&new_page, state).await?;
+                if !state.storage.is_empty() {
+                    new_page.reload().await?;
+                    let _ = new_page.wait_for_navigation().await;
+                    wait_for_page_done(&new_page).await?;
+                }
+            }
+
+            let local = new_page
+                .evaluate("localStorage.getItem('handoff-theme')")
+                .await?;
+            let session = new_page
+                .evaluate("sessionStorage.getItem('handoff-auth')")
+                .await?;
+            let cookie = new_page
+                .evaluate("document.cookie.includes('handoff=yes')")
+                .await?;
+            pool.close_session(&new_sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((local, session, cookie))
+        }
+        .await;
+
+        server.abort();
+
+        let (local, session, cookie) = outcome?;
+        let local: Value = local.into_value()?;
+        let session: Value = session.into_value()?;
+        let cookie: Value = cookie.into_value()?;
+        assert_eq!(local, Value::String("dark".to_string()));
+        assert_eq!(session, Value::String("ready".to_string()));
+        assert_eq!(cookie, Value::Bool(true));
+
         Ok(())
     }
 

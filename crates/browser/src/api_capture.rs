@@ -206,7 +206,7 @@ impl ApiCaptureRecorder {
         }
     }
 
-    pub fn record_request(
+    pub async fn record_request(
         &mut self,
         event: &EventRequestWillBeSent,
         fallback_request_body: Option<String>,
@@ -220,7 +220,9 @@ impl ApiCaptureRecorder {
             &self.config,
             observed.url.as_str(),
             observed.resource_type.as_deref(),
-        ) {
+        )
+        .await
+        {
             return;
         }
 
@@ -1365,33 +1367,44 @@ fn collect_semantic_hints_for_name(name: &str) -> BTreeSet<String> {
     hints
 }
 
-fn should_capture_request(
+async fn should_capture_request(
     config: &ApiCaptureConfig,
     url: &str,
     resource_type: Option<&str>,
 ) -> bool {
-    if !matches_allowed_hosts(url, &config.allowed_hosts) {
-        return false;
+    match resource_type {
+        Some("Fetch" | "XHR" | "EventSource" | "Other") | None => {},
+        Some("Document") if config.include_document_requests => {},
+        Some("Document") => return false,
+        _ => return false,
     }
+
     if !matches_url_patterns(url, &config.url_patterns) {
         return false;
-    }
-
-    match resource_type {
-        Some("Fetch" | "XHR" | "EventSource" | "Other") | None => true,
-        Some("Document") => config.include_document_requests,
-        _ => false,
-    }
-}
-
-fn matches_allowed_hosts(url: &str, allowed_hosts: &[String]) -> bool {
-    if allowed_hosts.is_empty() {
-        return true;
     }
 
     let Ok(parsed) = Url::parse(url) else {
         return false;
     };
+
+    if !matches_allowed_hosts(&parsed, &config.allowed_hosts) {
+        return false;
+    }
+
+    if config.allowed_hosts.is_empty() {
+        return true;
+    }
+
+    crate::host_guard::validate_public_url_target(&parsed, "API capture request")
+        .await
+        .is_ok()
+}
+
+fn matches_allowed_hosts(parsed: &Url, allowed_hosts: &[String]) -> bool {
+    if allowed_hosts.is_empty() {
+        return true;
+    }
+
     let Some(host) = parsed.host() else {
         return false;
     };
@@ -1663,8 +1676,8 @@ mod tests {
         recorder.apply_loading_finished(request_id);
     }
 
-    #[test]
-    fn capture_catalog_infers_search_endpoint() {
+    #[tokio::test]
+    async fn capture_catalog_infers_search_endpoint() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
         let event_a = request_event(
             "https://api.example.com/search?q=milk&page=1&limit=20",
@@ -1681,8 +1694,8 @@ mod tests {
         let req_id_a = event_a.request_id.clone();
         let req_id_b = event_b.request_id.clone();
 
-        recorder.record_request(&event_a, None);
-        recorder.record_request(&event_b, None);
+        recorder.record_request(&event_a, None).await;
+        recorder.record_request(&event_b, None).await;
         complete_successful_request(
             &mut recorder,
             &req_id_a,
@@ -1732,8 +1745,8 @@ mod tests {
         assert_eq!(endpoint.response.content_types, vec!["application/json"]);
     }
 
-    #[test]
-    fn capture_catalog_infers_graphql_operation() {
+    #[tokio::test]
+    async fn capture_catalog_infers_graphql_operation() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
         let event = request_event(
             "https://api.example.com/graphql",
@@ -1750,7 +1763,7 @@ mod tests {
         );
         let request_id = event.request_id.clone();
 
-        recorder.record_request(&event, None);
+        recorder.record_request(&event, None).await;
         complete_successful_request(
             &mut recorder,
             &request_id,
@@ -1824,8 +1837,8 @@ mod tests {
         assert_eq!(example.url, "/search");
     }
 
-    #[test]
-    fn loading_failed_flushes_pending_request() {
+    #[tokio::test]
+    async fn loading_failed_flushes_pending_request() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
         let event = request_event(
             "https://api.example.com/search?q=milk",
@@ -1834,7 +1847,7 @@ mod tests {
             None,
         );
         let request_id = event.request_id.clone();
-        recorder.record_request(&event, None);
+        recorder.record_request(&event, None).await;
         recorder.apply_loading_failed(&loading_failed_event(request_id.as_ref()));
 
         let catalog = recorder.build_catalog();
@@ -1842,21 +1855,23 @@ mod tests {
         assert_eq!(catalog.endpoints.len(), 1);
     }
 
-    #[test]
-    fn url_patterns_filter_capture() {
+    #[tokio::test]
+    async fn url_patterns_filter_capture() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig {
             url_patterns: vec!["*graphql*".to_string()],
             ..ApiCaptureConfig::default()
         });
-        recorder.record_request(
-            &request_event(
-                "https://api.example.com/search?q=milk",
-                "GET",
-                "Fetch",
+        recorder
+            .record_request(
+                &request_event(
+                    "https://api.example.com/search?q=milk",
+                    "GET",
+                    "Fetch",
+                    None,
+                ),
                 None,
-            ),
-            None,
-        );
+            )
+            .await;
         recorder.finish();
 
         let catalog = recorder.build_catalog();
@@ -1864,13 +1879,13 @@ mod tests {
         assert!(catalog.endpoints.is_empty());
     }
 
-    #[test]
-    fn document_requests_are_opt_in() {
+    #[tokio::test]
+    async fn document_requests_are_opt_in() {
         let event = request_event("https://app.example.com/dashboard", "GET", "Document", None);
         let request_id = event.request_id.clone();
 
         let mut excluded = ApiCaptureRecorder::new(ApiCaptureConfig::default());
-        excluded.record_request(&event, None);
+        excluded.record_request(&event, None).await;
         complete_successful_request(
             &mut excluded,
             &request_id,
@@ -1886,7 +1901,7 @@ mod tests {
             include_document_requests: true,
             ..ApiCaptureConfig::default()
         });
-        included.record_request(&event, None);
+        included.record_request(&event, None).await;
         complete_successful_request(
             &mut included,
             &request_id,
@@ -1899,8 +1914,8 @@ mod tests {
         assert_eq!(included_catalog.endpoints.len(), 1);
     }
 
-    #[test]
-    fn max_examples_per_endpoint_is_capped() {
+    #[tokio::test]
+    async fn max_examples_per_endpoint_is_capped() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig {
             max_examples_per_endpoint: 1,
             ..ApiCaptureConfig::default()
@@ -1920,8 +1935,8 @@ mod tests {
         let req_id_a = event_a.request_id.clone();
         let req_id_b = event_b.request_id.clone();
 
-        recorder.record_request(&event_a, None);
-        recorder.record_request(&event_b, None);
+        recorder.record_request(&event_a, None).await;
+        recorder.record_request(&event_b, None).await;
         complete_successful_request(
             &mut recorder,
             &req_id_a,
@@ -1942,8 +1957,8 @@ mod tests {
         assert_eq!(catalog.endpoints[0].examples.len(), 1);
     }
 
-    #[test]
-    fn repeated_query_params_are_preserved_and_marked_repeated() {
+    #[tokio::test]
+    async fn repeated_query_params_are_preserved_and_marked_repeated() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
         let event = request_event(
             "https://api.example.com/search?q=milk&filter=fresh&filter=organic",
@@ -1953,7 +1968,7 @@ mod tests {
         );
         let request_id = event.request_id.clone();
 
-        recorder.record_request(&event, None);
+        recorder.record_request(&event, None).await;
         complete_successful_request(
             &mut recorder,
             &request_id,
@@ -1978,8 +1993,8 @@ mod tests {
         assert!(endpoint.examples[0].redacted_url.contains("filter=organic"));
     }
 
-    #[test]
-    fn out_of_order_events_are_reconciled() {
+    #[tokio::test]
+    async fn out_of_order_events_are_reconciled() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
         let event = request_event(
             "https://api.example.com/search?q=milk",
@@ -1996,7 +2011,7 @@ mod tests {
             200,
         ));
         recorder.apply_loading_finished(&request_id);
-        recorder.record_request(&event, None);
+        recorder.record_request(&event, None).await;
 
         let catalog = recorder.build_catalog();
         assert_eq!(catalog.summary.captured_requests, 1);
@@ -2008,8 +2023,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fallback_request_body_infers_graphql_operation() {
+    #[tokio::test]
+    async fn fallback_request_body_infers_graphql_operation() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
         let mut event = request_event("https://api.example.com/graphql", "POST", "Fetch", None);
         event.request.has_post_data = Some(true);
@@ -2024,7 +2039,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("json body should serialize: {error}")),
         );
 
-        recorder.record_request(&event, Some(fallback_body));
+        recorder.record_request(&event, Some(fallback_body)).await;
         complete_successful_request(
             &mut recorder,
             &request_id,
@@ -2046,35 +2061,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn allowed_hosts_filter_capture() {
+    #[tokio::test]
+    async fn allowed_hosts_filter_capture() {
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig {
             allowed_hosts: vec!["api.example.com".to_string()],
             ..ApiCaptureConfig::default()
         });
-        recorder.record_request(
-            &request_event(
-                "https://api.example.com/search?q=milk",
-                "GET",
-                "Fetch",
+        recorder
+            .record_request(
+                &request_event(
+                    "https://api.example.com/search?q=milk",
+                    "GET",
+                    "Fetch",
+                    None,
+                ),
                 None,
-            ),
-            None,
-        );
-        recorder.record_request(
-            &request_event(
-                "https://cdn.example.net/search?q=milk",
-                "GET",
-                "Fetch",
+            )
+            .await;
+        recorder
+            .record_request(
+                &request_event(
+                    "https://cdn.example.net/search?q=milk",
+                    "GET",
+                    "Fetch",
+                    None,
+                ),
                 None,
-            ),
-            None,
-        );
+            )
+            .await;
         recorder.finish();
 
         let catalog = recorder.build_catalog();
         assert_eq!(catalog.summary.captured_requests, 1);
         assert_eq!(catalog.summary.hosts, vec!["https://api.example.com"]);
+    }
+
+    #[tokio::test]
+    async fn non_public_targets_are_excluded_from_capture() {
+        let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig {
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            ..ApiCaptureConfig::default()
+        });
+        recorder
+            .record_request(
+                &request_event("http://127.0.0.1/admin", "GET", "Fetch", None),
+                None,
+            )
+            .await;
+        recorder.finish();
+
+        let catalog = recorder.build_catalog();
+        assert_eq!(catalog.summary.captured_requests, 0);
+        assert!(catalog.endpoints.is_empty());
     }
 
     #[test]
