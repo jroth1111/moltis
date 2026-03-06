@@ -91,9 +91,66 @@ with sync_playwright() as p:
     interception_enabled = False
     interception_patterns = []
     interception_extra_headers = {}
+    pending_local_storage = {}
+    pending_session_storage = {}
 
     def current_page():
         return tabs[active_tab]
+
+    def _canonical_origin(value):
+        try:
+            parsed = urlparse(value or "")
+        except Exception:
+            return None
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return None
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+    def _normalize_storage_map(raw):
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(key): "" if value is None else str(value)
+            for key, value in raw.items()
+            if key is not None
+        }
+
+    def _queue_state_restore(state):
+        pending_local_storage.clear()
+        pending_session_storage.clear()
+        storage_entries = (state or {}).get("storage") or []
+        for entry in storage_entries:
+            origin = _canonical_origin((entry or {}).get("origin"))
+            if not origin:
+                continue
+            local_items = _normalize_storage_map((entry or {}).get("local"))
+            session_items = _normalize_storage_map((entry or {}).get("session"))
+            if local_items:
+                pending_local_storage.setdefault(origin, {}).update(local_items)
+            if session_items:
+                pending_session_storage.setdefault(origin, {}).update(session_items)
+
+    def _apply_pending_storage(page):
+        origin = _canonical_origin(getattr(page, "url", ""))
+        if not origin:
+            return False
+        local_items = pending_local_storage.pop(origin, None) or {}
+        session_items = pending_session_storage.pop(origin, None) or {}
+        if not local_items and not session_items:
+            return False
+        page.evaluate(
+            """([localItems, sessionItems]) => {
+                for (const [key, value] of Object.entries(localItems || {})) {
+                    try { window.localStorage.setItem(key, value ?? ""); } catch (_) {}
+                }
+                for (const [key, value] of Object.entries(sessionItems || {})) {
+                    try { window.sessionStorage.setItem(key, value ?? ""); } catch (_) {}
+                }
+            }""",
+            [local_items, session_items],
+        )
+        return True
 
     def _normalize_allowed_host(host):
         return (host or "").strip().strip(".").lower()
@@ -229,6 +286,8 @@ with sync_playwright() as p:
 
             if cmd == "goto":
                 current_page().goto(req["url"], wait_until="domcontentloaded", timeout=45000)
+                if _apply_pending_storage(current_page()):
+                    current_page().reload(wait_until="domcontentloaded", timeout=45000)
                 _result(request_id)
             elif cmd == "capture_page":
                 page = current_page()
@@ -263,6 +322,36 @@ with sync_playwright() as p:
             elif cmd == "screenshot":
                 data = current_page().screenshot(full_page=bool(req.get("full_page")))
                 _result(request_id, {"data_base64": base64.b64encode(data).decode("ascii")})
+            elif cmd == "restore_state":
+                state = req.get("state") or {}
+                cookies = []
+                for cookie in state.get("cookies") or []:
+                    item = {
+                        "name": str(cookie.get("name", "")),
+                        "value": str(cookie.get("value", "")),
+                        "path": str(cookie.get("path", "/") or "/"),
+                        "secure": bool(cookie.get("secure", False)),
+                        "httpOnly": bool(cookie.get("http_only", False)),
+                    }
+                    domain = str(cookie.get("domain", "") or "")
+                    if domain:
+                        item["domain"] = domain
+                    else:
+                        url = str(state.get("url", "") or "")
+                        if url:
+                            item["url"] = url
+                    expires = cookie.get("expires")
+                    if isinstance(expires, (int, float)) and expires > 0:
+                        item["expires"] = float(expires)
+                    if item.get("name") and item.get("value") and (item.get("domain") or item.get("url")):
+                        cookies.append(item)
+                if cookies:
+                    context.add_cookies(cookies)
+                _queue_state_restore(state)
+                _result(request_id, {
+                    "cookies": len(cookies),
+                    "origins": len(pending_local_storage) + len(pending_session_storage),
+                })
             elif cmd == "wait_selector":
                 try:
                     current_page().locator(req["selector"]).wait_for(

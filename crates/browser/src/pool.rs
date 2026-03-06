@@ -126,6 +126,7 @@ struct PatchrightApiCaptureState {
 pub(crate) struct SessionTransferState {
     interception: Option<crate::network::InterceptionSnapshot>,
     api_capture: Option<crate::api_capture::ApiCaptureSnapshot>,
+    session_state: Option<crate::session_state::SessionState>,
 }
 
 /// Pool of browser instances for reuse.
@@ -747,6 +748,7 @@ impl BrowserPool {
         SessionTransferState {
             interception: self.take_interception_snapshot(session_id).await,
             api_capture: self.take_api_capture_snapshot(session_id).await,
+            session_state: self.capture_transfer_session_state(session_id).await,
         }
     }
 
@@ -756,12 +758,32 @@ impl BrowserPool {
         transfer_state: SessionTransferState,
     ) -> Result<(), Error> {
         if let Some(snapshot) = transfer_state.interception {
-            self.restore_interception_snapshot(session_id, snapshot).await?;
+            self.restore_interception_snapshot(session_id, snapshot)
+                .await?;
         }
         if let Some(snapshot) = transfer_state.api_capture {
-            self.restore_api_capture_snapshot(session_id, snapshot).await?;
+            self.restore_api_capture_snapshot(session_id, snapshot)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn capture_transfer_session_state(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::session_state::SessionState> {
+        let page = self.get_active_page(session_id).await.ok()?;
+        match crate::session_state::capture_state(&page).await {
+            Ok(state) => Some(state),
+            Err(error) => {
+                warn!(
+                    session_id,
+                    error = %error,
+                    "failed to capture browser session state for backend handoff"
+                );
+                None
+            },
+        }
     }
 
     async fn apply_transfer_state_to_patchright(
@@ -772,7 +794,18 @@ impl BrowserPool {
         let SessionTransferState {
             interception,
             api_capture,
+            session_state,
         } = transfer_state;
+        if let Some(snapshot) = session_state.clone()
+            && let Err(error) = instance.session.restore_state(&snapshot).await
+        {
+            return Err((error, SessionTransferState {
+                interception,
+                api_capture,
+                session_state: Some(snapshot),
+            }));
+        }
+
         if let Some(snapshot) = interception {
             let crate::network::InterceptionSnapshot {
                 enabled,
@@ -785,17 +818,15 @@ impl BrowserPool {
                     .enable_interception(url_patterns.clone(), extra_headers.clone())
                     .await
             {
-                return Err((
-                    error,
-                    SessionTransferState {
-                        interception: Some(crate::network::InterceptionSnapshot {
-                            enabled,
-                            url_patterns,
-                            extra_headers,
-                        }),
-                        api_capture,
-                    },
-                ));
+                return Err((error, SessionTransferState {
+                    interception: Some(crate::network::InterceptionSnapshot {
+                        enabled,
+                        url_patterns,
+                        extra_headers,
+                    }),
+                    api_capture,
+                    session_state: None,
+                }));
             }
             instance.interception.enabled = enabled;
             instance.interception.url_patterns = url_patterns;
@@ -806,13 +837,11 @@ impl BrowserPool {
 
         if let Some(snapshot) = api_capture {
             if let Err(error) = instance.session.start_api_capture(&snapshot.config).await {
-                return Err((
-                    error,
-                    SessionTransferState {
-                        interception: None,
-                        api_capture: Some(snapshot),
-                    },
-                ));
+                return Err((error, SessionTransferState {
+                    interception: None,
+                    api_capture: Some(snapshot),
+                    session_state: None,
+                }));
             }
             instance.api_capture = Some(PatchrightApiCaptureState {
                 handle: snapshot.handle,
@@ -2800,6 +2829,67 @@ self.addEventListener('fetch', event => {
                 && request.auth.as_deref() == Some("Bearer patchright-token")
         }));
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replace_with_patchright_restores_browser_session_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let (addr, _state, server) = start_practical_server().await?;
+        let (pool, _profile_dir) = live_test_pool();
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("http://{addr}/page1")).await?;
+            wait_for_page_done(&page).await?;
+            page.evaluate(
+                r#"
+                    (() => {
+                        localStorage.setItem('handoff-theme', 'dark');
+                        sessionStorage.setItem('handoff-auth', 'ready');
+                        document.cookie = 'handoff=yes; path=/';
+                    })()
+                "#,
+            )
+            .await?;
+
+            pool.replace_with_patchright(&sid).await?;
+            let instance = pool.get_patchright_session(&sid).await?;
+            let mut inst = instance.lock().await;
+            inst.session.goto(&format!("http://{addr}/page1")).await?;
+            assert!(
+                inst.session
+                    .wait_selector("body[data-done='true']", 10_000)
+                    .await?
+            );
+            let local = inst
+                .session
+                .evaluate("localStorage.getItem('handoff-theme')")
+                .await?;
+            let session = inst
+                .session
+                .evaluate("sessionStorage.getItem('handoff-auth')")
+                .await?;
+            let cookie = inst
+                .session
+                .evaluate("document.cookie.includes('handoff=yes')")
+                .await?;
+            inst.session.close().await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((local, session, cookie))
+        }
+        .await;
+
+        server.abort();
+
+        let (local, session, cookie) = outcome?;
+        assert_eq!(local.as_str(), Some("dark"));
+        assert_eq!(session.as_str(), Some("ready"));
+        assert_eq!(cookie, Value::Bool(true));
         Ok(())
     }
 

@@ -10,7 +10,10 @@ use {
     },
 };
 
-use crate::{error::Error, protection::PatchrightLaunchProfile, types::ProtectionConfig};
+use crate::{
+    error::Error, protection::PatchrightLaunchProfile, session_state::SessionState,
+    types::ProtectionConfig,
+};
 
 #[derive(Debug, Clone)]
 pub struct PatchrightPageCapture {
@@ -47,6 +50,10 @@ enum PatchrightRequest {
     Screenshot {
         id: u64,
         full_page: bool,
+    },
+    RestoreState {
+        id: u64,
+        state: SessionState,
     },
     WaitSelector {
         id: u64,
@@ -256,6 +263,7 @@ impl PatchrightSession {
             | PatchrightRequest::CapturePage { id }
             | PatchrightRequest::Evaluate { id, .. }
             | PatchrightRequest::Screenshot { id, .. }
+            | PatchrightRequest::RestoreState { id, .. }
             | PatchrightRequest::WaitSelector { id, .. }
             | PatchrightRequest::MouseMove { id, .. }
             | PatchrightRequest::MouseClick { id, .. }
@@ -396,6 +404,16 @@ impl PatchrightSession {
             .and_then(Value::as_str)
             .map(ToString::to_string)
             .ok_or_else(|| Error::ScreenshotFailed("patchright screenshot missing data".into()))
+    }
+
+    pub async fn restore_state(&mut self, state: &SessionState) -> Result<(), Error> {
+        let id = self.next_id();
+        self.send(PatchrightRequest::RestoreState {
+            id,
+            state: state.clone(),
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn wait_selector(&mut self, selector: &str, timeout_ms: u64) -> Result<bool, Error> {
@@ -666,22 +684,31 @@ mod tests {
         sync::{Arc, OnceLock},
     };
 
-    use axum::{
-        Json, Router,
-        extract::State,
-        response::Html,
-        routing::{get, post},
-    };
-    use serde_json::json;
-    use tokio::{
-        net::TcpListener,
-        sync::{Mutex, MutexGuard},
-        task::JoinHandle,
-        time::{Duration, sleep},
+    use {
+        axum::{
+            Json, Router,
+            extract::State,
+            response::Html,
+            routing::{get, post},
+        },
+        serde_json::json,
+        tokio::{
+            net::TcpListener,
+            sync::{Mutex, MutexGuard},
+            task::JoinHandle,
+            time::{Duration, sleep},
+        },
     };
 
-    use super::*;
-    use crate::{api_capture::ApiCaptureConfig, protection::build_patchright_launch_profile_for_browser, types::BrowserConfig};
+    use {
+        super::*,
+        crate::{
+            api_capture::ApiCaptureConfig,
+            protection::build_patchright_launch_profile_for_browser,
+            session_state::{CookieEntry, SessionState, StorageEntry},
+            types::BrowserConfig,
+        },
+    };
 
     #[derive(Clone, Default)]
     struct WorkerTestState {
@@ -839,14 +866,77 @@ mod tests {
         assert!(records.iter().any(|record| {
             record.url.contains("/api/search")
                 && record.request_headers.iter().any(|(name, value)| {
-                    name.eq_ignore_ascii_case("authorization")
-                        && value == "Bearer patched-token"
+                    name.eq_ignore_ascii_case("authorization") && value == "Bearer patched-token"
                 })
         }));
         assert!(state.auth_headers.lock().unwrap().iter().any(|value| {
             value.as_deref() == Some("Bearer patched-token")
         }));
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patchright_session_restores_state_before_navigation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = acquire_live_browser_test_guard().await;
+        let (origin, _state, server) = start_worker_server().await?;
+        let config = test_browser_config();
+        let profile = build_patchright_launch_profile_for_browser(&config, None);
+        let mut session = PatchrightSession::start(&config.protection, &profile).await?;
+
+        session
+            .restore_state(&SessionState {
+                version: 1,
+                captured_at: "2026-03-06T00:00:00Z".to_string(),
+                url: format!("{origin}/page"),
+                cookies: vec![CookieEntry {
+                    name: "handoff".to_string(),
+                    value: "yes".to_string(),
+                    domain: "127.0.0.1".to_string(),
+                    path: "/".to_string(),
+                    secure: false,
+                    http_only: false,
+                    same_site: None,
+                    expires: 0.0,
+                }],
+                storage: vec![StorageEntry {
+                    origin: origin.clone(),
+                    local: HashMap::from([("theme".to_string(), "dark".to_string())]),
+                    session: HashMap::from([("auth".to_string(), "ready".to_string())]),
+                }],
+            })
+            .await?;
+
+        session.goto(&format!("{origin}/page")).await?;
+        assert!(
+            session
+                .wait_selector("body[data-ready='true']", 10_000)
+                .await?
+        );
+        assert_eq!(
+            session
+                .evaluate("localStorage.getItem('theme')")
+                .await?
+                .as_str(),
+            Some("dark")
+        );
+        assert_eq!(
+            session
+                .evaluate("sessionStorage.getItem('auth')")
+                .await?
+                .as_str(),
+            Some("ready")
+        );
+        assert_eq!(
+            session
+                .evaluate("document.cookie.includes('handoff=yes')")
+                .await?,
+            Value::Bool(true)
+        );
+
+        session.close().await?;
+        server.abort();
         Ok(())
     }
 }
