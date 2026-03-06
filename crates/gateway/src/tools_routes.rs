@@ -356,8 +356,8 @@ fn validate_config(config: &moltis_config::MoltisConfig) -> Vec<String> {
 
         if config.tools.browser.allowed_domains.is_empty() {
             warnings.push(
-                "No allowed_domains set for browser. All domains are accessible. \
-                 Consider restricting to trusted domains for security."
+                "No allowed_domains set for browser. Any public domain is accessible, \
+                 but localhost/private targets remain blocked. Consider restricting to trusted domains for security."
                     .to_string(),
             );
         }

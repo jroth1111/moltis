@@ -2029,7 +2029,8 @@ pub struct BrowserConfig {
     /// Sandbox mode is controlled per-session via the request, not globally.
     #[serde(default = "default_sandbox_image")]
     pub sandbox_image: String,
-    /// Allowed domains for navigation. Empty list means all domains allowed.
+    /// Allowed domains for navigation. Empty list means any public domain allowed.
+    /// Non-public hosts are still blocked by browser safety checks.
     /// When set, the browser will refuse to navigate to non-matching domains.
     /// Supports wildcards: "*.example.com" matches subdomains.
     #[serde(default)]

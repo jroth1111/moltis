@@ -1096,9 +1096,10 @@ impl From<&moltis_config::schema::BrowserConfig> for BrowserConfig {
 
 /// Check if a URL is allowed based on the allowed domains list.
 /// Returns true if allowed, false if blocked.
+/// Host-level browser safety checks still reject non-public targets.
 pub fn is_domain_allowed(url: &str, allowed_domains: &[String]) -> bool {
     if allowed_domains.is_empty() {
-        return true; // No restrictions
+        return true; // No allowlist restrictions
     }
 
     let Ok(parsed) = url::Url::parse(url) else {
@@ -1130,7 +1131,7 @@ mod tests {
 
     #[test]
     fn test_domain_allowed_empty_list() {
-        // Empty allowed_domains means all domains are allowed
+        // Empty allowed_domains removes allowlist restrictions for matching public domains.
         assert!(is_domain_allowed("https://example.com", &[]));
         assert!(is_domain_allowed("https://evil.com", &[]));
     }

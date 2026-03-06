@@ -456,14 +456,12 @@ sandbox = false                   # Run browser in Docker/Apple Container for is
 # Domain restrictions for security.
 # When set, browser will refuse to navigate to domains not in this list.
 # This helps prevent prompt injection from untrusted websites.
-allowed_domains = []              # Empty = all domains allowed
+allowed_domains = []              # Empty = any public domain allowed; non-public hosts stay blocked
 # For autonomous browser runs (cron/dispatch). Empty + empty allowed_domains = block autonomous navigation.
 autonomous_allowed_domains = []
 # allowed_domains = [
 #     "docs.example.com",         # Exact match
 #     "*.github.com",             # Wildcard: matches any subdomain of github.com
-#     "localhost",                # Allow localhost
-#     "127.0.0.1",
 # ]
 
 # ══════════════════════════════════════════════════════════════════════════════
