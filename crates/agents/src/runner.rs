@@ -2932,6 +2932,76 @@ mod tests {
         }
     }
 
+    struct MediumConfidenceReadOnlyBrowserProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MediumConfidenceReadOnlyBrowserProvider {
+        fn name(&self) -> &str {
+            "mock-medium-confidence-read-only"
+        }
+
+        fn id(&self) -> &str {
+            "mock-medium-confidence-read-only"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let call_count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_count == 0 {
+                Ok(CompletionResponse {
+                    text: Some("I should inspect the page first".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_medium_read_only".into(),
+                        name: "browser".into(),
+                        arguments: serde_json::json!({
+                            "action": "navigate",
+                            "url": "https://example.com"
+                        }),
+                    }],
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    },
+                    confidence: Some(ConfidenceMetrics {
+                        score: Some(0.5),
+                        logprobs: None,
+                        uncertainty_reason: Some("starting with page inspection".into()),
+                    }),
+                })
+            } else {
+                Ok(CompletionResponse {
+                    text: Some("Navigation complete".into()),
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                        ..Default::default()
+                    },
+                    confidence: None,
+                })
+            }
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
     struct ToolThenLowConfidenceAnswerProvider {
         call_count: std::sync::atomic::AtomicUsize,
     }
@@ -3238,6 +3308,43 @@ mod tests {
         assert_eq!(result.tool_calls_made, 0);
         assert!(
             !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::ToolCallStart { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_medium_confidence_allows_read_only_browser_navigation() {
+        let provider = Arc::new(MediumConfidenceReadOnlyBrowserProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(BrowserLikeTool));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Navigate to the page and inspect it"),
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Navigation complete");
+        assert_eq!(result.tool_calls_made, 1);
+        assert!(
+            events
                 .lock()
                 .unwrap()
                 .iter()
