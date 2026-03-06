@@ -163,7 +163,7 @@ tokio-stream = "0.1"
 tokio-test   = "0.4"
 tokio-util   = "0.7"
 # Config formats
-serde_yaml        = "0.9"
+serde_yaml        = { package = "serde_yml", version = "0.0.12" }
 tokio-tungstenite = "0.26"
 toml              = "0.8"
 toml_edit         = "0.22"
