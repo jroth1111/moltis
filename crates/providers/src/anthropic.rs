@@ -285,7 +285,7 @@ impl LlmProvider for AnthropicProvider {
             text,
             tool_calls,
             usage,
-        ..Default::default()
+            ..Default::default()
         })
     }
 

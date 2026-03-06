@@ -2067,8 +2067,10 @@ pub async fn prepare_gateway(
                                 if let Some(push_service) = state.get_push_service().await {
                                     let summary = {
                                         let max_chars = 120;
-                                        let mut truncated =
-                                            delivery_text.chars().take(max_chars).collect::<String>();
+                                        let mut truncated = delivery_text
+                                            .chars()
+                                            .take(max_chars)
+                                            .collect::<String>();
                                         if delivery_text.chars().count() > max_chars {
                                             truncated.push('…');
                                         }
@@ -2184,8 +2186,11 @@ pub async fn prepare_gateway(
                     .as_deref()
                     .map(serde_json::from_str::<moltis_tasks::TaskPrincipal>)
                     .transpose()
-                    .map_err(|e| moltis_cron::Error::message(format!("invalid principal_json: {e}")))?;
-                let resolved_list_id = if req.list_id.trim().is_empty() || req.list_id == "default" {
+                    .map_err(|e| {
+                        moltis_cron::Error::message(format!("invalid principal_json: {e}"))
+                    })?;
+                let resolved_list_id = if req.list_id.trim().is_empty() || req.list_id == "default"
+                {
                     principal
                         .as_ref()
                         .map(moltis_tasks::TaskPrincipal::canonical_list_id)

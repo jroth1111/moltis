@@ -148,9 +148,14 @@ impl ReadFileTool {
         Ok(bytes)
     }
 
-    async fn read_bytes_for_session(&self, session_key: &str, path: &str) -> crate::Result<Vec<u8>> {
+    async fn read_bytes_for_session(
+        &self,
+        session_key: &str,
+        path: &str,
+    ) -> crate::Result<Vec<u8>> {
         if let Some(ref router) = self.sandbox_router {
-            let has_container_backend = !matches!(router.backend_name(), "none" | "restricted-host");
+            let has_container_backend =
+                !matches!(router.backend_name(), "none" | "restricted-host");
             if has_container_backend && router.is_sandboxed(session_key).await {
                 return Self::read_sandbox_bytes(router, session_key, path).await;
             }
@@ -251,7 +256,10 @@ mod tests {
     #[tokio::test]
     async fn read_file_rejects_parent_traversal() {
         let tool = ReadFileTool::new();
-        let err = tool.execute(json!({"path": "../secret.txt"})).await.unwrap_err();
+        let err = tool
+            .execute(json!({"path": "../secret.txt"}))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("path traversal"));
     }
 

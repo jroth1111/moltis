@@ -207,7 +207,10 @@ impl ToolRegistry {
     #[must_use]
     pub fn side_effect_class(&self, name: &str) -> Option<ToolEffectClass> {
         let entry = self.tools.get(name)?;
-        if matches!(entry.source, ToolSource::Mcp { .. } | ToolSource::Wasm { .. }) {
+        if matches!(
+            entry.source,
+            ToolSource::Mcp { .. } | ToolSource::Wasm { .. }
+        ) {
             // Fail closed for externally supplied tool definitions.
             return Some(ToolEffectClass::ExternalEffect);
         }

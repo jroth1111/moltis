@@ -879,7 +879,9 @@ fn prepare_soul_sections(soul_text: &str) -> Result<PreparedSoulSections, SoulRo
         {
             diagnostics.push(
                 SoulRoutingIssueCode::DuplicateSoulSection,
-                format!("duplicate SOUL section placement for heading '{heading_key}' across lanes"),
+                format!(
+                    "duplicate SOUL section placement for heading '{heading_key}' across lanes"
+                ),
             );
         } else {
             let _ = seen_heading_lanes.insert(heading_key.clone(), section.lane);
@@ -1380,15 +1382,28 @@ fn slugify_heading(heading: &str) -> String {
 
 fn classify_priority_bucket(heading: &str) -> PriorityBucket {
     let key = heading.to_ascii_lowercase();
-    if ["security", "boundary", "risk", "privacy", "safety", "non-negotiable"]
-        .iter()
-        .any(|needle| key.contains(needle))
+    if [
+        "security",
+        "boundary",
+        "risk",
+        "privacy",
+        "safety",
+        "non-negotiable",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
     {
         return PriorityBucket::SafetyBoundaries;
     }
-    if ["identity", "constitutional", "role", "conflict", "precedence"]
-        .iter()
-        .any(|needle| key.contains(needle))
+    if [
+        "identity",
+        "constitutional",
+        "role",
+        "conflict",
+        "precedence",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
     {
         return PriorityBucket::IdentityConstraints;
     }
@@ -1435,11 +1450,7 @@ fn split_markdown_sections(text: &str) -> Option<Vec<MarkdownSection>> {
                 });
                 current.clear();
             }
-            current_heading = line
-                .trim()
-                .trim_start_matches("##")
-                .trim()
-                .to_string();
+            current_heading = line.trim().trim_start_matches("##").trim().to_string();
         }
         current.push(line.to_string());
     }
@@ -1764,7 +1775,9 @@ pub fn collect_dropped_prompt_sections(
             markdown_dropped.push(DroppedPromptSection {
                 section: section_name.to_string(),
                 section_id: format!("{section_name}-overflow"),
-                bucket: default_bucket_for_section(section_name).as_str().to_string(),
+                bucket: default_bucket_for_section(section_name)
+                    .as_str()
+                    .to_string(),
                 reason: "budget_exceeded".to_string(),
                 original_chars,
                 max_chars,
@@ -1912,21 +1925,23 @@ mod tests {
         runtime_context: Option<&PromptRuntimeContext>,
         memory_text: Option<&str>,
     ) -> String {
-        must_render(super::build_system_prompt_with_session_runtime_workspace_budgets(
-            tools,
-            native_tools,
-            project_context,
-            skills,
-            identity,
-            user,
-            soul_text,
-            agents_text,
-            tools_text,
-            heartbeat_text,
-            prompt_budgets,
-            runtime_context,
-            memory_text,
-        ))
+        must_render(
+            super::build_system_prompt_with_session_runtime_workspace_budgets(
+                tools,
+                native_tools,
+                project_context,
+                skills,
+                identity,
+                user,
+                soul_text,
+                agents_text,
+                tools_text,
+                heartbeat_text,
+                prompt_budgets,
+                runtime_context,
+                memory_text,
+            ),
+        )
     }
 
     fn build_system_prompt_minimal_runtime(
@@ -2989,8 +3004,14 @@ No fluff.
             let prepared = prepare_soul_sections(&soul);
             let combined = [
                 prepared.identity_soul_text.as_str(),
-                prepared.redistributed_agents_text.as_deref().unwrap_or_default(),
-                prepared.redistributed_tools_text.as_deref().unwrap_or_default(),
+                prepared
+                    .redistributed_agents_text
+                    .as_deref()
+                    .unwrap_or_default(),
+                prepared
+                    .redistributed_tools_text
+                    .as_deref()
+                    .unwrap_or_default(),
                 prepared
                     .redistributed_heartbeat_text
                     .as_deref()

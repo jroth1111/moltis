@@ -62,7 +62,7 @@ fn canonical_allowed_roots() -> Vec<PathBuf> {
             roots.push(cwd.clone());
         }
         if let Ok(canonical_cwd) = std::fs::canonicalize(cwd)
-        && !roots.contains(&canonical_cwd)
+            && !roots.contains(&canonical_cwd)
         {
             roots.push(canonical_cwd);
         }
@@ -271,7 +271,11 @@ mod tests {
     #[test]
     fn is_memory_scoped_sandbox_path_matches_memory_targets() {
         assert!(is_memory_scoped_sandbox_path("/home/sandbox/MEMORY.md"));
-        assert!(is_memory_scoped_sandbox_path("/home/sandbox/memory/notes.md"));
-        assert!(!is_memory_scoped_sandbox_path("/home/sandbox/docs/notes.md"));
+        assert!(is_memory_scoped_sandbox_path(
+            "/home/sandbox/memory/notes.md"
+        ));
+        assert!(!is_memory_scoped_sandbox_path(
+            "/home/sandbox/docs/notes.md"
+        ));
     }
 }

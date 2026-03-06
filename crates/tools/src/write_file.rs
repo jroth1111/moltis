@@ -99,12 +99,8 @@ impl WriteFileTool {
 
         match decision {
             ApprovalDecision::Approved => Ok(()),
-            ApprovalDecision::Denied => {
-                Err(Error::message("write_file denied by user"))
-            },
-            ApprovalDecision::Timeout => {
-                Err(Error::message("write_file approval timed out"))
-            },
+            ApprovalDecision::Denied => Err(Error::message("write_file denied by user")),
+            ApprovalDecision::Timeout => Err(Error::message("write_file approval timed out")),
         }
     }
 
@@ -156,7 +152,11 @@ impl WriteFileTool {
         backend.ensure_ready(&sandbox_id, Some(&image)).await?;
 
         let encoded = BASE64.encode(content.as_bytes());
-        let redirection = if append { ">>" } else { ">" };
+        let redirection = if append {
+            ">>"
+        } else {
+            ">"
+        };
         let quoted_path = shell_single_quote(&logical_path);
         let quoted_payload = shell_single_quote(&encoded);
         let command = format!(
@@ -254,7 +254,8 @@ impl AgentTool for WriteFileTool {
             .unwrap_or("main");
 
         if let Some(ref router) = self.sandbox_router {
-            let has_container_backend = !matches!(router.backend_name(), "none" | "restricted-host");
+            let has_container_backend =
+                !matches!(router.backend_name(), "none" | "restricted-host");
             if has_container_backend && router.is_sandboxed(session_key).await {
                 let sandbox_path = normalize_sandbox_path(path)?;
                 if !is_memory_scoped_sandbox_path(&sandbox_path) {

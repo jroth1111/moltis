@@ -200,7 +200,6 @@ impl AgentTool for SendImageTool {
         &["files"]
     }
 
-
     fn description(&self) -> &str {
         "Send a local image file to the current conversation's channel (e.g. Telegram). \
          Supported formats: PNG, JPEG, GIF, WebP, PPM. Maximum size: 20 MB."

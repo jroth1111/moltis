@@ -402,7 +402,10 @@ mod tests {
         let approval = policy.requires_approval("exec");
         assert!(approval.is_some());
         assert_eq!(approval.unwrap().tool, "exec");
-        assert_eq!(approval.unwrap().description, Some("Exec commands need approval".into()));
+        assert_eq!(
+            approval.unwrap().description,
+            Some("Exec commands need approval".into())
+        );
     }
 
     #[test]
@@ -470,6 +473,9 @@ mod tests {
         assert!(policy.is_allowed("exec"));
         let approval = policy.requires_approval("exec");
         assert!(approval.is_some());
-        assert_eq!(approval.unwrap().description, Some("Shell commands need approval".into()));
+        assert_eq!(
+            approval.unwrap().description,
+            Some("Shell commands need approval".into())
+        );
     }
 }

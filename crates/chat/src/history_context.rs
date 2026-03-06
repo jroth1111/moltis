@@ -21,7 +21,9 @@ fn tool_result_to_tool_message(value: &Value, max_content_chars: Option<usize>) 
         .unwrap_or("")
         .to_string();
     let mut content = tool_result_content(value);
-    if let Some(max_chars) = max_content_chars && content.len() > max_chars {
+    if let Some(max_chars) = max_content_chars
+        && content.len() > max_chars
+    {
         content = format!(
             "{}\n\n... [truncated — {} bytes total]",
             truncate_at_char_boundary(&content, max_chars),
@@ -52,7 +54,10 @@ pub(crate) fn normalize_for_context_view(history: Vec<Value>) -> Vec<Value> {
 /// Rebuild persisted history into model-consumable context while preserving
 /// tool call/result continuity. Only tool results that match an assistant
 /// tool call ID in the same history are retained.
-pub(crate) fn normalize_for_model_context(history: &[Value], max_tool_content_chars: usize) -> Vec<Value> {
+pub(crate) fn normalize_for_model_context(
+    history: &[Value],
+    max_tool_content_chars: usize,
+) -> Vec<Value> {
     let valid_tool_call_ids: std::collections::HashSet<String> = history
         .iter()
         .filter_map(|msg| msg.get("tool_calls").and_then(Value::as_array))

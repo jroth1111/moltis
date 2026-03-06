@@ -440,7 +440,6 @@ impl AgentTool for SpawnAgentTool {
         &["orchestration"]
     }
 
-
     fn description(&self) -> &str {
         "Spawn a sub-agent to handle a complex, multi-step task autonomously. \
          The sub-agent runs its own agent loop with access to tools and returns \

@@ -163,7 +163,10 @@ mod tests {
         });
 
         assert!(m.set_skill_status("a/b", "s1", SkillStatus::Trusted));
-        assert_eq!(m.find_repo("a/b").unwrap().skills[0].status, SkillStatus::Trusted);
+        assert_eq!(
+            m.find_repo("a/b").unwrap().skills[0].status,
+            SkillStatus::Trusted
+        );
         assert!(!m.set_skill_status("a/b", "missing", SkillStatus::Trusted));
     }
 

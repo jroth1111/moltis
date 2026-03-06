@@ -8,9 +8,9 @@
 
 use std::collections::HashSet;
 
-use moltis_agents::tool_registry::{ToolRegistry, ToolSource};
 #[cfg(test)]
 use crate::tool_names::WEB_FETCH;
+use moltis_agents::tool_registry::{ToolRegistry, ToolSource};
 /// Static keyword→category mapping. Each entry maps a lowercase keyword
 /// (or phrase) to the tool categories it implies.
 const KEYWORD_CATEGORIES: &[(&str, &[&str])] = &[

@@ -184,7 +184,10 @@ impl ChatRuntime for GatewayChatRuntime {
             if let Some(sk) = session_key
                 && self.state.has_active_session(sk).await
             {
-                tracing::debug!(session_key = sk, "skipping push notification for active session");
+                tracing::debug!(
+                    session_key = sk,
+                    "skipping push notification for active session"
+                );
                 return Ok(0);
             }
             if let Some(push_service) = self.state.get_push_service().await {

@@ -239,7 +239,6 @@ impl AgentTool for SessionsSendTool {
         &["session"]
     }
 
-
     fn description(&self) -> &str {
         "Send a message to another session. Optionally wait for the target session's reply."
     }

@@ -268,7 +268,6 @@ impl AgentTool for ExecTool {
         &["code", "files"]
     }
 
-
     fn description(&self) -> &str {
         "Execute a shell command on the server. Returns stdout, stderr, and exit code."
     }
@@ -985,7 +984,10 @@ mod tests {
             }))
             .await;
 
-        assert!(result.is_ok(), "approval should be skipped for container backends");
+        assert!(
+            result.is_ok(),
+            "approval should be skipped for container backends"
+        );
         assert!(!bc.called.load(Ordering::SeqCst));
     }
 

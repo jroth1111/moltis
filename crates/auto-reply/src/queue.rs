@@ -90,5 +90,4 @@ mod tests {
             "Background must outrank Maintenance"
         );
     }
-
 }

@@ -80,7 +80,6 @@ impl AgentTool for SessionsCreateTool {
         &["session"]
     }
 
-
     fn description(&self) -> &str {
         "Create a new chat session or resolve an existing one. \
          Optionally set label/model/project and inherit agent persona from another session."
@@ -153,7 +152,6 @@ impl AgentTool for SessionsDeleteTool {
     fn categories(&self) -> &'static [&'static str] {
         &["session", "destructive"]
     }
-
 
     fn description(&self) -> &str {
         "Delete a chat session and its history by key. \

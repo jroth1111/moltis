@@ -5,10 +5,10 @@ use std::path::PathBuf;
 
 #[cfg(feature = "wasm")]
 use crate::Result;
-#[cfg(feature = "wasm")]
-use crate::tool_names::WEB_FETCH;
 #[cfg(all(feature = "wasm", debug_assertions))]
 use crate::error::Context;
+#[cfg(feature = "wasm")]
+use crate::tool_names::WEB_FETCH;
 
 #[cfg(all(feature = "wasm", not(debug_assertions)))]
 const CALC_COMPONENT_RELEASE_BYTES: &[u8] = include_bytes!(concat!(

@@ -677,7 +677,16 @@ impl CronService {
                 error!(id = %job.id, error = %e, "cron job failed");
                 #[cfg(feature = "metrics")]
                 counter!(cron_metrics::ERRORS_TOTAL).increment(1);
-                (RunStatus::Error, Some(e.to_string()), None, None, None, None, None, None)
+                (
+                    RunStatus::Error,
+                    Some(e.to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             },
         };
 
@@ -812,10 +821,14 @@ fn validate_job_spec(job: &CronJob) -> Result<()> {
     } = &job.payload
     {
         if list_id.trim().is_empty() {
-            return Err(Error::message("createTask payload requires non-empty list_id"));
+            return Err(Error::message(
+                "createTask payload requires non-empty list_id",
+            ));
         }
         if subject.trim().is_empty() {
-            return Err(Error::message("createTask payload requires non-empty subject"));
+            return Err(Error::message(
+                "createTask payload requires non-empty subject",
+            ));
         }
         match autonomy_tier.trim() {
             "auto" | "confirm" | "approve" => {},
@@ -833,7 +846,9 @@ fn validate_job_spec(job: &CronJob) -> Result<()> {
                 ));
             }
             serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {
-                Error::message(format!("createTask payload principal_json is invalid JSON: {e}"))
+                Error::message(format!(
+                    "createTask payload principal_json is invalid JSON: {e}"
+                ))
             })?;
         }
         if blocked_by.iter().any(|id| id.trim().is_empty()) {
@@ -1749,7 +1764,8 @@ mod tests {
     #[tokio::test]
     async fn create_task_payload_defaults_autonomy_tier() {
         // autonomy_tier should default to "auto" when omitted.
-        let json = r#"{"kind":"createTask","list_id":"default","subject":"hello","description":""}"#;
+        let json =
+            r#"{"kind":"createTask","list_id":"default","subject":"hello","description":""}"#;
         let p: CronPayload = serde_json::from_str(json).unwrap();
         match p {
             CronPayload::CreateTask { autonomy_tier, .. } => {

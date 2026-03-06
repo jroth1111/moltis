@@ -1151,7 +1151,7 @@ impl LlmProvider for OpenAiProvider {
             text,
             tool_calls,
             usage,
-        ..Default::default()
+            ..Default::default()
         })
     }
 

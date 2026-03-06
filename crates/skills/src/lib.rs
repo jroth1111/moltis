@@ -3,8 +3,8 @@
 //! Skills are directories containing a `SKILL.md` file with YAML frontmatter
 //! and markdown instructions, following the Agent Skills open standard.
 
-pub mod attenuation;
 pub mod archive_audit;
+pub mod attenuation;
 pub mod audit;
 pub mod discover;
 pub mod formats;

@@ -621,8 +621,14 @@ mod tests {
         tool.save_session("session:a", "sid-a").await;
         tool.save_session("session:b", "sid-b").await;
 
-        assert_eq!(tool.get_saved_session("session:a").await.as_deref(), Some("sid-a"));
-        assert_eq!(tool.get_saved_session("session:b").await.as_deref(), Some("sid-b"));
+        assert_eq!(
+            tool.get_saved_session("session:a").await.as_deref(),
+            Some("sid-a")
+        );
+        assert_eq!(
+            tool.get_saved_session("session:b").await.as_deref(),
+            Some("sid-b")
+        );
         assert_eq!(tool.get_saved_session("main").await, None);
     }
 
@@ -639,7 +645,10 @@ mod tests {
         tool.clear_session("session:a").await;
 
         assert_eq!(tool.get_saved_session("session:a").await, None);
-        assert_eq!(tool.get_saved_session("session:b").await.as_deref(), Some("sid-b"));
+        assert_eq!(
+            tool.get_saved_session("session:b").await.as_deref(),
+            Some("sid-b")
+        );
     }
 
     #[test]
@@ -653,7 +662,10 @@ mod tests {
         let err = tool
             .ensure_autonomous_navigation_allowed("https://example.com")
             .unwrap_err();
-        assert!(err.to_string().contains("autonomous browser navigation blocked"));
+        assert!(
+            err.to_string()
+                .contains("autonomous browser navigation blocked")
+        );
     }
 
     #[test]

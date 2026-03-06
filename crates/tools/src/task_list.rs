@@ -28,8 +28,8 @@ use {
     },
     moltis_agents::tool_registry::AgentTool,
     moltis_tasks::{
-        AutonomyTier, FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskSpec,
-        TaskPrincipal, TaskStore, TerminalState, TransitionEvent,
+        AutonomyTier, FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskPrincipal,
+        TaskSpec, TaskStore, TerminalState, TransitionEvent,
     },
 };
 
@@ -209,7 +209,6 @@ impl AgentTool for TaskListTool {
         &["orchestration"]
     }
 
-
     fn description(&self) -> &str {
         "Manage a shared task list for coordinated multi-agent execution. \
          Actions: create, list, get, update, claim, fail, escalate, resolve, retry, history."
@@ -359,8 +358,8 @@ impl AgentTool for TaskListTool {
                     ))
                     .into());
                 }
-                let parent_task = str_param_any(&params, &["parent_task", "parentTask"])
-                    .map(TaskId::from);
+                let parent_task =
+                    str_param_any(&params, &["parent_task", "parentTask"]).map(TaskId::from);
                 let principal = params
                     .get("principal")
                     .cloned()
@@ -1000,7 +999,10 @@ mod tests {
 
         let store = t.store();
         let task = store.get("custom-list", &child_id).await.unwrap().unwrap();
-        assert_eq!(task.spec.parent_task.as_ref().map(|id| id.0.as_str()), Some(parent_id.as_str()));
+        assert_eq!(
+            task.spec.parent_task.as_ref().map(|id| id.0.as_str()),
+            Some(parent_id.as_str())
+        );
         assert_eq!(
             task.spec.principal.as_ref().map(|p| p.channel.as_str()),
             Some("web")
@@ -1040,7 +1042,10 @@ mod tests {
                 "_dispatch_autonomy_tier": "auto",
             }))
             .await;
-        assert!(result.is_err(), "create should fail when requested tier exceeds caller tier");
+        assert!(
+            result.is_err(),
+            "create should fail when requested tier exceeds caller tier"
+        );
         assert!(
             result
                 .unwrap_err()
@@ -1102,7 +1107,10 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("owned by 'owner-a'"), "unexpected error: {err}");
+        assert!(
+            err.contains("owned by 'owner-a'"),
+            "unexpected error: {err}"
+        );
         assert!(err.contains("owner-b"), "unexpected error: {err}");
     }
 

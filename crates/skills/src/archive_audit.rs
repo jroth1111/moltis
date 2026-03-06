@@ -12,19 +12,7 @@ pub const MAX_ARCHIVE_TOTAL_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 pub const MAX_SKILL_MARKDOWN_BYTES: usize = 64 * 1024; // 64 KB
 
 const BLOCKED_BINARY_EXTENSIONS: &[&str] = &[
-    "exe",
-    "dll",
-    "so",
-    "dylib",
-    "msi",
-    "dmg",
-    "iso",
-    "pkg",
-    "deb",
-    "rpm",
-    "apk",
-    "appimage",
-    "bin",
+    "exe", "dll", "so", "dylib", "msi", "dmg", "iso", "pkg", "deb", "rpm", "apk", "appimage", "bin",
 ];
 
 pub fn enforce_download_size_hint(content_length: Option<u64>) -> anyhow::Result<()> {
@@ -197,10 +185,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_archive_download_hint() {
-        assert!(enforce_download_size_hint(Some(
-            MAX_ARCHIVE_DOWNLOAD_BYTES as u64 + 1
-        ))
-        .is_err());
+        assert!(enforce_download_size_hint(Some(MAX_ARCHIVE_DOWNLOAD_BYTES as u64 + 1)).is_err());
     }
 
     #[test]

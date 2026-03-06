@@ -231,7 +231,9 @@ fn apply_memory_config_update(
     }
 }
 
-fn memory_config_response(memory: &moltis_config::schema::MemoryEmbeddingConfig) -> serde_json::Value {
+fn memory_config_response(
+    memory: &moltis_config::schema::MemoryEmbeddingConfig,
+) -> serde_json::Value {
     serde_json::json!({
         "backend": memory.backend.as_deref().unwrap_or("builtin"),
         "citations": memory.citations.as_deref().unwrap_or("auto"),

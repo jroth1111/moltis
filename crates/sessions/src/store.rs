@@ -7,8 +7,8 @@ use std::{
 use {
     crate::{Error, Result},
     fd_lock::RwLock,
-    serde_json::{Value, Map},
     serde::{Deserialize, Serialize},
+    serde_json::{Map, Value},
 };
 
 const REDACTED_VALUE: &str = "[REDACTED]";
@@ -30,7 +30,7 @@ fn redact_message(msg: &Value) -> Value {
                 }
             }
             Value::Object(redacted)
-        }
+        },
         _ => msg.clone(),
     }
 }
@@ -38,7 +38,10 @@ fn redact_message(msg: &Value) -> Value {
 /// Check if a key name suggests it contains sensitive data.
 fn is_sensitive_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
-    let compact: String = normalized.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let compact: String = normalized
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     compact.ends_with("apikey")
         || compact.ends_with("token")
         || compact.ends_with("secret")
@@ -144,11 +147,7 @@ fn assignment_key_bounds(text: &str, separator_idx: usize) -> Option<(usize, usi
 }
 
 /// Find the bounds of a value after an = or : separator.
-fn assignment_value_bounds(
-    text: &str,
-    separator_idx: usize,
-    key: &str,
-) -> Option<(usize, usize)> {
+fn assignment_value_bounds(text: &str, separator_idx: usize, key: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     if separator_idx >= bytes.len() {
         return None;
@@ -163,7 +162,10 @@ fn assignment_value_bounds(
     }
 
     let normalized_key = key.to_ascii_lowercase();
-    let normalized_key_compact: String = normalized_key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let normalized_key_compact: String = normalized_key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
     let mut quoted = None;
     let mut redact_start = value_start;
     if matches!(bytes[value_start], b'"' | b'\'') {
@@ -342,41 +344,40 @@ impl SessionStore {
     pub async fn read_with_stats(&self, key: &str) -> Result<ReadResult<Value>> {
         let path = self.path_for(key);
 
-        let result =
-            tokio::task::spawn_blocking(move || -> Result<ReadResult<Value>> {
-                if !path.exists() {
-                    return Ok(ReadResult {
-                        messages: vec![],
-                        skipped_lines: 0,
-                        total_lines: 0,
-                    });
+        let result = tokio::task::spawn_blocking(move || -> Result<ReadResult<Value>> {
+            if !path.exists() {
+                return Ok(ReadResult {
+                    messages: vec![],
+                    skipped_lines: 0,
+                    total_lines: 0,
+                });
+            }
+            let file = File::open(&path)?;
+            let reader = BufReader::new(file);
+            let mut messages = Vec::new();
+            let mut skipped_lines = 0usize;
+            let mut total_lines = 0usize;
+            for line in reader.lines() {
+                let line = line?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
                 }
-                let file = File::open(&path)?;
-                let reader = BufReader::new(file);
-                let mut messages = Vec::new();
-                let mut skipped_lines = 0usize;
-                let mut total_lines = 0usize;
-                for line in reader.lines() {
-                    let line = line?;
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    total_lines = total_lines.saturating_add(1);
-                    match serde_json::from_str(trimmed) {
-                        Ok(val) => messages.push(val),
-                        Err(_) => {
-                            skipped_lines = skipped_lines.saturating_add(1);
-                        },
-                    }
+                total_lines = total_lines.saturating_add(1);
+                match serde_json::from_str(trimmed) {
+                    Ok(val) => messages.push(val),
+                    Err(_) => {
+                        skipped_lines = skipped_lines.saturating_add(1);
+                    },
                 }
-                Ok(ReadResult {
-                    messages,
-                    skipped_lines,
-                    total_lines,
-                })
+            }
+            Ok(ReadResult {
+                messages,
+                skipped_lines,
+                total_lines,
             })
-            .await??;
+        })
+        .await??;
 
         #[cfg(feature = "metrics")]
         if result.skipped_lines > 0 {
@@ -717,11 +718,7 @@ impl SessionStore {
     /// are responsible for replacing the active history afterward.
     ///
     /// Returns the archive filename (relative to `{base_dir}/archive/`).
-    pub async fn archive_to_cold_store(
-        &self,
-        key: &str,
-        messages: &[Value],
-    ) -> Result<String> {
+    pub async fn archive_to_cold_store(&self, key: &str, messages: &[Value]) -> Result<String> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

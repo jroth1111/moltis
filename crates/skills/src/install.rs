@@ -4,8 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use moltis_metrics::{counter, histogram, skills as skills_metrics};
 
 use crate::{
-    archive_audit,
-    audit,
+    archive_audit, audit,
     formats::{PluginFormat, detect_format, scan_with_adapter},
     integrity,
     manifest::ManifestStore,

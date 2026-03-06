@@ -85,8 +85,7 @@ pub mod chat {
     /// Private persona injections blocked by deterministic policy.
     pub const PRIVATE_PERSONA_BLOCKED_TOTAL: &str = "moltis_policy_private_persona_blocked_total";
     /// Memory bootstrap injections blocked by deterministic policy.
-    pub const MEMORY_BOOTSTRAP_BLOCKED_TOTAL: &str =
-        "moltis_policy_memory_bootstrap_blocked_total";
+    pub const MEMORY_BOOTSTRAP_BLOCKED_TOTAL: &str = "moltis_policy_memory_bootstrap_blocked_total";
     /// Prompt sections dropped due deterministic budget priority handling.
     pub const DROPPED_SECTIONS_TOTAL: &str = "moltis_policy_dropped_sections_total";
 }

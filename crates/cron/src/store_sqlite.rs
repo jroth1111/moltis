@@ -49,7 +49,11 @@ impl SqliteStore {
     }
 
     /// Calculate delivery engagement stats for the most recent delivered runs.
-    pub async fn engagement_stats(&self, job_id: &str, last_n: usize) -> Result<Option<EngagementStats>> {
+    pub async fn engagement_stats(
+        &self,
+        job_id: &str,
+        last_n: usize,
+    ) -> Result<Option<EngagementStats>> {
         Self::engagement_stats_with_pool(&self.pool, job_id, last_n).await
     }
 
@@ -196,7 +200,11 @@ impl CronStore for SqliteStore {
         .bind(&run.delivery_channel)
         .bind(&run.delivery_to)
         .bind(run.delivered_at_ms.map(|v| v as i64))
-        .bind(if run.user_responded { 1i64 } else { 0i64 })
+        .bind(if run.user_responded {
+            1i64
+        } else {
+            0i64
+        })
         .bind(run.user_response_at_ms.map(|v| v as i64))
         .execute(&self.pool)
         .await?;
@@ -240,8 +248,14 @@ impl CronStore for SqliteStore {
                     .ok()
                     .flatten()
                     .map(|v| v as u64),
-                delivery_channel: row.try_get::<Option<String>, _>("delivery_channel").ok().flatten(),
-                delivery_to: row.try_get::<Option<String>, _>("delivery_to").ok().flatten(),
+                delivery_channel: row
+                    .try_get::<Option<String>, _>("delivery_channel")
+                    .ok()
+                    .flatten(),
+                delivery_to: row
+                    .try_get::<Option<String>, _>("delivery_to")
+                    .ok()
+                    .flatten(),
                 delivered_at_ms: row
                     .try_get::<Option<i64>, _>("delivered_at_ms")
                     .ok()

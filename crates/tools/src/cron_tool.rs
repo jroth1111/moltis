@@ -471,11 +471,12 @@ fn normalize_payload_value(payload: &mut Value, session_target_hint: Option<&str
                                 }
                             },
                             Value::Object(_) => {
-                                let encoded = serde_json::to_string(&principal_val).map_err(|e| {
-                                    Error::message(format!(
-                                        "failed to serialize payload.principal_json: {e}"
-                                    ))
-                                })?;
+                                let encoded =
+                                    serde_json::to_string(&principal_val).map_err(|e| {
+                                        Error::message(format!(
+                                            "failed to serialize payload.principal_json: {e}"
+                                        ))
+                                    })?;
                                 obj.insert("principal_json".to_string(), Value::String(encoded));
                             },
                             _ => {
@@ -492,16 +493,12 @@ fn normalize_payload_value(payload: &mut Value, session_target_hint: Option<&str
                             value
                                 .as_array()
                                 .ok_or_else(|| {
-                                    Error::message(
-                                        "payload.blocked_by must be an array of strings",
-                                    )
+                                    Error::message("payload.blocked_by must be an array of strings")
                                 })?
                                 .iter()
                                 .map(|v| {
                                     let s = v.as_str().ok_or_else(|| {
-                                        Error::message(
-                                            "payload.blocked_by entries must be strings",
-                                        )
+                                        Error::message("payload.blocked_by entries must be strings")
                                     })?;
                                     let trimmed = s.trim();
                                     if trimmed.is_empty() {
@@ -779,7 +776,6 @@ impl AgentTool for CronTool {
     fn categories(&self) -> &'static [&'static str] {
         &["scheduling"]
     }
-
 
     fn description(&self) -> &str {
         "Manage scheduled tasks (reminders, recurring jobs, cron schedules).\n\
@@ -1415,8 +1411,8 @@ mod tests {
     fn test_parameters_schema_includes_create_task_kind() {
         let tool = make_tool();
         let schema = tool.parameters_schema();
-        let kinds = &schema["properties"]["job"]["properties"]["payload"]["properties"]["kind"]
-            ["enum"];
+        let kinds =
+            &schema["properties"]["job"]["properties"]["payload"]["properties"]["kind"]["enum"];
         let kinds = kinds.as_array().expect("kind enum must be array");
         assert!(
             kinds.iter().any(|k| k == "createTask"),

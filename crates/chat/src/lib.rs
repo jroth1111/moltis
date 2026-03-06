@@ -56,8 +56,8 @@ pub use runtime::{ChatRuntime, TtsOverride};
 use {
     chat_error::parse_chat_error,
     compaction::{
-        ContextCompactionAction, emergency_reduction_plan, hard_reduction_plan,
-        context_compaction_action_for_usage, context_compaction_config_from_chat,
+        ContextCompactionAction, context_compaction_action_for_usage,
+        context_compaction_config_from_chat, emergency_reduction_plan, hard_reduction_plan,
         layer_stats_for_history, parse_compaction_facts, partition_history_for_summary,
         retain_with_importance, summary_context_plan, trim_summary_to_budget,
     },
@@ -347,10 +347,8 @@ fn estimate_history_tokens(history: &[Value]) -> u64 {
 }
 
 const MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS: usize = 4_000;
-const COMPACTION_STRUCTURED_SUMMARY_SYSTEM_PROMPT: &str =
-    "You are a conversation summarizer. Summarize only the compressible history and preserve key context. Do not invent facts. Do not include raw tool payload dumps.";
-const COMPACTION_EMPTY_GAP_SUMMARY: &str =
-    "No compressible background turns required summarization. Anchors and recent turns were preserved verbatim.";
+const COMPACTION_STRUCTURED_SUMMARY_SYSTEM_PROMPT: &str = "You are a conversation summarizer. Summarize only the compressible history and preserve key context. Do not invent facts. Do not include raw tool payload dumps.";
+const COMPACTION_EMPTY_GAP_SUMMARY: &str = "No compressible background turns required summarization. Anchors and recent turns were preserved verbatim.";
 
 #[must_use]
 fn compaction_structured_summary_user_prompt(summary_budget_tokens: u64) -> String {
@@ -371,11 +369,13 @@ fn build_compaction_summary_messages(
     normalized_summary_source: &[Value],
     summary_budget_tokens: u64,
 ) -> Vec<ChatMessage> {
-    let mut summary_messages = vec![ChatMessage::system(COMPACTION_STRUCTURED_SUMMARY_SYSTEM_PROMPT)];
+    let mut summary_messages = vec![ChatMessage::system(
+        COMPACTION_STRUCTURED_SUMMARY_SYSTEM_PROMPT,
+    )];
     summary_messages.extend(values_to_chat_messages(normalized_summary_source));
-    summary_messages.push(ChatMessage::user(compaction_structured_summary_user_prompt(
-        summary_budget_tokens,
-    )));
+    summary_messages.push(ChatMessage::user(
+        compaction_structured_summary_user_prompt(summary_budget_tokens),
+    ));
     summary_messages
 }
 
@@ -1881,8 +1881,9 @@ fn apply_runtime_tool_filters(
     // Tool availability here is controlled by configured runtime policy.
     // Fail closed: tools marked as `approval_required` are not exposed unless
     // runtime approval gating is actively enforced at execution-time.
-    base_registry
-        .clone_allowed_by(|name| policy.is_allowed(name) && policy.requires_approval(name).is_none())
+    base_registry.clone_allowed_by(|name| {
+        policy.is_allowed(name) && policy.requires_approval(name).is_none()
+    })
 }
 
 // ── Disabled Models Store ────────────────────────────────────────────────────
@@ -4322,7 +4323,8 @@ impl ChatService for LiveChatService {
         let estimated_next_input = token_usage
             .current_request_input_tokens
             .saturating_add(estimate_text_tokens(&text));
-        let layer_stats = layer_stats_for_history(&history, summary_context_plan(compaction_config));
+        let layer_stats =
+            layer_stats_for_history(&history, summary_context_plan(compaction_config));
         match context_compaction_action_for_usage(
             estimated_next_input,
             context_window,
@@ -4393,7 +4395,8 @@ impl ChatService for LiveChatService {
                 }
             },
             ContextCompactionAction::HardCompact => {
-                let reduction = retain_with_importance(&history, hard_reduction_plan(compaction_config));
+                let reduction =
+                    retain_with_importance(&history, hard_reduction_plan(compaction_config));
                 let removed_messages = reduction.removed_messages;
 
                 if removed_messages == 0 {
@@ -4402,7 +4405,8 @@ impl ChatService for LiveChatService {
                         "hard compaction skipped: no compressible background history"
                     );
                 } else {
-                    let dropped_messages = dropped_messages_for_retention(&history, &reduction.messages);
+                    let dropped_messages =
+                        dropped_messages_for_retention(&history, &reduction.messages);
                     let mut archive_file: Option<String> = None;
                     let mut new_history = reduction.messages.clone();
                     match self
@@ -4414,8 +4418,7 @@ impl ChatService for LiveChatService {
                             let notice = PersistedMessage::notice(format!(
                                 "[Context Archive] {removed_messages} background message(s) archived to \
                                  cold storage ({filename}). Retaining {} working message(s) and {} anchor message(s).",
-                                reduction.kept_recent_messages,
-                                reduction.retained_anchor_messages
+                                reduction.kept_recent_messages, reduction.retained_anchor_messages
                             ));
                             let mut with_notice = vec![notice.to_value()];
                             with_notice.extend(new_history);
@@ -5572,10 +5575,8 @@ impl ChatService for LiveChatService {
         if let Some(mm) = self.state.memory_manager()
             && let Ok(provider) = self.resolve_provider(&session_key, &history).await
         {
-            let normalized_history_for_memory = normalize_for_model_context(
-                &history,
-                MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
-            );
+            let normalized_history_for_memory =
+                normalize_for_model_context(&history, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
             let chat_history_for_memory = values_to_chat_messages(&normalized_history_for_memory);
             let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::new(
                 AgentScopedMemoryWriter::new(Arc::clone(mm), session_agent_id.clone()),
@@ -5606,19 +5607,27 @@ impl ChatService for LiveChatService {
             .await
             .map_err(ServiceError::message)?;
         let planning_started = Instant::now();
-        let (summary_plan, sections, summary_source, normalized_summary_source) = tracing::info_span!(
-            "chat.compaction.plan",
-            session = %session_key
-        )
-        .in_scope(|| {
-            let compaction_config = context_compaction_config_from_chat(&self.chat_config);
-            let summary_plan = summary_context_plan(compaction_config);
-            let sections = partition_history_for_summary(&history, summary_plan);
-            let summary_source = sections.summary_source.clone();
-            let normalized_summary_source =
-                normalize_for_model_context(&summary_source, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
-            (summary_plan, sections, summary_source, normalized_summary_source)
-        });
+        let (summary_plan, sections, summary_source, normalized_summary_source) =
+            tracing::info_span!(
+                "chat.compaction.plan",
+                session = %session_key
+            )
+            .in_scope(|| {
+                let compaction_config = context_compaction_config_from_chat(&self.chat_config);
+                let summary_plan = summary_context_plan(compaction_config);
+                let sections = partition_history_for_summary(&history, summary_plan);
+                let summary_source = sections.summary_source.clone();
+                let normalized_summary_source = normalize_for_model_context(
+                    &summary_source,
+                    MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS,
+                );
+                (
+                    summary_plan,
+                    sections,
+                    summary_source,
+                    normalized_summary_source,
+                )
+            });
         let planning_elapsed = planning_started.elapsed();
         #[cfg(feature = "metrics")]
         record_compaction_stage("manual", "plan", planning_elapsed);
@@ -5654,7 +5663,11 @@ impl ChatService for LiveChatService {
 
             let mut fact_stream = provider.stream(fact_messages);
             let mut facts_raw = String::new();
-            while let Some(event) = fact_stream.next().instrument(summarization_span.clone()).await {
+            while let Some(event) = fact_stream
+                .next()
+                .instrument(summarization_span.clone())
+                .await
+            {
                 match event {
                     StreamEvent::Delta(delta) => facts_raw.push_str(&delta),
                     StreamEvent::Done(_) => break,
@@ -5765,8 +5778,9 @@ impl ChatService for LiveChatService {
             }
             .to_value()
         });
-        let mut compacted =
-            Vec::with_capacity(summary_message.is_some() as usize + 1 + sections.anchors.len() + sections.recent.len());
+        let mut compacted = Vec::with_capacity(
+            summary_message.is_some() as usize + 1 + sections.anchors.len() + sections.recent.len(),
+        );
         if let Some(message) = summary_message {
             compacted.push(message);
         }
@@ -5867,7 +5881,11 @@ impl ChatService for LiveChatService {
                 session_key: session_key.clone(),
                 summary_len: summary.len(),
             };
-            if let Err(e) = hooks.dispatch(&payload).instrument(apply_span.clone()).await {
+            if let Err(e) = hooks
+                .dispatch(&payload)
+                .instrument(apply_span.clone())
+                .await
+            {
                 warn!(session = %session_key, error = %e, "AfterCompaction hook failed");
             }
         }
@@ -8842,9 +8860,13 @@ async fn run_with_tools(
                         compaction_config,
                         provider_ref.context_window() as u64,
                     ) {
-                        match store.replace_history(session_key, fallback.messages.clone()).await {
+                        match store
+                            .replace_history(session_key, fallback.messages.clone())
+                            .await
+                        {
                             Ok(()) => {
-                                let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
+                                let compacted_history_raw =
+                                    store.read(session_key).await.unwrap_or_default();
                                 let messages_removed =
                                     pre_message_count.saturating_sub(compacted_history_raw.len());
                                 broadcast(
@@ -9251,7 +9273,12 @@ async fn compact_session(
         let summary_source = sections.summary_source.clone();
         let normalized_summary_source =
             normalize_for_model_context(&summary_source, MODEL_CONTEXT_TOOL_RESULT_MAX_CHARS);
-        (summary_plan, sections, summary_source, normalized_summary_source)
+        (
+            summary_plan,
+            sections,
+            summary_source,
+            normalized_summary_source,
+        )
     });
     #[cfg(feature = "metrics")]
     let planning_elapsed = planning_started.elapsed();
@@ -9334,8 +9361,9 @@ async fn compact_session(
         }
         .to_value()
     });
-    let mut compacted =
-        Vec::with_capacity(summary_message.is_some() as usize + 1 + sections.anchors.len() + sections.recent.len());
+    let mut compacted = Vec::with_capacity(
+        summary_message.is_some() as usize + 1 + sections.anchors.len() + sections.recent.len(),
+    );
     if let Some(message) = summary_message {
         compacted.push(message);
     }
@@ -9365,7 +9393,9 @@ async fn compact_session(
         if compacted_estimated_tokens >= original_estimated_tokens {
             #[cfg(feature = "metrics")]
             record_compaction_result(COMPACTION_PATH, "error", compact_started.elapsed());
-            return Err(error::Error::message("compact produced no effective reduction"));
+            return Err(error::Error::message(
+                "compact produced no effective reduction",
+            ));
         }
     }
 
@@ -11309,8 +11339,8 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": "ack"}),
         ];
 
-        let fallback =
-            compaction_failure_fallback_reduction(&history, config, 20).expect("fallback reduction");
+        let fallback = compaction_failure_fallback_reduction(&history, config, 20)
+            .expect("fallback reduction");
         assert!(fallback.removed_messages > 0);
         assert!(
             fallback
@@ -13250,13 +13280,14 @@ mod tests {
         let mut cfg = moltis_config::MoltisConfig::default();
         cfg.tools.policy.profile = Some("full".into());
         cfg.tools.policy.deny = vec!["exec".into()];
-        cfg.tools.policy.approval_required.push(
-            moltis_config::schema::ApprovalPatternConfig {
+        cfg.tools
+            .policy
+            .approval_required
+            .push(moltis_config::schema::ApprovalPatternConfig {
                 tool: "web_fetch".into(),
                 condition: None,
                 description: Some("Requires human approval".into()),
-            },
-        );
+            });
 
         let policy = effective_tool_policy(&cfg);
         assert!(!policy.is_allowed("exec"));
@@ -13346,13 +13377,14 @@ mod tests {
 
         let mut cfg = moltis_config::MoltisConfig::default();
         cfg.tools.policy.allow = vec!["exec".into(), "web_fetch".into()];
-        cfg.tools.policy.approval_required.push(
-            moltis_config::schema::ApprovalPatternConfig {
+        cfg.tools
+            .policy
+            .approval_required
+            .push(moltis_config::schema::ApprovalPatternConfig {
                 tool: "exec".into(),
                 condition: None,
                 description: Some("Requires human approval".into()),
-            },
-        );
+            });
 
         let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false);
         assert!(filtered.get("exec").is_none());
