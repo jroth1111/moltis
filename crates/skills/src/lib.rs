@@ -11,6 +11,7 @@ pub mod evals;
 pub mod formats;
 pub mod install;
 pub mod integrity;
+pub mod local;
 pub mod manifest;
 pub mod migration;
 pub mod parse;

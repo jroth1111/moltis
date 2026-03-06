@@ -22,7 +22,7 @@ impl SkillStatus {
 }
 
 /// Top-level manifest tracking installed repos and per-skill status/enabled state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillsManifest {
     pub version: u32,
     #[serde(default)]
@@ -82,7 +82,7 @@ impl SkillsManifest {
 }
 
 /// A single cloned repository with its discovered skills.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoEntry {
     pub source: String,
     pub repo_name: String,
@@ -95,7 +95,7 @@ pub struct RepoEntry {
 }
 
 /// Per-skill state within a repo.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillState {
     pub name: String,
     pub relative_path: String,
@@ -114,6 +114,10 @@ pub struct SkillState {
 impl SkillState {
     pub fn is_trusted(&self) -> bool {
         self.status.is_trusted()
+    }
+
+    pub fn is_runnable(&self) -> bool {
+        self.enabled && self.is_trusted()
     }
 }
 
