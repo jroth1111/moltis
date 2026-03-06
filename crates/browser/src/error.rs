@@ -52,6 +52,9 @@ pub enum Error {
     #[error("action '{action}' is not supported on backend '{backend}'")]
     UnsupportedBackendAction { backend: String, action: String },
 
+    #[error(transparent)]
+    Telemetry(#[from] crate::telemetry::TelemetryError),
+
     #[error("browser error: {source}")]
     Other {
         #[source]

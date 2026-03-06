@@ -54,6 +54,11 @@ pub mod stealth;
 pub use {
     error::Error,
     manager::BrowserManager,
+    telemetry::{
+        ProbeBackendReport, ProbeBaselineUpdate, ProbeCanaryReport, ProbeCanarySpec,
+        ProbeCanaryVerdict, ProbeRunDrift, ProbeRunEvidence, ProbeRunProfile,
+        ProbeTelemetryPolicy, TlsJa4CollectionMode, TlsJa4SidecarConfig,
+    },
     types::{
         BrowserAction, BrowserBackendKind, BrowserConfig, BrowserKind, BrowserPreference,
         BrowserRequest, BrowserResponse, ChallengeEvidence, NavigationOutcome, NavigationTrigger,

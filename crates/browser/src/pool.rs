@@ -165,43 +165,7 @@ impl BrowserPool {
             }
         }
 
-        // Check pool capacity using memory-based limits
-        {
-            // If max_instances is set (> 0), enforce it as a hard limit
-            if self.config.max_instances > 0 {
-                let instances = self.instances.read().await;
-                let patchright_instances = self.patchright_instances.read().await;
-                if instances.len() + patchright_instances.len() >= self.config.max_instances {
-                    drop(instances);
-                    drop(patchright_instances);
-                    self.cleanup_idle().await;
-
-                    let instances = self.instances.read().await;
-                    let patchright_instances = self.patchright_instances.read().await;
-                    if instances.len() + patchright_instances.len() >= self.config.max_instances {
-                        return Err(Error::PoolExhausted);
-                    }
-                }
-            }
-
-            // Check memory usage - block new instances if above threshold
-            let memory_percent = get_memory_usage_percent();
-            if memory_percent >= self.config.memory_limit_percent {
-                // Try to clean up idle instances first
-                self.cleanup_idle().await;
-
-                // Re-check memory after cleanup
-                let memory_after = get_memory_usage_percent();
-                if memory_after >= self.config.memory_limit_percent {
-                    warn!(
-                        memory_usage = memory_after,
-                        threshold = self.config.memory_limit_percent,
-                        "blocking new browser instance due to high memory usage"
-                    );
-                    return Err(Error::PoolExhausted);
-                }
-            }
-        }
+        self.ensure_capacity().await?;
 
         // Create new instance
         let sid = session_id
@@ -232,6 +196,150 @@ impl BrowserPool {
         };
         info!(session_id = sid, mode, "launched new browser instance");
         Ok(sid)
+    }
+
+    pub(crate) async fn get_or_create_patchright(
+        &self,
+        session_id: Option<&str>,
+        browser: Option<BrowserPreference>,
+    ) -> Result<String, Error> {
+        let session_id = session_id.filter(|s| !s.is_empty());
+        if let Some(sid) = session_id {
+            let patchright_instances = self.patchright_instances.read().await;
+            if patchright_instances.contains_key(sid) {
+                debug!(session_id = sid, "reusing existing patchright session");
+                return Ok(sid.to_string());
+            }
+            drop(patchright_instances);
+
+            let instances = self.instances.read().await;
+            if instances.contains_key(sid) {
+                return Err(Error::InvalidAction(format!(
+                    "session {sid} already exists on chromiumoxide"
+                )));
+            }
+        }
+
+        self.ensure_capacity().await?;
+
+        let sid = session_id
+            .map(String::from)
+            .unwrap_or_else(generate_session_id);
+        let selected = self.resolve_host_browser(browser).await?;
+        let launch_profile =
+            build_patchright_launch_profile_for_browser(&self.config, Some(&selected));
+        let instance = PatchrightInstance {
+            session: PatchrightSession::start(&self.config.protection, &launch_profile).await?,
+            last_used: Instant::now(),
+            patchright_launch_profile: launch_profile,
+        };
+        let instance = Arc::new(Mutex::new(instance));
+
+        {
+            let mut patchright_instances = self.patchright_instances.write().await;
+            patchright_instances.insert(sid.clone(), instance);
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            self.active_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            moltis_metrics::gauge!(moltis_metrics::browser::INSTANCES_ACTIVE)
+                .set(self.active_count.load(std::sync::atomic::Ordering::Relaxed) as f64);
+            moltis_metrics::counter!(moltis_metrics::browser::INSTANCES_CREATED_TOTAL).increment(1);
+        }
+
+        info!(
+            session_id = sid,
+            browser = %selected.kind,
+            path = %selected.path.display(),
+            "launched new patchright browser session"
+        );
+        Ok(sid)
+    }
+
+    async fn ensure_capacity(&self) -> Result<(), Error> {
+        if self.config.max_instances > 0 {
+            let instances = self.instances.read().await;
+            let patchright_instances = self.patchright_instances.read().await;
+            if instances.len() + patchright_instances.len() >= self.config.max_instances {
+                drop(instances);
+                drop(patchright_instances);
+                self.cleanup_idle().await;
+
+                let instances = self.instances.read().await;
+                let patchright_instances = self.patchright_instances.read().await;
+                if instances.len() + patchright_instances.len() >= self.config.max_instances {
+                    return Err(Error::PoolExhausted);
+                }
+            }
+        }
+
+        let memory_percent = get_memory_usage_percent();
+        if memory_percent >= self.config.memory_limit_percent {
+            self.cleanup_idle().await;
+
+            let memory_after = get_memory_usage_percent();
+            if memory_after >= self.config.memory_limit_percent {
+                warn!(
+                    memory_usage = memory_after,
+                    threshold = self.config.memory_limit_percent,
+                    "blocking new browser instance due to high memory usage"
+                );
+                return Err(Error::PoolExhausted);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn resolve_host_browser(
+        &self,
+        browser: Option<BrowserPreference>,
+    ) -> Result<crate::detect::DetectedBrowser, Error> {
+        let requested_browser = browser.unwrap_or_default();
+        let mut detection = crate::detect::detect_browser(self.config.chrome_path.as_deref());
+        let mut install_attempt: Option<crate::detect::AutoInstallResult> = None;
+
+        if detection.browsers.is_empty() {
+            let result = crate::detect::auto_install_browser(requested_browser).await;
+            if result.attempted && result.installed {
+                info!(details = %result.details, "auto-installed browser on host");
+            } else if result.attempted {
+                warn!(details = %result.details, "browser auto-install failed");
+            } else {
+                warn!(
+                    details = %result.details,
+                    "browser auto-install skipped (installer unavailable)"
+                );
+            }
+            install_attempt = Some(result);
+            detection = crate::detect::detect_browser(self.config.chrome_path.as_deref());
+        }
+
+        if detection.browsers.is_empty() {
+            let mut message = format!("No compatible browser found. {}", detection.install_hint);
+            if let Some(attempt) = install_attempt
+                && attempt.attempted
+            {
+                message.push_str("\n\nAuto-install attempt:\n");
+                message.push_str(&attempt.details);
+            }
+            return Err(Error::LaunchFailed(message));
+        }
+
+        crate::detect::pick_browser(&detection.browsers, Some(requested_browser)).ok_or_else(|| {
+            let installed = crate::detect::installed_browser_labels(&detection.browsers);
+            let installed_list = if installed.is_empty() {
+                "none".to_string()
+            } else {
+                installed.join(", ")
+            };
+            Error::LaunchFailed(format!(
+                "requested browser '{}' is not installed. Installed browsers: {}",
+                requested_browser, installed_list
+            ))
+        })
     }
 
     /// Get the page for a session, creating one if needed.
@@ -1219,56 +1327,7 @@ impl BrowserPool {
         session_id: &str,
         browser: Option<BrowserPreference>,
     ) -> Result<BrowserInstance, Error> {
-        let requested_browser = browser.unwrap_or_default();
-
-        // Detect all installed browser candidates.
-        let mut detection = crate::detect::detect_browser(self.config.chrome_path.as_deref());
-        let mut install_attempt: Option<crate::detect::AutoInstallResult> = None;
-
-        // Auto-install is always on: if none are installed, try to install one.
-        if detection.browsers.is_empty() {
-            let result = crate::detect::auto_install_browser(requested_browser).await;
-            if result.attempted && result.installed {
-                info!(details = %result.details, "auto-installed browser on host");
-            } else if result.attempted {
-                warn!(details = %result.details, "browser auto-install failed");
-            } else {
-                warn!(
-                    details = %result.details,
-                    "browser auto-install skipped (installer unavailable)"
-                );
-            }
-            install_attempt = Some(result);
-            detection = crate::detect::detect_browser(self.config.chrome_path.as_deref());
-        }
-
-        if detection.browsers.is_empty() {
-            let mut message = format!("No compatible browser found. {}", detection.install_hint);
-            if let Some(attempt) = install_attempt
-                && attempt.attempted
-            {
-                message.push_str("\n\nAuto-install attempt:\n");
-                message.push_str(&attempt.details);
-            }
-            return Err(Error::LaunchFailed(message));
-        }
-
-        let selected =
-            match crate::detect::pick_browser(&detection.browsers, Some(requested_browser)) {
-                Some(browser) => browser,
-                None => {
-                    let installed = crate::detect::installed_browser_labels(&detection.browsers);
-                    let installed_list = if installed.is_empty() {
-                        "none".to_string()
-                    } else {
-                        installed.join(", ")
-                    };
-                    return Err(Error::LaunchFailed(format!(
-                        "requested browser '{}' is not installed. Installed browsers: {}",
-                        requested_browser, installed_list
-                    )));
-                },
-            };
+        let selected = self.resolve_host_browser(browser).await?;
 
         let mut builder = CdpBrowserConfig::builder();
         let force_non_headless =

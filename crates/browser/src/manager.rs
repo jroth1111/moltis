@@ -31,6 +31,12 @@ use crate::{
         build_scroll_into_view_js, extract_snapshot, find_element_by_ref, focus_element_by_ref,
         parse_find_element_result, parse_snapshot_payload, scroll_element_into_view,
     },
+    telemetry::{
+        ProbeBackendReport, ProbeBaselineStore, ProbeCanaryReport, ProbeCanarySpec,
+        ProbeCanaryVerdict, ProbeRunEvidence, ProbeRunProfile, browser_version_from_user_agent,
+        fetch_probe_behavior_report, fetch_probe_fingerprint_report,
+        fetch_probe_sequence_report, probe_browser_family, stable_hex_hash,
+    },
     types::{
         BrowserAction, BrowserBackendKind, BrowserConfig, BrowserPreference, BrowserRequest,
         BrowserResponse, ChallengeEvidence, NavigationOutcome, NavigationTrigger,
@@ -100,6 +106,403 @@ impl BrowserManager {
     /// Check if browser support is enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    pub async fn run_probe_canary(&self, spec: ProbeCanarySpec) -> Result<ProbeCanaryReport, Error> {
+        let origin = spec.validated_origin()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(self.config.navigation_timeout_ms))
+            .build()
+            .map_err(crate::telemetry::TelemetryError::from)?;
+        let mut backends = Vec::new();
+
+        for backend in spec.effective_backends() {
+            let started = Instant::now();
+            let report = match self
+                .run_probe_canary_backend(&client, &origin, &spec, backend)
+                .await
+            {
+                Ok(mut report) => {
+                    report.duration_ms = started.elapsed().as_millis() as u64;
+                    report
+                },
+                Err(error) => ProbeBackendReport {
+                    backend,
+                    verdict: ProbeCanaryVerdict::Failed,
+                    evidence: None,
+                    baseline: None,
+                    error: Some(error.to_string()),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+            };
+            backends.push(report);
+        }
+
+        Ok(ProbeCanaryReport {
+            origin: spec.origin,
+            browser: spec.browser,
+            backends,
+        })
+    }
+
+    async fn run_probe_canary_backend(
+        &self,
+        client: &reqwest::Client,
+        origin: &reqwest::Url,
+        spec: &ProbeCanarySpec,
+        backend: BrowserBackendKind,
+    ) -> Result<ProbeBackendReport, Error> {
+        let (session_id, selected) = self
+            .create_session_for_backend(backend, spec.browser)
+            .await?;
+        let baseline_store = ProbeBaselineStore::default();
+
+        let run_result = self
+            .collect_probe_canary_evidence(client, origin, spec, backend, &session_id, &selected)
+            .await;
+        let close_result = self.pool.close_session(&session_id).await;
+
+        let evidence = match run_result {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                let _ = close_result;
+                return Err(error);
+            },
+        };
+        close_result?;
+
+        let baseline = spec
+            .policy
+            .persist_and_compare_baseline(&baseline_store, &evidence)?;
+        let verdict = if baseline
+            .as_ref()
+            .and_then(|update| update.drift.as_ref())
+            .is_some_and(|drift| !drift.consistent())
+        {
+            ProbeCanaryVerdict::Drifted
+        } else {
+            ProbeCanaryVerdict::Clean
+        };
+
+        Ok(ProbeBackendReport {
+            backend,
+            verdict,
+            evidence: Some(evidence),
+            baseline,
+            error: None,
+            duration_ms: 0,
+        })
+    }
+
+    async fn collect_probe_canary_evidence(
+        &self,
+        client: &reqwest::Client,
+        origin: &reqwest::Url,
+        spec: &ProbeCanarySpec,
+        backend: BrowserBackendKind,
+        session_id: &str,
+        selected: &crate::detect::DetectedBrowser,
+    ) -> Result<ProbeRunEvidence, Error> {
+        let fingerprint_session = self
+            .run_probe_fingerprint_flow(session_id, origin, spec.browser)
+            .await?;
+        let behavior_session = self
+            .run_probe_behavior_flow(session_id, origin, spec.browser)
+            .await?;
+        let sequence_run_id = self
+            .run_probe_sequence_flow(session_id, origin, spec.browser)
+            .await?;
+
+        let fingerprint = fetch_probe_fingerprint_report(client, origin, &fingerprint_session).await?;
+        let behavior = fetch_probe_behavior_report(client, origin, &behavior_session).await?;
+        let sequence = fetch_probe_sequence_report(client, origin, &sequence_run_id).await?;
+
+        let launch_profile_hash = self.launch_profile_hash(backend, selected);
+        let profile = ProbeRunProfile {
+            browser_kind: selected.kind,
+            browser_family: probe_browser_family(selected.kind),
+            browser_version: browser_version_from_user_agent(&fingerprint.body.user_agent),
+            backend,
+            headless: self.config.headless,
+            proxy_mode: crate::telemetry::ProbeProxyMode::None,
+            browser_binary_basename: selected
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            launch_profile_hash,
+        };
+
+        Ok(ProbeRunEvidence {
+            profile,
+            fingerprint: fingerprint.body,
+            headers: fingerprint.headers,
+            behavior: behavior.summary,
+            request_sequence: sequence.summary,
+            tls_ja4: None,
+        })
+    }
+
+    async fn create_session_for_backend(
+        &self,
+        backend: BrowserBackendKind,
+        browser: BrowserPreference,
+    ) -> Result<(String, crate::detect::DetectedBrowser), Error> {
+        let selected = self.pool.resolve_host_browser(Some(browser)).await?;
+        let session_id = match backend {
+            BrowserBackendKind::Chromiumoxide => {
+                self.pool.get_or_create(None, false, Some(browser)).await?
+            },
+            BrowserBackendKind::Patchright => {
+                self.pool.get_or_create_patchright(None, Some(browser)).await?
+            },
+        };
+        Ok((session_id, selected))
+    }
+
+    fn launch_profile_hash(
+        &self,
+        backend: BrowserBackendKind,
+        selected: &crate::detect::DetectedBrowser,
+    ) -> String {
+        let profile = match backend {
+            BrowserBackendKind::Chromiumoxide => serde_json::json!({
+                "backend": backend,
+                "browser_kind": selected.kind.as_str(),
+                "path": selected.path,
+                "headless": self.config.headless,
+                "viewport_width": self.config.viewport_width,
+                "viewport_height": self.config.viewport_height,
+                "device_scale_factor": self.config.device_scale_factor,
+                "user_agent": self.config.user_agent,
+                "chrome_args": self.config.chrome_args,
+            }),
+            BrowserBackendKind::Patchright => serde_json::json!({
+                "backend": backend,
+                "browser_kind": selected.kind.as_str(),
+                "path": selected.path,
+                "profile": crate::protection::build_patchright_launch_profile_for_browser(
+                    &self.config,
+                    Some(selected),
+                ),
+            }),
+        };
+        stable_hex_hash(&profile.to_string())
+    }
+
+    async fn run_probe_fingerprint_flow(
+        &self,
+        session_id: &str,
+        origin: &reqwest::Url,
+        browser: BrowserPreference,
+    ) -> Result<String, Error> {
+        self.run_probe_navigate(session_id, origin, "/fp-probe", browser)
+            .await?;
+        self.run_probe_wait(
+            session_id,
+            "body[data-probe-fp='ready']",
+            10_000,
+            browser,
+        )
+        .await?;
+        self.run_probe_session_lookup(session_id, browser).await
+    }
+
+    async fn run_probe_behavior_flow(
+        &self,
+        session_id: &str,
+        origin: &reqwest::Url,
+        browser: BrowserPreference,
+    ) -> Result<String, Error> {
+        self.run_probe_navigate(session_id, origin, "/behavior-probe", browser)
+            .await?;
+        self.run_probe_wait(
+            session_id,
+            "body[data-behavior-ready='true']",
+            10_000,
+            browser,
+        )
+        .await?;
+        let snapshot = self.run_probe_snapshot(session_id, browser).await?;
+        let alpha = Self::probe_snapshot_ref(&snapshot, "Alpha")?;
+        let bravo = Self::probe_snapshot_ref(&snapshot, "Bravo")?;
+        let target = Self::probe_snapshot_ref(&snapshot, "Target")?;
+
+        self.run_probe_action(
+            Some(session_id.to_string()),
+            BrowserAction::Hover { ref_: alpha },
+            10_000,
+            browser,
+        )
+        .await?;
+        self.run_probe_action(
+            Some(session_id.to_string()),
+            BrowserAction::Hover { ref_: bravo },
+            10_000,
+            browser,
+        )
+        .await?;
+        self.run_probe_action(
+            Some(session_id.to_string()),
+            BrowserAction::Click { ref_: target },
+            10_000,
+            browser,
+        )
+        .await?;
+        self.run_probe_session_lookup(session_id, browser).await
+    }
+
+    async fn run_probe_sequence_flow(
+        &self,
+        session_id: &str,
+        origin: &reqwest::Url,
+        browser: BrowserPreference,
+    ) -> Result<String, Error> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let url = origin
+            .join(&format!("/sequence-probe?run_id={run_id}"))
+            .map_err(crate::telemetry::TelemetryError::from)?;
+        self.run_probe_action(
+            Some(session_id.to_string()),
+            BrowserAction::Navigate {
+                url: url.to_string(),
+            },
+            30_000,
+            browser,
+        )
+        .await?;
+        self.run_probe_wait(
+            session_id,
+            "body[data-sequence-ready='true']",
+            10_000,
+            browser,
+        )
+        .await?;
+        Ok(run_id)
+    }
+
+    async fn run_probe_navigate(
+        &self,
+        session_id: &str,
+        origin: &reqwest::Url,
+        path: &str,
+        browser: BrowserPreference,
+    ) -> Result<(), Error> {
+        let url = origin
+            .join(path)
+            .map_err(crate::telemetry::TelemetryError::from)?;
+        self.run_probe_action(
+            Some(session_id.to_string()),
+            BrowserAction::Navigate {
+                url: url.to_string(),
+            },
+            30_000,
+            browser,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn run_probe_wait(
+        &self,
+        session_id: &str,
+        selector: &str,
+        timeout_ms: u64,
+        browser: BrowserPreference,
+    ) -> Result<(), Error> {
+        self.run_probe_action(
+            Some(session_id.to_string()),
+            BrowserAction::Wait {
+                selector: Some(selector.to_string()),
+                ref_: None,
+                timeout_ms,
+            },
+            timeout_ms + 2_000,
+            browser,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn run_probe_snapshot(
+        &self,
+        session_id: &str,
+        browser: BrowserPreference,
+    ) -> Result<crate::types::DomSnapshot, Error> {
+        let response = self
+            .run_probe_action(
+                Some(session_id.to_string()),
+                BrowserAction::Snapshot,
+                20_000,
+                browser,
+            )
+            .await?;
+        response
+            .snapshot
+            .ok_or_else(|| Error::NavigationFailed("probe snapshot missing DOM payload".into()))
+    }
+
+    async fn run_probe_session_lookup(
+        &self,
+        session_id: &str,
+        browser: BrowserPreference,
+    ) -> Result<String, Error> {
+        let response = self
+            .run_probe_action(
+                Some(session_id.to_string()),
+                BrowserAction::Evaluate {
+                    code: "(window.__probeSessionId || document.body?.dataset?.probeSessionId || '')"
+                        .to_string(),
+                },
+                10_000,
+                browser,
+            )
+            .await?;
+        response
+            .result
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::NavigationFailed("probe session id missing from page".into()))
+    }
+
+    async fn run_probe_action(
+        &self,
+        session_id: Option<String>,
+        action: BrowserAction,
+        timeout_ms: u64,
+        browser: BrowserPreference,
+    ) -> Result<BrowserResponse, Error> {
+        let request = BrowserRequest {
+            session_id,
+            action: action.clone(),
+            timeout_ms,
+            sandbox: Some(false),
+            browser: Some(browser),
+        };
+        let response = self.handle_request(request).await;
+        if response.success {
+            return Ok(response);
+        }
+
+        Err(Error::NavigationFailed(format!(
+            "probe action {} failed: {}",
+            action,
+            response
+                .error
+                .unwrap_or_else(|| "unknown browser error".to_string())
+        )))
+    }
+
+    fn probe_snapshot_ref(snapshot: &crate::types::DomSnapshot, text: &str) -> Result<u32, Error> {
+        snapshot
+            .elements
+            .iter()
+            .find(|element| element.text.as_deref() == Some(text))
+            .map(|element| element.ref_)
+            .ok_or_else(|| Error::NavigationFailed(format!("probe element '{text}' not found")))
     }
 
     async fn session_backend(&self, session_id: Option<&str>) -> BrowserBackendKind {

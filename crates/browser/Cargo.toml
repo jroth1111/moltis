@@ -13,6 +13,7 @@ moltis-config  = { workspace = true }
 moltis-metrics = { optional = true, workspace = true }
 moltis-vault   = { optional = true, workspace = true }
 rand           = { workspace = true }
+reqwest        = { workspace = true }
 serde          = { workspace = true }
 serde_json     = { workspace = true }
 sha2           = { optional = true, workspace = true }

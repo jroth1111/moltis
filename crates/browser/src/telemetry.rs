@@ -5,7 +5,8 @@
 //! before anti-bot changes reach production targets.
 
 use {
-    crate::types::BrowserBackendKind,
+    crate::types::{BrowserBackendKind, BrowserKind, BrowserPreference},
+    reqwest::Url,
     serde::{Deserialize, Serialize},
     std::{
         collections::{BTreeMap, BTreeSet},
@@ -28,12 +29,33 @@ pub enum TelemetryError {
     #[error(transparent)]
     TimeFormat(#[from] time::error::Format),
 
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+
+    #[error(transparent)]
+    UrlParse(#[from] url::ParseError),
+
     #[error("invalid tls/ja4 sidecar line {line}: {source}")]
     InvalidJsonLine {
         line: usize,
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("invalid probe origin: {0}")]
+    InvalidProbeOrigin(String),
+
+    #[error("probe report missing data: {0}")]
+    MissingProbeData(String),
+
+    #[error("tls/ja4 sidecar exited before capture completed: {0}")]
+    TlsJa4SidecarExited(String),
+
+    #[error("tls/ja4 sidecar did not produce output at {0}")]
+    TlsJa4SidecarNoOutput(PathBuf),
+
+    #[error("tls/ja4 sidecar produced no observations at {0}")]
+    TlsJa4SidecarEmptyOutput(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +204,69 @@ impl RequestSequenceSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeFingerprintReport {
+    pub session_id: String,
+    pub body: FingerprintSnapshot,
+    #[serde(default)]
+    pub headers: FingerprintHeaders,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeBehaviorReport {
+    pub session_id: String,
+    #[serde(default)]
+    pub batches: Vec<BehaviorBatchSummary>,
+    pub summary: BehaviorBatchSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeSequenceReport {
+    pub run_id: String,
+    pub summary: RequestSequenceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeCanarySpec {
+    pub origin: String,
+    #[serde(default)]
+    pub browser: BrowserPreference,
+    #[serde(default)]
+    pub backends: Vec<BrowserBackendKind>,
+    #[serde(default)]
+    pub policy: ProbeTelemetryPolicy,
+    #[serde(default)]
+    pub tls_sidecar: Option<TlsJa4SidecarConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeCanaryVerdict {
+    Clean,
+    Drifted,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeBackendReport {
+    pub backend: BrowserBackendKind,
+    pub verdict: ProbeCanaryVerdict,
+    #[serde(default)]
+    pub evidence: Option<ProbeRunEvidence>,
+    #[serde(default)]
+    pub baseline: Option<ProbeBaselineUpdate>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeCanaryReport {
+    pub origin: String,
+    pub browser: BrowserPreference,
+    pub backends: Vec<ProbeBackendReport>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeBrowserFamily {
@@ -204,11 +289,14 @@ pub enum ProbeProxyMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeRunProfile {
+    pub browser_kind: BrowserKind,
     pub browser_family: ProbeBrowserFamily,
     pub browser_version: String,
     pub backend: BrowserBackendKind,
     pub headless: bool,
     pub proxy_mode: ProbeProxyMode,
+    pub browser_binary_basename: String,
+    pub launch_profile_hash: String,
 }
 
 impl ProbeBrowserFamily {
@@ -237,12 +325,54 @@ impl ProbeProxyMode {
     }
 }
 
+impl ProbeCanarySpec {
+    #[must_use]
+    pub fn effective_backends(&self) -> Vec<BrowserBackendKind> {
+        let backends = if self.backends.is_empty() {
+            vec![
+                BrowserBackendKind::Chromiumoxide,
+                BrowserBackendKind::Patchright,
+            ]
+        } else {
+            self.backends.clone()
+        };
+        let mut deduped = Vec::with_capacity(backends.len());
+        for backend in backends {
+            if !deduped.contains(&backend) {
+                deduped.push(backend);
+            }
+        }
+        deduped
+    }
+
+    pub fn validated_origin(&self) -> Result<Url, TelemetryError> {
+        let origin = Url::parse(&self.origin)?;
+        match origin.scheme() {
+            "http" => {
+                if self.tls_sidecar.is_some() {
+                    return Err(TelemetryError::InvalidProbeOrigin(
+                        "tls/ja4 capture requires an https probe origin".to_string(),
+                    ));
+                }
+            },
+            "https" => {},
+            other => {
+                return Err(TelemetryError::InvalidProbeOrigin(format!(
+                    "unsupported probe origin scheme '{other}'"
+                )));
+            },
+        }
+        Ok(origin)
+    }
+}
+
 impl ProbeRunProfile {
     #[must_use]
     pub fn storage_key(&self) -> String {
         let headless = if self.headless { "headless" } else { "headed" };
         format!(
-            "{}-{}-{}-{}-{}",
+            "{}-{}-{}-{}-{}-{}",
+            self.browser_kind.as_str(),
             self.browser_family.as_str(),
             sanitize_storage_component(&self.browser_version),
             self.backend,
@@ -257,6 +387,7 @@ pub struct ProbeRunEvidence {
     pub profile: ProbeRunProfile,
     pub fingerprint: FingerprintSnapshot,
     pub headers: FingerprintHeaders,
+    pub behavior: BehaviorBatchSummary,
     pub request_sequence: RequestSequenceSummary,
     #[serde(default)]
     pub tls_ja4: Option<TlsJa4Summary>,
@@ -652,6 +783,134 @@ pub fn default_tls_ja4_sidecar_dir() -> PathBuf {
         .join("browser")
         .join("telemetry")
         .join("tls-ja4")
+}
+
+#[must_use]
+pub fn probe_browser_family(kind: BrowserKind) -> ProbeBrowserFamily {
+    match kind {
+        BrowserKind::Chrome => ProbeBrowserFamily::Chrome,
+        BrowserKind::Chromium => ProbeBrowserFamily::Chromium,
+        BrowserKind::Edge => ProbeBrowserFamily::Edge,
+        BrowserKind::Brave => ProbeBrowserFamily::Brave,
+        BrowserKind::Opera | BrowserKind::Vivaldi | BrowserKind::Arc | BrowserKind::Custom => {
+            ProbeBrowserFamily::Other
+        },
+    }
+}
+
+#[must_use]
+pub fn browser_version_from_user_agent(user_agent: &str) -> String {
+    for marker in ["Chrome/", "Edg/", "OPR/", "Version/"] {
+        if let Some(index) = user_agent.find(marker) {
+            let version = user_agent[index + marker.len()..]
+                .split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if !version.is_empty() {
+                return version.to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+#[must_use]
+pub fn stable_hex_hash(input: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[must_use]
+pub fn aggregate_behavior_summaries(summaries: &[BehaviorBatchSummary]) -> BehaviorBatchSummary {
+    if summaries.is_empty() {
+        return BehaviorBatchSummary::empty();
+    }
+
+    let count = summaries.iter().map(|summary| summary.count).sum();
+    let duration_s = summaries.iter().filter_map(|summary| summary.duration_s).sum::<f64>();
+    let path_len_px = summaries
+        .iter()
+        .map(|summary| summary.path_len_px)
+        .sum::<f64>();
+    let straight_line_px = summaries
+        .iter()
+        .map(|summary| summary.straight_line_px)
+        .sum::<f64>();
+    let weighted = |extract: fn(&BehaviorBatchSummary) -> Option<f64>| -> Option<f64> {
+        let mut total_weight = 0.0;
+        let mut total = 0.0;
+        for summary in summaries {
+            let Some(value) = extract(summary) else {
+                continue;
+            };
+            let weight = summary.count.max(1) as f64;
+            total += value * weight;
+            total_weight += weight;
+        }
+        (total_weight > 0.0).then_some(total / total_weight)
+    };
+
+    BehaviorBatchSummary {
+        count,
+        duration_s: (duration_s > 0.0).then_some(duration_s),
+        path_len_px,
+        straight_line_px,
+        straightness: (path_len_px > 0.0).then_some(straight_line_px / path_len_px),
+        mean_dt_s: weighted(|summary| summary.mean_dt_s),
+        max_idle_gap_s: summaries
+            .iter()
+            .filter_map(|summary| summary.max_idle_gap_s)
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)),
+        mean_step_px: weighted(|summary| summary.mean_step_px),
+        mean_speed_px_s: weighted(|summary| summary.mean_speed_px_s),
+        event_rate_hz: weighted(|summary| summary.event_rate_hz),
+    }
+}
+
+fn probe_report_url(origin: &Url, path: &str) -> Result<Url, TelemetryError> {
+    origin.join(path).map_err(TelemetryError::from)
+}
+
+async fn fetch_probe_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: Url,
+) -> Result<T, TelemetryError> {
+    Ok(client.get(url).send().await?.error_for_status()?.json().await?)
+}
+
+pub async fn fetch_probe_fingerprint_report(
+    client: &reqwest::Client,
+    origin: &Url,
+    session_id: &str,
+) -> Result<ProbeFingerprintReport, TelemetryError> {
+    let session_id = url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect::<String>();
+    let url = probe_report_url(origin, &format!("/report/{session_id}"))?;
+    fetch_probe_json(client, url).await
+}
+
+pub async fn fetch_probe_behavior_report(
+    client: &reqwest::Client,
+    origin: &Url,
+    session_id: &str,
+) -> Result<ProbeBehaviorReport, TelemetryError> {
+    let session_id = url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect::<String>();
+    let url = probe_report_url(origin, &format!("/behavior-report/{session_id}"))?;
+    fetch_probe_json(client, url).await
+}
+
+pub async fn fetch_probe_sequence_report(
+    client: &reqwest::Client,
+    origin: &Url,
+    run_id: &str,
+) -> Result<ProbeSequenceReport, TelemetryError> {
+    let run_id = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect::<String>();
+    let url = probe_report_url(origin, &format!("/sequence-report/{run_id}"))?;
+    fetch_probe_json(client, url).await
 }
 
 pub fn load_tls_ja4_observations(path: &Path) -> Result<Vec<TlsJa4Observation>, TelemetryError> {
@@ -1078,8 +1337,8 @@ mod tests {
         },
         axum::{
             Json, Router,
-            extract::State,
-            http::{HeaderMap, Uri},
+            extract::{Path as AxumPath, State},
+            http::{HeaderMap, StatusCode, Uri},
             response::Html,
             routing::{get, post},
         },
@@ -1284,6 +1543,46 @@ mod tests {
         Json(json!({ "ok": true, "summary": summary }))
     }
 
+    async fn fingerprint_report(
+        AxumPath(session_id): AxumPath<String>,
+        State(state): State<ProbeState>,
+    ) -> Result<Json<ProbeFingerprintReport>, StatusCode> {
+        let fingerprint = state
+            .fingerprint(&session_id)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        Ok(Json(ProbeFingerprintReport {
+            session_id,
+            body: fingerprint.body,
+            headers: fingerprint.headers,
+        }))
+    }
+
+    async fn behavior_report(
+        AxumPath(session_id): AxumPath<String>,
+        State(state): State<ProbeState>,
+    ) -> Json<ProbeBehaviorReport> {
+        let batches = state.behaviors(&session_id);
+        let summaries = batches
+            .iter()
+            .map(|batch| batch.summary.clone())
+            .collect::<Vec<_>>();
+        Json(ProbeBehaviorReport {
+            session_id,
+            summary: aggregate_behavior_summaries(&summaries),
+            batches: summaries,
+        })
+    }
+
+    async fn sequence_report(
+        AxumPath(run_id): AxumPath<String>,
+        State(state): State<ProbeState>,
+    ) -> Json<ProbeSequenceReport> {
+        Json(ProbeSequenceReport {
+            run_id: run_id.clone(),
+            summary: state.request_summary(&run_id),
+        })
+    }
+
     async fn fingerprint_probe_page(
         State(state): State<ProbeState>,
         uri: Uri,
@@ -1354,6 +1653,7 @@ mod tests {
           body: JSON.stringify(payload)
         });
 
+        document.body.dataset.probeSessionId = sessionId;
         document.body.dataset.probeFp = 'ready';
       })();
     </script>
@@ -1401,6 +1701,7 @@ mod tests {
         const response = await fetch(`/session${location.search}`);
         sessionId = (await response.json()).session_id;
         window.__probeSessionId = sessionId;
+        document.body.dataset.probeSessionId = sessionId;
         document.body.dataset.behaviorReady = 'true';
       }
 
@@ -1484,6 +1785,7 @@ mod tests {
         const response = await fetch(withSearch('/session'));
         const session = await response.json();
         window.__probeSessionId = session.session_id;
+        document.body.dataset.probeSessionId = session.session_id;
 
         await runStep('alpha', 40);
         await runStep('bravo', 70);
@@ -1504,6 +1806,9 @@ mod tests {
             .route("/fp", post(collect_fp))
             .route("/behavior", post(collect_behavior))
             .route("/sequence-step", get(sequence_step))
+            .route("/report/{session_id}", get(fingerprint_report))
+            .route("/behavior-report/{session_id}", get(behavior_report))
+            .route("/sequence-report/{run_id}", get(sequence_report))
             .route("/fp-probe", get(fingerprint_probe_page))
             .route("/behavior-probe", get(behavior_probe_page))
             .route("/sequence-probe", get(sequence_probe_page))
@@ -1663,11 +1968,14 @@ mod tests {
     fn sample_probe_run_evidence() -> ProbeRunEvidence {
         ProbeRunEvidence {
             profile: ProbeRunProfile {
+                browser_kind: BrowserKind::Chrome,
                 browser_family: ProbeBrowserFamily::Chrome,
                 browser_version: "123.0.0.0".to_string(),
                 backend: BrowserBackendKind::Patchright,
                 headless: true,
                 proxy_mode: ProbeProxyMode::None,
+                browser_binary_basename: "Google Chrome".to_string(),
+                launch_profile_hash: "abc123def4567890".to_string(),
             },
             fingerprint: FingerprintSnapshot {
                 session_id: "session-1".to_string(),
@@ -1699,6 +2007,18 @@ mod tests {
                 sec_ch_ua_platform: Some("\"macOS\"".to_string()),
                 sec_fetch_site: Some("same-origin".to_string()),
                 x_forwarded_for: None,
+            },
+            behavior: BehaviorBatchSummary {
+                count: 6,
+                duration_s: Some(0.4),
+                path_len_px: 220.0,
+                straight_line_px: 200.0,
+                straightness: Some(0.91),
+                mean_dt_s: Some(0.08),
+                max_idle_gap_s: Some(0.15),
+                mean_step_px: Some(44.0),
+                mean_speed_px_s: Some(550.0),
+                event_rate_hz: Some(15.0),
             },
             request_sequence: RequestSequenceSummary {
                 request_count: 5,
@@ -1739,7 +2059,7 @@ mod tests {
 
         assert_eq!(
             baseline.storage_key(),
-            "chrome-123_0_0_0-patchright-headless-none"
+            "chrome-chrome-123_0_0_0-patchright-headless-none"
         );
         assert_ne!(baseline.storage_key(), headed.storage_key());
         assert_ne!(baseline.storage_key(), chromium.storage_key());
@@ -2347,6 +2667,45 @@ mod tests {
             .iter()
             .any(|batch| batch.summary.straightness.is_some()));
         assert!(!behavior_batches[0].sample.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_manager_probe_canary_reports_clean_runs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let _guard = acquire_live_browser_test_guard().await;
+        let (origin, _state, server) = start_probe_server().await?;
+        let manager = BrowserManager::new(test_browser_config());
+        let report = manager
+            .run_probe_canary(ProbeCanarySpec {
+                origin,
+                browser: BrowserPreference::Auto,
+                backends: vec![
+                    BrowserBackendKind::Chromiumoxide,
+                    BrowserBackendKind::Patchright,
+                ],
+                policy: ProbeTelemetryPolicy {
+                    persist_baselines: false,
+                    ..ProbeTelemetryPolicy::default()
+                },
+                tls_sidecar: None,
+            })
+            .await?;
+
+        manager.shutdown().await;
+        server.abort();
+
+        assert_eq!(report.backends.len(), 2);
+        for backend in &report.backends {
+            assert_eq!(backend.verdict, ProbeCanaryVerdict::Clean, "{backend:?}");
+            assert!(backend.error.is_none());
+            assert!(backend.baseline.is_none());
+            let evidence = backend.evidence.as_ref().unwrap();
+            assert_eq!(evidence.profile.backend, backend.backend);
+            assert!(evidence.behavior.count > 0);
+            assert_eq!(evidence.request_sequence.request_count, 5);
+        }
 
         Ok(())
     }
