@@ -381,10 +381,8 @@ mod tests {
         }
         let _reset = Reset;
 
-        let discoverer = FsSkillDiscoverer::new(vec![(
-            tmp.path().join("skills"),
-            SkillSource::Personal,
-        )]);
+        let discoverer =
+            FsSkillDiscoverer::new(vec![(tmp.path().join("skills"), SkillSource::Personal)]);
         let skills = discoverer.discover().await.unwrap();
         assert!(skills.is_empty());
     }

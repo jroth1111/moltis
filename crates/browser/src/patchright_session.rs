@@ -231,12 +231,7 @@ impl PatchrightSession {
                 "patchright worker reported an unknown startup error".to_string()
             })));
         }
-        if handshake
-            .result
-            .get("ready")
-            .and_then(Value::as_bool)
-            != Some(true)
-        {
+        if handshake.result.get("ready").and_then(Value::as_bool) != Some(true) {
             return Err(Error::LaunchFailed(
                 "patchright worker handshake missing ready signal".into(),
             ));
@@ -770,8 +765,8 @@ mod tests {
         Json(json!({ "ok": true }))
     }
 
-    async fn start_worker_server(
-    ) -> Result<(String, WorkerTestState, JoinHandle<()>), Box<dyn std::error::Error>> {
+    async fn start_worker_server()
+    -> Result<(String, WorkerTestState, JoinHandle<()>), Box<dyn std::error::Error>> {
         let state = WorkerTestState::default();
         let app = Router::new()
             .route("/page", get(worker_page))
@@ -855,7 +850,11 @@ mod tests {
             .await?;
 
         session.goto(&format!("{origin}/page")).await?;
-        assert!(session.wait_selector("body[data-ready='true']", 10_000).await?);
+        assert!(
+            session
+                .wait_selector("body[data-ready='true']", 10_000)
+                .await?
+        );
         sleep(Duration::from_millis(250)).await;
 
         let records = session.stop_api_capture().await?;
@@ -869,9 +868,14 @@ mod tests {
                     name.eq_ignore_ascii_case("authorization") && value == "Bearer patched-token"
                 })
         }));
-        assert!(state.auth_headers.lock().unwrap().iter().any(|value| {
-            value.as_deref() == Some("Bearer patched-token")
-        }));
+        assert!(
+            state
+                .auth_headers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|value| { value.as_deref() == Some("Bearer patched-token") })
+        );
 
         Ok(())
     }

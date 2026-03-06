@@ -40,8 +40,13 @@ pub struct ChallengeDetection {
     pub challenge_widget: bool,
 }
 
-const IMPERVA_MARKERS: &[&str] =
-    &["_incapsula_resource", "incapsula incident id", "visid_incap", "/_incap", "reese84"];
+const IMPERVA_MARKERS: &[&str] = &[
+    "_incapsula_resource",
+    "incapsula incident id",
+    "visid_incap",
+    "/_incap",
+    "reese84",
+];
 const IMPERVA_EXPLICIT_MARKERS: &[&str] = &[
     "pardon our interruption",
     "the website is using a security service",

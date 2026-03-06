@@ -85,7 +85,9 @@ fn validate_frontmatter_contract(meta: &SkillMetadata) -> anyhow::Result<()> {
         bail!("invalid skill frontmatter: `description` is required");
     }
     if meta.triggers.should_trigger.len() < 3 {
-        bail!("invalid skill frontmatter: `triggers.should_trigger` must contain at least 3 prompts");
+        bail!(
+            "invalid skill frontmatter: `triggers.should_trigger` must contain at least 3 prompts"
+        );
     }
     if meta.triggers.should_not_trigger.len() < 3 {
         bail!(

@@ -859,7 +859,11 @@ mod tests {
             Ok(&[])
         }
 
-        async fn call_tool(&self, _name: &str, _arguments: serde_json::Value) -> Result<ToolsCallResult> {
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<ToolsCallResult> {
             Err(Error::message("transport failed"))
         }
 

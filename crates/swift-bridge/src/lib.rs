@@ -959,10 +959,10 @@ fn vault_status_string() -> String {
 fn sandbox_effective_default_image(config: &moltis_config::MoltisConfig) -> String {
     if let Ok(bridge) = bridge_state()
         && let Some(value) = bridge
-        .sandbox_default_image_override
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+            .sandbox_default_image_override
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     {
         return value;
     }
@@ -2395,7 +2395,10 @@ pub extern "C" fn moltis_memory_status() -> *mut c_char {
         };
 
         let bridge = bridge_or_return_error!();
-        let pool = match bridge.runtime.block_on(sqlx::SqlitePool::connect_with(options)) {
+        let pool = match bridge
+            .runtime
+            .block_on(sqlx::SqlitePool::connect_with(options))
+        {
             Ok(pool) => pool,
             Err(error) => {
                 let response = MemoryStatusResponse {

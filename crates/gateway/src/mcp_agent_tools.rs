@@ -313,7 +313,9 @@ fn parse_selected_tools(params: &Value) -> Result<HashSet<String>> {
     let mut selectors = HashSet::with_capacity(selected.len());
     for entry in selected {
         let selector = normalize_selector(&format!("{}::{}", entry.server, entry.tool))
-            .ok_or_else(|| anyhow!("selected_tools entries must include non-empty server and tool"))?;
+            .ok_or_else(|| {
+                anyhow!("selected_tools entries must include non-empty server and tool")
+            })?;
         selectors.insert(selector);
     }
     Ok(selectors)
@@ -798,26 +800,27 @@ impl CodeExecStore {
 
         if let Some(row) = existing {
             let stored_program_json: String = row.try_get("program_json")?;
-            let stored_program_hash = if let Some(hash) = row.try_get::<Option<String>, _>("program_hash")? {
-                hash
-            } else {
-                let stored_program: Program = serde_json::from_str(&stored_program_json)
-                    .with_context(|| format!("stored program for run '{run_id}' is invalid"))?;
-                let hash = program_fingerprint(&stored_program)?;
-                sqlx::query(
-                    r#"
+            let stored_program_hash =
+                if let Some(hash) = row.try_get::<Option<String>, _>("program_hash")? {
+                    hash
+                } else {
+                    let stored_program: Program = serde_json::from_str(&stored_program_json)
+                        .with_context(|| format!("stored program for run '{run_id}' is invalid"))?;
+                    let hash = program_fingerprint(&stored_program)?;
+                    sqlx::query(
+                        r#"
                     UPDATE mcp_code_runs
                     SET program_hash = ?, updated_at = ?
                     WHERE run_id = ?
                     "#,
-                )
-                .bind(&hash)
-                .bind(now)
-                .bind(run_id)
-                .execute(pool)
-                .await?;
-                hash
-            };
+                    )
+                    .bind(&hash)
+                    .bind(now)
+                    .bind(run_id)
+                    .execute(pool)
+                    .await?;
+                    hash
+                };
 
             if stored_program_hash != program_hash {
                 return Err(anyhow!(
@@ -1417,9 +1420,11 @@ impl McpCodeExecTool {
             match called {
                 Ok(called) => match flatten_tool_result(called) {
                     Ok(flattened) => {
-                        if let Err(error) =
-                            ensure_serialized_value_limit(&flattened, self.max_stdout_bytes, "tool output")
-                        {
+                        if let Err(error) = ensure_serialized_value_limit(
+                            &flattened,
+                            self.max_stdout_bytes,
+                            "tool output",
+                        ) {
                             self.manager.record_tool_outcome(server, tool, false).await;
                             last_error = Some(error);
                             continue;
@@ -1945,13 +1950,7 @@ impl McpCodeExecTool {
                 let error_string = error.to_string();
                 let _ = self
                     .store
-                    .mark_run_done(
-                        &run_id,
-                        "timed_out",
-                        0,
-                        None,
-                        Some(error_string.as_str()),
-                    )
+                    .mark_run_done(&run_id, "timed_out", 0, None, Some(error_string.as_str()))
                     .await;
                 return Err(error);
             },
@@ -2236,9 +2235,10 @@ mod tests {
             "selected_tools": [{ "server": "filesystem" }]
         }))
         .expect_err("invalid selected_tools should fail");
-        assert!(err
-            .to_string()
-            .contains("selected_tools must be an array of {server, tool} objects"));
+        assert!(
+            err.to_string()
+                .contains("selected_tools must be an array of {server, tool} objects")
+        );
     }
 
     #[test]
@@ -2309,9 +2309,10 @@ mod tests {
             .start_run("run-1", &second)
             .await
             .expect_err("different program should be rejected");
-        assert!(err
-            .to_string()
-            .contains("run_id 'run-1' already exists for a different program"));
+        assert!(
+            err.to_string()
+                .contains("run_id 'run-1' already exists for a different program")
+        );
     }
 
     #[tokio::test]
@@ -2398,7 +2399,10 @@ mod tests {
             "tool output",
         )
         .expect_err("oversized value should be rejected");
-        assert!(err.to_string().contains("tool output exceeds configured size"));
+        assert!(
+            err.to_string()
+                .contains("tool output exceeds configured size")
+        );
     }
 
     #[test]
@@ -2434,5 +2438,4 @@ mod tests {
             })
         );
     }
-
 }

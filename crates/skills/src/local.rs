@@ -303,7 +303,9 @@ mod tests {
         let changed = sync_local_skill_manifest(&mut manifest, 55).unwrap();
         assert!(changed);
 
-        let repo = manifest.find_repo("personal").expect("personal repo missing");
+        let repo = manifest
+            .find_repo("personal")
+            .expect("personal repo missing");
         assert_eq!(repo.skills.len(), 1);
         assert_eq!(repo.skills[0].name, "demo");
         assert_eq!(repo.skills[0].status, SkillStatus::Pending);

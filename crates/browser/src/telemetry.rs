@@ -444,7 +444,11 @@ impl ProbeCanarySpec {
 impl ProbeRunProfile {
     #[must_use]
     pub fn storage_key(&self) -> String {
-        let headless = if self.headless { "headless" } else { "headed" };
+        let headless = if self.headless {
+            "headless"
+        } else {
+            "headed"
+        };
         format!(
             "{}-{}-{}-{}-{}-{}",
             self.browser_kind.as_str(),
@@ -947,7 +951,10 @@ pub fn aggregate_behavior_summaries(summaries: &[BehaviorBatchSummary]) -> Behav
     }
 
     let count = summaries.iter().map(|summary| summary.count).sum();
-    let duration_s = summaries.iter().filter_map(|summary| summary.duration_s).sum::<f64>();
+    let duration_s = summaries
+        .iter()
+        .filter_map(|summary| summary.duration_s)
+        .sum::<f64>();
     let path_len_px = summaries
         .iter()
         .map(|summary| summary.path_len_px)
@@ -995,7 +1002,13 @@ async fn fetch_probe_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: Url,
 ) -> Result<T, TelemetryError> {
-    Ok(client.get(url).send().await?.error_for_status()?.json().await?)
+    Ok(client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
 }
 
 pub async fn fetch_probe_fingerprint_report(
@@ -1003,7 +1016,8 @@ pub async fn fetch_probe_fingerprint_report(
     origin: &Url,
     session_id: &str,
 ) -> Result<ProbeFingerprintReport, TelemetryError> {
-    let session_id = url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect::<String>();
+    let session_id =
+        url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect::<String>();
     let url = probe_report_url(origin, &format!("/report/{session_id}"))?;
     let mut report: ProbeFingerprintReport = fetch_probe_json(client, url).await?;
     report.sanitize();
@@ -1015,7 +1029,8 @@ pub async fn fetch_probe_behavior_report(
     origin: &Url,
     session_id: &str,
 ) -> Result<ProbeBehaviorReport, TelemetryError> {
-    let session_id = url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect::<String>();
+    let session_id =
+        url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect::<String>();
     let url = probe_report_url(origin, &format!("/behavior-report/{session_id}"))?;
     let mut report: ProbeBehaviorReport = fetch_probe_json(client, url).await?;
     report.sanitize();
@@ -1047,10 +1062,8 @@ pub fn load_tls_ja4_observations(path: &Path) -> Result<Vec<TlsJa4Observation>, 
             (!trimmed.is_empty()).then_some((line + 1, trimmed))
         })
         .map(|(line, content)| {
-            serde_json::from_str(content).map_err(|source| TelemetryError::InvalidJsonLine {
-                line,
-                source,
-            })
+            serde_json::from_str(content)
+                .map_err(|source| TelemetryError::InvalidJsonLine { line, source })
         })
         .collect()
 }
@@ -1080,7 +1093,9 @@ pub fn summarize_tls_ja4_observations(observations: &[TlsJa4Observation]) -> Tls
         distinct_ja4s: distinct_ja4s.into_iter().collect(),
         distinct_alpn: distinct_alpn.into_iter().collect(),
         distinct_tls_versions: distinct_tls_versions.into_iter().collect(),
-        first_ja4: observations.iter().find_map(|observation| observation.ja4.clone()),
+        first_ja4: observations
+            .iter()
+            .find_map(|observation| observation.ja4.clone()),
         last_ja4: observations
             .iter()
             .rev()
@@ -1253,8 +1268,7 @@ pub fn compare_probe_run_with_thresholds(
             kind: ProbeDriftKind::HardwareConcurrencyChanged,
             detail: format!(
                 "hardware concurrency changed from {:?} to {:?}",
-                baseline.fingerprint.hardware_concurrency,
-                current.fingerprint.hardware_concurrency
+                baseline.fingerprint.hardware_concurrency, current.fingerprint.hardware_concurrency
             ),
         });
     }
@@ -1389,8 +1403,8 @@ pub fn compare_probe_run_with_thresholds(
                     ),
                 });
             }
-        }
-        (None, None) => {}
+        },
+        (None, None) => {},
     }
 
     push_optional_drift_issue(
@@ -1420,10 +1434,7 @@ pub fn compare_probe_run_with_thresholds(
 }
 
 #[must_use]
-pub fn compare_probe_run(
-    baseline: &ProbeRunEvidence,
-    current: &ProbeRunEvidence,
-) -> ProbeRunDrift {
+pub fn compare_probe_run(baseline: &ProbeRunEvidence, current: &ProbeRunEvidence) -> ProbeRunDrift {
     compare_probe_run_with_thresholds(baseline, current, &ProbeDriftThresholds::default())
 }
 
@@ -1461,7 +1472,11 @@ pub fn summarize_behavior_points(points: &[BehaviorPoint]) -> BehaviorBatchSumma
         let dx = b.x - a.x;
         let dy = b.y - a.y;
         let step_px = dx.hypot(dy);
-        let speed_px_s = if dt_s > 0.0 { step_px / dt_s } else { 0.0 };
+        let speed_px_s = if dt_s > 0.0 {
+            step_px / dt_s
+        } else {
+            0.0
+        };
 
         total_dt_s += dt_s;
         total_step_px += step_px;
@@ -1514,8 +1529,8 @@ pub fn summarize_request_sequence(events: &[RequestSequenceEvent]) -> RequestSeq
         .windows(2)
         .map(|window| (window[1].request_ts_ms - window[0].request_ts_ms).max(0.0))
         .collect();
-    let mean_gap_ms = (!gaps_ms.is_empty())
-        .then_some(gaps_ms.iter().sum::<f64>() / gaps_ms.len() as f64);
+    let mean_gap_ms =
+        (!gaps_ms.is_empty()).then_some(gaps_ms.iter().sum::<f64>() / gaps_ms.len() as f64);
     let max_gap_ms = gaps_ms.iter().copied().reduce(f64::max);
 
     RequestSequenceSummary {
@@ -1535,7 +1550,9 @@ mod tests {
     use {
         super::*,
         crate::{
-            BrowserManager, patchright_session::PatchrightSession, protection,
+            BrowserManager,
+            patchright_session::PatchrightSession,
+            protection,
             snapshot::sanitize_dom_text,
             types::{BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest},
         },
@@ -1607,12 +1624,7 @@ mod tests {
         }
 
         fn first_fingerprint_session(&self) -> Option<String> {
-            self.fingerprints
-                .lock()
-                .unwrap()
-                .keys()
-                .next()
-                .cloned()
+            self.fingerprints.lock().unwrap().keys().next().cloned()
         }
 
         fn first_behavior_session(&self) -> Option<String> {
@@ -1650,12 +1662,7 @@ mod tests {
         })
     }
 
-    fn record_request(
-        state: &ProbeState,
-        uri: &Uri,
-        method: &str,
-        status_code: u16,
-    ) {
+    fn record_request(state: &ProbeState, uri: &Uri, method: &str, status_code: u16) {
         let Some(run_id) = query_value(uri, "run_id") else {
             return;
         };
@@ -1674,10 +1681,7 @@ mod tests {
         });
     }
 
-    async fn new_session(
-        State(state): State<ProbeState>,
-        uri: Uri,
-    ) -> Json<serde_json::Value> {
+    async fn new_session(State(state): State<ProbeState>, uri: Uri) -> Json<serde_json::Value> {
         record_request(&state, &uri, "GET", 200);
         Json(json!({ "session_id": uuid::Uuid::new_v4().to_string() }))
     }
@@ -1872,10 +1876,7 @@ mod tests {
         )
     }
 
-    async fn behavior_probe_page(
-        State(state): State<ProbeState>,
-        uri: Uri,
-    ) -> Html<&'static str> {
+    async fn behavior_probe_page(State(state): State<ProbeState>, uri: Uri) -> Html<&'static str> {
         record_request(&state, &uri, "GET", 200);
         Html(
             r#"<!doctype html>
@@ -1956,10 +1957,7 @@ mod tests {
         )
     }
 
-    async fn sequence_step(
-        State(state): State<ProbeState>,
-        uri: Uri,
-    ) -> Json<serde_json::Value> {
+    async fn sequence_step(State(state): State<ProbeState>, uri: Uri) -> Json<serde_json::Value> {
         record_request(&state, &uri, "GET", 200);
         Json(json!({
             "ok": true,
@@ -1967,10 +1965,7 @@ mod tests {
         }))
     }
 
-    async fn sequence_probe_page(
-        State(state): State<ProbeState>,
-        uri: Uri,
-    ) -> Html<&'static str> {
+    async fn sequence_probe_page(State(state): State<ProbeState>, uri: Uri) -> Html<&'static str> {
         record_request(&state, &uri, "GET", 200);
         Html(
             r#"<!doctype html>
@@ -2014,7 +2009,8 @@ mod tests {
         )
     }
 
-    async fn start_probe_server() -> Result<(String, ProbeState, JoinHandle<()>), Box<dyn std::error::Error>> {
+    async fn start_probe_server()
+    -> Result<(String, ProbeState, JoinHandle<()>), Box<dyn std::error::Error>> {
         let state = ProbeState::new();
         let app = Router::new()
             .route("/session", get(new_session))
@@ -2051,7 +2047,11 @@ mod tests {
         (config, profile_dir)
     }
 
-    fn request(session_id: Option<String>, action: BrowserAction, timeout_ms: u64) -> BrowserRequest {
+    fn request(
+        session_id: Option<String>,
+        action: BrowserAction,
+        timeout_ms: u64,
+    ) -> BrowserRequest {
         BrowserRequest {
             session_id,
             action,
@@ -2081,7 +2081,8 @@ mod tests {
 
     fn patchright_profile(config: &BrowserConfig) -> protection::PatchrightLaunchProfile {
         let detection = crate::detect::detect_browser(config.chrome_path.as_deref());
-        let selected = crate::detect::pick_browser(&detection.browsers, Some(BrowserPreference::Auto));
+        let selected =
+            crate::detect::pick_browser(&detection.browsers, Some(BrowserPreference::Auto));
         protection::build_patchright_launch_profile_for_browser(config, selected.as_ref())
     }
 
@@ -2116,9 +2117,27 @@ mod tests {
     #[test]
     fn summarize_behavior_points_reports_shape_metrics() {
         let summary = summarize_behavior_points(&[
-            BehaviorPoint { t: 0.0, kind: "move".into(), x: 0.0, y: 0.0, buttons: Some(0) },
-            BehaviorPoint { t: 16.0, kind: "move".into(), x: 3.0, y: 4.0, buttons: Some(0) },
-            BehaviorPoint { t: 32.0, kind: "up".into(), x: 6.0, y: 8.0, buttons: Some(0) },
+            BehaviorPoint {
+                t: 0.0,
+                kind: "move".into(),
+                x: 0.0,
+                y: 0.0,
+                buttons: Some(0),
+            },
+            BehaviorPoint {
+                t: 16.0,
+                kind: "move".into(),
+                x: 3.0,
+                y: 4.0,
+                buttons: Some(0),
+            },
+            BehaviorPoint {
+                t: 32.0,
+                kind: "up".into(),
+                x: 6.0,
+                y: 8.0,
+                buttons: Some(0),
+            },
         ]);
 
         assert_eq!(summary.count, 3);
@@ -2328,10 +2347,12 @@ mod tests {
         let drift = store.compare(&current)?.unwrap();
 
         assert!(!drift.consistent());
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::AcceptLanguageChanged));
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::AcceptLanguageChanged)
+        );
 
         Ok(())
     }
@@ -2374,7 +2395,8 @@ mod tests {
     }
 
     #[test]
-    fn probe_telemetry_policy_persists_and_compares_baseline() -> Result<(), Box<dyn std::error::Error>> {
+    fn probe_telemetry_policy_persists_and_compares_baseline()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let store = ProbeBaselineStore::new(dir.path().join("probe-baselines"));
         let policy = ProbeTelemetryPolicy::default();
@@ -2393,10 +2415,12 @@ mod tests {
             .persist_and_compare_baseline(&store, &current)?
             .unwrap();
         assert!(second.previous.is_some());
-        assert!(second
-            .drift
-            .as_ref()
-            .is_some_and(|drift| !drift.consistent()));
+        assert!(
+            second
+                .drift
+                .as_ref()
+                .is_some_and(|drift| !drift.consistent())
+        );
         assert_eq!(
             second.current.evidence.headers.accept_language.as_deref(),
             Some("en-US,en;q=0.9")
@@ -2455,10 +2479,7 @@ mod tests {
         let config = TlsJa4SidecarConfig {
             command: "ja4-sidecar".to_string(),
             args: vec!["--output".to_string(), "{output_path}".to_string()],
-            env: BTreeMap::from([(
-                "JA4_OUTPUT".to_string(),
-                "{output_path}".to_string(),
-            )]),
+            env: BTreeMap::from([("JA4_OUTPUT".to_string(), "{output_path}".to_string())]),
             working_dir: None,
             output_dir: Some(PathBuf::from("/tmp/moltis-ja4")),
         };
@@ -2533,10 +2554,7 @@ mod tests {
     #[test]
     fn tls_ja4_sidecar_process_reports_early_exit() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
-        let child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("exit 0")
-            .spawn()?;
+        let child = Command::new("/bin/sh").arg("-c").arg("exit 0").spawn()?;
         std::thread::sleep(Duration::from_millis(50));
         let mut process = TlsJa4SidecarProcess {
             child,
@@ -2551,12 +2569,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tls_ja4_sidecar_process_requires_non_empty_output() -> Result<(), Box<dyn std::error::Error>> {
+    fn tls_ja4_sidecar_process_requires_non_empty_output() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempdir()?;
-        let child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("exit 0")
-            .spawn()?;
+        let child = Command::new("/bin/sh").arg("-c").arg("exit 0").spawn()?;
         let process = TlsJa4SidecarProcess {
             child,
             output_path: dir.path().join("capture.jsonl"),
@@ -2585,22 +2601,30 @@ mod tests {
         let drift = compare_probe_run(&baseline, &current);
 
         assert!(!drift.consistent());
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::TlsJa4Changed));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::TlsJa4sChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::TlsAlpnChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::TlsVersionChanged));
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::TlsJa4Changed)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::TlsJa4sChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::TlsAlpnChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::TlsVersionChanged)
+        );
     }
 
     #[test]
@@ -2633,50 +2657,72 @@ mod tests {
         let drift = compare_probe_run(&baseline, &current);
 
         assert!(!drift.consistent());
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BrowserKindChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BrowserVersionChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BackendChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::HeadlessChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::ProxyModeChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BrowserBinaryChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::LaunchProfileHashChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::UserAgentChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::AcceptLanguageChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::PlatformChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::TimezoneChanged));
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BrowserKindChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BrowserVersionChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BackendChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::HeadlessChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::ProxyModeChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BrowserBinaryChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::LaunchProfileHashChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::UserAgentChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::AcceptLanguageChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::PlatformChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::TimezoneChanged)
+        );
     }
 
     #[test]
@@ -2692,26 +2738,36 @@ mod tests {
         let drift = compare_probe_run(&baseline, &current);
 
         assert!(!drift.consistent());
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BehaviorCountDrift));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BehaviorPathDrift));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BehaviorStraightnessDrift));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BehaviorMeanDtDrift));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::BehaviorEventRateDrift));
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BehaviorCountDrift)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BehaviorPathDrift)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BehaviorStraightnessDrift)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BehaviorMeanDtDrift)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::BehaviorEventRateDrift)
+        );
     }
 
     #[test]
@@ -2749,8 +2805,14 @@ mod tests {
         assert_eq!(fingerprint.body.url, "https://example.com");
         assert_eq!(fingerprint.body.user_agent, "Mozilla");
         assert_eq!(fingerprint.body.platform.as_deref(), Some("MacIntel"));
-        assert_eq!(fingerprint.body.languages.as_deref(), Some(&["en-AU".to_string()][..]));
-        assert_eq!(fingerprint.headers.accept_language.as_deref(), Some("en-AU"));
+        assert_eq!(
+            fingerprint.body.languages.as_deref(),
+            Some(&["en-AU".to_string()][..])
+        );
+        assert_eq!(
+            fingerprint.headers.accept_language.as_deref(),
+            Some("en-AU")
+        );
 
         let mut sequence = ProbeSequenceReport {
             run_id: "run\u{200b}id".to_string(),
@@ -2776,7 +2838,10 @@ mod tests {
         let baseline = sample_probe_run_evidence();
         let mut current = baseline.clone();
         current.request_sequence.request_count = 6;
-        current.request_sequence.path_sequence.push("/fp".to_string());
+        current
+            .request_sequence
+            .path_sequence
+            .push("/fp".to_string());
         current.request_sequence.mean_gap_ms = Some(150.0);
         current.request_sequence.max_gap_ms = Some(250.0);
 
@@ -2791,22 +2856,30 @@ mod tests {
         );
 
         assert!(!drift.consistent());
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::RequestCountChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::PathSequenceChanged));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::MeanGapDrift));
-        assert!(drift
-            .issues
-            .iter()
-            .any(|issue| issue.kind == ProbeDriftKind::MaxGapDrift));
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::RequestCountChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::PathSequenceChanged)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::MeanGapDrift)
+        );
+        assert!(
+            drift
+                .issues
+                .iter()
+                .any(|issue| issue.kind == ProbeDriftKind::MaxGapDrift)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2843,7 +2916,11 @@ mod tests {
         assert!(wait.success, "{wait:?}");
 
         let snapshot = manager
-            .handle_request(request(Some(session_id.clone()), BrowserAction::Snapshot, 20_000))
+            .handle_request(request(
+                Some(session_id.clone()),
+                BrowserAction::Snapshot,
+                20_000,
+            ))
             .await;
         assert!(snapshot.success, "{snapshot:?}");
 
@@ -2883,7 +2960,11 @@ mod tests {
         assert!(behavior_wait.success, "{behavior_wait:?}");
 
         let behavior_snapshot = manager
-            .handle_request(request(Some(session_id.clone()), BrowserAction::Snapshot, 20_000))
+            .handle_request(request(
+                Some(session_id.clone()),
+                BrowserAction::Snapshot,
+                20_000,
+            ))
             .await;
         let behavior_snapshot = behavior_snapshot.snapshot.as_ref().unwrap();
         let alpha = snapshot_ref(behavior_snapshot, "Alpha");
@@ -2892,19 +2973,31 @@ mod tests {
 
         assert!(
             manager
-                .handle_request(request(Some(session_id.clone()), BrowserAction::Hover { ref_: alpha }, 10_000))
+                .handle_request(request(
+                    Some(session_id.clone()),
+                    BrowserAction::Hover { ref_: alpha },
+                    10_000
+                ))
                 .await
                 .success
         );
         assert!(
             manager
-                .handle_request(request(Some(session_id.clone()), BrowserAction::Hover { ref_: bravo }, 10_000))
+                .handle_request(request(
+                    Some(session_id.clone()),
+                    BrowserAction::Hover { ref_: bravo },
+                    10_000
+                ))
                 .await
                 .success
         );
         assert!(
             manager
-                .handle_request(request(Some(session_id.clone()), BrowserAction::Click { ref_: target }, 10_000))
+                .handle_request(request(
+                    Some(session_id.clone()),
+                    BrowserAction::Click { ref_: target },
+                    10_000
+                ))
                 .await
                 .success
         );
@@ -2959,27 +3052,46 @@ mod tests {
             .as_ref()
             .and_then(|page| page.content.as_deref())
             .unwrap();
-        assert_eq!(sanitize_dom_text(snapshot_content).as_ref(), snapshot_content);
+        assert_eq!(
+            sanitize_dom_text(snapshot_content).as_ref(),
+            snapshot_content
+        );
         assert!(!snapshot_content.contains('\u{200B}'));
 
         let behavior_batches = state.behaviors(&behavior_session);
         assert!(!behavior_batches.is_empty());
-        let total_count: usize = behavior_batches.iter().map(|batch| batch.summary.count).sum();
+        let total_count: usize = behavior_batches
+            .iter()
+            .map(|batch| batch.summary.count)
+            .sum();
         let total_path_len: f64 = behavior_batches
             .iter()
             .map(|batch| batch.summary.path_len_px)
             .sum();
         assert!(total_count >= 3);
         assert!(total_path_len > 0.0);
-        assert!(behavior_batches.iter().any(|batch| batch.summary.mean_dt_s.is_some()));
-        assert!(behavior_batches.iter().any(|batch| batch.summary.max_idle_gap_s.is_some()));
-        assert!(behavior_batches.iter().any(|batch| batch.summary.event_rate_hz.is_some()));
+        assert!(
+            behavior_batches
+                .iter()
+                .any(|batch| batch.summary.mean_dt_s.is_some())
+        );
+        assert!(
+            behavior_batches
+                .iter()
+                .any(|batch| batch.summary.max_idle_gap_s.is_some())
+        );
+        assert!(
+            behavior_batches
+                .iter()
+                .any(|batch| batch.summary.event_rate_hz.is_some())
+        );
 
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn patchright_probe_captures_identity_and_behavior() -> Result<(), Box<dyn std::error::Error>> {
+    async fn patchright_probe_captures_identity_and_behavior()
+    -> Result<(), Box<dyn std::error::Error>> {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
         let (config, _profile_dir) = test_browser_env();
@@ -2987,13 +3099,19 @@ mod tests {
         let mut session = PatchrightSession::start(&config.protection, &profile).await?;
 
         session.goto(&format!("{origin}/fp-probe")).await?;
-        assert!(session.wait_selector("body[data-probe-fp='ready']", 10_000).await?);
+        assert!(
+            session
+                .wait_selector("body[data-probe-fp='ready']", 10_000)
+                .await?
+        );
         let fingerprint_session = wait_for_patchright_session_id(&state, "fingerprint").await?;
 
         session.goto(&format!("{origin}/behavior-probe")).await?;
-        assert!(session
-            .wait_selector("body[data-behavior-ready='true']", 10_000)
-            .await?);
+        assert!(
+            session
+                .wait_selector("body[data-behavior-ready='true']", 10_000)
+                .await?
+        );
         let centers = session
             .evaluate(
                 r#"(() => ['box-a', 'box-b', 'box-c'].map(id => {
@@ -3006,10 +3124,7 @@ mod tests {
 
         for point in &centers[..2] {
             session
-                .mouse_move(
-                    point["x"].as_f64().unwrap(),
-                    point["y"].as_f64().unwrap(),
-                )
+                .mouse_move(point["x"].as_f64().unwrap(), point["y"].as_f64().unwrap())
                 .await?;
         }
         for offset in [(-18.0, -12.0), (-8.0, -5.0), (6.0, 4.0), (12.0, 8.0)] {
@@ -3048,27 +3163,34 @@ mod tests {
 
         let behavior_batches = state.behaviors(&behavior_session);
         assert!(!behavior_batches.is_empty());
-        let total_count: usize = behavior_batches.iter().map(|batch| batch.summary.count).sum();
+        let total_count: usize = behavior_batches
+            .iter()
+            .map(|batch| batch.summary.count)
+            .sum();
         let total_path_len: f64 = behavior_batches
             .iter()
             .map(|batch| batch.summary.path_len_px)
             .sum();
         assert!(total_count >= 3);
         assert!(total_path_len > 0.0);
-        assert!(behavior_batches
-            .iter()
-            .any(|batch| batch.summary.mean_speed_px_s.is_some()));
-        assert!(behavior_batches
-            .iter()
-            .any(|batch| batch.summary.straightness.is_some()));
+        assert!(
+            behavior_batches
+                .iter()
+                .any(|batch| batch.summary.mean_speed_px_s.is_some())
+        );
+        assert!(
+            behavior_batches
+                .iter()
+                .any(|batch| batch.summary.straightness.is_some())
+        );
         assert!(!behavior_batches[0].sample.is_empty());
 
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn browser_manager_probe_canary_reports_clean_runs() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn browser_manager_probe_canary_reports_clean_runs()
+    -> Result<(), Box<dyn std::error::Error>> {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, _state, server) = start_probe_server().await?;
         let (config, _profile_dir) = test_browser_env();
@@ -3107,7 +3229,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn browser_manager_probe_captures_request_sequence() -> Result<(), Box<dyn std::error::Error>> {
+    async fn browser_manager_probe_captures_request_sequence()
+    -> Result<(), Box<dyn std::error::Error>> {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
         let (config, _profile_dir) = test_browser_env();
@@ -3163,7 +3286,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn patchright_probe_captures_request_sequence() -> Result<(), Box<dyn std::error::Error>> {
+    async fn patchright_probe_captures_request_sequence() -> Result<(), Box<dyn std::error::Error>>
+    {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
         let (config, _profile_dir) = test_browser_env();
@@ -3174,9 +3298,11 @@ mod tests {
         session
             .goto(&format!("{origin}/sequence-probe?run_id={run_id}"))
             .await?;
-        assert!(session
-            .wait_selector("body[data-sequence-ready='true']", 10_000)
-            .await?);
+        assert!(
+            session
+                .wait_selector("body[data-sequence-ready='true']", 10_000)
+                .await?
+        );
 
         session.close().await?;
         server.abort();

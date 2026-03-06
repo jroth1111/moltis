@@ -11,8 +11,8 @@ use {
         ChannelAttachment, ChannelEvent, ChannelEventSink, ChannelMessageMeta, ChannelReplyTarget,
         Error as ChannelError, Result as ChannelResult,
     },
-    moltis_skills::discover::SkillDiscoverer,
     moltis_sessions::metadata::SqliteSessionMetadata,
+    moltis_skills::discover::SkillDiscoverer,
 };
 
 use crate::{
@@ -1794,10 +1794,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
             _ => {
                 let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
                 let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
-                let discovered_skills = discoverer
-                    .discover()
-                    .await
-                    .unwrap_or_else(|_| Vec::new());
+                let discovered_skills = discoverer.discover().await.unwrap_or_else(|_| Vec::new());
 
                 if discovered_skills.iter().any(|skill| skill.name == cmd) {
                     let slash_text = if args.is_empty() {
@@ -1821,7 +1818,9 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .unwrap_or_else(|| format!("Executed /{cmd}."));
                     Ok(reply_text)
                 } else {
-                    Err(ChannelError::invalid_input(format!("unknown command: /{cmd}")))
+                    Err(ChannelError::invalid_input(format!(
+                        "unknown command: /{cmd}"
+                    )))
                 }
             },
         }

@@ -76,7 +76,10 @@ fn send_internal_error_close(
         code: INTERNAL_ERROR_CLOSE_CODE,
         reason: format!("internal server error: {context}"),
     });
-    warn!(conn_id, context, "ws: closing connection after outbound serialization failure");
+    warn!(
+        conn_id,
+        context, "ws: closing connection after outbound serialization failure"
+    );
 }
 
 /// Handle a single WebSocket connection through its full lifecycle:
@@ -530,12 +533,9 @@ pub async fn handle_connection(
                             "gateway is shutting down; request rejected",
                         ),
                     );
-                    if let Err(error) = try_send_json_frame(
-                        &client_tx,
-                        &response,
-                        &conn_id,
-                        "shutdown response",
-                    ) {
+                    if let Err(error) =
+                        try_send_json_frame(&client_tx, &response, &conn_id, "shutdown response")
+                    {
                         if error == OutboundJsonError::Serialize {
                             send_internal_error_close(&client_tx, &conn_id, "shutdown response");
                         }

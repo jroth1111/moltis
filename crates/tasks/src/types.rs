@@ -486,21 +486,25 @@ mod tests {
 
     #[test]
     fn completion_evidence_requires_non_empty_summary() {
-        assert!(!CompletionEvidence {
-            summary: "   ".into(),
-            source_tool: Some("exec".into()),
-            source_call_id: Some("call-1".into()),
-            verified_at: OffsetDateTime::now_utc(),
-        }
-        .is_valid());
+        assert!(
+            !CompletionEvidence {
+                summary: "   ".into(),
+                source_tool: Some("exec".into()),
+                source_call_id: Some("call-1".into()),
+                verified_at: OffsetDateTime::now_utc(),
+            }
+            .is_valid()
+        );
 
-        assert!(CompletionEvidence {
-            summary: "tests passed".into(),
-            source_tool: Some("exec".into()),
-            source_call_id: Some("call-1".into()),
-            verified_at: OffsetDateTime::now_utc(),
-        }
-        .is_valid());
+        assert!(
+            CompletionEvidence {
+                summary: "tests passed".into(),
+                source_tool: Some("exec".into()),
+                source_call_id: Some("call-1".into()),
+                verified_at: OffsetDateTime::now_utc(),
+            }
+            .is_valid()
+        );
     }
 
     #[test]

@@ -69,7 +69,11 @@ struct SiteTestResult {
 
 impl std::fmt::Display for SiteTestResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status = if self.success { "PASS" } else { "FAIL" };
+        let status = if self.success {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         writeln!(f, "=== {} [{}] ===", self.name, status)?;
         writeln!(f, "  backend: {}", self.backend)?;
         writeln!(f, "  challenge_type: {:?}", self.challenge_type)?;
@@ -164,7 +168,11 @@ async fn test_site(site: &TargetSite) -> SiteTestResult {
         final_url,
         page_title: title.title.unwrap_or_default(),
         snapshot_elements,
-        error: navigate.error.or(snapshot.error).or(title.error).or(url.error),
+        error: navigate
+            .error
+            .or(snapshot.error)
+            .or(title.error)
+            .or(url.error),
     }
 }
 
@@ -178,8 +186,7 @@ async fn assert_site(site: &TargetSite, timeout_secs: u64) {
     assert!(
         result.success,
         "{} navigation failed: {:?}",
-        site.url,
-        result.error
+        site.url, result.error
     );
     assert!(
         result.challenge_type.is_none(),
@@ -197,7 +204,10 @@ async fn assert_site(site: &TargetSite, timeout_secs: u64) {
         "snapshot returned no interactive elements"
     );
     assert!(!result.page_title.is_empty(), "title lookup returned empty");
-    assert!(!result.final_url.is_empty(), "final_url should not be empty");
+    assert!(
+        !result.final_url.is_empty(),
+        "final_url should not be empty"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

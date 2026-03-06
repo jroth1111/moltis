@@ -196,7 +196,10 @@ pub(crate) fn sanitize_dom_text(input: &str) -> Cow<'_, str> {
         return Cow::Borrowed(input);
     }
 
-    let sanitized = input.chars().filter(|ch| !is_filtered_dom_char(*ch)).collect();
+    let sanitized = input
+        .chars()
+        .filter(|ch| !is_filtered_dom_char(*ch))
+        .collect();
     Cow::Owned(sanitized)
 }
 
@@ -561,7 +564,10 @@ mod tests {
         assert_eq!(snapshot.content.as_deref(), Some("visible text"));
         assert_eq!(snapshot.elements[0].role.as_deref(), Some("button"));
         assert_eq!(snapshot.elements[0].text.as_deref(), Some("Click"));
-        assert_eq!(snapshot.elements[0].placeholder.as_deref(), Some("placeholder"));
+        assert_eq!(
+            snapshot.elements[0].placeholder.as_deref(),
+            Some("placeholder")
+        );
         assert_eq!(snapshot.elements[0].aria_label.as_deref(), Some("label"));
     }
 }

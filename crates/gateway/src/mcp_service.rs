@@ -111,7 +111,10 @@ pub(crate) async fn sync_mcp_tools(
     }
 
     if count > 0 {
-        info!(tools = count, "legacy direct MCP tools synced into tool registry");
+        info!(
+            tools = count,
+            "legacy direct MCP tools synced into tool registry"
+        );
     }
 }
 
@@ -714,7 +717,8 @@ impl McpService for LiveMcpService {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(15)
                 .clamp(1, i64::MAX as u64);
-            state.enabled_until = Some(SystemTime::now() + Duration::from_secs(ttl_minutes.saturating_mul(60)));
+            state.enabled_until =
+                Some(SystemTime::now() + Duration::from_secs(ttl_minutes.saturating_mul(60)));
             state.allow_servers = params
                 .get("allowServers")
                 .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
@@ -911,7 +915,8 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_direct_expiry_task_unregisters_tools() {
-        let service = LiveMcpService::new(Arc::new(moltis_mcp::McpManager::new(McpRegistry::new())));
+        let service =
+            LiveMcpService::new(Arc::new(moltis_mcp::McpManager::new(McpRegistry::new())));
         let registry = Arc::new(RwLock::new(ToolRegistry::new()));
         service.set_tool_registry(Arc::clone(&registry)).await;
 

@@ -474,7 +474,10 @@ fn summarize_tool_calls(tool_calls: &[ToolCall]) -> String {
     }
 
     if tool_calls.len() > MAX_SUMMARY_ACTIONS {
-        parts.push(format!("and {} more action(s)", tool_calls.len() - MAX_SUMMARY_ACTIONS));
+        parts.push(format!(
+            "and {} more action(s)",
+            tool_calls.len() - MAX_SUMMARY_ACTIONS
+        ));
     }
 
     parts.join(", ")

@@ -7,8 +7,7 @@ use std::{
 use moltis_metrics::{counter, histogram, skills as skills_metrics};
 
 use crate::{
-    archive_audit,
-    audit,
+    archive_audit, audit,
     evals::{
         SkillEvalInput, SkillEvalRunSummary, SkillEvalStore, SkillGateDecision,
         evaluate_install_gate,
@@ -107,7 +106,9 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
         let _ = tokio::fs::remove_dir_all(&staging).await;
         append_upgrade_history(
             &canonical_source,
-            existing_repo.as_ref().and_then(|repo| repo.commit_sha.clone()),
+            existing_repo
+                .as_ref()
+                .and_then(|repo| repo.commit_sha.clone()),
             commit_sha.clone(),
             Some("rolled_back_regression"),
             None,
@@ -144,7 +145,10 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
                     let _ = tokio::fs::rename(backup, &target).await;
                 }
                 let _ = tokio::fs::remove_dir_all(&staging).await;
-                anyhow::bail!("failed to promote upgraded repo '{}': {err}", canonical_source);
+                anyhow::bail!(
+                    "failed to promote upgraded repo '{}': {err}",
+                    canonical_source
+                );
             }
         }
     }
@@ -174,7 +178,9 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
     if is_upgrade {
         append_upgrade_history(
             &canonical_source,
-            existing_repo.as_ref().and_then(|repo| repo.commit_sha.clone()),
+            existing_repo
+                .as_ref()
+                .and_then(|repo| repo.commit_sha.clone()),
             commit_sha,
             Some("upgraded"),
             backup_dir
@@ -384,18 +390,21 @@ fn build_eval_inputs_for_installed_repo(
         .collect())
 }
 
-fn normalize_state_repo_prefixes(states: &mut [SkillState], from_repo_dir: &str, to_repo_dir: &str) {
+fn normalize_state_repo_prefixes(
+    states: &mut [SkillState],
+    from_repo_dir: &str,
+    to_repo_dir: &str,
+) {
     for state in states {
-        state.relative_path = rewrite_relative_repo_path(&state.relative_path, from_repo_dir, to_repo_dir);
+        state.relative_path =
+            rewrite_relative_repo_path(&state.relative_path, from_repo_dir, to_repo_dir);
     }
 }
 
 fn rewrite_relative_repo_path(path: &str, from_repo_dir: &str, to_repo_dir: &str) -> String {
     let mut components = Path::new(path).components();
     match components.next() {
-        Some(Component::Normal(prefix))
-            if prefix == std::ffi::OsStr::new(from_repo_dir) =>
-        {
+        Some(Component::Normal(prefix)) if prefix == std::ffi::OsStr::new(from_repo_dir) => {
             let mut rebuilt = PathBuf::from(to_repo_dir);
             for component in components {
                 rebuilt.push(component.as_os_str());
@@ -430,7 +439,8 @@ fn detect_upgrade_regressions(
     }
 
     for after_decision in after {
-        let Some(before_decision) = before_by_name.get(after_decision.run.skill_name.as_str()) else {
+        let Some(before_decision) = before_by_name.get(after_decision.run.skill_name.as_str())
+        else {
             continue;
         };
 
@@ -911,7 +921,11 @@ Support {description}.
             "owner-repo/skills/demo"
         );
         assert_eq!(
-            rewrite_relative_repo_path("owner-repo.upgrade-123", "owner-repo.upgrade-123", "owner-repo"),
+            rewrite_relative_repo_path(
+                "owner-repo.upgrade-123",
+                "owner-repo.upgrade-123",
+                "owner-repo"
+            ),
             "owner-repo"
         );
         assert_eq!(
@@ -920,7 +934,12 @@ Support {description}.
         );
     }
 
-    fn mock_summary(with_skill_pass_rate: f64, pass_rate_delta: f64, precision: f64, recall: f64) -> SkillEvalRunSummary {
+    fn mock_summary(
+        with_skill_pass_rate: f64,
+        pass_rate_delta: f64,
+        precision: f64,
+        recall: f64,
+    ) -> SkillEvalRunSummary {
         SkillEvalRunSummary {
             with_skill_pass_rate,
             without_skill_pass_rate: with_skill_pass_rate - pass_rate_delta,
@@ -941,10 +960,26 @@ Support {description}.
         let before = mock_summary(0.90, 0.40, 0.95, 0.90);
         let after = mock_summary(0.80, 0.20, 0.82, 0.79);
         let reasons = compare_run_summaries(&before, &after);
-        assert!(reasons.iter().any(|r| r.contains("with-skill pass rate regressed")));
-        assert!(reasons.iter().any(|r| r.contains("pass-rate delta regressed")));
-        assert!(reasons.iter().any(|r| r.contains("trigger precision regressed")));
-        assert!(reasons.iter().any(|r| r.contains("trigger recall regressed")));
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("with-skill pass rate regressed"))
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("pass-rate delta regressed"))
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("trigger precision regressed"))
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("trigger recall regressed"))
+        );
     }
 
     #[test]

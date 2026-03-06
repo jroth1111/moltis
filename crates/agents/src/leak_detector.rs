@@ -72,11 +72,7 @@ fn raw_patterns() -> &'static [RawPatternEntry] {
             "stripe_live_key",
             LeakAction::Redact,
         ),
-        (
-            r"-----BEGIN [A-Z ]+-----",
-            "pem_block",
-            LeakAction::Warn,
-        ),
+        (r"-----BEGIN [A-Z ]+-----", "pem_block", LeakAction::Warn),
         (
             r"eyJ[A-Za-z0-9\-_=]+\.eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]+",
             "jwt",

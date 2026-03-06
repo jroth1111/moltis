@@ -28,8 +28,8 @@ use {
     },
     moltis_agents::tool_registry::AgentTool,
     moltis_tasks::{
-        AutonomyTier, CompletionEvidence, FailureClass, HandoffContext, RuntimeState, Task,
-        TaskId, TaskPrincipal, TaskSpec, TaskStore, TerminalState, TransitionEvent,
+        AutonomyTier, CompletionEvidence, FailureClass, HandoffContext, RuntimeState, Task, TaskId,
+        TaskPrincipal, TaskSpec, TaskStore, TerminalState, TransitionEvent,
     },
 };
 
@@ -933,8 +933,8 @@ mod tests {
                 "source_call_id": "call-1"
             }
         }))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let result = t
             .execute(json!({ "action": "claim", "id": id, "owner": "b" }))
@@ -1286,7 +1286,10 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("owned by 'owner-a'"), "unexpected error: {err}");
+        assert!(
+            err.contains("owned by 'owner-a'"),
+            "unexpected error: {err}"
+        );
         assert!(err.contains("owner-b"), "unexpected error: {err}");
     }
 

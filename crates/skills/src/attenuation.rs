@@ -155,9 +155,11 @@ pub fn resolve_allowed_tools<'a>(
     let unmatched_specs: Vec<String> = spec_patterns
         .iter()
         .filter_map(|(spec, patterns)| {
-            let has_match = patterns
-                .iter()
-                .any(|pattern| matched_tools.iter().any(|tool| wildcard_match(pattern, tool)));
+            let has_match = patterns.iter().any(|pattern| {
+                matched_tools
+                    .iter()
+                    .any(|tool| wildcard_match(pattern, tool))
+            });
             if has_match {
                 None
             } else {
@@ -230,7 +232,9 @@ pub fn attenuate_tools<'a>(
 mod tests {
     use {
         super::*,
-        crate::types::{SkillEvals, SkillMetadata, SkillPermissions, SkillRequirements, SkillTriggers},
+        crate::types::{
+            SkillEvals, SkillMetadata, SkillPermissions, SkillRequirements, SkillTriggers,
+        },
         std::path::PathBuf,
     };
 
@@ -309,10 +313,7 @@ mod tests {
 
     #[test]
     fn trusted_skill_allowed_tools_rejects_wrapped_specs() {
-        let skill = mock_skill(vec![
-            "Bash(git:*)".to_string(),
-            "web_fetch".to_string(),
-        ]);
+        let skill = mock_skill(vec!["Bash(git:*)".to_string(), "web_fetch".to_string()]);
         let all = &[
             "exec",
             "read_file",

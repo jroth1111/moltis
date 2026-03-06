@@ -984,7 +984,10 @@ mod tests {
             }))
             .await;
 
-        assert!(result.is_ok(), "approval should be skipped for container backends");
+        assert!(
+            result.is_ok(),
+            "approval should be skipped for container backends"
+        );
         assert!(!bc.called.load(Ordering::SeqCst));
     }
 

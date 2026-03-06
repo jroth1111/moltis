@@ -1473,29 +1473,35 @@ fn collect_scan_findings(value: &Value, out: &mut Vec<ScanFinding>) {
                 .and_then(normalize_scan_severity);
 
             if let Some(severity) = severity {
-                let reason = strings_from_keys(obj, &[
-                    "message",
-                    "description",
-                    "summary",
-                    "title",
-                    "rule",
-                    "check",
-                    "id",
-                ])
+                let reason = strings_from_keys(
+                    obj,
+                    &[
+                        "message",
+                        "description",
+                        "summary",
+                        "title",
+                        "rule",
+                        "check",
+                        "id",
+                    ],
+                )
                 .into_iter()
                 .find(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("{severity} severity mcp-scan finding"));
-                let path_hints = strings_from_keys(obj, &[
-                    "path",
-                    "paths",
-                    "file",
-                    "file_path",
-                    "filename",
-                    "location",
-                    "target",
-                    "resource",
-                    "source_file",
-                ]);
+                let path_hints = strings_from_keys(
+                    obj,
+                    &[
+                        "path",
+                        "paths",
+                        "file",
+                        "file_path",
+                        "filename",
+                        "location",
+                        "target",
+                        "resource",
+                        "source_file",
+                    ],
+                );
                 let skill_hints =
                     strings_from_keys(obj, &["skill", "skill_name", "skillId", "skill_id", "name"]);
 
@@ -2670,11 +2676,12 @@ mod tests {
                     }],
                 }],
             };
-            let store = moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
+            let store =
+                moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
             store.save(&manifest).unwrap();
 
-            let detail =
-                skill_detail_discovered("personal", "demo").expect("local skill detail should load");
+            let detail = skill_detail_discovered("personal", "demo")
+                .expect("local skill detail should load");
 
             assert_eq!(detail["status"], "trusted");
             assert_eq!(detail["trusted"], true);
@@ -2714,7 +2721,8 @@ mod tests {
                     }],
                 }],
             };
-            let store = moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
+            let store =
+                moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
             store.save(&manifest).unwrap();
 
             let error = toggle_skill(
@@ -2727,9 +2735,7 @@ mod tests {
             .expect_err("drifted local skill should require revalidation");
 
             assert!(
-                error
-                    .to_string()
-                    .contains("changed since last validation"),
+                error.to_string().contains("changed since last validation"),
                 "unexpected error: {error}"
             );
         });

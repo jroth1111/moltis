@@ -73,7 +73,9 @@ pub fn select_skills<'a>(
 mod tests {
     use {
         super::*,
-        crate::types::{SkillEvals, SkillMetadata, SkillPermissions, SkillRequirements, SkillTriggers},
+        crate::types::{
+            SkillEvals, SkillMetadata, SkillPermissions, SkillRequirements, SkillTriggers,
+        },
         std::path::PathBuf,
     };
 

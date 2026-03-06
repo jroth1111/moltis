@@ -125,8 +125,10 @@ pub(crate) fn build_patchright_launch_profile_for_browser(
         .or_else(|| config.stealth.user_agent.clone());
 
     let (channel, executable_path) = if let Some(selected) = selected {
-        let use_channel =
-            !matches!(selected.source, DetectionSource::CustomPath | DetectionSource::EnvVar);
+        let use_channel = !matches!(
+            selected.source,
+            DetectionSource::CustomPath | DetectionSource::EnvVar
+        );
         let channel = if use_channel {
             patchright_channel_for_browser(selected.kind).map(ToString::to_string)
         } else {
@@ -269,13 +271,7 @@ mod tests {
         cfg.domains = vec!["*.example.com".to_string()];
         cfg.triggers = vec![ProtectionTrigger::Kasada];
 
-        let diagnostics = assess_html(
-            "https://shop.example.com".to_string(),
-            5,
-            0,
-            0,
-            "kpsdk",
-        );
+        let diagnostics = assess_html("https://shop.example.com".to_string(), 5, 0, 0, "kpsdk");
         assert_eq!(
             protection_trigger_for_fallback(&diagnostics, false, "https://shop.example.com/", &cfg),
             Some(ProtectionTrigger::Kasada)
@@ -285,7 +281,12 @@ mod tests {
             None
         );
         assert_eq!(
-            protection_trigger_for_fallback(&diagnostics, false, "https://other.example.net/", &cfg),
+            protection_trigger_for_fallback(
+                &diagnostics,
+                false,
+                "https://other.example.net/",
+                &cfg
+            ),
             None
         );
     }
