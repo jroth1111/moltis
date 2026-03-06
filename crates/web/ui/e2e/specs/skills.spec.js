@@ -313,6 +313,108 @@ test.describe("Skills page", () => {
 			.toBe(false);
 	});
 
+	test("pending local skill keeps delete separate from revalidate", async ({ page }) => {
+		await mockSkillsApi(page, {
+			repos: [
+				{
+					source: "personal",
+					repo_name: "__local-personal__",
+					skill_count: 1,
+					enabled_count: 0,
+					quarantined_count: 0,
+				},
+			],
+			searchSkills: [
+				{
+					name: "local-skill",
+					display_name: "Local Skill",
+					description: "Pending local fixture",
+					trusted: false,
+					status: "pending",
+					quarantined: false,
+					integrity_ok: false,
+					enabled: false,
+					eligible: true,
+				},
+			],
+		});
+		await installSkillsRpcMock(page, {
+			"skills.skill.detail": {
+				ok: true,
+				payload: {
+					name: "local-skill",
+					display_name: "Local Skill",
+					source: "personal",
+					description: "Pending local detail fixture",
+					trusted: false,
+					status: "pending",
+					quarantined: false,
+					integrity_ok: false,
+					enabled: false,
+					eligible: true,
+					protected: false,
+					missing_bins: [],
+					body_html: "<p>fixture</p>",
+				},
+			},
+			"skills.skill.delete": {
+				ok: true,
+				payload: { deleted: true },
+			},
+		});
+
+		await navigateAndWait(page, "/skills");
+		await expandRepo(page, "personal");
+		await openSkillDetail(page, "Local Skill");
+
+		await expect(page.getByRole("button", { name: "Revalidate", exact: true }).first()).toBeVisible();
+		await expect(page.getByRole("button", { name: "Delete", exact: true }).first()).toBeVisible();
+
+		await page.getByRole("button", { name: "Delete", exact: true }).first().click();
+		await expect(page.locator(".modal-overlay")).toContainText('Delete skill "local-skill"?');
+		await page.locator(".modal-overlay").getByRole("button", { name: "Delete", exact: true }).click();
+
+		await expect
+			.poll(() => page.evaluate(() => (window.__skillsRpcCalls || []).map((c) => c.method)))
+			.toContain("skills.skill.delete");
+		await expect
+			.poll(() => page.evaluate(() => (window.__skillsRpcCalls || []).map((c) => c.method)))
+			.not.toContain("skills.skill.disable");
+		await expect
+			.poll(() => page.evaluate(() => (window.__skillsRpcCalls || []).map((c) => c.method)))
+			.not.toContain("skills.skill.enable");
+	});
+
+	test("enabled local skill disables instead of deleting from the enabled table", async ({ page }) => {
+		await mockSkillsApi(page, {
+			enabledSkills: [
+				{
+					name: "local-skill",
+					description: "Trusted local fixture",
+					source: "personal",
+					enabled: true,
+				},
+			],
+			repos: [],
+		});
+		await installSkillsRpcMock(page, {
+			"skills.skill.disable": {
+				ok: true,
+				payload: { ok: true },
+			},
+		});
+
+		await navigateAndWait(page, "/skills");
+		await page.getByRole("button", { name: "Disable", exact: true }).first().click();
+
+		await expect
+			.poll(() => page.evaluate(() => (window.__skillsRpcCalls || []).map((c) => c.method)))
+			.toContain("skills.skill.disable");
+		await expect
+			.poll(() => page.evaluate(() => (window.__skillsRpcCalls || []).map((c) => c.method)))
+			.not.toContain("skills.skill.delete");
+	});
+
 	test("skill eval benchmark can be started from skills page", async ({ page }) => {
 		await mockSkillsApi(page, {
 			enabledSkills: [
