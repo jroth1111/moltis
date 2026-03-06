@@ -145,3 +145,26 @@
       - Woolworths PASS (`patchright`)
       - Coles PASS (`patchright`)
       - Realestate PASS (`patchright`)
+- Applied the recommended usage model in `crates/browser/src/telemetry.rs`:
+  - probe baselines are routine by default through `ProbeTelemetryPolicy`
+  - TLS/JA4 capture is explicit opt-in by default and can be forced or disabled
+  - policy helper persists and compares baselines in one step for regular probe runs
+- Validation for the policy step:
+  - `cargo check -p moltis-browser --quiet`
+    - exit `0`
+  - `cargo test -p moltis-browser --lib telemetry::tests:: -- --nocapture`
+    - exit `0`
+    - `20 passed`
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `139 passed, 0 failed, 8 ignored`
+  - `cargo test -p moltis-browser --test real_sites_test --no-run --quiet`
+    - exit `0`
+  - `CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' MOLTIS_DATA_DIR=$(mktemp -d) CARGO_TARGET_DIR=$(mktemp -d) cargo test -q -p moltis-browser --test real_sites_test -- --nocapture --test-threads=1`
+    - exit `0`
+    - `5 passed`
+    - Summary:
+      - Google PASS (`chromiumoxide`)
+      - Woolworths PASS (`patchright`)
+      - Coles PASS (`patchright`)
+      - Realestate PASS (`patchright`)

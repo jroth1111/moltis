@@ -274,6 +274,45 @@ pub struct ProbeBaselineStore {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsJa4CollectionMode {
+    Disabled,
+    #[default]
+    OnDemand,
+    Always,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeTelemetryPolicy {
+    pub persist_baselines: bool,
+    pub tls_ja4_mode: TlsJa4CollectionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeCapturePlan {
+    pub persist_baseline: bool,
+    pub capture_tls_ja4: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeBaselineUpdate {
+    #[serde(default)]
+    pub previous: Option<ProbeBaselineRecord>,
+    pub current: ProbeBaselineRecord,
+    #[serde(default)]
+    pub drift: Option<ProbeRunDrift>,
+}
+
+impl Default for ProbeTelemetryPolicy {
+    fn default() -> Self {
+        Self {
+            persist_baselines: true,
+            tls_ja4_mode: TlsJa4CollectionMode::OnDemand,
+        }
+    }
+}
+
 impl Default for ProbeBaselineStore {
     fn default() -> Self {
         Self::new(default_probe_baseline_dir())
@@ -344,6 +383,44 @@ impl ProbeBaselineStore {
         current: &ProbeRunEvidence,
     ) -> Result<Option<ProbeRunDrift>, TelemetryError> {
         self.compare_with_thresholds(current, &ProbeDriftThresholds::default())
+    }
+}
+
+impl ProbeTelemetryPolicy {
+    #[must_use]
+    pub fn capture_plan(&self, request_tls_ja4: bool) -> ProbeCapturePlan {
+        let capture_tls_ja4 = match self.tls_ja4_mode {
+            TlsJa4CollectionMode::Disabled => false,
+            TlsJa4CollectionMode::OnDemand => request_tls_ja4,
+            TlsJa4CollectionMode::Always => true,
+        };
+
+        ProbeCapturePlan {
+            persist_baseline: self.persist_baselines,
+            capture_tls_ja4,
+        }
+    }
+
+    pub fn persist_and_compare_baseline(
+        &self,
+        store: &ProbeBaselineStore,
+        current: &ProbeRunEvidence,
+    ) -> Result<Option<ProbeBaselineUpdate>, TelemetryError> {
+        if !self.persist_baselines {
+            return Ok(None);
+        }
+
+        let previous = store.load(&current.profile)?;
+        let drift = previous
+            .as_ref()
+            .map(|baseline| compare_probe_run(&baseline.evidence, current));
+        let current = store.save(current)?;
+
+        Ok(Some(ProbeBaselineUpdate {
+            previous,
+            current,
+            drift,
+        }))
     }
 }
 
@@ -1718,6 +1795,75 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.kind == ProbeDriftKind::AcceptLanguageChanged));
+
+        Ok(())
+    }
+
+    #[test]
+    fn probe_telemetry_policy_defaults_to_routine_baselines_and_opt_in_tls() {
+        let policy = ProbeTelemetryPolicy::default();
+
+        assert_eq!(
+            policy.capture_plan(false),
+            ProbeCapturePlan {
+                persist_baseline: true,
+                capture_tls_ja4: false,
+            }
+        );
+        assert_eq!(
+            policy.capture_plan(true),
+            ProbeCapturePlan {
+                persist_baseline: true,
+                capture_tls_ja4: true,
+            }
+        );
+    }
+
+    #[test]
+    fn probe_telemetry_policy_can_disable_or_force_tls_capture() {
+        let disabled = ProbeTelemetryPolicy {
+            persist_baselines: true,
+            tls_ja4_mode: TlsJa4CollectionMode::Disabled,
+        };
+        let always = ProbeTelemetryPolicy {
+            persist_baselines: true,
+            tls_ja4_mode: TlsJa4CollectionMode::Always,
+        };
+
+        assert!(!disabled.capture_plan(true).capture_tls_ja4);
+        assert!(!disabled.capture_plan(false).capture_tls_ja4);
+        assert!(always.capture_plan(false).capture_tls_ja4);
+        assert!(always.capture_plan(true).capture_tls_ja4);
+    }
+
+    #[test]
+    fn probe_telemetry_policy_persists_and_compares_baseline() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let store = ProbeBaselineStore::new(dir.path().join("probe-baselines"));
+        let policy = ProbeTelemetryPolicy::default();
+        let baseline = sample_probe_run_evidence();
+
+        let first = policy
+            .persist_and_compare_baseline(&store, &baseline)?
+            .unwrap();
+        assert!(first.previous.is_none());
+        assert!(first.drift.is_none());
+
+        let mut current = baseline.clone();
+        current.headers.accept_language = Some("en-US,en;q=0.9".to_string());
+
+        let second = policy
+            .persist_and_compare_baseline(&store, &current)?
+            .unwrap();
+        assert!(second.previous.is_some());
+        assert!(second
+            .drift
+            .as_ref()
+            .is_some_and(|drift| !drift.consistent()));
+        assert_eq!(
+            second.current.evidence.headers.accept_language.as_deref(),
+            Some("en-US,en;q=0.9")
+        );
 
         Ok(())
     }
