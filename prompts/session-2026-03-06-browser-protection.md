@@ -121,3 +121,27 @@
       - Woolworths PASS (`patchright`)
       - Coles PASS (`patchright`)
       - Realestate PASS (`patchright`)
+- Added external TLS/JA4 sidecar support in `crates/browser/src/telemetry.rs`:
+  - typed TLS/JA4 observation and summary models
+  - JSONL load/summarize helpers for external capture output
+  - placeholder-based sidecar config and process wrapper with output-path resolution
+  - optional TLS/JA4 evidence in probe baselines plus TLS drift classification
+- Validation for the TLS/JA4 sidecar step:
+  - `cargo check -p moltis-browser --quiet`
+    - exit `0`
+  - `cargo test -p moltis-browser --lib telemetry::tests:: -- --nocapture`
+    - exit `0`
+    - `17 passed`
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `136 passed, 0 failed, 8 ignored`
+  - `cargo test -p moltis-browser --test real_sites_test --no-run --quiet`
+    - exit `0`
+  - `CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' MOLTIS_DATA_DIR=$(mktemp -d) cargo test -p moltis-browser --test real_sites_test -- --nocapture --test-threads=1`
+    - exit `0`
+    - `5 passed`
+    - Summary:
+      - Google PASS (`chromiumoxide`)
+      - Woolworths PASS (`patchright`)
+      - Coles PASS (`patchright`)
+      - Realestate PASS (`patchright`)

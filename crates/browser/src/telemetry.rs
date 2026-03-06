@@ -8,8 +8,10 @@ use {
     crate::types::BrowserBackendKind,
     serde::{Deserialize, Serialize},
     std::{
+        collections::{BTreeMap, BTreeSet},
         fs,
         path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
     },
     thiserror::Error,
     time::{OffsetDateTime, format_description::well_known::Rfc3339},
@@ -25,6 +27,13 @@ pub enum TelemetryError {
 
     #[error(transparent)]
     TimeFormat(#[from] time::error::Format),
+
+    #[error("invalid tls/ja4 sidecar line {line}: {source}")]
+    InvalidJsonLine {
+        line: usize,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -249,6 +258,8 @@ pub struct ProbeRunEvidence {
     pub fingerprint: FingerprintSnapshot,
     pub headers: FingerprintHeaders,
     pub request_sequence: RequestSequenceSummary,
+    #[serde(default)]
+    pub tls_ja4: Option<TlsJa4Summary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -336,10 +347,146 @@ impl ProbeBaselineStore {
     }
 }
 
+impl TlsJa4SidecarConfig {
+    #[must_use]
+    pub fn output_dir(&self) -> PathBuf {
+        self.output_dir
+            .clone()
+            .unwrap_or_else(default_tls_ja4_sidecar_dir)
+    }
+
+    #[must_use]
+    pub fn output_path(&self, run_id: &str) -> PathBuf {
+        self.output_dir()
+            .join(format!("{}.jsonl", sanitize_storage_component(run_id)))
+    }
+
+    #[must_use]
+    pub fn resolved_args(&self, output_path: &Path) -> Vec<String> {
+        let output_path = output_path.to_string_lossy();
+        self.args
+            .iter()
+            .map(|arg| arg.replace("{output_path}", &output_path))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn resolved_env(&self, output_path: &Path) -> BTreeMap<String, String> {
+        let output_path = output_path.to_string_lossy();
+        self.env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.replace("{output_path}", &output_path)))
+            .collect()
+    }
+
+    pub fn spawn(&self, run_id: &str) -> Result<TlsJa4SidecarProcess, TelemetryError> {
+        let output_path = self.output_path(run_id);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut command = Command::new(self.command.trim());
+        command.args(self.resolved_args(&output_path));
+        if let Some(working_dir) = &self.working_dir {
+            command.current_dir(working_dir);
+        }
+        for (key, value) in self.resolved_env(&output_path) {
+            command.env(key, value);
+        }
+        command.env("MOLTIS_TLS_JA4_OUTPUT_PATH", &output_path);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+
+        let child = command.spawn()?;
+        Ok(TlsJa4SidecarProcess { child, output_path })
+    }
+}
+
+impl TlsJa4SidecarProcess {
+    #[must_use]
+    pub fn output_path(&self) -> &Path {
+        &self.output_path
+    }
+
+    pub fn stop(mut self) -> Result<(), TelemetryError> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+            let _ = self.child.wait()?;
+        }
+        Ok(())
+    }
+
+    pub fn load_observations(&self) -> Result<Vec<TlsJa4Observation>, TelemetryError> {
+        load_tls_ja4_observations(self.output_path())
+    }
+
+    pub fn load_summary(&self) -> Result<TlsJa4Summary, TelemetryError> {
+        Ok(summarize_tls_ja4_observations(&self.load_observations()?))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeDriftThresholds {
     pub mean_gap_ratio: f64,
     pub max_gap_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TlsJa4Observation {
+    pub ts_ms: f64,
+    #[serde(default)]
+    pub ja4: Option<String>,
+    #[serde(default)]
+    pub ja4s: Option<String>,
+    #[serde(default)]
+    pub alpn: Option<String>,
+    #[serde(default)]
+    pub tls_version: Option<String>,
+    #[serde(default)]
+    pub cipher_suite: Option<String>,
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub destination_addr: Option<String>,
+    #[serde(default)]
+    pub destination_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TlsJa4Summary {
+    pub event_count: usize,
+    #[serde(default)]
+    pub distinct_ja4: Vec<String>,
+    #[serde(default)]
+    pub distinct_ja4s: Vec<String>,
+    #[serde(default)]
+    pub distinct_alpn: Vec<String>,
+    #[serde(default)]
+    pub distinct_tls_versions: Vec<String>,
+    #[serde(default)]
+    pub first_ja4: Option<String>,
+    #[serde(default)]
+    pub last_ja4: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsJa4SidecarConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct TlsJa4SidecarProcess {
+    child: Child,
+    output_path: PathBuf,
 }
 
 impl Default for ProbeDriftThresholds {
@@ -371,6 +518,12 @@ pub enum ProbeDriftKind {
     PathSequenceChanged,
     MeanGapDrift,
     MaxGapDrift,
+    TlsJa4Added,
+    TlsJa4Missing,
+    TlsJa4Changed,
+    TlsJa4sChanged,
+    TlsAlpnChanged,
+    TlsVersionChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -414,6 +567,68 @@ pub fn default_probe_baseline_dir() -> PathBuf {
         .join("browser")
         .join("telemetry")
         .join("probe-baselines")
+}
+
+#[must_use]
+pub fn default_tls_ja4_sidecar_dir() -> PathBuf {
+    moltis_config::data_dir()
+        .join("browser")
+        .join("telemetry")
+        .join("tls-ja4")
+}
+
+pub fn load_tls_ja4_observations(path: &Path) -> Result<Vec<TlsJa4Observation>, TelemetryError> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    fs::read_to_string(path)?
+        .lines()
+        .enumerate()
+        .filter_map(|(line, content)| {
+            let trimmed = content.trim();
+            (!trimmed.is_empty()).then_some((line + 1, trimmed))
+        })
+        .map(|(line, content)| {
+            serde_json::from_str(content).map_err(|source| TelemetryError::InvalidJsonLine {
+                line,
+                source,
+            })
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn summarize_tls_ja4_observations(observations: &[TlsJa4Observation]) -> TlsJa4Summary {
+    let distinct_ja4: BTreeSet<String> = observations
+        .iter()
+        .filter_map(|observation| observation.ja4.clone())
+        .collect();
+    let distinct_ja4s: BTreeSet<String> = observations
+        .iter()
+        .filter_map(|observation| observation.ja4s.clone())
+        .collect();
+    let distinct_alpn: BTreeSet<String> = observations
+        .iter()
+        .filter_map(|observation| observation.alpn.clone())
+        .collect();
+    let distinct_tls_versions: BTreeSet<String> = observations
+        .iter()
+        .filter_map(|observation| observation.tls_version.clone())
+        .collect();
+
+    TlsJa4Summary {
+        event_count: observations.len(),
+        distinct_ja4: distinct_ja4.into_iter().collect(),
+        distinct_ja4s: distinct_ja4s.into_iter().collect(),
+        distinct_alpn: distinct_alpn.into_iter().collect(),
+        distinct_tls_versions: distinct_tls_versions.into_iter().collect(),
+        first_ja4: observations.iter().find_map(|observation| observation.ja4.clone()),
+        last_ja4: observations
+            .iter()
+            .rev()
+            .find_map(|observation| observation.ja4.clone()),
+    }
 }
 
 fn relative_delta(baseline: f64, current: f64) -> f64 {
@@ -588,6 +803,56 @@ pub fn compare_probe_run_with_thresholds(
         });
     }
 
+    match (&baseline.tls_ja4, &current.tls_ja4) {
+        (Some(_), None) => issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::TlsJa4Missing,
+            detail: "tls/ja4 summary missing from current probe run".to_string(),
+        }),
+        (None, Some(_)) => issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::TlsJa4Added,
+            detail: "tls/ja4 summary added to current probe run".to_string(),
+        }),
+        (Some(baseline_tls), Some(current_tls)) => {
+            if baseline_tls.distinct_ja4 != current_tls.distinct_ja4 {
+                issues.push(ProbeDriftIssue {
+                    kind: ProbeDriftKind::TlsJa4Changed,
+                    detail: format!(
+                        "ja4 values changed from {:?} to {:?}",
+                        baseline_tls.distinct_ja4, current_tls.distinct_ja4
+                    ),
+                });
+            }
+            if baseline_tls.distinct_ja4s != current_tls.distinct_ja4s {
+                issues.push(ProbeDriftIssue {
+                    kind: ProbeDriftKind::TlsJa4sChanged,
+                    detail: format!(
+                        "ja4s values changed from {:?} to {:?}",
+                        baseline_tls.distinct_ja4s, current_tls.distinct_ja4s
+                    ),
+                });
+            }
+            if baseline_tls.distinct_alpn != current_tls.distinct_alpn {
+                issues.push(ProbeDriftIssue {
+                    kind: ProbeDriftKind::TlsAlpnChanged,
+                    detail: format!(
+                        "alpn values changed from {:?} to {:?}",
+                        baseline_tls.distinct_alpn, current_tls.distinct_alpn
+                    ),
+                });
+            }
+            if baseline_tls.distinct_tls_versions != current_tls.distinct_tls_versions {
+                issues.push(ProbeDriftIssue {
+                    kind: ProbeDriftKind::TlsVersionChanged,
+                    detail: format!(
+                        "tls versions changed from {:?} to {:?}",
+                        baseline_tls.distinct_tls_versions, current_tls.distinct_tls_versions
+                    ),
+                });
+            }
+        }
+        (None, None) => {}
+    }
+
     push_optional_drift_issue(
         &mut issues,
         ProbeDriftKind::MeanGapDrift,
@@ -700,7 +965,7 @@ pub fn summarize_request_sequence(events: &[RequestSequenceEvent]) -> RequestSeq
     sorted.sort_by(|left, right| left.request_index.cmp(&right.request_index));
 
     let path_sequence: Vec<String> = sorted.iter().map(|event| event.path.clone()).collect();
-    let mut distinct_paths = std::collections::BTreeSet::new();
+    let mut distinct_paths = BTreeSet::new();
     for path in &path_sequence {
         distinct_paths.insert(path.clone());
     }
@@ -743,7 +1008,8 @@ mod tests {
         },
         serde_json::json,
         std::{
-            collections::HashMap,
+            collections::{BTreeMap, HashMap},
+            path::PathBuf,
             sync::{Arc, Mutex as StdMutex, OnceLock},
             time::Instant,
         },
@@ -1372,6 +1638,15 @@ mod tests {
                 mean_gap_ms: Some(75.0),
                 max_gap_ms: Some(120.0),
             },
+            tls_ja4: Some(TlsJa4Summary {
+                event_count: 2,
+                distinct_ja4: vec!["t13d1516h2_8daaf6152771_b186095e22b6".to_string()],
+                distinct_ja4s: vec!["t120200_c030_1".to_string()],
+                distinct_alpn: vec!["h2".to_string()],
+                distinct_tls_versions: vec!["tls1.3".to_string()],
+                first_ja4: Some("t13d1516h2_8daaf6152771_b186095e22b6".to_string()),
+                last_ja4: Some("t13d1516h2_8daaf6152771_b186095e22b6".to_string()),
+            }),
         }
     }
 
@@ -1445,6 +1720,143 @@ mod tests {
             .any(|issue| issue.kind == ProbeDriftKind::AcceptLanguageChanged));
 
         Ok(())
+    }
+
+    #[test]
+    fn summarize_tls_ja4_observations_reports_distinct_values() {
+        let summary = summarize_tls_ja4_observations(&[
+            TlsJa4Observation {
+                ts_ms: 1.0,
+                ja4: Some("ja4-a".to_string()),
+                ja4s: Some("ja4s-a".to_string()),
+                alpn: Some("h2".to_string()),
+                tls_version: Some("tls1.3".to_string()),
+                cipher_suite: Some("TLS_AES_128_GCM_SHA256".to_string()),
+                server_name: Some("example.com".to_string()),
+                destination_addr: Some("203.0.113.10".to_string()),
+                destination_port: Some(443),
+            },
+            TlsJa4Observation {
+                ts_ms: 2.0,
+                ja4: Some("ja4-a".to_string()),
+                ja4s: Some("ja4s-b".to_string()),
+                alpn: Some("http/1.1".to_string()),
+                tls_version: Some("tls1.2".to_string()),
+                cipher_suite: Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".to_string()),
+                server_name: Some("example.com".to_string()),
+                destination_addr: Some("203.0.113.10".to_string()),
+                destination_port: Some(443),
+            },
+        ]);
+
+        assert_eq!(summary.event_count, 2);
+        assert_eq!(summary.distinct_ja4, vec!["ja4-a".to_string()]);
+        assert_eq!(
+            summary.distinct_ja4s,
+            vec!["ja4s-a".to_string(), "ja4s-b".to_string()]
+        );
+        assert_eq!(
+            summary.distinct_alpn,
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+        assert_eq!(
+            summary.distinct_tls_versions,
+            vec!["tls1.2".to_string(), "tls1.3".to_string()]
+        );
+        assert_eq!(summary.first_ja4.as_deref(), Some("ja4-a"));
+        assert_eq!(summary.last_ja4.as_deref(), Some("ja4-a"));
+    }
+
+    #[test]
+    fn tls_ja4_sidecar_config_resolves_output_path_and_placeholders() {
+        let config = TlsJa4SidecarConfig {
+            command: "ja4-sidecar".to_string(),
+            args: vec!["--output".to_string(), "{output_path}".to_string()],
+            env: BTreeMap::from([(
+                "JA4_OUTPUT".to_string(),
+                "{output_path}".to_string(),
+            )]),
+            working_dir: None,
+            output_dir: Some(PathBuf::from("/tmp/moltis-ja4")),
+        };
+
+        let output_path = config.output_path("realestate-run");
+
+        assert_eq!(
+            output_path,
+            PathBuf::from("/tmp/moltis-ja4/realestate_run.jsonl")
+        );
+        assert_eq!(
+            config.resolved_args(&output_path),
+            vec![
+                "--output".to_string(),
+                "/tmp/moltis-ja4/realestate_run.jsonl".to_string(),
+            ]
+        );
+        assert_eq!(
+            config.resolved_env(&output_path).get("JA4_OUTPUT"),
+            Some(&"/tmp/moltis-ja4/realestate_run.jsonl".to_string())
+        );
+    }
+
+    #[test]
+    fn load_tls_ja4_observations_reads_jsonl() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let path = dir.path().join("capture.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"ts_ms\":1.0,\"ja4\":\"ja4-a\",\"ja4s\":\"ja4s-a\",\"alpn\":\"h2\",\"tls_version\":\"tls1.3\"}\n",
+                "{\"ts_ms\":2.0,\"ja4\":\"ja4-b\",\"ja4s\":\"ja4s-a\",\"alpn\":\"h2\",\"tls_version\":\"tls1.3\"}\n",
+            ),
+        )?;
+
+        let observations = load_tls_ja4_observations(&path)?;
+        let summary = summarize_tls_ja4_observations(&observations);
+
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            summary.distinct_ja4,
+            vec!["ja4-a".to_string(), "ja4-b".to_string()]
+        );
+        assert_eq!(summary.distinct_ja4s, vec!["ja4s-a".to_string()]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn compare_probe_run_reports_tls_ja4_drift() {
+        let baseline = sample_probe_run_evidence();
+        let mut current = baseline.clone();
+        current.tls_ja4 = Some(TlsJa4Summary {
+            event_count: 1,
+            distinct_ja4: vec!["ja4-b".to_string()],
+            distinct_ja4s: vec!["ja4s-b".to_string()],
+            distinct_alpn: vec!["http/1.1".to_string()],
+            distinct_tls_versions: vec!["tls1.2".to_string()],
+            first_ja4: Some("ja4-b".to_string()),
+            last_ja4: Some("ja4-b".to_string()),
+        });
+
+        let drift = compare_probe_run(&baseline, &current);
+
+        assert!(!drift.consistent());
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::TlsJa4Changed));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::TlsJa4sChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::TlsAlpnChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::TlsVersionChanged));
     }
 
     #[test]
