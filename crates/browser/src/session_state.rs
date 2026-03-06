@@ -115,6 +115,26 @@ pub struct StorageEntry {
     pub session: HashMap<String, String>,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct CapturedStorageEntry {
+    origin: String,
+    #[serde(default)]
+    local: HashMap<String, String>,
+    #[serde(default)]
+    session: HashMap<String, String>,
+}
+
+fn parse_captured_storage_entry(value: serde_json::Value) -> Result<StorageEntry, Error> {
+    let captured: CapturedStorageEntry = serde_json::from_value(value).map_err(|error| {
+        Error::JsEvalFailed(format!("storage dump returned invalid payload: {error}"))
+    })?;
+    Ok(StorageEntry {
+        origin: captured.origin,
+        local: captured.local,
+        session: captured.session,
+    })
+}
+
 /// Complete browser session state snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
@@ -190,49 +210,23 @@ pub async fn capture_state(page: &Page) -> Result<SessionState, Error> {
                     var k = s.key(i);
                     out[k] = s.getItem(k);
                 }
-                return out;
-            }
-            return JSON.stringify({
-                origin: window.location.origin,
-                local: dumpStorage(window.localStorage),
-                session: dumpStorage(window.sessionStorage)
-            });
+            return out;
+        }
+        return {
+            origin: window.location.origin,
+            local: dumpStorage(window.localStorage),
+            session: dumpStorage(window.sessionStorage)
+        };
         })()
     "#;
 
-    let js_result = page
-        .evaluate(storage_js)
-        .await
-        .map_err(|e| Error::Cdp(format!("storage dump eval failed: {e}")))?;
-
-    let storage_entry = js_result
-        .value()
-        .and_then(|v| v.as_str())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .map(|obj| {
-            let origin = obj["origin"].as_str().unwrap_or("").to_string();
-            let local = obj["local"]
-                .as_object()
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let session = obj["session"]
-                .as_object()
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            StorageEntry {
-                origin,
-                local,
-                session,
-            }
-        });
+    let storage_entry = parse_captured_storage_entry(
+        page.evaluate(storage_js)
+            .await
+            .map_err(|e| Error::Cdp(format!("storage dump eval failed: {e}")))?
+            .into_value()
+            .map_err(|e| Error::JsEvalFailed(format!("storage dump value decode failed: {e}")))?,
+    )?;
 
     let now = time::OffsetDateTime::now_utc();
     let captured_at = now
@@ -244,7 +238,7 @@ pub async fn capture_state(page: &Page) -> Result<SessionState, Error> {
         captured_at,
         url,
         cookies,
-        storage: storage_entry.into_iter().collect(),
+        storage: vec![storage_entry],
     })
 }
 
@@ -681,6 +675,42 @@ mod tests {
 
         let param = CookieParam::from(&entry);
         assert_eq!(param.same_site, Some(CdpCookieSameSite::Strict));
+    }
+
+    #[test]
+    fn parse_captured_storage_entry_accepts_raw_object_payload() {
+        let entry = parse_captured_storage_entry(serde_json::json!({
+            "origin": "https://example.com",
+            "local": {
+                "theme": "dark",
+            },
+            "session": {
+                "auth": "ready",
+            },
+        }))
+        .expect("raw storage payload should deserialize");
+
+        assert_eq!(entry.origin, "https://example.com");
+        assert_eq!(entry.local.get("theme"), Some(&"dark".to_string()));
+        assert_eq!(entry.session.get("auth"), Some(&"ready".to_string()));
+    }
+
+    #[test]
+    fn parse_captured_storage_entry_rejects_invalid_value_shapes() {
+        let error = parse_captured_storage_entry(serde_json::json!({
+            "origin": "https://example.com",
+            "local": {
+                "theme": 1,
+            },
+            "session": {},
+        }))
+        .expect_err("non-string storage values should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("storage dump returned invalid payload")
+        );
     }
 
     #[tokio::test]
