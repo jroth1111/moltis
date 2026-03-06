@@ -6218,85 +6218,6 @@ guidance with task-specific instructions before enabling it.
 - "Show me the sections a new SKILL.md should contain"
 "#;
 
-/// Content for a built-in meta-skill that creates and improves skills.
-const SKILL_CREATOR_SKILL_MD: &str = r#"---
-version: 3
-name: skill-creator
-description: Create and improve Moltis skills with iterative prompts, baseline comparisons, and measurable quality checks. Use this whenever a user asks to create, update, optimize, evaluate, benchmark, or debug any skill.
-triggers:
-  should_trigger:
-    - "Create a new skill for this workflow"
-    - "Improve the trigger logic in an existing skill"
-    - "Benchmark two SKILL.md variants against each other"
-  should_not_trigger:
-    - "Answer a general product question"
-    - "Run a one-off shell command"
-    - "Investigate a bug outside the skills system"
-evals:
-  path: evals/evals.json
-allowed-tools:
-  - read_file
-  - write_file
-  - create_skill
-  - update_skill
-  - delete_skill
-  - spawn_agent
-  - exec
----
-
-## Purpose
-
-Use this skill for tasks about skill authoring, tuning, benchmarking, and
-quality checks.
-
-## Inputs
-
-- The desired skill behavior and trigger boundaries
-- Any existing SKILL.md draft or baseline implementation
-- Expected output format, constraints, and required tools
-- Example prompts that should and should not trigger the skill
-
-## Workflow
-
-1. Capture intent before writing:
-- what the skill should do
-- when it should trigger
-- expected outputs
-- required tools, binaries, or setup
-
-2. Draft or revise SKILL.md:
-- keep frontmatter accurate (`name`, `description`, `allowed-tools`, optional `requires`)
-- keep body task-focused, concrete, and imperative
-- move long references into separate files when needed
-
-3. Build an eval set:
-- write 2-5 realistic user prompts
-- include at least one edge case
-- include one prompt that should NOT trigger the skill
-
-4. Run side-by-side checks:
-- run the prompt with the updated skill
-- run the same prompt against baseline (previous skill revision or no-skill)
-- capture correctness, latency, and token cost
-
-5. Improve and retest:
-- tighten ambiguous instructions
-- remove low-signal or redundant text
-- improve trigger phrasing in description to avoid under-triggering
-
-## Failure Modes
-
-- Do not ship a skill with vague trigger guidance or missing negative examples.
-- Do not broaden permissions without a concrete need.
-- Do not compare revisions using unrealistic prompts or incomplete acceptance criteria.
-
-## Examples
-
-- "Create a deployment skill that only triggers on Vercel release work"
-- "Tighten this skill so it stops firing on ordinary shell requests"
-- "Compare the current SKILL.md against the previous revision and keep the better trigger wording"
-"#;
-
 /// Content for the built-in tmux skill (interactive terminal processes).
 const TMUX_SKILL_MD: &str = r#"---
 version: 3
@@ -6818,14 +6739,6 @@ mod tests {
         moltis_config::clear_data_dir();
     }
 
-    #[test]
-    fn seeded_builtin_skills_parse_as_v3_contract() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        assert!(moltis_skills::parse::parse_skill(EXAMPLE_SKILL_MD, tmp.path()).is_ok());
-        assert!(moltis_skills::parse::parse_skill(SKILL_CREATOR_SKILL_MD, tmp.path()).is_ok());
-        assert!(moltis_skills::parse::parse_skill(TMUX_SKILL_MD, tmp.path()).is_ok());
-    }
     #[tokio::test]
     async fn command_hook_dispatch_saves_session_memory_file() {
         let tmp = tempfile::tempdir().unwrap();
