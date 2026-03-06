@@ -36,9 +36,9 @@ use {
     moltis_agents::runner::classify_error as classify_shift_error,
     moltis_config::schema::TasksConfig,
     moltis_tasks::{
-        AutonomyTier, FailureClass, HandoffContext, IntentStore, ObjectiveSnapshot, OutputStore,
-        RuntimeState, ShiftOutput, Task, TaskId, TaskSpec, TaskStore, TerminalState,
-        TransitionError, TransitionEvent,
+        AutonomyTier, CompletionEvidence, FailureClass, HandoffContext, IntentStore,
+        ObjectiveSnapshot, OutputStore, RuntimeState, ShiftOutput, Task, TaskId, TaskSpec,
+        TaskStore, TerminalState, TransitionError, TransitionEvent,
     },
     moltis_tools::tool_names,
     serde_json::Value,
@@ -383,7 +383,14 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
                         &list_id,
                         &shift.id.0,
                         None,
-                        &TransitionEvent::Complete,
+                        &TransitionEvent::Complete {
+                            evidence: CompletionEvidence {
+                                summary: "dispatch shift completed successfully".into(),
+                                source_tool: Some("dispatch".into()),
+                                source_call_id: None,
+                                verified_at: OffsetDateTime::now_utc(),
+                            },
+                        },
                     )
                     .await?;
                 },
@@ -1069,7 +1076,19 @@ mod tests {
             .await
             .expect("claim shift");
         store
-            .apply_transition("default", &shift.id.0, None, &TransitionEvent::Complete)
+            .apply_transition(
+                "default",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Complete {
+                    evidence: CompletionEvidence {
+                        summary: "dispatch shift completed successfully".into(),
+                        source_tool: Some("dispatch".into()),
+                        source_call_id: None,
+                        verified_at: OffsetDateTime::now_utc(),
+                    },
+                },
+            )
             .await
             .expect("complete shift");
 
