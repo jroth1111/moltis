@@ -10,6 +10,7 @@ pub use moltis_service_traits::*;
 
 use {
     async_trait::async_trait,
+    serde::Deserialize,
     serde_json::Value,
     std::{
         collections::{HashMap, HashSet},
@@ -49,6 +50,78 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn is_local_skill_source(source: &str) -> bool {
+    moltis_skills::local::is_local_source_key(source)
+}
+
+fn load_skills_manifest_with_local_sync() -> Result<
+    (
+        moltis_skills::manifest::ManifestStore,
+        moltis_skills::types::SkillsManifest,
+    ),
+    ServiceError,
+> {
+    let manifest_path =
+        moltis_skills::manifest::ManifestStore::default_path().map_err(ServiceError::message)?;
+    let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
+    let mut manifest = store.load().map_err(ServiceError::message)?;
+    if moltis_skills::local::sync_local_skill_manifest(&mut manifest, current_time_ms())
+        .map_err(ServiceError::message)?
+    {
+        store.save(&manifest).map_err(ServiceError::message)?;
+    }
+    Ok((store, manifest))
+}
+
+fn local_skill_dir(source: &str, skill_name: &str) -> Result<std::path::PathBuf, ServiceError> {
+    let base = moltis_skills::local::local_repo_root_from_key(source)
+        .ok_or_else(|| ServiceError::message(format!("unknown local skill source '{source}'")))?;
+    Ok(base.join(skill_name))
+}
+
+fn local_skill_state<'a>(
+    manifest: &'a moltis_skills::types::SkillsManifest,
+    source: &str,
+    skill_name: &str,
+) -> Result<&'a moltis_skills::types::SkillState, ServiceError> {
+    let local_source = moltis_skills::local::local_source_from_key(source)
+        .ok_or_else(|| ServiceError::message(format!("unknown local skill source '{source}'")))?;
+    moltis_skills::local::local_skill_state(manifest, &local_source, skill_name).ok_or_else(|| {
+        ServiceError::message(format!(
+            "skill '{skill_name}' not found in source '{source}'"
+        ))
+    })
+}
+
+fn repo_root_dir(
+    repo: &moltis_skills::types::RepoEntry,
+    install_dir: &Path,
+) -> Result<std::path::PathBuf, ServiceError> {
+    if is_local_skill_source(&repo.source) {
+        return moltis_skills::local::local_repo_root_from_key(&repo.source).ok_or_else(|| {
+            ServiceError::message(format!("unknown local skill source '{}'", repo.source))
+        });
+    }
+    Ok(install_dir.join(&repo.repo_name))
+}
+
+fn repo_skill_dir(
+    repo: &moltis_skills::types::RepoEntry,
+    skill: &moltis_skills::types::SkillState,
+    install_dir: &Path,
+) -> Result<std::path::PathBuf, ServiceError> {
+    if is_local_skill_source(&repo.source) {
+        let base =
+            moltis_skills::local::local_repo_root_from_key(&repo.source).ok_or_else(|| {
+                ServiceError::message(format!("unknown local skill source '{}'", repo.source))
+            })?;
+        return moltis_skills::audit::resolve_relative_within(&base, &skill.relative_path)
+            .map_err(ServiceError::message);
+    }
+    moltis_skills::audit::resolve_relative_within(install_dir, &skill.relative_path)
+        .map_err(ServiceError::message)
 }
 
 async fn command_available(command: &str) -> bool {
@@ -156,9 +229,100 @@ fn commit_age_days(commit_ts_ms: Option<u64>) -> Option<u64> {
 fn skill_status_label(status: moltis_skills::types::SkillStatus) -> &'static str {
     match status {
         moltis_skills::types::SkillStatus::Trusted => "trusted",
-        moltis_skills::types::SkillStatus::Untrusted => "untrusted",
+        moltis_skills::types::SkillStatus::Pending => "pending",
         moltis_skills::types::SkillStatus::Quarantined => "quarantined",
+        moltis_skills::types::SkillStatus::FailedValidation => "failed_validation",
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillDetailForEval {
+    name: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    body: String,
+    #[serde(default)]
+    allowed_tools: Vec<String>,
+    #[serde(default)]
+    compatibility: Option<String>,
+    #[serde(default)]
+    requires: Option<moltis_skills::types::SkillRequirements>,
+    #[serde(default)]
+    triggers: Option<moltis_skills::types::SkillTriggers>,
+}
+
+fn skill_eval_store() -> Result<moltis_skills::evals::SkillEvalStore, ServiceError> {
+    let path =
+        moltis_skills::evals::SkillEvalStore::default_path().map_err(ServiceError::message)?;
+    Ok(moltis_skills::evals::SkillEvalStore::new(path))
+}
+
+fn parse_eval_rounds(params: &Value) -> Result<Option<u32>, ServiceError> {
+    let Some(value) = params.get("rounds") else {
+        return Ok(None);
+    };
+    let rounds = value
+        .as_u64()
+        .ok_or_else(|| ServiceError::message("'rounds' must be an integer"))?;
+    if !(1..=20).contains(&rounds) {
+        return Err(ServiceError::message("'rounds' must be in range 1..=20"));
+    }
+    Ok(Some(rounds as u32))
+}
+
+fn skill_eval_input_from_detail(
+    source: &str,
+    detail: Value,
+) -> Result<moltis_skills::evals::SkillEvalInput, ServiceError> {
+    let detail: SkillDetailForEval =
+        serde_json::from_value(detail).map_err(ServiceError::message)?;
+    if detail.body.trim().is_empty() {
+        return Err(ServiceError::message(
+            "skill body is empty; cannot evaluate",
+        ));
+    }
+    Ok(moltis_skills::evals::SkillEvalInput {
+        name: detail.name,
+        source: detail.source.unwrap_or_else(|| source.to_string()),
+        description: detail.description.unwrap_or_default(),
+        body: detail.body,
+        allowed_tools: detail.allowed_tools,
+        compatibility: detail.compatibility,
+        requires: detail.requires.unwrap_or_default(),
+        should_trigger: detail
+            .triggers
+            .as_ref()
+            .map(|t| t.should_trigger.clone())
+            .unwrap_or_default(),
+        should_not_trigger: detail
+            .triggers
+            .as_ref()
+            .map(|t| t.should_not_trigger.clone())
+            .unwrap_or_default(),
+    })
+}
+
+fn skill_eval_summary_json(run: &moltis_skills::evals::SkillEvalRun) -> Value {
+    serde_json::json!({
+        "id": run.id,
+        "skill_name": run.skill_name,
+        "source": run.source,
+        "created_at_ms": run.created_at_ms,
+        "status": run.status,
+        "with_skill_pass_rate": run.benchmark.run_summary.with_skill_pass_rate,
+        "without_skill_pass_rate": run.benchmark.run_summary.without_skill_pass_rate,
+        "pass_rate_delta": run.benchmark.run_summary.pass_rate_delta,
+        "with_skill_avg_duration_ms": run.benchmark.run_summary.with_skill_avg_duration_ms,
+        "without_skill_avg_duration_ms": run.benchmark.run_summary.without_skill_avg_duration_ms,
+        "with_skill_avg_tokens": run.benchmark.run_summary.with_skill_avg_tokens,
+        "without_skill_avg_tokens": run.benchmark.run_summary.without_skill_avg_tokens,
+        "trigger_precision": run.benchmark.run_summary.trigger_precision,
+        "trigger_recall": run.benchmark.run_summary.trigger_recall,
+        "with_skill_duration_ratio": run.benchmark.run_summary.with_skill_duration_ratio,
+        "with_skill_token_ratio": run.benchmark.run_summary.with_skill_token_ratio,
+    })
 }
 
 fn risky_install_pattern(command: &str) -> Option<&'static str> {
@@ -290,10 +454,6 @@ impl SkillsService for NoopSkillsService {
         Ok(serde_json::json!({ "installed": installed }))
     }
 
-    async fn update(&self, _p: Value) -> ServiceResult {
-        Err("skills not available".into())
-    }
-
     async fn list(&self) -> ServiceResult {
         use moltis_skills::{
             discover::{FsSkillDiscoverer, SkillDiscoverer},
@@ -348,10 +508,7 @@ impl SkillsService for NoopSkillsService {
     async fn repos_list(&self) -> ServiceResult {
         let install_dir =
             moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
-        let manifest_path = moltis_skills::manifest::ManifestStore::default_path()
-            .map_err(ServiceError::message)?;
-        let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
-        let mut manifest = store.load().map_err(ServiceError::message)?;
+        let (store, mut manifest) = load_skills_manifest_with_local_sync()?;
         let (drift_changed, drifted_sources) =
             detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
         if drift_changed {
@@ -368,8 +525,9 @@ impl SkillsService for NoopSkillsService {
                     .iter()
                     .filter(|s| s.status == moltis_skills::types::SkillStatus::Quarantined)
                     .count();
-                // Re-detect format for repos that predate the formats module
-                let format = if repo.format == moltis_skills::formats::PluginFormat::Skill {
+                let format = if is_local_skill_source(&repo.source) {
+                    moltis_skills::formats::PluginFormat::Skill
+                } else if repo.format == moltis_skills::formats::PluginFormat::Skill {
                     let repo_dir = install_dir.join(&repo.repo_name);
                     moltis_skills::formats::detect_format(&repo_dir)
                 } else {
@@ -424,10 +582,7 @@ impl SkillsService for NoopSkillsService {
 
         let install_dir =
             moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
-        let manifest_path = moltis_skills::manifest::ManifestStore::default_path()
-            .map_err(ServiceError::message)?;
-        let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
-        let mut manifest = store.load().map_err(ServiceError::message)?;
+        let (store, mut manifest) = load_skills_manifest_with_local_sync()?;
         let (drift_changed, drifted_sources) =
             detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
         if drift_changed {
@@ -438,9 +593,10 @@ impl SkillsService for NoopSkillsService {
             .repos
             .iter()
             .map(|repo| {
-                let repo_dir = install_dir.join(&repo.repo_name);
-                // Re-detect format for repos that predate the formats module
-                let format = if repo.format == moltis_skills::formats::PluginFormat::Skill {
+                let repo_dir = repo_root_dir(repo, &install_dir).unwrap_or_else(|_| install_dir.join(&repo.repo_name));
+                let format = if is_local_skill_source(&repo.source) {
+                    moltis_skills::formats::PluginFormat::Skill
+                } else if repo.format == moltis_skills::formats::PluginFormat::Skill {
                     moltis_skills::formats::detect_format(&repo_dir)
                 } else {
                     repo.format
@@ -478,7 +634,8 @@ impl SkillsService for NoopSkillsService {
                             })
                         } else {
                             // SKILL.md format: parse from disk.
-                            let skill_dir = install_dir.join(&s.relative_path);
+                            let skill_dir = repo_skill_dir(repo, s, &install_dir)
+                                .unwrap_or_else(|_| install_dir.join(&s.relative_path));
                             let skill_md = skill_dir.join("SKILL.md");
                             let meta_json = moltis_skills::parse::read_meta_json(&skill_dir);
                             let (description, display_name, elig) =
@@ -636,18 +793,22 @@ impl SkillsService for NoopSkillsService {
     }
 
     async fn skill_disable(&self, params: Value) -> ServiceResult {
-        let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
-
-        // Personal/project skills live as files — delete the directory to disable.
-        if source == "personal" || source == "project" {
-            return delete_discovered_skill(source, &params);
-        }
-
         toggle_skill(&params, false)
     }
 
-    async fn skill_trust(&self, params: Value) -> ServiceResult {
-        set_skill_trusted(&params, true)
+    async fn skill_revalidate(&self, params: Value) -> ServiceResult {
+        revalidate_skill(&params)
+    }
+
+    async fn skill_delete(&self, params: Value) -> ServiceResult {
+        let source = params
+            .get("source")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'source' parameter".to_string())?;
+        if source != "personal" && source != "project" {
+            return Err("skill deletion is only supported for personal/project skills".into());
+        }
+        delete_discovered_skill(source, &params)
     }
 
     async fn skill_unquarantine(&self, params: Value) -> ServiceResult {
@@ -747,6 +908,7 @@ impl SkillsService for NoopSkillsService {
                     "license_url": license_url,
                     "compatibility": content.metadata.compatibility,
                     "allowed_tools": content.metadata.allowed_tools,
+                    "triggers": content.metadata.triggers,
                     "requires": content.metadata.requires,
                     "eligible": elig.eligible,
                     "missing_bins": elig.missing_bins,
@@ -797,6 +959,7 @@ impl SkillsService for NoopSkillsService {
                     "license_url": license_url,
                     "compatibility": entry.metadata.compatibility,
                     "allowed_tools": entry.metadata.allowed_tools,
+                    "triggers": entry.metadata.triggers,
                     "requires": entry.metadata.requires,
                     "eligible": true,
                     "missing_bins": empty,
@@ -1002,6 +1165,61 @@ impl SkillsService for NoopSkillsService {
             "reasons": enforcement.reasons,
         }))
     }
+
+    async fn evals_list(&self) -> ServiceResult {
+        let store = skill_eval_store()?;
+        let log = store.load().map_err(ServiceError::message)?;
+        let runs: Vec<_> = log.runs.iter().map(skill_eval_summary_json).collect();
+        Ok(serde_json::json!(runs))
+    }
+
+    async fn evals_get(&self, params: Value) -> ServiceResult {
+        let id = params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServiceError::message("missing 'id' parameter"))?;
+        let store = skill_eval_store()?;
+        let log = store.load().map_err(ServiceError::message)?;
+        let run = log
+            .runs
+            .into_iter()
+            .find(|run| run.id == id)
+            .ok_or_else(|| ServiceError::message(format!("eval run '{id}' not found")))?;
+        serde_json::to_value(run).map_err(ServiceError::message)
+    }
+
+    async fn evals_run(&self, params: Value) -> ServiceResult {
+        let source = params
+            .get("source")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServiceError::message("missing 'source' parameter"))?;
+        let skill = params
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServiceError::message("missing 'skill' parameter"))?;
+        let rounds = parse_eval_rounds(&params)?;
+
+        let detail = self
+            .skill_detail(serde_json::json!({ "source": source, "skill": skill }))
+            .await?;
+        let eval_input = skill_eval_input_from_detail(source, detail)?;
+        let run = moltis_skills::evals::run_skill_eval(&eval_input, rounds);
+        let store = skill_eval_store()?;
+        store.append(run.clone()).map_err(ServiceError::message)?;
+
+        security_audit(
+            "skills.evals.run",
+            serde_json::json!({
+                "source": source,
+                "skill": skill,
+                "rounds": rounds.unwrap_or(5),
+                "eval_id": run.id,
+                "pass_rate_delta": run.benchmark.run_summary.pass_rate_delta,
+            }),
+        );
+
+        serde_json::to_value(run).map_err(ServiceError::message)
+    }
 }
 
 fn local_repo_head_sha(repo_dir: &Path) -> Option<String> {
@@ -1014,7 +1232,12 @@ fn compute_repo_skill_hashes(
     repo: &moltis_skills::types::RepoEntry,
     install_dir: &Path,
 ) -> anyhow::Result<HashMap<String, String>> {
-    let repo_dir = install_dir.join(&repo.repo_name);
+    let repo_dir = if is_local_skill_source(&repo.source) {
+        moltis_skills::local::local_repo_root_from_key(&repo.source)
+            .ok_or_else(|| anyhow::anyhow!("unknown local skill source '{}'", repo.source))?
+    } else {
+        install_dir.join(&repo.repo_name)
+    };
     let format = if repo.format == moltis_skills::formats::PluginFormat::Skill {
         moltis_skills::formats::detect_format(&repo_dir)
     } else {
@@ -1025,10 +1248,14 @@ fn compute_repo_skill_hashes(
         moltis_skills::formats::PluginFormat::Skill => {
             let mut hashes = HashMap::new();
             for skill in &repo.skills {
-                let skill_dir = moltis_skills::audit::resolve_relative_within(
-                    install_dir,
-                    &skill.relative_path,
-                )?;
+                let skill_dir = if is_local_skill_source(&repo.source) {
+                    moltis_skills::audit::resolve_relative_within(&repo_dir, &skill.relative_path)?
+                } else {
+                    moltis_skills::audit::resolve_relative_within(
+                        install_dir,
+                        &skill.relative_path,
+                    )?
+                };
                 let skill_md = skill_dir.join("SKILL.md");
                 let raw = std::fs::read_to_string(&skill_md)?;
                 hashes.insert(
@@ -1065,6 +1292,9 @@ fn detect_and_enforce_repo_integrity(
     let mut drifted = HashSet::new();
 
     for repo in &mut manifest.repos {
+        if is_local_skill_source(&repo.source) {
+            continue;
+        }
         let repo_dir = install_dir.join(&repo.repo_name);
         let mut repo_drifted = false;
         if let Some(expected_sha) = repo.commit_sha.clone()
@@ -1243,35 +1473,29 @@ fn collect_scan_findings(value: &Value, out: &mut Vec<ScanFinding>) {
                 .and_then(normalize_scan_severity);
 
             if let Some(severity) = severity {
-                let reason = strings_from_keys(
-                    obj,
-                    &[
-                        "message",
-                        "description",
-                        "summary",
-                        "title",
-                        "rule",
-                        "check",
-                        "id",
-                    ],
-                )
+                let reason = strings_from_keys(obj, &[
+                    "message",
+                    "description",
+                    "summary",
+                    "title",
+                    "rule",
+                    "check",
+                    "id",
+                ])
                 .into_iter()
                 .find(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("{severity} severity mcp-scan finding"));
-                let path_hints = strings_from_keys(
-                    obj,
-                    &[
-                        "path",
-                        "paths",
-                        "file",
-                        "file_path",
-                        "filename",
-                        "location",
-                        "target",
-                        "resource",
-                        "source_file",
-                    ],
-                );
+                let path_hints = strings_from_keys(obj, &[
+                    "path",
+                    "paths",
+                    "file",
+                    "file_path",
+                    "filename",
+                    "location",
+                    "target",
+                    "resource",
+                    "source_file",
+                ]);
                 let skill_hints =
                     strings_from_keys(obj, &["skill", "skill_name", "skillId", "skill_id", "name"]);
 
@@ -1336,6 +1560,9 @@ fn enforce_scan_findings_on_manifest(
     let mut unique_reasons = HashSet::new();
 
     for repo in &mut manifest.repos {
+        if is_local_skill_source(&repo.source) {
+            continue;
+        }
         let repo_source = repo.source.clone();
         let repo_name = repo.repo_name.clone();
 
@@ -1423,19 +1650,20 @@ fn delete_discovered_skill(source_type: &str, params: &Value) -> ServiceResult {
         return Err(format!("invalid skill name '{skill_name}'").into());
     }
 
-    let search_dir = if source_type == "personal" {
-        moltis_config::data_dir().join("skills")
-    } else {
-        moltis_config::data_dir().join(".moltis/skills")
-    };
-
-    let skill_dir = search_dir.join(skill_name);
+    let skill_dir = local_skill_dir(source_type, skill_name)?;
     if !skill_dir.exists() {
         return Err(format!("skill '{skill_name}' not found").into());
     }
 
     std::fs::remove_dir_all(&skill_dir)
         .map_err(|e| format!("failed to delete skill '{skill_name}': {e}"))?;
+
+    let (store, mut manifest) = load_skills_manifest_with_local_sync()?;
+    if moltis_skills::local::sync_local_skill_manifest(&mut manifest, current_time_ms())
+        .map_err(ServiceError::message)?
+    {
+        store.save(&manifest).map_err(ServiceError::message)?;
+    }
 
     security_audit(
         "skills.discovered.delete",
@@ -1452,14 +1680,9 @@ fn delete_discovered_skill(source_type: &str, params: &Value) -> ServiceResult {
 fn skill_detail_discovered(source_type: &str, skill_name: &str) -> ServiceResult {
     use moltis_skills::requirements::check_requirements;
 
-    // Build search paths for the requested source type.
-    let search_dir = if source_type == "personal" {
-        moltis_config::data_dir().join("skills")
-    } else {
-        moltis_config::data_dir().join(".moltis/skills")
-    };
-
-    let skill_dir = search_dir.join(skill_name);
+    let (_, manifest) = load_skills_manifest_with_local_sync()?;
+    let skill_state = local_skill_state(&manifest, source_type, skill_name)?;
+    let skill_dir = local_skill_dir(source_type, skill_name)?;
     let skill_md = skill_dir.join("SKILL.md");
     let raw = std::fs::read_to_string(&skill_md)
         .map_err(|e| format!("failed to read SKILL.md for '{skill_name}': {e}"))?;
@@ -1476,17 +1699,18 @@ fn skill_detail_discovered(source_type: &str, skill_name: &str) -> ServiceResult
         "license_url": license_url_for_source(source_type, content.metadata.license.as_deref()),
         "compatibility": content.metadata.compatibility,
         "allowed_tools": content.metadata.allowed_tools,
+        "triggers": content.metadata.triggers,
         "requires": content.metadata.requires,
         "eligible": elig.eligible,
         "missing_bins": elig.missing_bins,
         "install_options": elig.install_options,
-        "trusted": true,
-        "status": "trusted",
-        "quarantined": false,
-        "quarantine_reason": null,
-        "last_audited_ms": null,
-        "integrity_ok": true,
-        "enabled": true,
+        "trusted": skill_state.status.is_trusted(),
+        "status": skill_status_label(skill_state.status),
+        "quarantined": skill_state.status == moltis_skills::types::SkillStatus::Quarantined,
+        "quarantine_reason": skill_state.quarantine_reason,
+        "last_audited_ms": skill_state.last_audited_ms,
+        "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(skill_state),
+        "enabled": skill_state.enabled,
         "protected": is_protected_discovered_skill(skill_name),
         "body": content.body,
         "body_html": markdown_to_html(&content.body),
@@ -1505,10 +1729,7 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing 'skill' parameter".to_string())?;
 
-    let manifest_path =
-        moltis_skills::manifest::ManifestStore::default_path().map_err(ServiceError::message)?;
-    let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
-    let mut manifest = store.load().map_err(ServiceError::message)?;
+    let (store, mut manifest) = load_skills_manifest_with_local_sync()?;
 
     let install_dir =
         moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
@@ -1519,27 +1740,35 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
     }
 
     if enabled {
-        if drifted_sources.contains(source) {
+        if !is_local_skill_source(source) && drifted_sources.contains(source) {
             return Err(format!(
-                "skill '{skill_name}' source changed since it was last trusted. Review and run skills.skill.trust before enabling"
+                "skill '{skill_name}' source changed since last validation. Review and run skills.skill.revalidate before enabling"
             )
             .into());
         }
 
-        let status = manifest
+        let skill = manifest
             .find_repo(source)
             .and_then(|r| r.skills.iter().find(|s| s.name == skill_name))
-            .map(|s| s.status)
             .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
+        let status = skill.status;
         if status == moltis_skills::types::SkillStatus::Quarantined {
             return Err(format!(
-                "skill '{skill_name}' is quarantined due to integrity checks. Review and re-trust before enabling"
+                "skill '{skill_name}' is quarantined due to integrity checks. Review and revalidate before enabling"
             )
             .into());
         }
-        if !status.is_trusted() {
+        if !skill.is_runnable() && !status.is_trusted() {
             return Err(format!(
-                "skill '{skill_name}' is not trusted. Review it and run skills.skill.trust before enabling"
+                "skill '{skill_name}' is not validated. Review it and run skills.skill.revalidate before enabling"
+            )
+            .into());
+        }
+        if is_local_skill_source(source)
+            && !moltis_skills::integrity::integrity_matches_trusted_hash(skill)
+        {
+            return Err(format!(
+                "skill '{skill_name}' changed since last validation. Review and run skills.skill.revalidate before enabling"
             )
             .into());
         }
@@ -1562,7 +1791,11 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
     Ok(serde_json::json!({ "ok": true, "source": source, "skill": skill_name, "enabled": enabled }))
 }
 
-fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
+fn revalidate_skill(params: &Value) -> ServiceResult {
+    let confirm = params
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let source = params
         .get("source")
         .and_then(|v| v.as_str())
@@ -1572,11 +1805,7 @@ fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing 'skill' parameter".to_string())?;
 
-    let manifest_path =
-        moltis_skills::manifest::ManifestStore::default_path().map_err(ServiceError::message)?;
-    let store = moltis_skills::manifest::ManifestStore::new(manifest_path);
-    let mut manifest = store.load().map_err(ServiceError::message)?;
-
+    let (store, mut manifest) = load_skills_manifest_with_local_sync()?;
     let install_dir =
         moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
     let (integrity_changed, _) = detect_and_enforce_repo_integrity(&mut manifest, &install_dir);
@@ -1585,37 +1814,115 @@ fn set_skill_trusted(params: &Value, trusted: bool) -> ServiceResult {
     }
 
     let now_ms = current_time_ms();
-    let skill = manifest
-        .find_repo_mut(source)
-        .and_then(|repo| repo.skills.iter_mut().find(|s| s.name == skill_name))
+    let repo_index = manifest
+        .repos
+        .iter()
+        .position(|repo| repo.source == source)
+        .ok_or_else(|| format!("repo '{source}' not found"))?;
+    let repo = &manifest.repos[repo_index];
+    let skill_index = repo
+        .skills
+        .iter()
+        .position(|skill| skill.name == skill_name)
         .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
+    let skill_state = &repo.skills[skill_index];
+    let repo_dir = repo_root_dir(repo, &install_dir)?;
 
-    if trusted {
-        if skill.content_hash.is_none() {
-            return Err(format!(
-                "skill '{skill_name}' could not be trusted because its content hash is unavailable"
-            )
-            .into());
+    let eval_input = match repo.format {
+        moltis_skills::formats::PluginFormat::Skill => {
+            let skill_dir = repo_skill_dir(repo, skill_state, &install_dir)?;
+            let raw = std::fs::read_to_string(skill_dir.join("SKILL.md"))
+                .map_err(|e| format!("failed to read SKILL.md for '{skill_name}': {e}"))?;
+            let content = moltis_skills::parse::parse_skill(&raw, &skill_dir)
+                .map_err(|e| format!("failed to parse SKILL.md: {e}"))?;
+            moltis_skills::evals::SkillEvalInput {
+                name: content.metadata.name,
+                source: source.to_string(),
+                description: content.metadata.description,
+                body: content.body,
+                allowed_tools: content.metadata.allowed_tools,
+                compatibility: content.metadata.compatibility,
+                requires: content.metadata.requires,
+                should_trigger: content.metadata.triggers.should_trigger,
+                should_not_trigger: content.metadata.triggers.should_not_trigger,
+            }
+        },
+        format => {
+            let entries = moltis_skills::formats::scan_with_adapter(&repo_dir, format)
+                .ok_or_else(|| format!("no adapter for format '{format}'"))?
+                .map_err(|e| format!("scan error: {e}"))?;
+            let entry = entries
+                .into_iter()
+                .find(|entry| entry.metadata.name == skill_name)
+                .ok_or_else(|| format!("skill '{skill_name}' not found on disk"))?;
+            moltis_skills::evals::SkillEvalInput {
+                name: entry.metadata.name,
+                source: source.to_string(),
+                description: entry.metadata.description,
+                body: entry.body,
+                allowed_tools: entry.metadata.allowed_tools,
+                compatibility: entry.metadata.compatibility,
+                requires: entry.metadata.requires,
+                should_trigger: entry.metadata.triggers.should_trigger,
+                should_not_trigger: entry.metadata.triggers.should_not_trigger,
+            }
+        },
+    };
+
+    let decision = moltis_skills::evals::evaluate_install_gate(&eval_input, Some(1));
+    let eval_store = skill_eval_store()?;
+    eval_store
+        .append(decision.run.clone())
+        .map_err(ServiceError::message)?;
+
+    let skill = manifest
+        .repos
+        .get_mut(repo_index)
+        .and_then(|repo| repo.skills.get_mut(skill_index))
+        .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
+    if decision.passed {
+        skill.status = moltis_skills::types::SkillStatus::Pending;
+        skill.enabled = false;
+        skill.trusted_hash = None;
+        skill.last_audited_ms = Some(now_ms);
+        skill.quarantine_reason = None;
+        if confirm {
+            moltis_skills::integrity::trust_skill(skill, now_ms);
         }
-        moltis_skills::integrity::trust_skill(skill, now_ms);
     } else {
-        moltis_skills::integrity::untrust_skill(skill, now_ms);
+        skill.status = moltis_skills::types::SkillStatus::FailedValidation;
+        skill.enabled = false;
+        skill.trusted_hash = None;
+        skill.last_audited_ms = Some(now_ms);
+        skill.quarantine_reason = Some(format!(
+            "validation failed: {}",
+            decision.reasons.join("; ")
+        ));
     }
+    let status = skill.status;
 
-    let audited_content_hash = skill.content_hash.clone();
-    let audited_trusted_hash = skill.trusted_hash.clone();
     store.save(&manifest).map_err(ServiceError::message)?;
     security_audit(
-        "skills.skill.trust",
+        "skills.skill.revalidate",
         serde_json::json!({
             "source": source,
             "skill": skill_name,
-            "trusted": trusted,
-            "trusted_hash": audited_trusted_hash,
-            "content_hash": audited_content_hash,
+            "passed": decision.passed,
+            "confirmed": confirm,
+            "status": skill_status_label(status),
+            "reason_count": decision.reasons.len(),
         }),
     );
-    Ok(serde_json::json!({ "ok": true, "source": source, "skill": skill_name, "trusted": trusted }))
+    Ok(serde_json::json!({
+        "ok": true,
+        "source": source,
+        "skill": skill_name,
+        "status": skill_status_label(status),
+        "passed": decision.passed,
+        "confirmed": confirm,
+        "reasons": decision.reasons,
+        "benchmark": decision.run.benchmark,
+    }))
 }
 
 fn apply_skill_unquarantine(
@@ -1636,7 +1943,7 @@ fn apply_skill_unquarantine(
         "ok": true,
         "source": source,
         "skill": skill_name,
-        "status": "untrusted",
+        "status": "pending",
         "enabled": false,
         "quarantined": false,
     }))
@@ -1678,7 +1985,7 @@ fn unquarantine_skill(params: &Value) -> ServiceResult {
         serde_json::json!({
             "source": source,
             "skill": skill_name,
-            "status": "untrusted",
+            "status": "pending",
             "enabled": false,
         }),
     );
@@ -1968,12 +2275,18 @@ impl GatewayServices {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use moltis_skills::{
-        formats::PluginFormat,
-        types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
+    use {
+        super::*,
+        moltis_skills::{
+            formats::PluginFormat,
+            types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
+        },
+        std::{
+            path::Path,
+            process::Command,
+            sync::{Mutex, OnceLock},
+        },
     };
-    use std::{path::Path, process::Command};
 
     fn write_skill_file(install_dir: &Path, repo_name: &str, relative_path: &str, body: &str) {
         let skill_dir = install_dir.join(relative_path);
@@ -2036,6 +2349,38 @@ mod tests {
             path_hints: vec![path_hint.to_string()],
             skill_hints: vec![],
         }
+    }
+
+    fn data_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn strong_local_skill_markdown(name: &str) -> String {
+        format!(
+            "---\nversion: 3\nname: {name}\ndescription: Create a new skill, improve an existing SKILL.md, and benchmark skill quality with a concise skill-authoring workflow that reviews target files, documents success criteria, updates instructions, validates outputs, compares benchmark results, confirms risky commands before running them, and uses repeatable checks to keep reusable skills reliable, maintainable, and easy to review across revisions.\ntriggers:\n  should_trigger:\n    - create a new skill\n    - improve an existing SKILL.md\n    - benchmark skill quality\n  should_not_trigger:\n    - simple translation request\n    - general brainstorming\n    - non-skill coding task\nevals:\n  path: evals/evals.json\nallowed_tools:\n  - read_file\nrequires:\n  bins:\n    - rg\n---\n## Purpose\n\nCreate and improve skills safely.\n\n## Inputs\n\n- Target skill files.\n- Success criteria.\n\n## Workflow\n\n1. Read files.\n2. Update instructions.\n3. Validate output.\n4. Confirm risky commands before running.\n\n## Failure Modes\n\n- Stop on unrelated requests.\n- Do not run risky commands without confirmation.\n\n## Examples\n\nExample: improve a SKILL.md and benchmark results.\n"
+        )
+    }
+
+    fn with_temp_data_dir<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _guard = data_dir_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                moltis_config::clear_data_dir();
+            }
+        }
+        let _reset = Reset;
+        f(tmp.path())
+    }
+
+    fn write_local_skill(source: &str, name: &str, content: &str) {
+        let base = moltis_skills::local::local_repo_root_from_key(source).unwrap();
+        let skill_dir = base.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
     }
 
     #[test]
@@ -2250,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn unquarantine_transitions_to_untrusted_and_disabled() {
+    fn unquarantine_transitions_to_pending_and_disabled() {
         let mut manifest = single_skill_manifest(
             "owner/repo",
             "owner-repo",
@@ -2268,12 +2613,12 @@ mod tests {
             .expect("unquarantine should succeed");
 
         let skill = &manifest.repos[0].skills[0];
-        assert_eq!(skill.status, SkillStatus::Untrusted);
+        assert_eq!(skill.status, SkillStatus::Pending);
         assert!(!skill.enabled);
         assert!(skill.quarantine_reason.is_none());
         assert!(skill.trusted_hash.is_none());
         assert_eq!(skill.last_audited_ms, Some(123));
-        assert_eq!(payload["status"], "untrusted");
+        assert_eq!(payload["status"], "pending");
         assert_eq!(payload["enabled"], false);
         assert_eq!(payload["quarantined"], false);
     }
@@ -2285,7 +2630,7 @@ mod tests {
             "owner-repo",
             "owner-repo/skills/demo",
             None,
-            SkillStatus::Untrusted,
+            SkillStatus::Pending,
             false,
             Some("content".to_string()),
             None,
@@ -2296,6 +2641,98 @@ mod tests {
             err.to_string().contains("not quarantined"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn skill_detail_discovered_reflects_persisted_local_trust_state() {
+        with_temp_data_dir(|data_dir| {
+            let markdown = strong_local_skill_markdown("demo");
+            let content_hash = moltis_skills::integrity::hash_skill_markdown(&markdown);
+            write_local_skill("personal", "demo", &markdown);
+
+            let manifest = SkillsManifest {
+                version: 3,
+                repos: vec![RepoEntry {
+                    source: "personal".into(),
+                    repo_name: "__local-personal__".into(),
+                    installed_at_ms: 0,
+                    commit_sha: None,
+                    format: PluginFormat::Skill,
+                    skills: vec![SkillState {
+                        name: "demo".into(),
+                        relative_path: "demo".into(),
+                        status: SkillStatus::Trusted,
+                        quarantine_reason: None,
+                        last_audited_ms: Some(42),
+                        content_hash: Some(content_hash.clone()),
+                        trusted_hash: Some(content_hash),
+                        enabled: false,
+                    }],
+                }],
+            };
+            let store = moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
+            store.save(&manifest).unwrap();
+
+            let detail =
+                skill_detail_discovered("personal", "demo").expect("local skill detail should load");
+
+            assert_eq!(detail["status"], "trusted");
+            assert_eq!(detail["trusted"], true);
+            assert_eq!(detail["enabled"], false);
+            assert_eq!(detail["integrity_ok"], true);
+            assert_eq!(detail["last_audited_ms"], 42);
+        });
+    }
+
+    #[test]
+    fn toggle_skill_rejects_local_content_drift_until_revalidated() {
+        with_temp_data_dir(|data_dir| {
+            let trusted_markdown = strong_local_skill_markdown("demo");
+            let drifted_markdown =
+                trusted_markdown.replace("structured evaluation workflow", "rewritten workflow");
+            let trusted_hash = moltis_skills::integrity::hash_skill_markdown(&trusted_markdown);
+
+            write_local_skill("personal", "demo", &drifted_markdown);
+
+            let manifest = SkillsManifest {
+                version: 3,
+                repos: vec![RepoEntry {
+                    source: "personal".into(),
+                    repo_name: "__local-personal__".into(),
+                    installed_at_ms: 0,
+                    commit_sha: None,
+                    format: PluginFormat::Skill,
+                    skills: vec![SkillState {
+                        name: "demo".into(),
+                        relative_path: "demo".into(),
+                        status: SkillStatus::Trusted,
+                        quarantine_reason: None,
+                        last_audited_ms: Some(42),
+                        content_hash: Some(trusted_hash.clone()),
+                        trusted_hash: Some(trusted_hash),
+                        enabled: false,
+                    }],
+                }],
+            };
+            let store = moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
+            store.save(&manifest).unwrap();
+
+            let error = toggle_skill(
+                &serde_json::json!({
+                    "source": "personal",
+                    "skill": "demo",
+                }),
+                true,
+            )
+            .expect_err("drifted local skill should require revalidation");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed since last validation"),
+                "unexpected error: {error}"
+            );
+        });
     }
 
     #[test]
@@ -2342,7 +2779,7 @@ mod tests {
             "owner-repo",
             "owner-repo/skills/demo",
             None,
-            SkillStatus::Untrusted,
+            SkillStatus::Pending,
             true,
             None,
             None,
@@ -2371,7 +2808,7 @@ mod tests {
             "owner-repo",
             "owner-repo/skills/demo",
             None,
-            SkillStatus::Untrusted,
+            SkillStatus::Pending,
             true,
             None,
             None,
@@ -2390,7 +2827,7 @@ mod tests {
         assert_eq!(low_summary.enforced_quarantines, 0);
         assert_eq!(
             manifest_low_only.repos[0].skills[0].status,
-            SkillStatus::Untrusted
+            SkillStatus::Pending
         );
         assert!(manifest_low_only.repos[0].skills[0].enabled);
     }
@@ -2404,7 +2841,7 @@ mod tests {
             "owner-repo",
             "owner-repo/skills/demo",
             None,
-            SkillStatus::Untrusted,
+            SkillStatus::Pending,
             true,
             None,
             None,
@@ -2422,7 +2859,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_quarantine_lifecycle_allows_unquarantine_then_retrust() {
+    fn scan_quarantine_lifecycle_allows_unquarantine_then_revalidate() {
         let tmp = tempfile::tempdir().unwrap();
         let install_dir = tmp.path();
         let hash = "trusted-hash".to_string();
@@ -2449,11 +2886,86 @@ mod tests {
 
         let payload = apply_skill_unquarantine(&mut manifest, "owner/repo", "demo", 100)
             .expect("unquarantine should succeed after scanner quarantine");
-        assert_eq!(payload["status"], "untrusted");
-        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Untrusted);
+        assert_eq!(payload["status"], "pending");
+        assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Pending);
 
         moltis_skills::integrity::trust_skill(&mut manifest.repos[0].skills[0], 101);
         assert_eq!(manifest.repos[0].skills[0].status, SkillStatus::Trusted);
+    }
+
+    #[test]
+    fn local_pending_skill_cannot_be_enabled() {
+        with_temp_data_dir(|_| {
+            write_local_skill("personal", "demo", &strong_local_skill_markdown("demo"));
+
+            let err = toggle_skill(
+                &serde_json::json!({
+                    "source": "personal",
+                    "skill": "demo",
+                }),
+                true,
+            )
+            .expect_err("pending local skill should not enable");
+
+            assert!(err.to_string().contains("not validated"));
+        });
+    }
+
+    #[test]
+    fn local_revalidate_persists_trusted_state() {
+        with_temp_data_dir(|tmp| {
+            write_local_skill("personal", "demo", &strong_local_skill_markdown("demo"));
+
+            let response = revalidate_skill(&serde_json::json!({
+                "source": "personal",
+                "skill": "demo",
+                "confirm": true,
+            }))
+            .expect("revalidation should succeed");
+
+            assert_eq!(response["ok"], true);
+            assert_eq!(response["status"], "trusted");
+            assert_eq!(response["passed"], true);
+            assert_eq!(response["confirmed"], true);
+
+            let store =
+                moltis_skills::manifest::ManifestStore::new(tmp.join("skills-manifest.json"));
+            let manifest = store.load().unwrap();
+            let skill = manifest
+                .find_repo("personal")
+                .and_then(|repo| repo.skills.iter().find(|skill| skill.name == "demo"))
+                .expect("local skill missing from manifest");
+            assert_eq!(skill.status, SkillStatus::Trusted);
+            assert!(!skill.enabled);
+            assert_eq!(skill.trusted_hash, skill.content_hash);
+            assert!(skill.last_audited_ms.is_some());
+        });
+    }
+
+    #[test]
+    fn local_skill_detail_uses_persisted_status() {
+        with_temp_data_dir(|tmp| {
+            let content = strong_local_skill_markdown("demo");
+            write_local_skill("personal", "demo", &content);
+
+            let store =
+                moltis_skills::manifest::ManifestStore::new(tmp.join("skills-manifest.json"));
+            let mut manifest = SkillsManifest::default();
+            moltis_skills::local::sync_local_skill_manifest(&mut manifest, 11).unwrap();
+            let skill = manifest
+                .find_repo_mut("personal")
+                .and_then(|repo| repo.skills.iter_mut().find(|skill| skill.name == "demo"))
+                .expect("local skill missing from manifest");
+            moltis_skills::integrity::trust_skill(skill, 22);
+            skill.enabled = true;
+            store.save(&manifest).unwrap();
+
+            let detail = skill_detail_discovered("personal", "demo").expect("detail should load");
+            assert_eq!(detail["trusted"], true);
+            assert_eq!(detail["status"], "trusted");
+            assert_eq!(detail["enabled"], true);
+            assert_eq!(detail["integrity_ok"], true);
+        });
     }
 
     #[tokio::test]

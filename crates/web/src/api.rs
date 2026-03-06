@@ -17,6 +17,9 @@ use {
 use crate::templates::{build_nav_counts, onboarding_completed};
 
 const MCP_LIST_FAILED: &str = "MCP_LIST_FAILED";
+const SKILLS_EVALS_LIST_FAILED: &str = "SKILLS_EVALS_LIST_FAILED";
+const SKILLS_EVAL_GET_FAILED: &str = "SKILLS_EVAL_GET_FAILED";
+const SKILLS_EVAL_RUN_FAILED: &str = "SKILLS_EVAL_RUN_FAILED";
 const IMAGE_CACHE_DELETE_FAILED: &str = "IMAGE_CACHE_DELETE_FAILED";
 const IMAGE_CACHE_PRUNE_FAILED: &str = "IMAGE_CACHE_PRUNE_FAILED";
 const SANDBOX_CHECK_PACKAGES_FAILED: &str = "SANDBOX_CHECK_PACKAGES_FAILED";
@@ -189,8 +192,9 @@ where
     fn status_label(status: moltis_skills::types::SkillStatus) -> &'static str {
         match status {
             moltis_skills::types::SkillStatus::Trusted => "trusted",
-            moltis_skills::types::SkillStatus::Untrusted => "untrusted",
+            moltis_skills::types::SkillStatus::Pending => "pending",
             moltis_skills::types::SkillStatus::Quarantined => "quarantined",
+            moltis_skills::types::SkillStatus::FailedValidation => "failed_validation",
         }
     }
 
@@ -198,30 +202,42 @@ where
         return Vec::new();
     };
     let store = moltis_skills::manifest::ManifestStore::new(path);
-    store
-        .load()
-        .map(|m| {
-            m.repos
-                .iter()
-                .flat_map(|repo| {
-                    let source = repo.source.clone();
-                    repo.skills.iter().filter(|s| s.enabled).map(move |s| {
-                        serde_json::json!({
-                            "name": s.name,
-                            "source": source,
-                            "trusted": s.status.is_trusted(),
-                            "status": status_label(s.status),
-                            "quarantined": s.status == moltis_skills::types::SkillStatus::Quarantined,
-                            "quarantine_reason": s.quarantine_reason,
-                            "last_audited_ms": s.last_audited_ms,
-                            "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(s),
-                            "enabled": true,
-                        })
-                    })
+    let mut manifest = match store.load() {
+        Ok(manifest) => manifest,
+        Err(_) => return Vec::new(),
+    };
+    if moltis_skills::local::sync_local_skill_manifest(
+        &mut manifest,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    )
+    .ok()
+    .unwrap_or(false)
+    {
+        let _ = store.save(&manifest);
+    }
+    manifest
+        .repos
+        .iter()
+        .flat_map(|repo| {
+            let source = repo.source.clone();
+            repo.skills.iter().filter(|s| s.is_runnable()).map(move |s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "source": source,
+                    "trusted": s.status.is_trusted(),
+                    "status": status_label(s.status),
+                    "quarantined": s.status == moltis_skills::types::SkillStatus::Quarantined,
+                    "quarantine_reason": s.quarantine_reason,
+                    "last_audited_ms": s.last_audited_ms,
+                    "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(s),
+                    "enabled": true,
                 })
-                .collect()
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 pub async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -235,33 +251,7 @@ pub async fn api_skills_handler(State(state): State<AppState>) -> impl IntoRespo
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    let mut skills = enabled_from_manifest(moltis_skills::manifest::ManifestStore::default_path());
-
-    {
-        use moltis_skills::discover::{FsSkillDiscoverer, SkillDiscoverer};
-        let data_dir = moltis_config::data_dir();
-        let search_paths = vec![
-            (
-                data_dir.join("skills"),
-                moltis_skills::types::SkillSource::Personal,
-            ),
-            (
-                data_dir.join(".moltis/skills"),
-                moltis_skills::types::SkillSource::Project,
-            ),
-        ];
-        let discoverer = FsSkillDiscoverer::new(search_paths);
-        if let Ok(discovered) = discoverer.discover().await {
-            for s in discovered {
-                skills.push(serde_json::json!({
-                    "name": s.name,
-                    "description": s.description,
-                    "source": s.source,
-                    "enabled": true,
-                }));
-            }
-        }
-    }
+    let skills = enabled_from_manifest(moltis_skills::manifest::ManifestStore::default_path());
 
     Json(serde_json::json!({ "skills": skills, "repos": repos }))
 }
@@ -326,6 +316,51 @@ pub async fn api_skills_search_handler(
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
     api_search_handler(repos, &source, &query).await
+}
+
+pub async fn api_skills_evals_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.gateway.services.skills.evals_list().await {
+        Ok(val) => Json(serde_json::json!({ "runs": val })).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SKILLS_EVALS_LIST_FAILED,
+            e.to_string(),
+        ),
+    }
+}
+
+pub async fn api_skills_eval_detail_handler(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state
+        .gateway
+        .services
+        .skills
+        .evals_get(serde_json::json!({ "id": id }))
+        .await
+    {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SKILLS_EVAL_GET_FAILED,
+            e.to_string(),
+        ),
+    }
+}
+
+pub async fn api_skills_eval_run_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    match state.gateway.services.skills.evals_run(payload).await {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SKILLS_EVAL_RUN_FAILED,
+            e.to_string(),
+        ),
+    }
 }
 
 // ── Images ───────────────────────────────────────────────────────────────────

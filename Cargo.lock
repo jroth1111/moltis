@@ -6651,6 +6651,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "time",
  "tokio",
  "tracing",
 ]
@@ -6811,6 +6812,7 @@ dependencies = [
  "secrecy 0.8.0",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "shell-words",
  "sqlx",

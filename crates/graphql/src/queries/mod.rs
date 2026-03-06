@@ -15,8 +15,8 @@ use crate::{
         HookInfo, LocalSystemInfo, LogListResult, LogStatus, LogTailResult, McpServer, McpTool,
         MemoryConfig, MemoryStatus, ModelInfo, NodeDescription, NodeInfo, Project, ProjectContext,
         ProviderInfo, SecurityScanResult, SecurityStatus, SessionActiveResult, SessionBranch,
-        SessionEntry, SessionShareResult, SkillInfo, SkillRepo, StatusInfo, SttStatus,
-        SystemPresence, TtsStatus, UsageCost, UsageStatus, VoiceConfig, VoicewakeConfig,
+        SessionEntry, SessionShareResult, SkillEvalRunInfo, SkillInfo, SkillRepo, StatusInfo,
+        SttStatus, SystemPresence, TtsStatus, UsageCost, UsageStatus, VoiceConfig, VoicewakeConfig,
         VoxtralRequirements,
     },
 };
@@ -591,6 +591,18 @@ impl SkillsQuery {
     async fn security_scan(&self, ctx: &Context<'_>) -> Result<SecurityScanResult> {
         let s = services!(ctx);
         from_service(s.skills.security_scan().await)
+    }
+
+    /// List previously recorded skill eval runs.
+    async fn evals(&self, ctx: &Context<'_>) -> Result<Vec<SkillEvalRunInfo>> {
+        let s = services!(ctx);
+        from_service(s.skills.evals_list().await)
+    }
+
+    /// Get detailed payload for a single skill eval run.
+    async fn eval(&self, ctx: &Context<'_>, id: String) -> Result<Json> {
+        let s = services!(ctx);
+        from_service_json(s.skills.evals_get(serde_json::json!({ "id": id })).await)
     }
 }
 

@@ -36,12 +36,30 @@ The agent can create a skill by calling the `create_skill` tool:
 ```json
 {
   "name": "summarize-pr",
-  "content": "# summarize-pr\n\nSummarize a GitHub pull request...",
-  "description": "Summarize GitHub PRs with key changes and review notes"
+  "description": "Summarize GitHub PRs with key changes and review notes",
+  "body": "# summarize-pr\n\nSummarize a GitHub pull request...",
+  "allowed_tools": ["Read", "Bash(git:*)"],
+  "compatibility": "Requires git and network access",
+  "homepage": "https://example.com/summarize-pr",
+  "license": "MIT",
+  "dockerfile": "Dockerfile",
+  "requires": {
+    "bins": ["git"],
+    "any_bins": ["gh", "hub"],
+    "install": [
+      {
+        "kind": "brew",
+        "formula": "gh",
+        "bins": ["gh"],
+        "os": ["darwin"]
+      }
+    ]
+  }
 }
 ```
 
-This writes `.moltis/skills/summarize-pr/SKILL.md` with the provided content.
+This writes `.moltis/skills/summarize-pr/SKILL.md` with structured frontmatter
+plus the markdown `body`.
 The skill discoverer picks it up on the next message.
 
 ## Updating a Skill
@@ -49,7 +67,8 @@ The skill discoverer picks it up on the next message.
 ```json
 {
   "name": "summarize-pr",
-  "content": "# summarize-pr\n\nUpdated instructions..."
+  "description": "Summarize and risk-check PRs",
+  "body": "# summarize-pr\n\nUpdated instructions..."
 }
 ```
 
@@ -67,3 +86,20 @@ This removes the entire `.moltis/skills/summarize-pr/` directory.
 Deleted skills cannot be recovered. The agent should confirm with the user
 before deleting a skill.
 ```
+
+## Skill Eval APIs
+
+Moltis also supports built-in deterministic benchmarking for skills:
+
+- RPC:
+  - `skills.evals.run` with `{ "source", "skill", "rounds?" }`
+  - `skills.evals.list`
+  - `skills.evals.get` with `{ "id" }`
+- REST:
+  - `POST /api/skills/evals` (same payload as `skills.evals.run`)
+  - `GET /api/skills/evals`
+  - `GET /api/skills/evals/{id}`
+
+`skills.evals.run` stores each run in `~/.moltis/skills-evals.json` and emits
+`skills.evals.progress` events (`start`, `scoring`, `done`, `error`) for UI
+progress updates.

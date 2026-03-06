@@ -59,6 +59,14 @@ fn build_api_routes() -> Router<AppState> {
         .route("/api/gon", get(gon::api_gon_handler))
         .route("/api/skills", get(api::api_skills_handler))
         .route("/api/skills/search", get(api::api_skills_search_handler))
+        .route(
+            "/api/skills/evals",
+            get(api::api_skills_evals_handler).post(api::api_skills_eval_run_handler),
+        )
+        .route(
+            "/api/skills/evals/{id}",
+            get(api::api_skills_eval_detail_handler),
+        )
         .route("/api/mcp", get(api::api_mcp_handler))
         .route("/api/hooks", get(api::api_hooks_handler))
         .route(

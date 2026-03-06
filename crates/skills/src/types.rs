@@ -10,8 +10,9 @@ use crate::formats::PluginFormat;
 #[serde(rename_all = "snake_case")]
 pub enum SkillStatus {
     Trusted,
-    Untrusted,
+    Pending,
     Quarantined,
+    FailedValidation,
 }
 
 impl SkillStatus {
@@ -21,7 +22,7 @@ impl SkillStatus {
 }
 
 /// Top-level manifest tracking installed repos and per-skill status/enabled state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillsManifest {
     pub version: u32,
     #[serde(default)]
@@ -31,7 +32,7 @@ pub struct SkillsManifest {
 impl Default for SkillsManifest {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             repos: Vec::new(),
         }
     }
@@ -81,7 +82,7 @@ impl SkillsManifest {
 }
 
 /// A single cloned repository with its discovered skills.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoEntry {
     pub source: String,
     pub repo_name: String,
@@ -94,7 +95,7 @@ pub struct RepoEntry {
 }
 
 /// Per-skill state within a repo.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillState {
     pub name: String,
     pub relative_path: String,
@@ -114,6 +115,10 @@ impl SkillState {
     pub fn is_trusted(&self) -> bool {
         self.status.is_trusted()
     }
+
+    pub fn is_runnable(&self) -> bool {
+        self.enabled && self.is_trusted()
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -122,12 +127,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skill_state_defaults_to_untrusted() {
+    fn skill_state_defaults_to_pending() {
         let parsed: SkillState = serde_json::from_str(
-            r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":true,"status":"untrusted"}"#,
+            r#"{"name":"demo","relative_path":"repo/skills/demo","enabled":true,"status":"pending"}"#,
         )
         .unwrap();
-        assert_eq!(parsed.status, SkillStatus::Untrusted);
+        assert_eq!(parsed.status, SkillStatus::Pending);
         assert!(!parsed.is_trusted());
     }
 
@@ -142,8 +147,8 @@ mod tests {
 
     #[test]
     fn skill_source_default_trust_mapping() {
-        assert_eq!(SkillSource::Project.default_trust(), SkillTrust::Trusted);
-        assert_eq!(SkillSource::Personal.default_trust(), SkillTrust::Trusted);
+        assert_eq!(SkillSource::Project.default_trust(), SkillTrust::Installed);
+        assert_eq!(SkillSource::Personal.default_trust(), SkillTrust::Installed);
         assert_eq!(SkillSource::Plugin.default_trust(), SkillTrust::Installed);
         assert_eq!(SkillSource::Registry.default_trust(), SkillTrust::Installed);
     }
@@ -168,22 +173,52 @@ pub enum SkillSource {
 impl SkillSource {
     /// Returns the default trust level for skills from this source.
     pub fn default_trust(&self) -> SkillTrust {
-        match self {
-            Self::Project | Self::Personal => SkillTrust::Trusted,
-            Self::Plugin | Self::Registry => SkillTrust::Installed,
-        }
+        let _ = self;
+        SkillTrust::Installed
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillTriggers {
+    #[serde(default)]
+    pub should_trigger: Vec<String>,
+    #[serde(default)]
+    pub should_not_trigger: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillEvals {
+    #[serde(default)]
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillPermissions {
+    #[serde(default, alias = "allowed-tools")]
+    pub allowed_tools: Vec<String>,
 }
 
 /// Lightweight metadata parsed from SKILL.md frontmatter.
 /// Loaded at startup for all discovered skills (cheap).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
+    /// Skill metadata schema version. V3 is mandatory.
+    #[serde(default)]
+    pub version: u32,
     /// Skill name — lowercase, hyphens allowed, 1-64 chars.
     pub name: String,
     /// Short human-readable description.
     #[serde(default)]
     pub description: String,
+    /// Trigger examples used by the selector and eval gates.
+    #[serde(default)]
+    pub triggers: SkillTriggers,
+    /// Path to eval definitions.
+    #[serde(default)]
+    pub evals: SkillEvals,
+    /// Explicit permission block.
+    #[serde(default)]
+    pub permissions: SkillPermissions,
     /// Homepage URL.
     #[serde(default)]
     pub homepage: Option<String>,

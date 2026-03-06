@@ -61,22 +61,22 @@ export default {
 	// ── Skill detail panel ──────────────────────────────────
 	protected: "Protected",
 	protectedCannotDelete: "Skill {{name}} is protected and cannot be deleted from UI",
-	trustAndEnable: "Trust & Enable",
-	trust: "Trust",
-	trusting: "Trusting...",
+	trustAndEnable: "Revalidate & Enable",
+	trust: "Revalidate",
+	trusting: "Validating...",
 	unquarantine: "Unquarantine",
 	unquarantining: "Unquarantining...",
-	trustSkillConfirm: 'Trust skill "{{name}}" from {{source}}?',
+	trustSkillConfirm: 'Revalidate skill "{{name}}" from {{source}}?',
 	unquarantineConfirm:
-		'Unquarantine skill "{{name}}"?\n\nReason: {{reason}}\n\nAfter unquarantine, you still need to trust and enable it separately.',
-	unquarantinedSuccess: "Unquarantined {{name}}. Review, trust, then enable.",
-	trustedSuccess: "Trusted {{name}}. Enable it when ready.",
-	trustFailed: "Trust failed: {{error}}",
+		'Unquarantine skill "{{name}}"?\n\nReason: {{reason}}\n\nAfter unquarantine, you still need to revalidate and enable it separately.',
+	unquarantinedSuccess: "Unquarantined {{name}}. Review, revalidate, then enable.",
+	trustedSuccess: "Validated {{name}}. Enable it when ready.",
+	trustFailed: "Validation failed: {{error}}",
 	failedToLoad: "Failed to load: {{error}}",
 	skillMdSource: "SKILL.md source",
 	quarantinedBannerTitle: "Quarantined:",
 	quarantinedBannerBody:
-		"This skill is fail-closed and cannot be enabled until you explicitly unquarantine, review, trust, and enable it.",
+		"This skill is fail-closed and cannot be enabled until you explicitly unquarantine, review, revalidate, and enable it.",
 
 	// ── Metadata ────────────────────────────────────────────
 	author: "Author: {{name}}",
@@ -89,7 +89,7 @@ export default {
 	blocked: "blocked",
 	eligible: "eligible",
 	noDeps: "no deps declared",
-	untrusted: "untrusted",
+	untrusted: "pending",
 	quarantined: "quarantined",
 	enabled: "enabled",
 
@@ -104,13 +104,13 @@ export default {
 	// ── Commit warning ──────────────────────────────────────
 	recentCommitWarning: "Recent commit warning:",
 	recentCommitMessage:
-		"This skill was updated {{days}} day{{s}} ago. Treat recent updates as high risk and review diffs before trusting/enabling.",
+		"This skill was updated {{days}} day{{s}} ago. Treat recent updates as high risk and review diffs before revalidating/enabling.",
 
 	// ── Drift warning ───────────────────────────────────────
-	driftWarning: "Source changed since last trust; review updates before enabling again.",
+	driftWarning: "Source changed since last validation; review updates before enabling again.",
 
 	// ── Security warning ────────────────────────────────────
-	securityTitle: "\u26a0\ufe0f Skills run code on your machine \u2014 treat every skill as untrusted",
+	securityTitle: "\u26a0\ufe0f Skills run code on your machine \u2014 keep every skill pending until validated",
 	securityIntro:
 		"Skills are community-authored instructions that the AI agent follows <strong>with your full system privileges</strong>. Popularity or download count does not mean a skill is safe. A malicious skill can instruct the agent to:",
 	threat1: "Execute arbitrary shell commands on your machine (install malware, cryptominers, backdoors)",

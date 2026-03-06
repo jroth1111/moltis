@@ -73,14 +73,18 @@ pub fn select_skills<'a>(
 mod tests {
     use {
         super::*,
-        crate::types::{SkillMetadata, SkillRequirements},
+        crate::types::{SkillEvals, SkillMetadata, SkillPermissions, SkillRequirements, SkillTriggers},
         std::path::PathBuf,
     };
 
     fn mock_skill(name: &str, description: &str) -> SkillMetadata {
         SkillMetadata {
+            version: 3,
             name: name.to_string(),
             description: description.to_string(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions: SkillPermissions::default(),
             homepage: None,
             license: None,
             compatibility: None,

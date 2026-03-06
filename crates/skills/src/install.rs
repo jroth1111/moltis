@@ -1,10 +1,18 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+};
 
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, histogram, skills as skills_metrics};
 
 use crate::{
-    archive_audit, audit,
+    archive_audit,
+    audit,
+    evals::{
+        SkillEvalInput, SkillEvalRunSummary, SkillEvalStore, SkillGateDecision,
+        evaluate_install_gate,
+    },
     formats::{PluginFormat, detect_format, scan_with_adapter},
     integrity,
     manifest::ManifestStore,
@@ -25,111 +33,164 @@ pub async fn install_skill(source: &str, install_dir: &Path) -> anyhow::Result<V
     counter!(skills_metrics::INSTALLATION_ATTEMPTS_TOTAL).increment(1);
 
     let (owner, repo) = parse_source(source)?;
+    let canonical_source = format!("{owner}/{repo}");
     let dir_name = format!("{owner}-{repo}");
     let target = install_dir.join(&dir_name);
+    let now_ms = current_time_ms();
 
-    if target.exists() {
-        let manifest_path = ManifestStore::default_path()?;
-        let store = ManifestStore::new(manifest_path);
-        let manifest = store.load()?;
-        if manifest.find_repo(source).is_none() {
-            tokio::fs::remove_dir_all(&target).await?;
-        } else {
-            anyhow::bail!(
-                "repo directory already exists: {}. Remove it first with `skills remove`.",
-                target.display()
+    tokio::fs::create_dir_all(install_dir).await?;
+
+    let manifest_path = ManifestStore::default_path()?;
+    let store = ManifestStore::new(manifest_path);
+    let mut manifest = store.load()?;
+    let existing_repo = manifest.find_repo(&canonical_source).cloned();
+    let is_upgrade = existing_repo.is_some();
+
+    // Clean up orphaned install dir from an interrupted prior attempt.
+    if target.exists() && !is_upgrade {
+        tokio::fs::remove_dir_all(&target).await?;
+    }
+
+    let eval_store = SkillEvalStore::new(SkillEvalStore::default_path()?);
+    let mut before_decisions = Vec::new();
+    if let Some(existing) = &existing_repo {
+        let existing_dir = install_dir.join(&existing.repo_name);
+        if existing_dir.is_dir()
+            && let Ok(before_inputs) =
+                build_eval_inputs_for_installed_repo(existing, install_dir, &canonical_source)
+        {
+            before_decisions = run_gate_and_update_states(
+                &before_inputs,
+                &mut Vec::new(),
+                &eval_store,
+                "upgrade baseline",
             );
         }
     }
 
-    tokio::fs::create_dir_all(install_dir).await?;
+    let staging = if is_upgrade {
+        install_dir.join(format!("{dir_name}.upgrade-{now_ms}"))
+    } else {
+        target.clone()
+    };
+    if staging.exists() {
+        tokio::fs::remove_dir_all(&staging).await?;
+    }
 
     #[cfg(feature = "metrics")]
     counter!("moltis_skills_git_clone_fallback_total").increment(1);
-    let commit_sha = install_via_http(&owner, &repo, &target).await?;
-    audit::reject_symlinks_recursively(&target)?;
+    let commit_sha = install_via_http(&owner, &repo, &staging).await?;
+    audit::reject_symlinks_recursively(&staging)?;
 
-    // Auto-detect repo format and scan accordingly.
-    let format = detect_format(&target);
-    let (skills_meta, skill_states) = match format {
-        PluginFormat::Skill => scan_repo_skills(&target, install_dir).await?,
-        _ => match scan_with_adapter(&target, format) {
-            Some(result) => {
-                let entries = result?;
-                for entry in &entries {
-                    audit::ensure_not_symlink(&entry.metadata.path)?;
-                    let source_hint = entry
-                        .source_file
-                        .as_deref()
-                        .map(|relative| target.join(relative))
-                        .unwrap_or_else(|| entry.metadata.path.join("SKILL.md"));
-                    archive_audit::enforce_skill_markdown_size(&source_hint, &entry.body)?;
-                    audit::audit_skill_markdown(&entry.metadata.path, &entry.body, &source_hint)?;
-                }
-                let relative = target
-                    .strip_prefix(install_dir)
-                    .unwrap_or(&target)
-                    .to_string_lossy()
-                    .to_string();
-                let meta: Vec<SkillMetadata> = entries.iter().map(|e| e.metadata.clone()).collect();
-                let states: Vec<SkillState> = entries
-                    .iter()
-                    .map(|e| SkillState {
-                        name: e.metadata.name.clone(),
-                        relative_path: relative.clone(),
-                        status: crate::types::SkillStatus::Untrusted,
-                        quarantine_reason: None,
-                        last_audited_ms: None,
-                        content_hash: Some(integrity::hash_adapter_skill(
-                            e.source_file.as_deref(),
-                            &e.body,
-                        )),
-                        trusted_hash: None,
-                        enabled: false,
-                    })
-                    .collect();
-                (meta, states)
-            },
-            None => {
-                let _ = tokio::fs::remove_dir_all(&target).await;
-                anyhow::bail!("no adapter available for format '{format}' in repo '{source}'");
-            },
-        },
-    };
-
-    if skills_meta.is_empty() {
-        let _ = tokio::fs::remove_dir_all(&target).await;
+    let mut scanned = scan_repo_for_install(&canonical_source, &staging, install_dir).await?;
+    if scanned.skills_meta.is_empty() {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
         anyhow::bail!(
             "repository contains no skills (checked {})",
-            target.display()
+            staging.display()
         );
     }
 
-    // Write manifest.
-    let manifest_path = ManifestStore::default_path()?;
-    let store = ManifestStore::new(manifest_path);
-    let mut manifest = store.load()?;
+    let after_decisions = run_gate_and_update_states(
+        &scanned.eval_inputs,
+        &mut scanned.skill_states,
+        &eval_store,
+        "install gate",
+    );
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let regressions = if is_upgrade {
+        detect_upgrade_regressions(&before_decisions, &after_decisions)
+    } else {
+        Vec::new()
+    };
+    if !regressions.is_empty() {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        append_upgrade_history(
+            &canonical_source,
+            existing_repo.as_ref().and_then(|repo| repo.commit_sha.clone()),
+            commit_sha.clone(),
+            Some("rolled_back_regression"),
+            None,
+            &before_decisions,
+            &after_decisions,
+            &regressions,
+        )?;
+        anyhow::bail!(
+            "upgrade rolled back for '{}': {}",
+            canonical_source,
+            regressions.join("; ")
+        );
+    }
 
-    manifest.add_repo(RepoEntry {
-        source: format!("{owner}/{repo}"),
+    let mut backup_dir: Option<PathBuf> = None;
+    if is_upgrade {
+        if target.exists() {
+            let rollback_root = install_dir.join(".rollback");
+            tokio::fs::create_dir_all(&rollback_root).await?;
+            let candidate = rollback_root.join(format!("{dir_name}-{now_ms}"));
+            tokio::fs::rename(&target, &candidate).await?;
+            backup_dir = Some(candidate);
+        }
+
+        if staging != target {
+            let staging_name = staging
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("invalid staging directory name"))?;
+            normalize_state_repo_prefixes(&mut scanned.skill_states, staging_name, &dir_name);
+
+            if let Err(err) = tokio::fs::rename(&staging, &target).await {
+                if let Some(backup) = &backup_dir {
+                    let _ = tokio::fs::rename(backup, &target).await;
+                }
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                anyhow::bail!("failed to promote upgraded repo '{}': {err}", canonical_source);
+            }
+        }
+    }
+
+    let updated_repo = RepoEntry {
+        source: canonical_source.clone(),
         repo_name: dir_name,
-        installed_at_ms: now,
-        commit_sha,
-        format,
-        skills: skill_states,
-    });
-    store.save(&manifest)?;
+        installed_at_ms: now_ms,
+        commit_sha: commit_sha.clone(),
+        format: scanned.format,
+        skills: scanned.skill_states,
+    };
+    if let Some(repo) = manifest.find_repo_mut(&canonical_source) {
+        *repo = updated_repo;
+    } else {
+        manifest.add_repo(updated_repo);
+    }
+
+    if let Err(err) = store.save(&manifest) {
+        if let Some(backup) = &backup_dir {
+            let _ = tokio::fs::remove_dir_all(&target).await;
+            let _ = tokio::fs::rename(backup, &target).await;
+        }
+        anyhow::bail!("failed to save skills manifest: {err}");
+    }
+
+    if is_upgrade {
+        append_upgrade_history(
+            &canonical_source,
+            existing_repo.as_ref().and_then(|repo| repo.commit_sha.clone()),
+            commit_sha,
+            Some("upgraded"),
+            backup_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            &before_decisions,
+            &after_decisions,
+            &[],
+        )?;
+    }
 
     #[cfg(feature = "metrics")]
     histogram!(skills_metrics::INSTALLATION_DURATION_SECONDS).record(start.elapsed().as_secs_f64());
 
-    tracing::info!(count = skills_meta.len(), %source, "installed repo skills");
-    Ok(skills_meta)
+    tracing::info!(count = scanned.skills_meta.len(), %source, %canonical_source, "installed repo skills");
+    Ok(scanned.skills_meta)
 }
 
 /// Remove a repo: delete directory and manifest entry.
@@ -149,6 +210,339 @@ pub async fn remove_repo(source: &str, install_dir: &Path) -> anyhow::Result<()>
 
     manifest.remove_repo(source);
     store.save(&manifest)?;
+    Ok(())
+}
+
+struct ScannedInstallData {
+    format: PluginFormat,
+    skills_meta: Vec<SkillMetadata>,
+    skill_states: Vec<SkillState>,
+    eval_inputs: Vec<SkillEvalInput>,
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn scan_repo_for_install(
+    source: &str,
+    repo_dir: &Path,
+    install_dir: &Path,
+) -> anyhow::Result<ScannedInstallData> {
+    let format = detect_format(repo_dir);
+    if format == PluginFormat::Generic {
+        anyhow::bail!(
+            "repository format '{}' is not supported in V3 (supported: skill, claude_code)",
+            format
+        );
+    }
+
+    let (skills_meta, skill_states, mut eval_inputs) = match format {
+        PluginFormat::Skill => {
+            let (meta, states) = scan_repo_skills(repo_dir, install_dir).await?;
+            (meta, states, Vec::new())
+        },
+        _ => match scan_with_adapter(repo_dir, format) {
+            Some(result) => {
+                let entries = result?;
+                for entry in &entries {
+                    audit::ensure_not_symlink(&entry.metadata.path)?;
+                    let source_hint = entry
+                        .source_file
+                        .as_deref()
+                        .map(|relative| repo_dir.join(relative))
+                        .unwrap_or_else(|| entry.metadata.path.join("SKILL.md"));
+                    archive_audit::enforce_skill_markdown_size(&source_hint, &entry.body)?;
+                    audit::audit_skill_markdown(&entry.metadata.path, &entry.body, &source_hint)?;
+                }
+                let relative = repo_dir
+                    .strip_prefix(install_dir)
+                    .unwrap_or(repo_dir)
+                    .to_string_lossy()
+                    .to_string();
+                let meta: Vec<SkillMetadata> = entries.iter().map(|e| e.metadata.clone()).collect();
+                let states: Vec<SkillState> = entries
+                    .iter()
+                    .map(|e| SkillState {
+                        name: e.metadata.name.clone(),
+                        relative_path: relative.clone(),
+                        status: crate::types::SkillStatus::Pending,
+                        quarantine_reason: None,
+                        last_audited_ms: None,
+                        content_hash: Some(integrity::hash_adapter_skill(
+                            e.source_file.as_deref(),
+                            &e.body,
+                        )),
+                        trusted_hash: None,
+                        enabled: false,
+                    })
+                    .collect();
+                let inputs: Vec<SkillEvalInput> = entries
+                    .into_iter()
+                    .map(|entry| SkillEvalInput {
+                        name: entry.metadata.name.clone(),
+                        source: source.to_string(),
+                        description: entry.metadata.description.clone(),
+                        body: entry.body,
+                        allowed_tools: entry.metadata.allowed_tools.clone(),
+                        compatibility: entry.metadata.compatibility.clone(),
+                        requires: entry.metadata.requires.clone(),
+                        should_trigger: entry.metadata.triggers.should_trigger.clone(),
+                        should_not_trigger: entry.metadata.triggers.should_not_trigger.clone(),
+                    })
+                    .collect();
+                (meta, states, inputs)
+            },
+            None => anyhow::bail!("no adapter available for format '{format}' in repo '{source}'"),
+        },
+    };
+
+    if format == PluginFormat::Skill && eval_inputs.is_empty() {
+        eval_inputs = build_eval_inputs_for_skill_repo(&skill_states, install_dir, source)?;
+    }
+
+    Ok(ScannedInstallData {
+        format,
+        skills_meta,
+        skill_states,
+        eval_inputs,
+    })
+}
+
+fn run_gate_and_update_states(
+    eval_inputs: &[SkillEvalInput],
+    states: &mut [SkillState],
+    eval_store: &SkillEvalStore,
+    context_label: &str,
+) -> Vec<SkillGateDecision> {
+    let by_name: HashMap<&str, &SkillEvalInput> = eval_inputs
+        .iter()
+        .map(|input| (input.name.as_str(), input))
+        .collect();
+    let mut decisions = Vec::new();
+
+    for state in states {
+        let Some(input) = by_name.get(state.name.as_str()).copied() else {
+            state.status = crate::types::SkillStatus::FailedValidation;
+            state.enabled = false;
+            state.trusted_hash = None;
+            state.quarantine_reason = Some(format!(
+                "{context_label} failed: missing eval input for skill"
+            ));
+            continue;
+        };
+
+        let decision = evaluate_install_gate(input, Some(1));
+        let _ = eval_store.append(decision.run.clone());
+        if decision.passed {
+            state.status = crate::types::SkillStatus::Trusted;
+            state.quarantine_reason = None;
+            state.trusted_hash = state.content_hash.clone();
+        } else {
+            state.status = crate::types::SkillStatus::FailedValidation;
+            state.enabled = false;
+            state.trusted_hash = None;
+            state.quarantine_reason = Some(format!(
+                "{context_label} failed: {}",
+                decision.reasons.join("; ")
+            ));
+        }
+        decisions.push(decision);
+    }
+
+    decisions
+}
+
+fn build_eval_inputs_for_installed_repo(
+    repo: &RepoEntry,
+    install_dir: &Path,
+    source: &str,
+) -> anyhow::Result<Vec<SkillEvalInput>> {
+    let repo_dir = install_dir.join(&repo.repo_name);
+    if repo.format == PluginFormat::Skill {
+        return build_eval_inputs_for_skill_repo(&repo.skills, install_dir, source);
+    }
+
+    let entries = scan_with_adapter(&repo_dir, repo.format)
+        .ok_or_else(|| anyhow::anyhow!("no adapter available for format '{}'", repo.format))??;
+    Ok(entries
+        .into_iter()
+        .map(|entry| SkillEvalInput {
+            name: entry.metadata.name.clone(),
+            source: source.to_string(),
+            description: entry.metadata.description.clone(),
+            body: entry.body,
+            allowed_tools: entry.metadata.allowed_tools.clone(),
+            compatibility: entry.metadata.compatibility.clone(),
+            requires: entry.metadata.requires.clone(),
+            should_trigger: entry.metadata.triggers.should_trigger.clone(),
+            should_not_trigger: entry.metadata.triggers.should_not_trigger.clone(),
+        })
+        .collect())
+}
+
+fn normalize_state_repo_prefixes(states: &mut [SkillState], from_repo_dir: &str, to_repo_dir: &str) {
+    for state in states {
+        state.relative_path = rewrite_relative_repo_path(&state.relative_path, from_repo_dir, to_repo_dir);
+    }
+}
+
+fn rewrite_relative_repo_path(path: &str, from_repo_dir: &str, to_repo_dir: &str) -> String {
+    let mut components = Path::new(path).components();
+    match components.next() {
+        Some(Component::Normal(prefix))
+            if prefix == std::ffi::OsStr::new(from_repo_dir) =>
+        {
+            let mut rebuilt = PathBuf::from(to_repo_dir);
+            for component in components {
+                rebuilt.push(component.as_os_str());
+            }
+            rebuilt.to_string_lossy().to_string()
+        },
+        _ => path.to_string(),
+    }
+}
+
+fn detect_upgrade_regressions(
+    before: &[SkillGateDecision],
+    after: &[SkillGateDecision],
+) -> Vec<String> {
+    let before_by_name: HashMap<&str, &SkillGateDecision> = before
+        .iter()
+        .map(|decision| (decision.run.skill_name.as_str(), decision))
+        .collect();
+    let after_by_name: HashMap<&str, &SkillGateDecision> = after
+        .iter()
+        .map(|decision| (decision.run.skill_name.as_str(), decision))
+        .collect();
+    let mut regressions = Vec::new();
+
+    for before_decision in before {
+        if !after_by_name.contains_key(before_decision.run.skill_name.as_str()) {
+            regressions.push(format!(
+                "{} missing after upgrade",
+                before_decision.run.skill_name
+            ));
+        }
+    }
+
+    for after_decision in after {
+        let Some(before_decision) = before_by_name.get(after_decision.run.skill_name.as_str()) else {
+            continue;
+        };
+
+        if before_decision.passed && !after_decision.passed {
+            regressions.push(format!(
+                "{} failed validation after upgrade",
+                after_decision.run.skill_name
+            ));
+        }
+
+        let reasons = compare_run_summaries(
+            &before_decision.run.benchmark.run_summary,
+            &after_decision.run.benchmark.run_summary,
+        );
+        regressions.extend(
+            reasons
+                .into_iter()
+                .map(|reason| format!("{}: {reason}", after_decision.run.skill_name)),
+        );
+    }
+
+    regressions.sort_unstable();
+    regressions.dedup();
+    regressions
+}
+
+fn compare_run_summaries(before: &SkillEvalRunSummary, after: &SkillEvalRunSummary) -> Vec<String> {
+    const TOLERANCE: f64 = 0.05;
+    let mut reasons = Vec::new();
+
+    if after.with_skill_pass_rate + TOLERANCE < before.with_skill_pass_rate {
+        reasons.push(format!(
+            "with-skill pass rate regressed from {:.2} to {:.2}",
+            before.with_skill_pass_rate, after.with_skill_pass_rate
+        ));
+    }
+    if after.pass_rate_delta + TOLERANCE < before.pass_rate_delta {
+        reasons.push(format!(
+            "pass-rate delta regressed from {:.2} to {:.2}",
+            before.pass_rate_delta, after.pass_rate_delta
+        ));
+    }
+    if after.trigger_precision + TOLERANCE < before.trigger_precision {
+        reasons.push(format!(
+            "trigger precision regressed from {:.2} to {:.2}",
+            before.trigger_precision, after.trigger_precision
+        ));
+    }
+    if after.trigger_recall + TOLERANCE < before.trigger_recall {
+        reasons.push(format!(
+            "trigger recall regressed from {:.2} to {:.2}",
+            before.trigger_recall, after.trigger_recall
+        ));
+    }
+
+    reasons
+}
+
+fn summarize_decisions(decisions: &[SkillGateDecision]) -> Vec<serde_json::Value> {
+    decisions
+        .iter()
+        .map(|decision| {
+            let summary = &decision.run.benchmark.run_summary;
+            serde_json::json!({
+                "skill": decision.run.skill_name,
+                "passed": decision.passed,
+                "with_skill_pass_rate": summary.with_skill_pass_rate,
+                "without_skill_pass_rate": summary.without_skill_pass_rate,
+                "pass_rate_delta": summary.pass_rate_delta,
+                "trigger_precision": summary.trigger_precision,
+                "trigger_recall": summary.trigger_recall,
+                "duration_ratio": summary.with_skill_duration_ratio,
+                "token_ratio": summary.with_skill_token_ratio,
+            })
+        })
+        .collect()
+}
+
+fn append_upgrade_history(
+    source: &str,
+    previous_commit_sha: Option<String>,
+    new_commit_sha: Option<String>,
+    outcome: Option<&str>,
+    backup_dir: Option<String>,
+    before: &[SkillGateDecision],
+    after: &[SkillGateDecision],
+    regressions: &[String],
+) -> anyhow::Result<()> {
+    let path = moltis_config::data_dir().join("skills-upgrade-history.jsonl");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let line = serde_json::json!({
+        "timestamp_ms": current_time_ms(),
+        "source": source,
+        "outcome": outcome.unwrap_or("unknown"),
+        "previous_commit_sha": previous_commit_sha,
+        "new_commit_sha": new_commit_sha,
+        "backup_dir": backup_dir,
+        "before": summarize_decisions(before),
+        "after": summarize_decisions(after),
+        "regressions": regressions,
+    })
+    .to_string();
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    use std::io::Write as _;
+    writeln!(file, "{line}")?;
     Ok(())
 }
 
@@ -298,7 +692,7 @@ async fn scan_repo_skills(
         let state = SkillState {
             name: meta.name.clone(),
             relative_path: relative,
-            status: crate::types::SkillStatus::Untrusted,
+            status: crate::types::SkillStatus::Pending,
             quarantine_reason: None,
             last_audited_ms: None,
             content_hash: Some(integrity::hash_skill_markdown(&content)),
@@ -348,7 +742,7 @@ async fn scan_repo_skills(
                         skill_states.push(SkillState {
                             name: meta.name.clone(),
                             relative_path: relative,
-                            status: crate::types::SkillStatus::Untrusted,
+                            status: crate::types::SkillStatus::Pending,
                             quarantine_reason: None,
                             last_audited_ms: None,
                             content_hash: Some(integrity::hash_skill_markdown(&content)),
@@ -368,6 +762,31 @@ async fn scan_repo_skills(
     }
 
     Ok((skills_meta, skill_states))
+}
+
+fn build_eval_inputs_for_skill_repo(
+    states: &[SkillState],
+    install_dir: &Path,
+    source: &str,
+) -> anyhow::Result<Vec<SkillEvalInput>> {
+    let mut out = Vec::new();
+    for state in states {
+        let skill_dir = install_dir.join(&state.relative_path);
+        let raw = std::fs::read_to_string(skill_dir.join("SKILL.md"))?;
+        let content = parse::parse_skill(&raw, &skill_dir)?;
+        out.push(SkillEvalInput {
+            name: content.metadata.name.clone(),
+            source: source.to_string(),
+            description: content.metadata.description.clone(),
+            body: content.body,
+            allowed_tools: content.metadata.allowed_tools.clone(),
+            compatibility: content.metadata.compatibility.clone(),
+            requires: content.metadata.requires.clone(),
+            should_trigger: content.metadata.triggers.should_trigger.clone(),
+            should_not_trigger: content.metadata.triggers.should_not_trigger.clone(),
+        });
+    }
+    Ok(out)
 }
 
 /// Parse `owner/repo` from a source string.
@@ -398,6 +817,41 @@ pub fn default_install_dir() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_skill_markdown(name: &str, description: &str) -> String {
+        format!(
+            r#"---
+version: 3
+name: {name}
+description: {description}
+triggers:
+  should_trigger: ["a", "b", "c"]
+  should_not_trigger: ["d", "e", "f"]
+evals:
+  path: evals/evals.json
+permissions:
+  allowed_tools: ["Read"]
+---
+## Purpose
+Support {description}.
+
+## Inputs
+- User request
+
+## Workflow
+1. Inspect input.
+2. Apply skill guidance.
+3. Return result.
+
+## Failure Modes
+- Missing context.
+- Unsupported format.
+
+## Examples
+- Example usage.
+"#
+        )
+    }
 
     #[test]
     fn test_parse_source_valid() {
@@ -446,6 +900,97 @@ mod tests {
         assert_eq!(sanitized, PathBuf::from("skills/demo/SKILL.md"));
     }
 
+    #[test]
+    fn test_rewrite_relative_repo_path_rewrites_prefix() {
+        assert_eq!(
+            rewrite_relative_repo_path(
+                "owner-repo.upgrade-123/skills/demo",
+                "owner-repo.upgrade-123",
+                "owner-repo"
+            ),
+            "owner-repo/skills/demo"
+        );
+        assert_eq!(
+            rewrite_relative_repo_path("owner-repo.upgrade-123", "owner-repo.upgrade-123", "owner-repo"),
+            "owner-repo"
+        );
+        assert_eq!(
+            rewrite_relative_repo_path("other/skills/demo", "owner-repo.upgrade-123", "owner-repo"),
+            "other/skills/demo"
+        );
+    }
+
+    fn mock_summary(with_skill_pass_rate: f64, pass_rate_delta: f64, precision: f64, recall: f64) -> SkillEvalRunSummary {
+        SkillEvalRunSummary {
+            with_skill_pass_rate,
+            without_skill_pass_rate: with_skill_pass_rate - pass_rate_delta,
+            pass_rate_delta,
+            with_skill_avg_duration_ms: 120.0,
+            without_skill_avg_duration_ms: 100.0,
+            with_skill_avg_tokens: 260.0,
+            without_skill_avg_tokens: 200.0,
+            trigger_precision: precision,
+            trigger_recall: recall,
+            with_skill_duration_ratio: 1.2,
+            with_skill_token_ratio: 1.3,
+        }
+    }
+
+    #[test]
+    fn test_compare_run_summaries_flags_material_regressions() {
+        let before = mock_summary(0.90, 0.40, 0.95, 0.90);
+        let after = mock_summary(0.80, 0.20, 0.82, 0.79);
+        let reasons = compare_run_summaries(&before, &after);
+        assert!(reasons.iter().any(|r| r.contains("with-skill pass rate regressed")));
+        assert!(reasons.iter().any(|r| r.contains("pass-rate delta regressed")));
+        assert!(reasons.iter().any(|r| r.contains("trigger precision regressed")));
+        assert!(reasons.iter().any(|r| r.contains("trigger recall regressed")));
+    }
+
+    #[test]
+    fn test_compare_run_summaries_ignores_small_deltas() {
+        let before = mock_summary(0.86, 0.33, 0.88, 0.87);
+        let after = mock_summary(0.82, 0.30, 0.84, 0.83);
+        let reasons = compare_run_summaries(&before, &after);
+        assert!(reasons.is_empty());
+    }
+
+    fn gate_decision(skill_name: &str, passed: bool) -> SkillGateDecision {
+        SkillGateDecision {
+            passed,
+            reasons: Vec::new(),
+            run: crate::evals::SkillEvalRun {
+                id: format!("{skill_name}-run"),
+                skill_name: skill_name.to_string(),
+                source: "owner/repo".to_string(),
+                created_at_ms: 1,
+                status: if passed {
+                    "passed".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                benchmark: crate::evals::SkillEvalBenchmark {
+                    metadata: crate::evals::SkillEvalMetadata {
+                        timestamp_ms: 1,
+                        rounds: 1,
+                        skill_name: skill_name.to_string(),
+                        source: "owner/repo".to_string(),
+                    },
+                    configurations: Vec::new(),
+                    assertions: Vec::new(),
+                    run_summary: mock_summary(1.0, 0.5, 1.0, 1.0),
+                    notes: Vec::new(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn detect_upgrade_regressions_flags_missing_skills() {
+        let regressions = detect_upgrade_regressions(&[gate_decision("demo", true)], &[]);
+        assert_eq!(regressions, vec!["demo missing after upgrade".to_string()]);
+    }
+
     #[tokio::test]
     async fn test_scan_single_skill_repo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -454,7 +999,7 @@ mod tests {
         std::fs::create_dir_all(&repo_dir).unwrap();
         std::fs::write(
             repo_dir.join("SKILL.md"),
-            "---\nname: single\ndescription: test\n---\nbody\n",
+            valid_skill_markdown("single", "test skill"),
         )
         .unwrap();
 
@@ -503,7 +1048,7 @@ mod tests {
             .map(|e| SkillState {
                 name: e.metadata.name.clone(),
                 relative_path: "test-owner-test-repo".into(),
-                status: crate::types::SkillStatus::Untrusted,
+                status: crate::types::SkillStatus::Pending,
                 quarantine_reason: None,
                 last_audited_ms: None,
                 content_hash: Some(integrity::hash_adapter_skill(
@@ -528,12 +1073,12 @@ mod tests {
         std::fs::create_dir_all(repo_dir.join("skills/b")).unwrap();
         std::fs::write(
             repo_dir.join("skills/a/SKILL.md"),
-            "---\nname: skill-a\ndescription: A\n---\nbody\n",
+            valid_skill_markdown("skill-a", "Skill A"),
         )
         .unwrap();
         std::fs::write(
             repo_dir.join("skills/b/SKILL.md"),
-            "---\nname: skill-b\ndescription: B\n---\nbody\n",
+            valid_skill_markdown("skill-b", "Skill B"),
         )
         .unwrap();
 

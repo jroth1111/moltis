@@ -4,22 +4,18 @@ use std::collections::HashSet;
 
 use crate::types::SkillTrust;
 
-/// Tools available in read-only (untrusted/installed) mode.
+/// Tools available in read-only (pending/installed) mode.
 /// This is the minimum set that lets an installed skill be useful
 /// without being able to exfiltrate data or run arbitrary code.
 const READ_ONLY_TOOLS: &[&str] = &["memory_search", "read_file", "list_directory", "echo"];
 
-fn strip_tool_wrapper(tool_spec: &str) -> &str {
-    let trimmed = tool_spec.trim();
-    if let Some(open_idx) = trimmed.find('(')
-        && trimmed.ends_with(')')
-    {
-        let wrapper = trimmed[..open_idx].trim();
-        if !wrapper.is_empty() {
-            return wrapper;
-        }
-    }
-    trimmed
+/// Result of resolving `allowed_tools` specs against a runtime tool list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedToolsResolution<'a> {
+    /// Runtime tool names that matched at least one allowed-tools spec.
+    pub matched_tools: Vec<&'a str>,
+    /// Allowed-tools specs that did not match any runtime tool name.
+    pub unmatched_specs: Vec<String>,
 }
 
 fn normalize_tool_token(raw: &str, keep_wildcard: bool) -> String {
@@ -58,24 +54,17 @@ fn normalize_tool_token(raw: &str, keep_wildcard: bool) -> String {
 }
 
 fn expand_allowed_tool_patterns(tool_spec: &str) -> Vec<String> {
-    let base = strip_tool_wrapper(tool_spec);
-    let normalized = normalize_tool_token(base, true);
+    let trimmed = tool_spec.trim();
+    if trimmed.contains('(') || trimmed.contains(')') {
+        return Vec::new();
+    }
+
+    let normalized = normalize_tool_token(trimmed, true);
     if normalized.is_empty() {
         return Vec::new();
     }
 
-    match normalized.as_str() {
-        // Accepted Claude/OpenClaw wrapper format.
-        "bash" => vec!["exec".to_string()],
-        // Accepted high-level format for file reads.
-        "read" => vec!["read_file".to_string(), "list_directory".to_string()],
-        "ls" => vec!["list_directory".to_string()],
-        // Normalize camel/pascal case names to runtime snake_case.
-        "webfetch" | "web_fetch" => vec!["web_fetch".to_string()],
-        "websearch" | "web_search" => vec!["web_search".to_string()],
-        "memorysearch" | "memory_search" => vec!["memory_search".to_string()],
-        _ => vec![normalized],
-    }
+    vec![normalized]
 }
 
 fn wildcard_match(pattern: &str, candidate: &str) -> bool {
@@ -133,6 +122,56 @@ fn tool_matches_patterns(tool_name: &str, allowed_patterns: &HashSet<String>) ->
         .any(|pattern| wildcard_match(pattern, &normalized_tool))
 }
 
+/// Resolve `allowed-tools` specs against runtime tool names.
+///
+/// Empty `allowed_specs` means no explicit skill-level restriction.
+#[must_use]
+pub fn resolve_allowed_tools<'a>(
+    allowed_specs: &[String],
+    all_tool_names: &[&'a str],
+) -> AllowedToolsResolution<'a> {
+    if allowed_specs.is_empty() {
+        return AllowedToolsResolution {
+            matched_tools: all_tool_names.to_vec(),
+            unmatched_specs: Vec::new(),
+        };
+    }
+
+    let spec_patterns: Vec<(&str, Vec<String>)> = allowed_specs
+        .iter()
+        .map(|spec| (spec.as_str(), expand_allowed_tool_patterns(spec)))
+        .collect();
+    let allowed_patterns: HashSet<String> = spec_patterns
+        .iter()
+        .flat_map(|(_, patterns)| patterns.iter().cloned())
+        .collect();
+
+    let matched_tools: Vec<&str> = all_tool_names
+        .iter()
+        .copied()
+        .filter(|name| tool_matches_patterns(name, &allowed_patterns))
+        .collect();
+
+    let unmatched_specs: Vec<String> = spec_patterns
+        .iter()
+        .filter_map(|(spec, patterns)| {
+            let has_match = patterns
+                .iter()
+                .any(|pattern| matched_tools.iter().any(|tool| wildcard_match(pattern, tool)));
+            if has_match {
+                None
+            } else {
+                Some((*spec).to_string())
+            }
+        })
+        .collect();
+
+    AllowedToolsResolution {
+        matched_tools,
+        unmatched_specs,
+    }
+}
+
 fn is_read_only_tool(tool_name: &str) -> bool {
     let normalized_tool = normalize_tool_token(tool_name, false);
     READ_ONLY_TOOLS
@@ -146,7 +185,7 @@ fn is_read_only_tool(tool_name: &str) -> bool {
 /// Rules:
 /// 1. No active skills -> return all tools unchanged.
 /// 2. All active skills are `Trusted` -> return union of `allowed_tools` across all skills.
-///    If `allowed_tools` is empty for all skills, return all tools (backward compat).
+///    If `allowed_tools` is empty for all skills, return no tools (default-deny).
 /// 3. Any `Installed` skill is active -> return read-only subset only.
 #[must_use]
 pub fn attenuate_tools<'a>(
@@ -177,8 +216,7 @@ pub fn attenuate_tools<'a>(
         .collect();
 
     if allowed_patterns.is_empty() {
-        // No restrictions declared -> all tools available
-        return all_tool_names.to_vec();
+        return Vec::new();
     }
 
     all_tool_names
@@ -192,14 +230,21 @@ pub fn attenuate_tools<'a>(
 mod tests {
     use {
         super::*,
-        crate::types::{SkillMetadata, SkillRequirements},
+        crate::types::{SkillEvals, SkillMetadata, SkillPermissions, SkillRequirements, SkillTriggers},
         std::path::PathBuf,
     };
 
     fn mock_skill(allowed_tools: Vec<String>) -> SkillMetadata {
+        let permissions = SkillPermissions {
+            allowed_tools: allowed_tools.clone(),
+        };
         SkillMetadata {
+            version: 3,
             name: "test".to_string(),
             description: String::new(),
+            triggers: SkillTriggers::default(),
+            evals: SkillEvals::default(),
+            permissions,
             homepage: None,
             license: None,
             compatibility: None,
@@ -240,11 +285,11 @@ mod tests {
     }
 
     #[test]
-    fn trusted_skill_no_allowed_tools_returns_all() {
+    fn trusted_skill_no_allowed_tools_returns_none() {
         let skill = mock_skill(vec![]);
         let all = &["read_file", "exec", "web_search"];
         let result = attenuate_tools(&[(&skill, SkillTrust::Trusted)], all);
-        assert_eq!(result, all.to_vec());
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -263,11 +308,10 @@ mod tests {
     }
 
     #[test]
-    fn trusted_skill_allowed_tools_support_aliases_and_wrappers() {
+    fn trusted_skill_allowed_tools_rejects_wrapped_specs() {
         let skill = mock_skill(vec![
             "Bash(git:*)".to_string(),
-            "Read".to_string(),
-            "WebFetch".to_string(),
+            "web_fetch".to_string(),
         ]);
         let all = &[
             "exec",
@@ -279,10 +323,10 @@ mod tests {
 
         let result = attenuate_tools(&[(&skill, SkillTrust::Trusted)], all);
 
-        assert!(result.contains(&"exec"));
-        assert!(result.contains(&"read_file"));
-        assert!(result.contains(&"list_directory"));
         assert!(result.contains(&"web_fetch"));
+        assert!(!result.contains(&"exec"));
+        assert!(!result.contains(&"read_file"));
+        assert!(!result.contains(&"list_directory"));
         assert!(!result.contains(&"web_search"));
     }
 
@@ -296,6 +340,47 @@ mod tests {
         assert!(result.contains(&"web_fetch"));
         assert!(result.contains(&"web_search"));
         assert!(!result.contains(&"exec"));
+    }
+
+    #[test]
+    fn resolve_allowed_tools_rejects_wrapped_specs() {
+        let specs = vec!["Bash(git:*)".to_string(), "web_fetch".to_string()];
+        let all = &[
+            "exec",
+            "read_file",
+            "list_directory",
+            "web_fetch",
+            "web_search",
+        ];
+
+        let resolved = resolve_allowed_tools(&specs, all);
+
+        assert_eq!(resolved.matched_tools, vec!["web_fetch"]);
+        assert_eq!(resolved.unmatched_specs, vec!["Bash(git:*)".to_string()]);
+    }
+
+    #[test]
+    fn resolve_allowed_tools_tracks_unmatched_specs() {
+        let specs = vec!["web_search".to_string(), "Bash(git:*)".to_string()];
+        let all = &["exec", "read_file"];
+
+        let resolved = resolve_allowed_tools(&specs, all);
+
+        assert!(resolved.matched_tools.is_empty());
+        assert_eq!(
+            resolved.unmatched_specs,
+            vec!["web_search".to_string(), "Bash(git:*)".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_allowed_tools_empty_specs_is_unrestricted() {
+        let all = &["exec", "web_fetch"];
+
+        let resolved = resolve_allowed_tools(&[], all);
+
+        assert_eq!(resolved.matched_tools, all.to_vec());
+        assert!(resolved.unmatched_specs.is_empty());
     }
 
     #[test]

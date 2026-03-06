@@ -23,7 +23,7 @@ pub fn trust_skill(skill: &mut SkillState, audited_ms: u64) {
 }
 
 pub fn untrust_skill(skill: &mut SkillState, audited_ms: u64) {
-    skill.status = SkillStatus::Untrusted;
+    skill.status = SkillStatus::Pending;
     skill.enabled = false;
     skill.quarantine_reason = None;
     skill.last_audited_ms = Some(audited_ms);
@@ -86,7 +86,7 @@ mod tests {
         let mut skill = SkillState {
             name: "demo".into(),
             relative_path: "demo".into(),
-            status: SkillStatus::Untrusted,
+            status: SkillStatus::Pending,
             quarantine_reason: None,
             last_audited_ms: None,
             content_hash: Some(hash_skill_markdown("body")),

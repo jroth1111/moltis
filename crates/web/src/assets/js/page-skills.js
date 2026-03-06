@@ -21,6 +21,11 @@ var toasts = signal([]);
 var toastId = 0;
 var installProgresses = signal([]);
 var installProgressId = 0;
+var evalRuns = signal([]);
+var evalProgresses = signal([]);
+var selectedEvalTargetKey = signal("");
+var selectedEvalRunId = signal("");
+var selectedEvalRunDetail = signal(null);
 
 // Lazy prefetch: starts on first navigation to /skills, not at module load
 var prefetchPromise = null;
@@ -46,6 +51,17 @@ var skillRepoMap = computed(() => {
 	});
 	return map;
 });
+
+var evalTargets = computed(() =>
+	enabledSkills.value
+		.filter((skill) => skill?.name && skill?.source)
+		.map((skill) => ({
+			key: `${skill.source}::${skill.name}`,
+			name: skill.name,
+			source: skill.source,
+			description: skill.description || "",
+		})),
+);
 
 // ── Helpers ──────────────────────────────────────────────────
 function showToast(message, type) {
@@ -93,19 +109,120 @@ function stopInstallProgress(id, ok) {
 	installProgresses.value = installProgresses.value.filter((p) => p.id !== id);
 }
 
-function fetchAll() {
-	loading.value = true;
-	fetch("/api/skills")
+function startEvalProgress(source, skill, id) {
+	if (!id) id = `eval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	if (evalProgresses.value.some((p) => p.id === id)) return id;
+	evalProgresses.value = evalProgresses.value.concat([
+		{ id: id, source: source || "", skill: skill || "", state: "running" },
+	]);
+	return id;
+}
+
+function stopEvalProgress(id, ok) {
+	void ok;
+	evalProgresses.value = evalProgresses.value.filter((p) => p.id !== id);
+}
+
+function fetchEvalRuns() {
+	return fetch("/api/skills/evals")
 		.then((r) => r.json())
 		.then((data) => {
-			if (data.skills) enabledSkills.value = data.skills;
-			if (data.repos) repos.value = data.repos;
-			loading.value = false;
-			updateNavCount("skills", (data.skills || []).length);
+			evalRuns.value = data.runs || [];
+			if (selectedEvalRunId.value && !evalRuns.value.some((run) => run.id === selectedEvalRunId.value)) {
+				selectedEvalRunId.value = "";
+				selectedEvalRunDetail.value = null;
+			}
 		})
 		.catch(() => {
+			evalRuns.value = [];
+		});
+}
+
+function fetchAll() {
+	loading.value = true;
+	return Promise.all([
+		fetch("/api/skills")
+			.then((r) => r.json())
+			.then((data) => {
+				if (data.skills) enabledSkills.value = data.skills;
+				if (data.repos) repos.value = data.repos;
+				updateNavCount("skills", (data.skills || []).length);
+			}),
+		fetchEvalRuns(),
+	])
+		.catch(() => null)
+		.finally(() => {
 			loading.value = false;
 		});
+}
+
+function runSelectedEval(target) {
+	if (!(target?.source && target.name)) return Promise.resolve();
+	if (!S.connected) {
+		showToast("Not connected to gateway.", "error");
+		return Promise.resolve();
+	}
+	var opId = `skills-eval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	startEvalProgress(target.source, target.name, opId);
+	return sendRpc("skills.evals.run", {
+		source: target.source,
+		skill: target.name,
+		rounds: 5,
+		op_id: opId,
+	})
+		.then((res) => {
+			if (!res?.ok) {
+				showToast(`Eval failed: ${res?.error || "unknown error"}`, "error");
+				stopEvalProgress(opId, false);
+				return;
+			}
+			var payload = res.payload || {};
+			selectedEvalRunId.value = payload.id || "";
+			selectedEvalRunDetail.value = payload;
+			showToast(`Eval complete for ${target.name}`, "success");
+			stopEvalProgress(opId, true);
+			fetchEvalRuns();
+		})
+		.catch(() => {
+			showToast("Eval failed: transport error", "error");
+			stopEvalProgress(opId, false);
+		});
+}
+
+function loadEvalDetail(id) {
+	if (!id) return Promise.resolve();
+	selectedEvalRunId.value = id;
+	return fetch(`/api/skills/evals/${encodeURIComponent(id)}`)
+		.then((r) => r.json())
+		.then((run) => {
+			selectedEvalRunDetail.value = run;
+		})
+		.catch(() => {
+			showToast("Failed to load eval detail.", "error");
+		});
+}
+
+function handleEvalProgress(payload) {
+	var opId = payload?.op_id;
+	if (!opId) return;
+	var source = payload?.source || "";
+	var skill = payload?.skill || "";
+	if (payload?.phase === "start" || payload?.phase === "scoring") {
+		startEvalProgress(source, skill, opId);
+		return;
+	}
+	if (payload?.phase === "done") {
+		stopEvalProgress(opId, true);
+		fetchEvalRuns();
+		if (payload?.eval_id) {
+			loadEvalDetail(payload.eval_id);
+		}
+		return;
+	}
+	if (payload?.phase === "error") {
+		stopEvalProgress(opId, false);
+		showToast(`Eval failed: ${payload?.error || "unknown error"}`, "error");
+	}
 }
 
 function doInstall(source) {
@@ -172,6 +289,21 @@ function InstallProgressBar() {
   </div>`;
 }
 
+function EvalProgressBar() {
+	var items = evalProgresses.value;
+	if (!items.length) return null;
+	return html`<div style="display:flex;flex-direction:column;gap:8px">
+    ${items.map(
+			(
+				p,
+			) => html`<div key=${p.id} style="border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 10px;background:var(--surface);font-size:.78rem;color:var(--muted)">
+				<div><strong style="color:var(--text-strong)">Benchmarking ${p.skill || "skill"} (${p.source})...</strong></div>
+				<div style="margin-top:3px">Running with-skill vs baseline scoring.</div>
+    </div>`,
+		)}
+  </div>`;
+}
+
 function SecurityWarning() {
 	var dismissed = useSignal(!!localStorage.getItem("moltis-skills-warning-dismissed"));
 	if (dismissed.value) return null;
@@ -187,7 +319,7 @@ function SecurityWarning() {
 	}
 
 	return html`<div class="skills-warn">
-    <div class="skills-warn-title">\u26a0\ufe0f Skills run code on your machine \u2014 treat every skill as untrusted</div>
+    <div class="skills-warn-title">\u26a0\ufe0f Skills run code on your machine \u2014 keep skills pending until validated</div>
     <div>Skills are community-authored instructions that the AI agent follows <strong>with your full system privileges</strong>. Popularity or download count does not mean a skill is safe. A malicious skill can instruct the agent to:</div>
     <ul style="margin:6px 0 6px 18px;padding:0">
       ${threats.map((t) => html`<li>${t}</li>`)}
@@ -280,8 +412,10 @@ function isQuarantinedSkill(d) {
 
 function trustBadge(d) {
 	if (isQuarantinedSkill(d)) return null;
-	if (d.trusted === false)
-		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">untrusted</span>`;
+	if (d.status === "failed_validation")
+		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">failed validation</span>`;
+	if (d.trusted === false || d.status === "pending" || d.integrity_ok === false)
+		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">pending</span>`;
 	return null;
 }
 
@@ -375,7 +509,8 @@ function SkillDetail(props) {
 
 	var isDisc = d.source === "personal" || d.source === "project";
 	var isQuarantined = isQuarantinedSkill(d);
-	var needsTrust = !isDisc && d.trusted === false;
+	var needsValidation =
+		d.trusted === false || d.status === "pending" || d.status === "failed_validation" || d.integrity_ok === false;
 	var isProtected = isDisc && d.protected === true;
 	var quarantineReason = d.quarantine_reason || "integrity checks failed";
 
@@ -385,13 +520,26 @@ function SkillDetail(props) {
 		sendRpc(method, { source: props.repoSource, skill: d.name }).then((r) => {
 			actionBusy.value = false;
 			if (r?.ok) {
-				if (isDisc) onClose();
 				fetchAll();
 				props.onReload?.();
 			} else {
 				showToast(`Failed: ${r?.error || "unknown error"}`, "error");
 			}
-			});
+		});
+	}
+
+	function doDelete() {
+		actionBusy.value = true;
+		sendRpc("skills.skill.delete", { source: props.repoSource, skill: d.name }).then((r) => {
+			actionBusy.value = false;
+			if (r?.payload?.deleted === true) {
+				onClose();
+				fetchAll();
+				props.onReload?.();
+			} else {
+				showToast(`Delete failed: ${r?.error || "unknown error"}`, "error");
+			}
+		});
 	}
 
 	function doUnquarantine() {
@@ -403,7 +551,7 @@ function SkillDetail(props) {
 		}).then((r) => {
 			actionBusy.value = false;
 			if (r?.ok) {
-				showToast(`Unquarantined ${d.name}. Review, trust, then enable.`, "success");
+				showToast(`Unquarantined ${d.name}. Revalidate, then enable.`, "success");
 				fetchAll();
 				props.onReload?.();
 			} else {
@@ -412,16 +560,24 @@ function SkillDetail(props) {
 		});
 	}
 
-	function doTrustOnly() {
+	function doRevalidate() {
 		actionBusy.value = true;
-		sendRpc("skills.skill.trust", { source: props.repoSource, skill: d.name }).then((res) => {
+		sendRpc("skills.skill.revalidate", {
+			source: props.repoSource,
+			skill: d.name,
+			confirm: true,
+		}).then((res) => {
 			actionBusy.value = false;
 			if (res?.ok) {
-				showToast(`Trusted ${d.name}. Enable it when ready.`, "success");
+				if (res?.passed === true) {
+					showToast(`Validated ${d.name}. Enable it when ready.`, "success");
+				} else {
+					showToast(`Validation failed for ${d.name}. Review benchmark details.`, "error");
+				}
 				fetchAll();
 				props.onReload?.();
 			} else {
-				showToast(`Trust failed: ${res?.error || "unknown error"}`, "error");
+				showToast(`Validation failed: ${res?.error || "unknown error"}`, "error");
 			}
 		});
 	}
@@ -429,13 +585,9 @@ function SkillDetail(props) {
 	function onToggle() {
 		if (!S.connected) return;
 		if (actionBusy.value) return;
-		if (isProtected) {
-			showToast(`Skill ${d.name} is protected and cannot be deleted from UI`, "error");
-			return;
-		}
 		if (isQuarantined) {
 			requestConfirm(
-				`Unquarantine skill "${d.name}"?\n\nReason: ${quarantineReason}\n\nAfter unquarantine, you still need to trust and enable it separately.`,
+				`Unquarantine skill "${d.name}"?\n\nReason: ${quarantineReason}\n\nAfter unquarantine, you still need to revalidate and enable it separately.`,
 				{
 					confirmLabel: "Unquarantine",
 					danger: true,
@@ -445,20 +597,11 @@ function SkillDetail(props) {
 			});
 			return;
 		}
-		if (!d.enabled && needsTrust) {
-			requestConfirm(`Trust skill "${d.name}" from ${props.repoSource}?`, {
-				confirmLabel: "Trust",
+		if (!d.enabled && needsValidation) {
+			requestConfirm(`Revalidate skill "${d.name}" from ${props.repoSource}?`, {
+				confirmLabel: "Revalidate",
 			}).then((yes) => {
-				if (yes) doTrustOnly();
-			});
-			return;
-		}
-		if (isDisc && d.enabled) {
-			requestConfirm(`Delete skill "${d.name}"? This removes the SKILL.md file.`, {
-				confirmLabel: "Delete",
-				danger: true,
-			}).then((yes) => {
-				if (yes) doToggle();
+				if (yes) doRevalidate();
 			});
 			return;
 		}
@@ -468,22 +611,16 @@ function SkillDetail(props) {
 	var actionLabel = actionBusy.value
 		? isQuarantined
 			? "Unquarantining..."
-			: needsTrust && !d.enabled
-				? "Trusting..."
-			: isDisc && d.enabled
-				? "Deleting..."
+			: needsValidation && !d.enabled
+				? "Validating..."
 				: "Loading..."
-		: isProtected
-			? "Protected"
-			: isQuarantined
-				? "Unquarantine"
-				: needsTrust && !d.enabled
-					? "Trust"
-				: isDisc && d.enabled
-					? "Delete"
-					: d.enabled
-						? "Disable"
-						: "Enable";
+		: isQuarantined
+			? "Unquarantine"
+			: needsValidation && !d.enabled
+				? "Revalidate"
+				: d.enabled
+					? "Disable"
+					: "Enable";
 
 	return html`<div ref=${panelRef} class="skills-detail-panel" style="display:block">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
@@ -497,22 +634,29 @@ function SkillDetail(props) {
 	        ${trustBadge(d)}
 	      </div>
 	      <div style="display:flex;align-items:center;gap:6px">
-					<button onClick=${onToggle} disabled=${isProtected || actionBusy.value} class=${
-						isDisc && d.enabled && !isQuarantined ? "provider-btn provider-btn-sm provider-btn-danger" : ""
-					} style=${
-						isDisc && d.enabled && !isQuarantined
-							? {}
-							: {
-									background: isQuarantined ? "var(--error, #e55)" : d.enabled ? "none" : "var(--accent)",
-									border: "1px solid var(--border)",
-									borderRadius: "var(--radius-sm)",
-									fontSize: ".72rem",
-									padding: "3px 10px",
-									cursor: "pointer",
-									color: d.enabled && !isQuarantined ? "var(--muted)" : "#fff",
-									fontWeight: 500,
-								}
-					}>${actionLabel}</button>
+					<button onClick=${onToggle} disabled=${actionBusy.value} style=${{
+						background: isQuarantined ? "var(--error, #e55)" : d.enabled ? "none" : "var(--accent)",
+						border: "1px solid var(--border)",
+						borderRadius: "var(--radius-sm)",
+						fontSize: ".72rem",
+						padding: "3px 10px",
+						cursor: "pointer",
+						color: d.enabled && !isQuarantined ? "var(--muted)" : "#fff",
+						fontWeight: 500,
+					}}>${actionLabel}</button>
+					${
+						isDisc &&
+						!isProtected &&
+						html`<button class="provider-btn provider-btn-secondary provider-btn-sm" onClick=${() => {
+							if (actionBusy.value) return;
+							requestConfirm(`Delete skill "${d.name}"? This removes the SKILL.md file.`, {
+								confirmLabel: "Delete",
+								danger: true,
+							}).then((yes) => {
+								if (yes) doDelete();
+							});
+						}}>Delete</button>`
+					}
         <button onClick=${onClose} style="background:none;border:none;color:var(--muted);font-size:.9rem;cursor:pointer;padding:2px 4px">\u2715</button>
       </div>
     </div>
@@ -521,11 +665,11 @@ function SkillDetail(props) {
 				isQuarantined &&
 				html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--error, #e55);background:color-mix(in srgb, var(--error, #e55) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)">
 	      <strong style="color:var(--error, #e55)">Quarantined:</strong> ${quarantineReason}.<br />
-	      This skill is fail-closed and cannot be enabled until you explicitly unquarantine, review, trust, and enable it.
+	      This skill is fail-closed and cannot be enabled until you explicitly unquarantine, review, revalidate, and enable it.
 	    </div>`
 			}
-	    ${d.commit_age_days != null && d.commit_age_days <= 14 && html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--warning, #c77d00);background:color-mix(in srgb, var(--warning, #c77d00) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)"><strong style="color:var(--warning, #c77d00)">Recent commit warning:</strong> This skill was updated ${d.commit_age_days} day${d.commit_age_days === 1 ? "" : "s"} ago. Treat recent updates as high risk and review diffs before trusting/enabling.</div>`}
-    ${d.drifted && html`<div style="margin:0 0 8px;font-size:.75rem;color:var(--warning, #c77d00)">Source changed since last trust; review updates before enabling again.</div>`}
+	    ${d.commit_age_days != null && d.commit_age_days <= 14 && html`<div style="margin:0 0 10px;padding:10px 12px;border:1px solid var(--warning, #c77d00);background:color-mix(in srgb, var(--warning, #c77d00) 14%, transparent);border-radius:var(--radius-sm);font-size:.8rem;color:var(--text)"><strong style="color:var(--warning, #c77d00)">Recent commit warning:</strong> This skill was updated ${d.commit_age_days} day${d.commit_age_days === 1 ? "" : "s"} ago. Treat recent updates as high risk and review diffs before revalidating/enabling.</div>`}
+    ${d.drifted && html`<div style="margin:0 0 8px;font-size:.75rem;color:var(--warning, #c77d00)">Source changed since last validation; revalidate before enabling again.</div>`}
     ${d.description && html`<p style="margin:0 0 8px;font-size:.82rem;color:var(--text)">${d.description}</p>`}
     <${MissingDepsSection} detail=${d} onReload=${props.onReload} />
     ${d.compatibility && html`<div style="margin-bottom:8px;font-size:.75rem;color:var(--muted);font-style:italic">${d.compatibility}</div>`}
@@ -549,6 +693,7 @@ function SkillDetail(props) {
 }
 
 // ── Repo card with server-side search ────────────────────────
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: UI component with multiple states
 function RepoCard(props) {
 	var repo = props.repo;
 	var expanded = useSignal(false);
@@ -669,7 +814,8 @@ function RepoCard(props) {
 	              <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;margin-left:8px">
 	                ${skill.enabled && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--accent);color:#fff;font-weight:500">enabled</span>`}
 	                ${(skill.quarantined === true || skill.status === "quarantined") && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">quarantined</span>`}
-	                ${skill.trusted === false && skill.quarantined !== true && skill.status !== "quarantined" && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">untrusted</span>`}
+	                ${skill.status === "failed_validation" && skill.quarantined !== true && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">failed validation</span>`}
+	                ${skill.trusted === false && skill.quarantined !== true && skill.status !== "quarantined" && skill.status !== "failed_validation" && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">pending</span>`}
 	                ${skill.drifted && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">source changed</span>`}
 	                ${skill.eligible === false && html`<span style="font-size:.6rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">blocked</span>`}
 	              </div>
@@ -716,6 +862,160 @@ function ReposSection() {
   </div>`;
 }
 
+function formatPercent(value) {
+	if (typeof value !== "number" || Number.isNaN(value)) return "0.0%";
+	return `${(value * 100).toFixed(1)}%`;
+}
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: benchmark panel rendering has multiple conditional states
+function SkillEvalsSection() {
+	var targets = evalTargets.value;
+	var runs = evalRuns.value || [];
+	if (targets.length > 0 && !targets.some((target) => target.key === selectedEvalTargetKey.value)) {
+		selectedEvalTargetKey.value = targets[0].key;
+	}
+	var selectedTarget = targets.find((target) => target.key === selectedEvalTargetKey.value) || targets[0] || null;
+	var selectedRun = selectedEvalRunDetail.value;
+	var hasActiveEval = evalProgresses.value.length > 0;
+
+	return html`<div class="skills-section">
+    <h3 class="skills-section-title">Skill Evals</h3>
+    <p style="margin:0 0 8px;color:var(--muted);font-size:.78rem">
+      Compare each skill against a no-skill baseline using deterministic assertions (trigger quality, workflow clarity, safety, validation, examples, dependencies).
+    </p>
+    ${
+			targets.length === 0 &&
+			html`<div style="padding:12px;color:var(--muted);font-size:.82rem">Enable at least one skill to run benchmarks.</div>`
+		}
+    ${
+			targets.length > 0 &&
+			html`<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+        ${targets.slice(0, 20).map(
+					(target) => html`<button
+            key=${target.key}
+            class="provider-btn provider-btn-sm ${selectedEvalTargetKey.value === target.key ? "" : "provider-btn-secondary"}"
+            onClick=${() => {
+							selectedEvalTargetKey.value = target.key;
+						}}
+            style=${
+							selectedEvalTargetKey.value === target.key
+								? {}
+								: {
+										opacity: 0.9,
+									}
+						}
+          >
+            <span style="font-family:var(--font-mono)">${target.name}</span>
+            <span style="margin-left:6px;font-size:.65rem;opacity:.8">${target.source}</span>
+          </button>`,
+				)}
+      </div>`
+		}
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <button
+        class="provider-btn provider-btn-sm"
+        disabled=${!selectedTarget || hasActiveEval}
+        onClick=${() => {
+					if (selectedTarget) runSelectedEval(selectedTarget);
+				}}
+      >${hasActiveEval ? "Benchmarking..." : "Run Benchmark"}</button>
+      ${
+				selectedTarget &&
+				html`<span style="font-size:.74rem;color:var(--muted)">Target: <code>${selectedTarget.name}</code> from <code>${selectedTarget.source}</code></span>`
+			}
+    </div>
+    ${
+			runs.length === 0 &&
+			html`<div style="padding:12px;color:var(--muted);font-size:.82rem">No benchmark runs yet.</div>`
+		}
+    ${
+			runs.length > 0 &&
+			html`<div class="skills-table-wrap">
+        <table style="width:100%;border-collapse:collapse;font-size:.8rem">
+          <thead>
+            <tr style="border-bottom:1px solid var(--border);background:var(--surface)">
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">Skill</th>
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">With</th>
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">Without</th>
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">Delta</th>
+              <th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.04em">When</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${runs.slice(0, 20).map(
+							(run) => html`<tr
+                key=${run.id}
+                style="border-bottom:1px solid var(--border);cursor:pointer;background:${
+									selectedEvalRunId.value === run.id ? "var(--bg-hover)" : "transparent"
+								}"
+                onClick=${() => {
+									loadEvalDetail(run.id);
+								}}
+              >
+                <td style="padding:8px 10px">
+                  <div style="font-family:var(--font-mono);color:var(--text-strong)">${run.skill_name || "\u2014"}</div>
+                  <div style="font-size:.68rem;color:var(--muted)">${run.source || ""}</div>
+                </td>
+                <td style="padding:8px 10px;color:var(--text)">${formatPercent(run.with_skill_pass_rate)}</td>
+                <td style="padding:8px 10px;color:var(--text)">${formatPercent(run.without_skill_pass_rate)}</td>
+                <td style="padding:8px 10px;color:${Number(run.pass_rate_delta || 0) >= 0 ? "var(--success, #4a4)" : "var(--error, #e55)"}">${formatPercent(run.pass_rate_delta || 0)}</td>
+                <td style="padding:8px 10px;color:var(--muted)">${new Date(run.created_at_ms || 0).toLocaleString()}</td>
+              </tr>`,
+						)}
+          </tbody>
+        </table>
+      </div>`
+		}
+    ${
+			selectedRun &&
+			html`<div style="margin-top:10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface2);padding:10px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px">
+          <strong style="font-size:.82rem;color:var(--text-strong)">Eval ${selectedRun.id}</strong>
+          <button class="provider-btn provider-btn-secondary provider-btn-sm" onClick=${() => {
+						selectedEvalRunId.value = "";
+						selectedEvalRunDetail.value = null;
+					}}>Close</button>
+        </div>
+        <div style="font-size:.76rem;color:var(--muted);margin-bottom:8px">
+          Pass delta: <strong style="color:${Number(selectedRun?.benchmark?.run_summary?.pass_rate_delta || 0) >= 0 ? "var(--success, #4a4)" : "var(--error, #e55)"}">${formatPercent(selectedRun?.benchmark?.run_summary?.pass_rate_delta || 0)}</strong>
+        </div>
+        ${
+					selectedRun?.benchmark?.notes?.length > 0 &&
+					html`<div style="margin-bottom:8px">
+            ${selectedRun.benchmark.notes.map(
+							(note, idx) =>
+								html`<div key=${idx} style="font-size:.76rem;color:var(--text);margin-bottom:4px">\u2022 ${note}</div>`,
+						)}
+          </div>`
+				}
+        ${
+					selectedRun?.benchmark?.assertions?.length > 0 &&
+					html`<div class="skills-table-wrap">
+            <table style="width:100%;border-collapse:collapse;font-size:.76rem">
+              <thead>
+                <tr style="border-bottom:1px solid var(--border);background:var(--surface)">
+                  <th style="text-align:left;padding:6px 8px;color:var(--muted)">Assertion</th>
+                  <th style="text-align:left;padding:6px 8px;color:var(--muted)">With</th>
+                  <th style="text-align:left;padding:6px 8px;color:var(--muted)">Without</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${selectedRun.benchmark.assertions.map(
+									(assertion) => html`<tr key=${assertion.id} style="border-bottom:1px solid var(--border)">
+                    <td style="padding:6px 8px;color:var(--text)">${assertion.label}</td>
+                    <td style="padding:6px 8px;color:${assertion.with_skill?.passed ? "var(--success, #4a4)" : "var(--error, #e55)"}">${assertion.with_skill?.passed ? "pass" : "fail"}</td>
+                    <td style="padding:6px 8px;color:${assertion.without_skill?.passed ? "var(--success, #4a4)" : "var(--error, #e55)"}">${assertion.without_skill?.passed ? "pass" : "fail"}</td>
+                  </tr>`,
+								)}
+              </tbody>
+            </table>
+          </div>`
+				}
+      </div>`
+		}
+  </div>`;
+}
+
 function SourceBadge(props) {
 	var src = props.source || "";
 	// Discovered skills have source types like "personal", "project".
@@ -734,11 +1034,6 @@ function EnabledSkillsTable() {
 	var pendingActionSkill = useSignal(null);
 	if (!s || s.length === 0) return null;
 
-	function isDiscovered(skill) {
-		var src = skill.source || "";
-		return src === "personal" || src === "project";
-	}
-
 	function doDisable(skill) {
 		var source = map[skill.name] || skill.source;
 		pendingActionSkill.value = skill.name;
@@ -746,7 +1041,7 @@ function EnabledSkillsTable() {
 			pendingActionSkill.value = null;
 			if (res?.ok) {
 				activeDetail.value = null;
-				showToast(isDiscovered(skill) ? `Deleted ${skill.name}` : `Disabled ${skill.name}`, "success");
+				showToast(`Disabled ${skill.name}`, "success");
 				fetchAll();
 			} else {
 				showToast(`Failed: ${res?.error?.message || res?.error || "unknown error"}`, "error");
@@ -761,19 +1056,6 @@ function EnabledSkillsTable() {
 			return;
 		}
 		if (pendingActionSkill.value) return;
-		if (isDiscovered(skill) && skill.protected === true) {
-			showToast(`Skill ${skill.name} is protected and cannot be deleted from UI`, "error");
-			return;
-		}
-		if (isDiscovered(skill)) {
-			requestConfirm(`Delete skill "${skill.name}"? This removes the SKILL.md file.`, {
-				confirmLabel: "Delete",
-				danger: true,
-			}).then((yes) => {
-				if (yes) doDisable(skill);
-			});
-			return;
-		}
 		doDisable(skill);
 	}
 
@@ -824,22 +1106,12 @@ function EnabledSkillsTable() {
               <td style="padding:8px 12px;color:var(--text)">${skill.description || "\u2014"}</td>
               <td style="padding:8px 12px"><${SourceBadge} source=${skill.source} /></td>
               <td style="padding:8px 12px;text-align:right">
-                <button disabled=${(isDiscovered(skill) && skill.protected === true) || pendingActionSkill.value === skill.name} class=${isDiscovered(skill) ? "provider-btn provider-btn-sm provider-btn-danger" : "provider-btn provider-btn-sm provider-btn-secondary"} onClick=${(
+                <button disabled=${pendingActionSkill.value === skill.name} class="provider-btn provider-btn-sm provider-btn-secondary" onClick=${(
 									e,
 								) => {
 									e.stopPropagation();
 									onDisable(skill);
-								}}>${
-									pendingActionSkill.value === skill.name
-										? isDiscovered(skill)
-											? "Deleting..."
-											: "Disabling..."
-										: isDiscovered(skill) && skill.protected === true
-											? "Protected"
-											: isDiscovered(skill)
-												? "Delete"
-												: "Disable"
-								}</button>
+								}}>${pendingActionSkill.value === skill.name ? "Disabling..." : "Disable"}</button>
               </td>
             </tr>`,
 					)}
@@ -869,7 +1141,7 @@ function SkillsPage() {
 			fetchAll();
 		});
 
-		var off = onEvent("skills.install.progress", (payload) => {
+		var offInstall = onEvent("skills.install.progress", (payload) => {
 			var opId = payload?.op_id;
 			if (!opId) return;
 			var source = payload?.source || "repository";
@@ -886,7 +1158,12 @@ function SkillsPage() {
 			}
 		});
 
-		return off;
+		var offEval = onEvent("skills.evals.progress", handleEvalProgress);
+
+		return () => {
+			if (typeof offInstall === "function") offInstall();
+			if (typeof offEval === "function") offEval();
+		};
 	}, []);
 
 	return html`
@@ -900,8 +1177,10 @@ function SkillsPage() {
       <${SecurityWarning} />
       <${InstallBox} />
       <${InstallProgressBar} />
+      <${EvalProgressBar} />
       <${FeaturedSection} />
       <${ReposSection} />
+      <${SkillEvalsSection} />
       ${loading.value && enabledSkills.value.length === 0 && repos.value.length === 0 && html`<div style="padding:24px;text-align:center;color:var(--muted);font-size:.85rem">Loading skills\u2026</div>`}
       <${EnabledSkillsTable} />
     </div>
