@@ -202,14 +202,29 @@ where
         return Vec::new();
     };
     let store = moltis_skills::manifest::ManifestStore::new(path);
-    store
-        .load()
+    let mut manifest = match store.load() {
+        Ok(manifest) => manifest,
+        Err(_) => return Vec::new(),
+    };
+    if moltis_skills::local::sync_local_skill_manifest(
+        &mut manifest,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    )
+    .ok()
+    .unwrap_or(false)
+    {
+        let _ = store.save(&manifest);
+    }
+    Ok(manifest)
         .map(|m| {
             m.repos
                 .iter()
                 .flat_map(|repo| {
                     let source = repo.source.clone();
-                    repo.skills.iter().filter(|s| s.enabled).map(move |s| {
+                    repo.skills.iter().filter(|s| s.is_runnable()).map(move |s| {
                         serde_json::json!({
                             "name": s.name,
                             "source": source,
@@ -239,33 +254,7 @@ pub async fn api_skills_handler(State(state): State<AppState>) -> impl IntoRespo
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    let mut skills = enabled_from_manifest(moltis_skills::manifest::ManifestStore::default_path());
-
-    {
-        use moltis_skills::discover::{FsSkillDiscoverer, SkillDiscoverer};
-        let data_dir = moltis_config::data_dir();
-        let search_paths = vec![
-            (
-                data_dir.join("skills"),
-                moltis_skills::types::SkillSource::Personal,
-            ),
-            (
-                data_dir.join(".moltis/skills"),
-                moltis_skills::types::SkillSource::Project,
-            ),
-        ];
-        let discoverer = FsSkillDiscoverer::new(search_paths);
-        if let Ok(discovered) = discoverer.discover().await {
-            for s in discovered {
-                skills.push(serde_json::json!({
-                    "name": s.name,
-                    "description": s.description,
-                    "source": s.source,
-                    "enabled": true,
-                }));
-            }
-        }
-    }
+    let skills = enabled_from_manifest(moltis_skills::manifest::ManifestStore::default_path());
 
     Json(serde_json::json!({ "skills": skills, "repos": repos }))
 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use {
     async_trait::async_trait,
     moltis_agents::tool_registry::AgentTool,
-    moltis_skills::types::SkillRequirements,
+    moltis_skills::types::{SkillEvals, SkillPermissions, SkillRequirements, SkillTriggers},
     serde::Serialize,
     serde_json::{Value, json},
 };
@@ -25,8 +25,12 @@ struct SkillFrontmatterInput {
 
 #[derive(Serialize)]
 struct SkillFrontmatter {
+    version: u32,
     name: String,
     description: String,
+    triggers: SkillTriggers,
+    evals: SkillEvals,
+    permissions: SkillPermissions,
     #[serde(skip_serializing_if = "Option::is_none")]
     compatibility: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,6 +43,28 @@ struct SkillFrontmatter {
     dockerfile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     requires: Option<SkillRequirements>,
+}
+
+fn build_default_triggers(name: &str, description: &str) -> SkillTriggers {
+    SkillTriggers {
+        should_trigger: vec![
+            format!("Use the {name} skill for this task"),
+            format!("Help with {}", description.trim_end_matches('.')),
+            format!("Run the workflow described by {name}"),
+        ],
+        should_not_trigger: vec![
+            "Answer a general question without using a skill".to_string(),
+            "Run a one-off command that does not need a reusable skill".to_string(),
+            "Handle an unrelated task outside this skill's scope".to_string(),
+        ],
+    }
+}
+
+fn build_v3_body(description: &str, body: &str) -> String {
+    let trimmed_body = body.trim();
+    format!(
+        "## Purpose\n\n{description}\n\n## Inputs\n\n- The user's request and relevant workspace context\n- Any files, tools, or constraints needed for the task\n\n## Workflow\n\n{trimmed_body}\n\n## Failure Modes\n\n- Stop and explain blockers when required inputs, permissions, or tools are missing.\n- Do not guess about destructive or irreversible actions.\n\n## Examples\n\n- \"Use this skill when the request matches its documented workflow.\"\n- \"Skip this skill when the task is outside its scope.\"\n"
+    )
 }
 
 fn required_str<'a>(params: &'a Value, key: &str) -> anyhow::Result<&'a str> {
@@ -476,8 +502,16 @@ fn build_skill_md(
     frontmatter_input: SkillFrontmatterInput,
 ) -> anyhow::Result<String> {
     let frontmatter = SkillFrontmatter {
+        version: 3,
         name: name.to_string(),
         description: description.to_string(),
+        triggers: build_default_triggers(name, description),
+        evals: SkillEvals {
+            path: "evals/evals.json".to_string(),
+        },
+        permissions: SkillPermissions {
+            allowed_tools: frontmatter_input.allowed_tools.clone(),
+        },
         compatibility: frontmatter_input.compatibility,
         homepage: frontmatter_input.homepage,
         license: frontmatter_input.license,
@@ -497,10 +531,7 @@ fn build_skill_md(
     let mut content = String::from("---\n");
     content.push_str(yaml.trim_end());
     content.push_str("\n---\n\n");
-    content.push_str(body);
-    if !body.ends_with('\n') {
-        content.push('\n');
-    }
+    content.push_str(&build_v3_body(description, body));
     Ok(content)
 }
 
@@ -541,8 +572,12 @@ mod tests {
         let skill_md = tmp.path().join("skills/my-skill/SKILL.md");
         assert!(skill_md.exists());
         let content = std::fs::read_to_string(&skill_md).unwrap();
+        assert!(content.contains("version: 3"));
         assert!(content.contains("name: my-skill"));
+        assert!(content.contains("## Purpose"));
+        assert!(content.contains("## Workflow"));
         assert!(content.contains("Do something useful."));
+        assert!(moltis_skills::parse::parse_skill(&content, tmp.path()).is_ok());
     }
 
     #[tokio::test]
@@ -604,6 +639,7 @@ mod tests {
         assert!(content.contains("- python3"));
         assert!(content.contains("kind: brew"));
         assert!(content.contains("formula: jq"));
+        assert!(moltis_skills::parse::parse_skill(&content, tmp.path()).is_ok());
     }
 
     #[tokio::test]
@@ -737,6 +773,7 @@ mod tests {
         let content = std::fs::read_to_string(tmp.path().join("skills/my-skill/SKILL.md")).unwrap();
         assert!(content.contains("description: updated"));
         assert!(content.contains("new body"));
+        assert!(moltis_skills::parse::parse_skill(&content, tmp.path()).is_ok());
     }
 
     #[tokio::test]

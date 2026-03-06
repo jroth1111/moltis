@@ -414,7 +414,7 @@ function trustBadge(d) {
 	if (isQuarantinedSkill(d)) return null;
 	if (d.status === "failed_validation")
 		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--error, #e55);color:#fff;font-weight:500">failed validation</span>`;
-	if (d.trusted === false || d.status === "pending")
+	if (d.trusted === false || d.status === "pending" || d.integrity_ok === false)
 		return html`<span style="font-size:.65rem;padding:1px 5px;border-radius:9999px;background:var(--warning, #c77d00);color:#fff;font-weight:500">pending</span>`;
 	return null;
 }
@@ -509,34 +509,35 @@ function SkillDetail(props) {
 
 	var isDisc = d.source === "personal" || d.source === "project";
 	var isQuarantined = isQuarantinedSkill(d);
-	var needsValidation = !isDisc && d.trusted === false;
+	var needsValidation =
+		d.trusted === false || d.status === "pending" || d.status === "failed_validation" || d.integrity_ok === false;
 	var isProtected = isDisc && d.protected === true;
 	var quarantineReason = d.quarantine_reason || "integrity checks failed";
 
 	function doToggle() {
 		actionBusy.value = true;
-		if (isDisc && d.enabled) {
-			sendRpc("skills.skill.delete", { source: props.repoSource, skill: d.name }).then((r) => {
-				actionBusy.value = false;
-				if (r?.deleted) {
-					onClose();
-					fetchAll();
-					props.onReload?.();
-				} else {
-					showToast(`Delete failed: ${r?.error || "unknown error"}`, "error");
-				}
-			});
-			return;
-		}
 		var method = d.enabled ? "skills.skill.disable" : "skills.skill.enable";
 		sendRpc(method, { source: props.repoSource, skill: d.name }).then((r) => {
 			actionBusy.value = false;
 			if (r?.ok) {
-				if (isDisc) onClose();
 				fetchAll();
 				props.onReload?.();
 			} else {
 				showToast(`Failed: ${r?.error || "unknown error"}`, "error");
+			}
+		});
+	}
+
+	function doDelete() {
+		actionBusy.value = true;
+		sendRpc("skills.skill.delete", { source: props.repoSource, skill: d.name }).then((r) => {
+			actionBusy.value = false;
+			if (r?.deleted) {
+				onClose();
+				fetchAll();
+				props.onReload?.();
+			} else {
+				showToast(`Delete failed: ${r?.error || "unknown error"}`, "error");
 			}
 		});
 	}
@@ -580,10 +581,6 @@ function SkillDetail(props) {
 	function onToggle() {
 		if (!S.connected) return;
 		if (actionBusy.value) return;
-		if (isProtected) {
-			showToast(`Skill ${d.name} is protected and cannot be deleted from UI`, "error");
-			return;
-		}
 		if (isQuarantined) {
 			requestConfirm(
 				`Unquarantine skill "${d.name}"?\n\nReason: ${quarantineReason}\n\nAfter unquarantine, you still need to revalidate and enable it separately.`,
@@ -604,15 +601,6 @@ function SkillDetail(props) {
 			});
 			return;
 		}
-		if (isDisc && d.enabled) {
-			requestConfirm(`Delete skill "${d.name}"? This removes the SKILL.md file.`, {
-				confirmLabel: "Delete",
-				danger: true,
-			}).then((yes) => {
-				if (yes) doToggle();
-			});
-			return;
-		}
 		doToggle();
 	}
 
@@ -621,20 +609,14 @@ function SkillDetail(props) {
 			? "Unquarantining..."
 			: needsValidation && !d.enabled
 				? "Validating..."
-				: isDisc && d.enabled
-					? "Deleting..."
-					: "Loading..."
-		: isProtected
-			? "Protected"
-			: isQuarantined
-				? "Unquarantine"
-				: needsValidation && !d.enabled
-					? "Revalidate"
-					: isDisc && d.enabled
-						? "Delete"
-						: d.enabled
-							? "Disable"
-							: "Enable";
+				: "Loading..."
+		: isQuarantined
+			? "Unquarantine"
+			: needsValidation && !d.enabled
+				? "Revalidate"
+				: d.enabled
+					? "Disable"
+					: "Enable";
 
 	return html`<div ref=${panelRef} class="skills-detail-panel" style="display:block">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
@@ -648,22 +630,29 @@ function SkillDetail(props) {
 	        ${trustBadge(d)}
 	      </div>
 	      <div style="display:flex;align-items:center;gap:6px">
-					<button onClick=${onToggle} disabled=${isProtected || actionBusy.value} class=${
-						isDisc && d.enabled && !isQuarantined ? "provider-btn provider-btn-sm provider-btn-danger" : ""
-					} style=${
-						isDisc && d.enabled && !isQuarantined
-							? {}
-							: {
-									background: isQuarantined ? "var(--error, #e55)" : d.enabled ? "none" : "var(--accent)",
-									border: "1px solid var(--border)",
-									borderRadius: "var(--radius-sm)",
-									fontSize: ".72rem",
-									padding: "3px 10px",
-									cursor: "pointer",
-									color: d.enabled && !isQuarantined ? "var(--muted)" : "#fff",
-									fontWeight: 500,
-								}
-					}>${actionLabel}</button>
+					<button onClick=${onToggle} disabled=${actionBusy.value} style=${{
+						background: isQuarantined ? "var(--error, #e55)" : d.enabled ? "none" : "var(--accent)",
+						border: "1px solid var(--border)",
+						borderRadius: "var(--radius-sm)",
+						fontSize: ".72rem",
+						padding: "3px 10px",
+						cursor: "pointer",
+						color: d.enabled && !isQuarantined ? "var(--muted)" : "#fff",
+						fontWeight: 500,
+					}}>${actionLabel}</button>
+					${
+						isDisc &&
+						!isProtected &&
+						html`<button class="provider-btn provider-btn-secondary provider-btn-sm" onClick=${() => {
+							if (actionBusy.value) return;
+							requestConfirm(`Delete skill "${d.name}"? This removes the SKILL.md file.`, {
+								confirmLabel: "Delete",
+								danger: true,
+							}).then((yes) => {
+								if (yes) doDelete();
+							});
+						}}>Delete</button>`
+					}
         <button onClick=${onClose} style="background:none;border:none;color:var(--muted);font-size:.9rem;cursor:pointer;padding:2px 4px">\u2715</button>
       </div>
     </div>
@@ -700,6 +689,7 @@ function SkillDetail(props) {
 }
 
 // ── Repo card with server-side search ────────────────────────
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: UI component with multiple states
 function RepoCard(props) {
 	var repo = props.repo;
 	var expanded = useSignal(false);
@@ -1040,11 +1030,6 @@ function EnabledSkillsTable() {
 	var pendingActionSkill = useSignal(null);
 	if (!s || s.length === 0) return null;
 
-	function isDiscovered(skill) {
-		var src = skill.source || "";
-		return src === "personal" || src === "project";
-	}
-
 	function doDisable(skill) {
 		var source = map[skill.name] || skill.source;
 		pendingActionSkill.value = skill.name;
@@ -1052,7 +1037,7 @@ function EnabledSkillsTable() {
 			pendingActionSkill.value = null;
 			if (res?.ok) {
 				activeDetail.value = null;
-				showToast(isDiscovered(skill) ? `Deleted ${skill.name}` : `Disabled ${skill.name}`, "success");
+				showToast(`Disabled ${skill.name}`, "success");
 				fetchAll();
 			} else {
 				showToast(`Failed: ${res?.error?.message || res?.error || "unknown error"}`, "error");
@@ -1067,19 +1052,6 @@ function EnabledSkillsTable() {
 			return;
 		}
 		if (pendingActionSkill.value) return;
-		if (isDiscovered(skill) && skill.protected === true) {
-			showToast(`Skill ${skill.name} is protected and cannot be deleted from UI`, "error");
-			return;
-		}
-		if (isDiscovered(skill)) {
-			requestConfirm(`Delete skill "${skill.name}"? This removes the SKILL.md file.`, {
-				confirmLabel: "Delete",
-				danger: true,
-			}).then((yes) => {
-				if (yes) doDisable(skill);
-			});
-			return;
-		}
 		doDisable(skill);
 	}
 
@@ -1130,22 +1102,12 @@ function EnabledSkillsTable() {
               <td style="padding:8px 12px;color:var(--text)">${skill.description || "\u2014"}</td>
               <td style="padding:8px 12px"><${SourceBadge} source=${skill.source} /></td>
               <td style="padding:8px 12px;text-align:right">
-                <button disabled=${(isDiscovered(skill) && skill.protected === true) || pendingActionSkill.value === skill.name} class=${isDiscovered(skill) ? "provider-btn provider-btn-sm provider-btn-danger" : "provider-btn provider-btn-sm provider-btn-secondary"} onClick=${(
+                <button disabled=${pendingActionSkill.value === skill.name} class="provider-btn provider-btn-sm provider-btn-secondary" onClick=${(
 									e,
 								) => {
 									e.stopPropagation();
 									onDisable(skill);
-								}}>${
-									pendingActionSkill.value === skill.name
-										? isDiscovered(skill)
-											? "Deleting..."
-											: "Disabling..."
-										: isDiscovered(skill) && skill.protected === true
-											? "Protected"
-											: isDiscovered(skill)
-												? "Delete"
-												: "Disable"
-								}</button>
+								}}>${pendingActionSkill.value === skill.name ? "Disabling..." : "Disable"}</button>
               </td>
             </tr>`,
 					)}

@@ -144,14 +144,11 @@ impl moltis_tools::location::LocationRequester for GatewayLocationRequester {
         {
             let mut inner_w = self.state.inner.write().await;
             let invokes = &mut inner_w.pending_invokes;
-            invokes.insert(
-                request_id.clone(),
-                crate::state::PendingInvoke {
-                    request_id: request_id.clone(),
-                    sender: tx,
-                    created_at: std::time::Instant::now(),
-                },
-            );
+            invokes.insert(request_id.clone(), crate::state::PendingInvoke {
+                request_id: request_id.clone(),
+                sender: tx,
+                created_at: std::time::Instant::now(),
+            });
         }
 
         // Wait up to 30 seconds for the user to grant/deny permission.
@@ -265,14 +262,13 @@ impl moltis_tools::location::LocationRequester for GatewayLocationRequester {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut inner = self.state.inner.write().await;
-            inner.pending_invokes.insert(
-                pending_key.clone(),
-                crate::state::PendingInvoke {
+            inner
+                .pending_invokes
+                .insert(pending_key.clone(), crate::state::PendingInvoke {
                     request_id: pending_key.clone(),
                     sender: tx,
                     created_at: std::time::Instant::now(),
-                },
-            );
+                });
         }
 
         // Wait up to 60 seconds — user needs to navigate Telegram's UI.
@@ -1432,9 +1428,9 @@ pub async fn prepare_gateway(
                         token_url: o.token_url.clone(),
                         scopes: o.scopes.clone(),
                     });
-                merged.servers.insert(
-                    name.clone(),
-                    moltis_mcp::McpServerConfig {
+                merged
+                    .servers
+                    .insert(name.clone(), moltis_mcp::McpServerConfig {
                         command: entry.command.clone(),
                         args: entry.args.clone(),
                         env: entry.env.clone(),
@@ -1442,8 +1438,7 @@ pub async fn prepare_gateway(
                         transport,
                         url: entry.url.clone(),
                         oauth,
-                    },
-                );
+                    });
             }
         }
         mcp_configured_count = merged.servers.values().filter(|s| s.enabled).count();
@@ -2067,8 +2062,10 @@ pub async fn prepare_gateway(
                                 if let Some(push_service) = state.get_push_service().await {
                                     let summary = {
                                         let max_chars = 120;
-                                        let mut truncated =
-                                            delivery_text.chars().take(max_chars).collect::<String>();
+                                        let mut truncated = delivery_text
+                                            .chars()
+                                            .take(max_chars)
+                                            .collect::<String>();
                                         if delivery_text.chars().count() > max_chars {
                                             truncated.push('…');
                                         }
@@ -2138,15 +2135,10 @@ pub async fn prepare_gateway(
             // Spawn async broadcast in a background task since we're in a sync callback.
             let state = Arc::clone(state);
             tokio::spawn(async move {
-                broadcast_raw(
-                    &state,
-                    event,
-                    payload,
-                    BroadcastOpts {
-                        drop_if_slow: true,
-                        ..Default::default()
-                    },
-                )
+                broadcast_raw(&state, event, payload, BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                })
                 .await;
             });
         });
@@ -2184,8 +2176,11 @@ pub async fn prepare_gateway(
                     .as_deref()
                     .map(serde_json::from_str::<moltis_tasks::TaskPrincipal>)
                     .transpose()
-                    .map_err(|e| moltis_cron::Error::message(format!("invalid principal_json: {e}")))?;
-                let resolved_list_id = if req.list_id.trim().is_empty() || req.list_id == "default" {
+                    .map_err(|e| {
+                        moltis_cron::Error::message(format!("invalid principal_json: {e}"))
+                    })?;
+                let resolved_list_id = if req.list_id.trim().is_empty() || req.list_id == "default"
+                {
                     principal
                         .as_ref()
                         .map(moltis_tasks::TaskPrincipal::canonical_list_id)
@@ -4491,15 +4486,10 @@ pub async fn prepare_gateway(
                         if let SessionEvent::Recovered { recovery_type, .. } = &event {
                             payload["recoveryType"] = serde_json::json!(recovery_type);
                         }
-                        broadcast_raw(
-                            &ws_state,
-                            "session",
-                            payload,
-                            BroadcastOpts {
-                                drop_if_slow: true,
-                                ..Default::default()
-                            },
-                        )
+                        broadcast_raw(&ws_state, "session", payload, BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        })
                         .await;
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -4560,15 +4550,10 @@ pub async fn prepare_gateway(
                         }
                     };
                     if changed && let Ok(payload) = serde_json::to_value(&next) {
-                        broadcast_raw(
-                            &update_state,
-                            "update.available",
-                            payload,
-                            BroadcastOpts {
-                                drop_if_slow: true,
-                                ..Default::default()
-                            },
-                        )
+                        broadcast_raw(&update_state, "update.available", payload, BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        })
                         .await;
                     }
                 },
@@ -4667,15 +4652,12 @@ pub async fn prepare_gateway(
                         .by_provider
                         .iter()
                         .map(|(name, metrics)| {
-                            (
-                                name.clone(),
-                                moltis_metrics::ProviderTokens {
-                                    input_tokens: metrics.input_tokens,
-                                    output_tokens: metrics.output_tokens,
-                                    completions: metrics.completions,
-                                    errors: metrics.errors,
-                                },
-                            )
+                            (name.clone(), moltis_metrics::ProviderTokens {
+                                input_tokens: metrics.input_tokens,
+                                output_tokens: metrics.output_tokens,
+                                completions: metrics.completions,
+                                errors: metrics.errors,
+                            })
                         })
                         .collect();
 
@@ -4837,15 +4819,10 @@ pub async fn prepare_gateway(
                                 }),
                             ),
                         };
-                        broadcast_raw(
-                            &event_state,
-                            event_name,
-                            payload,
-                            BroadcastOpts {
-                                drop_if_slow: true,
-                                ..Default::default()
-                            },
-                        )
+                        broadcast_raw(&event_state, event_name, payload, BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        })
                         .await;
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -4893,15 +4870,10 @@ pub async fn prepare_gateway(
                 match rx.recv().await {
                     Ok(entry) => {
                         if let Ok(payload) = serde_json::to_value(&entry) {
-                            broadcast_raw(
-                                &log_state,
-                                "logs.entry",
-                                payload,
-                                BroadcastOpts {
-                                    drop_if_slow: true,
-                                    ..Default::default()
-                                },
-                            )
+                            broadcast_raw(&log_state, "logs.entry", payload, BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            })
                             .await;
                         }
                     },
@@ -5970,7 +5942,6 @@ fn seed_dcg_guard_hook() {
 /// is never overwritten.
 fn seed_example_skill() {
     seed_skill_if_missing("template-skill", EXAMPLE_SKILL_MD);
-    seed_skill_if_missing("skill-creator", SKILL_CREATOR_SKILL_MD);
     seed_skill_if_missing("tmux", TMUX_SKILL_MD);
 }
 
@@ -6164,31 +6135,71 @@ exit 0
 
 /// Content for the starter example personal skill.
 const EXAMPLE_SKILL_MD: &str = r#"---
+version: 3
 name: template-skill
 description: Starter skill template (safe to copy and edit)
+triggers:
+  should_trigger:
+    - "Create a new skill from the template-skill starter"
+    - "Show me how to structure a new personal skill"
+    - "Draft a SKILL.md using the built-in template"
+  should_not_trigger:
+    - "Answer a general knowledge question"
+    - "Debug an existing skill implementation"
+    - "Run a command in the terminal"
+evals:
+  path: evals/evals.json
 ---
 
-# Template Skill
+## Purpose
 
-Use this as a starting point for your own skills.
+Use this as a starting point for a new personal skill. Replace the placeholder
+guidance with task-specific instructions before enabling it.
 
-## How to use
+## Inputs
 
-1. Copy this folder to a new skill name (or edit in place)
-2. Update `name` and `description` in frontmatter
-3. Replace this body with clear, specific instructions
+- The skill name, description, and trigger examples you want to ship
+- The concrete workflow the agent should follow
+- Any required tools, binaries, or environmental assumptions
 
-## Tips
+## Workflow
 
-- Keep instructions explicit and task-focused
-- Avoid broad permissions unless required
-- Document required tools and expected inputs
+1. Copy this folder to a new skill name or edit it in place.
+2. Update the frontmatter so `name`, `description`, `triggers`, and `evals.path`
+   match the skill you actually want.
+3. Replace each section below with clear, imperative instructions for the task.
+4. Add the narrowest `allowed-tools` set that still lets the skill succeed.
+5. Review the finished SKILL.md before enabling it.
+
+## Failure Modes
+
+- Do not leave placeholder examples or vague instructions in a skill you plan to run.
+- Do not grant broad tool access unless the skill truly needs it.
+- If the task requires extra setup, document it explicitly instead of assuming it.
+
+## Examples
+
+- "Create a git-release helper skill from the template"
+- "Draft a local docs-search skill using template-skill"
+- "Show me the sections a new SKILL.md should contain"
 "#;
 
 /// Content for a built-in meta-skill that creates and improves skills.
 const SKILL_CREATOR_SKILL_MD: &str = r#"---
+version: 3
 name: skill-creator
 description: Create and improve Moltis skills with iterative prompts, baseline comparisons, and measurable quality checks. Use this whenever a user asks to create, update, optimize, evaluate, benchmark, or debug any skill.
+triggers:
+  should_trigger:
+    - "Create a new skill for this workflow"
+    - "Improve the trigger logic in an existing skill"
+    - "Benchmark two SKILL.md variants against each other"
+  should_not_trigger:
+    - "Answer a general product question"
+    - "Run a one-off shell command"
+    - "Investigate a bug outside the skills system"
+evals:
+  path: evals/evals.json
 allowed-tools:
   - read_file
   - write_file
@@ -6199,16 +6210,17 @@ allowed-tools:
   - exec
 ---
 
-# Skill Creator
+## Purpose
 
-Use this skill for any task about skill authoring, tuning, or evaluation.
+Use this skill for tasks about skill authoring, tuning, benchmarking, and
+quality checks.
 
-## Outcomes
+## Inputs
 
-- Produce a clear SKILL.md with precise trigger language
-- Validate behavior with realistic prompts
-- Compare new behavior against baseline behavior
-- Iterate until quality is stable
+- The desired skill behavior and trigger boundaries
+- Any existing SKILL.md draft or baseline implementation
+- Expected output format, constraints, and required tools
+- Example prompts that should and should not trigger the skill
 
 ## Workflow
 
@@ -6238,38 +6250,51 @@ Use this skill for any task about skill authoring, tuning, or evaluation.
 - remove low-signal or redundant text
 - improve trigger phrasing in description to avoid under-triggering
 
-## SKILL.md checklist
+## Failure Modes
 
-- frontmatter parses as YAML
-- `description` includes explicit "when to use" cues
-- instructions explain expected output format
-- dependencies are declared in `requires` when needed
-- examples are realistic and short
-- no unsafe or misleading instructions
+- Do not ship a skill with vague trigger guidance or missing negative examples.
+- Do not broaden permissions without a concrete need.
+- Do not compare revisions using unrealistic prompts or incomplete acceptance criteria.
 
-## Implementation notes
+## Examples
 
-- Use `create_skill` for new skills.
-- Use `update_skill` for revisions.
-- Keep old revisions by writing snapshots to a workspace file before major rewrites.
-- Prefer small iterations over one large rewrite.
+- "Create a deployment skill that only triggers on Vercel release work"
+- "Tighten this skill so it stops firing on ordinary shell requests"
+- "Compare the current SKILL.md against the previous revision and keep the better trigger wording"
 "#;
 
 /// Content for the built-in tmux skill (interactive terminal processes).
 const TMUX_SKILL_MD: &str = r#"---
+version: 3
 name: tmux
 description: Run and interact with terminal applications (htop, vim, etc.) using tmux sessions in the sandbox
+triggers:
+  should_trigger:
+    - "Run htop in an interactive terminal session"
+    - "Use tmux to drive a Python REPL"
+    - "Start a long-running process and poll its output"
+  should_not_trigger:
+    - "Run a simple ls command once"
+    - "Answer a documentation question"
+    - "Modify a source file directly"
+evals:
+  path: evals/evals.json
 allowed-tools:
   - process
 ---
 
-# tmux — Interactive Terminal Sessions
+## Purpose
 
 Use the `process` tool to run and interact with interactive or long-running
-programs inside the sandbox. Every command runs in a named **tmux session**,
-giving you full control over TUI apps, REPLs, and background processes.
+programs inside the sandbox. Every command runs in a named tmux session.
 
-## When to use this skill
+## Inputs
+
+- The interactive command to run
+- An optional stable tmux session name
+- Any keys or pasted input required to drive the program
+
+## Workflow
 
 - **TUI / ncurses apps**: htop, vim, nano, less, top, iftop
 - **Interactive REPLs**: python3, node, irb, psql, sqlite3
@@ -6277,9 +6302,6 @@ giving you full control over TUI apps, REPLs, and background processes.
 - **Programs that need keyboard input**: anything that waits for keypresses
 
 For simple one-shot commands (ls, cat, echo), use `exec` instead.
-
-## Workflow
-
 1. **Start** a session with a command
 2. **Poll** to see the current terminal output
 3. **Send keys** or **paste text** to interact
@@ -6365,12 +6387,18 @@ keystrokes, prefer `send_keys`.
 3. `send_keys` with `"keys": "C-c"` when done
 4. `kill` the session
 
-## Tips
+## Failure Modes
 
 - Session names must be `[a-zA-Z0-9_-]` only (no spaces or special chars)
 - Always `kill` sessions when done to free resources
 - If a program is unresponsive, `send_keys` with `C-c` or `C-\` first
 - Poll output is a snapshot; poll again for updates after sending input
+
+## Examples
+
+- "Start htop, inspect the output, then quit cleanly"
+- "Open a Python REPL in tmux and evaluate a short expression"
+- "Tail a log file, watch a few updates, then stop the session"
 "#;
 
 /// Default BOOT.md content seeded into workspace root.
@@ -6742,6 +6770,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn seed_example_skill_does_not_seed_skill_creator() {
+        let tmp = tempfile::tempdir().unwrap();
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+
+        seed_example_skill();
+
+        assert!(tmp.path().join("skills/template-skill/SKILL.md").exists());
+        assert!(tmp.path().join("skills/tmux/SKILL.md").exists());
+        assert!(!tmp.path().join("skills/skill-creator/SKILL.md").exists());
+
+        moltis_config::clear_data_dir();
+    }
+
+    #[test]
+    fn seeded_builtin_skills_parse_as_v3_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        assert!(moltis_skills::parse::parse_skill(EXAMPLE_SKILL_MD, tmp.path()).is_ok());
+        assert!(moltis_skills::parse::parse_skill(SKILL_CREATOR_SKILL_MD, tmp.path()).is_ok());
+        assert!(moltis_skills::parse::parse_skill(TMUX_SKILL_MD, tmp.path()).is_ok());
+    }
+
     #[tokio::test]
     async fn command_hook_dispatch_saves_session_memory_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7063,27 +7114,21 @@ mod tests {
             "https://localhost:49494".to_string(),
             "https://m4max.local:49494".to_string(),
         ]);
-        assert_eq!(
-            lines,
-            vec![
-                "passkey origin: https://localhost:49494",
-                "passkey origin: https://m4max.local:49494",
-            ]
-        );
+        assert_eq!(lines, vec![
+            "passkey origin: https://localhost:49494",
+            "passkey origin: https://m4max.local:49494",
+        ]);
     }
 
     #[test]
     fn startup_setup_code_lines_adds_spacers() {
         let lines = startup_setup_code_lines("493413");
-        assert_eq!(
-            lines,
-            vec![
-                "",
-                "setup code: 493413",
-                "enter this code to set your password or register a passkey",
-                "",
-            ]
-        );
+        assert_eq!(lines, vec![
+            "",
+            "setup code: 493413",
+            "enter this code to set your password or register a passkey",
+            "",
+        ]);
     }
 
     #[test]
@@ -7111,16 +7156,13 @@ mod tests {
             ("OPENAI_API_KEY".to_string(), "config-openai".to_string()),
             ("BRAVE_API_KEY".to_string(), "config-brave".to_string()),
         ]);
-        let merged = merge_env_overrides(
-            &base,
-            vec![
-                ("OPENAI_API_KEY".to_string(), "db-openai".to_string()),
-                (
-                    "PERPLEXITY_API_KEY".to_string(),
-                    "db-perplexity".to_string(),
-                ),
-            ],
-        );
+        let merged = merge_env_overrides(&base, vec![
+            ("OPENAI_API_KEY".to_string(), "db-openai".to_string()),
+            (
+                "PERPLEXITY_API_KEY".to_string(),
+                "db-perplexity".to_string(),
+            ),
+        ]);
         assert_eq!(
             merged.get("OPENAI_API_KEY").map(String::as_str),
             Some("config-openai")
