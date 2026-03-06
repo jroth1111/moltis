@@ -6,8 +6,7 @@ use std::{
 
 use {async_trait::async_trait, tracing::debug, url::Url};
 
-use crate::error::Error;
-use crate::tool_names::WEB_FETCH;
+use crate::{error::Error, tool_names::WEB_FETCH};
 
 use {
     crate::ssrf::ssrf_check, moltis_agents::tool_registry::AgentTool,

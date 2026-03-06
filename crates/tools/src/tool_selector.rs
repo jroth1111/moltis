@@ -165,8 +165,7 @@ pub fn select_tools_for_task(task: &str, registry: &ToolRegistry) -> ToolRegistr
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
+    use {super::*, serde_json::json};
 
     struct FakeTool {
         name: &'static str,
@@ -178,15 +177,19 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
+
         fn description(&self) -> &str {
             "test"
         }
+
         fn parameters_schema(&self) -> serde_json::Value {
             json!({"type": "object"})
         }
+
         async fn execute(&self, _params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
             Ok(json!("ok"))
         }
+
         fn categories(&self) -> &'static [&'static str] {
             self.cats
         }

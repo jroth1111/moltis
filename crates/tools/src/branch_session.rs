@@ -9,8 +9,7 @@ use {
     serde_json::{Value, json},
 };
 
-use crate::error::Error;
-use crate::tool_names::BRANCH_SESSION;
+use crate::{error::Error, tool_names::BRANCH_SESSION};
 
 /// Agent tool that forks the current session at a given message index.
 pub struct BranchSessionTool {

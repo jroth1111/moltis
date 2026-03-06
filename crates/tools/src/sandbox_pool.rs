@@ -9,8 +9,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use {
+    tokio::sync::mpsc,
+    tracing::{debug, info, warn},
+};
 
 use crate::sandbox::{Sandbox, SandboxId, SandboxScope};
 
@@ -198,8 +200,7 @@ impl SandboxPool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicU32;
+    use {super::*, std::sync::atomic::AtomicU32};
 
     use crate::exec::{ExecOpts, ExecResult};
 

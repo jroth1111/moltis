@@ -12,8 +12,7 @@ use {
     serde_json::{Value, json},
 };
 
-use crate::error::Error;
-use crate::tool_names::SESSION_STATE;
+use crate::{error::Error, tool_names::SESSION_STATE};
 
 /// Agent tool exposing per-session key-value state operations.
 pub struct SessionStateTool {
