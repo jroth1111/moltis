@@ -1802,7 +1802,12 @@ mod tests {
   </head>
   <body>
     <h1>Fingerprint Probe</h1>
+    <p>
+      This owned probe page records browser-visible identity traits and request headers for
+      baseline drift detection in permissioned automation tests.
+    </p>
     <p id="payload"></p>
+    <button id="probe-ready" type="button">Ready</button>
     <script>
       async function getSessionId() {
         const response = await fetch(`/session${location.search}`);
@@ -1976,6 +1981,11 @@ mod tests {
   </head>
   <body>
     <h1>Sequence Probe</h1>
+    <p>
+      This page triggers a fixed request cadence so the canary can compare path order and timing
+      gaps against a stored baseline.
+    </p>
+    <button id="sequence-anchor" type="button">Sequence Anchor</button>
     <script>
       function withSearch(path) {
         return `${path}${location.search}`;

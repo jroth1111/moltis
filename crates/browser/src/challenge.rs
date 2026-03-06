@@ -34,26 +34,32 @@ impl ChallengeType {
 /// Detection result for HTML challenge classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChallengeDetection {
-    pub challenge_type: Option<ChallengeType>,
+    pub candidate_type: Option<ChallengeType>,
     pub markers: Vec<&'static str>,
+    pub explicit_challenge: bool,
+    pub challenge_widget: bool,
 }
 
-const IMPERVA_MARKERS: &[&str] = &[
+const IMPERVA_MARKERS: &[&str] =
+    &["_incapsula_resource", "incapsula incident id", "visid_incap", "/_incap", "reese84"];
+const IMPERVA_EXPLICIT_MARKERS: &[&str] = &[
     "pardon our interruption",
-    "_incapsula_resource",
-    "incapsula incident id",
-    "visid_incap",
-    "/_incap",
-    "reese84",
+    "the website is using a security service",
+    "please enable cookies",
 ];
 
 const KASADA_MARKERS: &[&str] = &["kpsdk", "ips.js?", "x-kpsdk", "kasada"];
+const KASADA_EXPLICIT_MARKERS: &[&str] = &[
+    "please enable javascript",
+    "please enable cookies",
+    "access to this page has been denied",
+];
 
-const CLOUDFLARE_MARKERS: &[&str] = &[
-    "__cf_chl",
-    "cf-chl",
-    "cloudflare",
+const CLOUDFLARE_MARKERS: &[&str] = &["__cf_chl", "cf-chl", "cloudflare"];
+const CLOUDFLARE_EXPLICIT_MARKERS: &[&str] = &[
     "checking your browser before accessing",
+    "just a moment",
+    "verify you are human",
 ];
 
 const GENERIC_BROWSER_CHECK_MARKERS: &[&str] = &["checking your browser", "browser check"];
@@ -80,26 +86,41 @@ pub fn detect_challenge(html: &str) -> ChallengeDetection {
     let lower = html.to_lowercase();
 
     let imperva = collect_markers(&lower, IMPERVA_MARKERS);
-    if !imperva.is_empty() {
+    let imperva_explicit = collect_markers(&lower, IMPERVA_EXPLICIT_MARKERS);
+    if !imperva.is_empty() || !imperva_explicit.is_empty() {
+        let mut markers = imperva;
+        markers.extend(imperva_explicit.iter().copied());
         return ChallengeDetection {
-            challenge_type: Some(ChallengeType::Imperva),
-            markers: imperva,
+            candidate_type: Some(ChallengeType::Imperva),
+            markers,
+            explicit_challenge: !imperva_explicit.is_empty(),
+            challenge_widget: false,
         };
     }
 
     let kasada = collect_markers(&lower, KASADA_MARKERS);
-    if !kasada.is_empty() {
+    let kasada_explicit = collect_markers(&lower, KASADA_EXPLICIT_MARKERS);
+    if !kasada.is_empty() || !kasada_explicit.is_empty() {
+        let mut markers = kasada;
+        markers.extend(kasada_explicit.iter().copied());
         return ChallengeDetection {
-            challenge_type: Some(ChallengeType::Kasada),
-            markers: kasada,
+            candidate_type: Some(ChallengeType::Kasada),
+            markers,
+            explicit_challenge: !kasada_explicit.is_empty(),
+            challenge_widget: false,
         };
     }
 
     let cloudflare = collect_markers(&lower, CLOUDFLARE_MARKERS);
-    if !cloudflare.is_empty() && lower.contains("challenge") {
+    let cloudflare_explicit = collect_markers(&lower, CLOUDFLARE_EXPLICIT_MARKERS);
+    if !cloudflare.is_empty() || !cloudflare_explicit.is_empty() {
+        let mut markers = cloudflare;
+        markers.extend(cloudflare_explicit.iter().copied());
         return ChallengeDetection {
-            challenge_type: Some(ChallengeType::Cloudflare),
-            markers: cloudflare,
+            candidate_type: Some(ChallengeType::Cloudflare),
+            markers,
+            explicit_challenge: !cloudflare_explicit.is_empty(),
+            challenge_widget: false,
         };
     }
 
@@ -111,23 +132,36 @@ pub fn detect_challenge(html: &str) -> ChallengeDetection {
         && (lower.contains("challenge") || lower.contains("verify you are human"));
     if has_recaptcha_widget || recaptcha_shell {
         return ChallengeDetection {
-            challenge_type: Some(ChallengeType::Recaptcha),
+            candidate_type: Some(ChallengeType::Recaptcha),
             markers: vec!["recaptcha"],
+            explicit_challenge: recaptcha_shell,
+            challenge_widget: has_recaptcha_widget,
         };
     }
 
-    if lower.contains("hcaptcha") {
+    let has_hcaptcha_widget = lower.contains("hcaptcha")
+        && (lower.contains("hcaptcha.com/1/api.js")
+            || lower.contains("class=\"h-captcha\"")
+            || lower.contains("data-hcaptcha-response")
+            || lower.contains("iframe"));
+    let hcaptcha_shell = lower.contains("hcaptcha")
+        && (lower.contains("verify you are human") || lower.contains("checkbox"));
+    if has_hcaptcha_widget || hcaptcha_shell {
         return ChallengeDetection {
-            challenge_type: Some(ChallengeType::Hcaptcha),
+            candidate_type: Some(ChallengeType::Hcaptcha),
             markers: vec!["hcaptcha"],
+            explicit_challenge: hcaptcha_shell,
+            challenge_widget: has_hcaptcha_widget,
         };
     }
 
     let browser_check = collect_markers(&lower, GENERIC_BROWSER_CHECK_MARKERS);
     if !browser_check.is_empty() {
         return ChallengeDetection {
-            challenge_type: Some(ChallengeType::GenericBrowserCheck),
+            candidate_type: Some(ChallengeType::GenericBrowserCheck),
             markers: browser_check,
+            explicit_challenge: true,
+            challenge_widget: false,
         };
     }
 
@@ -135,15 +169,19 @@ pub fn detect_challenge(html: &str) -> ChallengeDetection {
         let generic = collect_markers(&lower, GENERIC_CHALLENGE_MARKERS);
         if !generic.is_empty() {
             return ChallengeDetection {
-                challenge_type: Some(ChallengeType::GenericChallenge),
+                candidate_type: Some(ChallengeType::GenericChallenge),
                 markers: generic,
+                explicit_challenge: true,
+                challenge_widget: false,
             };
         }
     }
 
     ChallengeDetection {
-        challenge_type: None,
+        candidate_type: None,
         markers: Vec::new(),
+        explicit_challenge: false,
+        challenge_widget: false,
     }
 }
 
@@ -155,33 +193,36 @@ mod tests {
     fn detects_imperva_marker() {
         let html = r#"<html><script src="/_Incapsula_Resource?x"></script></html>"#;
         let result = detect_challenge(html);
-        assert_eq!(result.challenge_type, Some(ChallengeType::Imperva));
+        assert_eq!(result.candidate_type, Some(ChallengeType::Imperva));
         assert!(
             result.markers.iter().any(|m| *m == "_incapsula_resource"),
             "expected incapsula marker in {:?}",
             result.markers
         );
+        assert!(!result.explicit_challenge);
     }
 
     #[test]
     fn detects_kasada_marker() {
         let html = r#"<html><script>window.KPSDK=true</script></html>"#;
         let result = detect_challenge(html);
-        assert_eq!(result.challenge_type, Some(ChallengeType::Kasada));
+        assert_eq!(result.candidate_type, Some(ChallengeType::Kasada));
+        assert!(!result.explicit_challenge);
     }
 
     #[test]
     fn detects_cloudflare_challenge() {
-        let html = "<html>Cloudflare challenge page</html>";
+        let html = "<html>Cloudflare checking your browser before accessing</html>";
         let result = detect_challenge(html);
-        assert_eq!(result.challenge_type, Some(ChallengeType::Cloudflare));
+        assert_eq!(result.candidate_type, Some(ChallengeType::Cloudflare));
+        assert!(result.explicit_challenge);
     }
 
     #[test]
     fn ignores_normal_page() {
         let html = "<html><head><title>Home</title></head><body><nav>Shop</nav></body></html>";
         let result = detect_challenge(html);
-        assert_eq!(result.challenge_type, None);
+        assert_eq!(result.candidate_type, None);
         assert!(result.markers.is_empty());
     }
 
@@ -189,6 +230,6 @@ mod tests {
     fn ignores_passive_recaptcha_v3() {
         let html = r#"<html><body><script src="https://www.google.com/recaptcha/api.js?render=site-key"></script><main>content</main></body></html>"#;
         let result = detect_challenge(html);
-        assert_eq!(result.challenge_type, None);
+        assert_eq!(result.candidate_type, None);
     }
 }

@@ -106,7 +106,7 @@ pub enum ProtectionTrigger {
     Hcaptcha,
     GenericBrowserCheck,
     GenericChallenge,
-    EmptyShell,
+    UnresolvedInterstitial,
 }
 
 impl ProtectionTrigger {
@@ -120,7 +120,7 @@ impl ProtectionTrigger {
             Self::Hcaptcha => "hcaptcha",
             Self::GenericBrowserCheck => "generic_browser_check",
             Self::GenericChallenge => "generic_challenge",
-            Self::EmptyShell => "empty_shell",
+            Self::UnresolvedInterstitial => "unresolved_interstitial",
         }
     }
 }
@@ -157,7 +157,9 @@ impl From<moltis_config::schema::ProtectionTrigger> for ProtectionTrigger {
                 Self::GenericBrowserCheck
             },
             moltis_config::schema::ProtectionTrigger::GenericChallenge => Self::GenericChallenge,
-            moltis_config::schema::ProtectionTrigger::EmptyShell => Self::EmptyShell,
+            moltis_config::schema::ProtectionTrigger::UnresolvedInterstitial => {
+                Self::UnresolvedInterstitial
+            },
         }
     }
 }
@@ -192,7 +194,7 @@ impl Default for ProtectionConfig {
                 ProtectionTrigger::Cloudflare,
                 ProtectionTrigger::GenericBrowserCheck,
                 ProtectionTrigger::GenericChallenge,
-                ProtectionTrigger::EmptyShell,
+                ProtectionTrigger::UnresolvedInterstitial,
             ],
             domains: Vec::new(),
             max_retries: 2,
@@ -770,7 +772,7 @@ pub struct ChallengeEvidence {
 pub enum NavigationTrigger {
     Direct,
     Challenge,
-    EmptyShell,
+    UnresolvedInterstitial,
 }
 
 /// Final classified outcome of a navigation attempt.
@@ -779,7 +781,7 @@ pub enum NavigationTrigger {
 pub enum NavigationVerdict {
     Content,
     Challenge,
-    EmptyShell,
+    UnresolvedInterstitial,
 }
 
 /// Structured navigation/protection outcome.
@@ -788,6 +790,7 @@ pub struct NavigationOutcome {
     pub final_url: String,
     pub title_len: u64,
     pub body_text_len: u64,
+    pub interactive_element_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge: Option<ChallengeEvidence>,
     pub trigger: NavigationTrigger,

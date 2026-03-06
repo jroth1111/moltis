@@ -2112,7 +2112,7 @@ pub enum ProtectionTrigger {
     Hcaptcha,
     GenericBrowserCheck,
     GenericChallenge,
-    EmptyShell,
+    UnresolvedInterstitial,
 }
 
 /// Protected-site backend switching configuration.
@@ -2145,7 +2145,7 @@ impl Default for ProtectionConfig {
                 ProtectionTrigger::Cloudflare,
                 ProtectionTrigger::GenericBrowserCheck,
                 ProtectionTrigger::GenericChallenge,
-                ProtectionTrigger::EmptyShell,
+                ProtectionTrigger::UnresolvedInterstitial,
             ],
             domains: Vec::new(),
             max_retries: 2,

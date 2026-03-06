@@ -449,7 +449,7 @@ sandbox = false                   # Run browser in Docker/Apple Container for is
 # enabled = false                 # Enable Patchright-backed protected sessions
 # python_binary = "python3"       # Python executable with patchright installed
 # timeout_ms = 45000              # Worker RPC timeout
-# triggers = ["kasada", "imperva", "empty_shell"] # Trigger classes that switch backend
+# triggers = ["kasada", "imperva", "unresolved_interstitial"] # Trigger classes that switch backend
 # domains = []                    # Optional domain allowlist (empty = all)
 # max_retries = 2                 # Retry backend handoff this many times before giving up
 

@@ -1,20 +1,19 @@
 use serde::Serialize;
 
 use crate::{
-    challenge::ChallengeType,
+    challenge::{ChallengeDetection, ChallengeType},
     detect::{DetectedBrowser, DetectionSource},
     types::{BrowserConfig, BrowserKind, ProtectionConfig, ProtectionTrigger},
 };
 
-const CONTENTFUL_CHALLENGE_BODY_THRESHOLD: usize = 1_000;
-const CONTENTFUL_CHALLENGE_TITLE_THRESHOLD: usize = 20;
-const CONTENTFUL_CHALLENGE_SOFT_BODY_THRESHOLD: usize = 400;
+const UNRESOLVED_BODY_TEXT_THRESHOLD: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProtectionAssessment {
     pub final_url: String,
     pub title_len: usize,
     pub body_text_len: usize,
+    pub interactive_element_count: usize,
     pub html_len: usize,
     pub challenge_type: Option<ChallengeType>,
     pub challenge_markers: Vec<String>,
@@ -22,27 +21,21 @@ pub(crate) struct ProtectionAssessment {
 
 impl ProtectionAssessment {
     pub(crate) fn is_content(&self) -> bool {
-        self.challenge_type.is_none() && !self.is_empty_shell()
+        self.challenge_type.is_none() && !self.is_unresolved_interstitial()
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_better_than(&self, other: &Self) -> bool {
-        self.body_text_len > other.body_text_len || self.title_len > other.title_len
-    }
-
-    pub(crate) fn is_empty_shell(&self) -> bool {
-        self.challenge_type.is_none()
-            && self.title_len == 0
-            && self.body_text_len == 0
-            && self.html_len > 0
+    pub(crate) fn is_unresolved_interstitial(&self) -> bool {
+        self.body_text_len == 0
+            || (self.body_text_len < UNRESOLVED_BODY_TEXT_THRESHOLD
+                && self.interactive_element_count == 0)
     }
 
     pub(crate) fn fallback_trigger(&self) -> Option<ProtectionTrigger> {
         self.challenge_type
             .map(ProtectionTrigger::from)
             .or_else(|| {
-                self.is_empty_shell()
-                    .then_some(ProtectionTrigger::EmptyShell)
+                self.is_unresolved_interstitial()
+                    .then_some(ProtectionTrigger::UnresolvedInterstitial)
             })
     }
 }
@@ -62,26 +55,29 @@ pub(crate) fn assess_html(
     final_url: String,
     title_len: usize,
     body_text_len: usize,
+    interactive_element_count: usize,
     html: &str,
 ) -> ProtectionAssessment {
     let html_len = html.len();
+    let unresolved_interstitial = body_text_len == 0
+        || (body_text_len < UNRESOLVED_BODY_TEXT_THRESHOLD && interactive_element_count == 0);
     let detection = crate::challenge::detect_challenge(html);
-    let mut challenge_type = detection.challenge_type;
-    let mut challenge_markers: Vec<String> = detection
-        .markers
-        .into_iter()
-        .map(ToString::to_string)
-        .collect();
-
-    if should_suppress_challenge(challenge_type, title_len, body_text_len) {
-        challenge_type = None;
-        challenge_markers.clear();
-    }
+    let challenge_type = classify_blocking_challenge(&detection, unresolved_interstitial);
+    let challenge_markers = challenge_type
+        .map(|_| {
+            detection
+                .markers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     ProtectionAssessment {
         final_url,
         title_len,
         body_text_len,
+        interactive_element_count,
         html_len,
         challenge_type,
         challenge_markers,
@@ -89,7 +85,7 @@ pub(crate) fn assess_html(
 }
 
 pub(crate) fn should_wait_for_challenge_resolution(diagnostics: &ProtectionAssessment) -> bool {
-    diagnostics.challenge_type.is_some() || diagnostics.is_empty_shell()
+    diagnostics.challenge_type.is_some() || diagnostics.is_unresolved_interstitial()
 }
 
 pub(crate) fn protection_trigger_for_fallback(
@@ -157,21 +153,24 @@ pub(crate) fn build_patchright_launch_profile_for_browser(
     }
 }
 
-fn should_suppress_challenge(
-    challenge_type: Option<ChallengeType>,
-    title_len: usize,
-    body_text_len: usize,
-) -> bool {
-    match challenge_type {
-        Some(ChallengeType::Imperva)
-        | Some(ChallengeType::Kasada)
-        | Some(ChallengeType::Cloudflare)
-        | Some(ChallengeType::GenericBrowserCheck) => {
-            body_text_len >= CONTENTFUL_CHALLENGE_BODY_THRESHOLD
-                || (title_len >= CONTENTFUL_CHALLENGE_TITLE_THRESHOLD
-                    && body_text_len >= CONTENTFUL_CHALLENGE_SOFT_BODY_THRESHOLD)
+fn classify_blocking_challenge(
+    detection: &ChallengeDetection,
+    unresolved_interstitial: bool,
+) -> Option<ChallengeType> {
+    match detection.candidate_type {
+        Some(
+            challenge @ (ChallengeType::Imperva
+            | ChallengeType::Kasada
+            | ChallengeType::Cloudflare
+            | ChallengeType::GenericBrowserCheck
+            | ChallengeType::GenericChallenge),
+        ) if detection.explicit_challenge || unresolved_interstitial => Some(challenge),
+        Some(challenge @ (ChallengeType::Recaptcha | ChallengeType::Hcaptcha))
+            if detection.explicit_challenge || detection.challenge_widget =>
+        {
+            Some(challenge)
         },
-        _ => false,
+        _ => None,
     }
 }
 
@@ -198,60 +197,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn suppresses_contentful_vendor_challenge_pages() {
-        let imperva = assess_html(
-            "https://coles.com.au".to_string(),
-            41,
-            6_316,
-            "_incapsula_resource pardon our interruption",
+    fn vendor_script_on_contentful_page_is_not_blocking() {
+        let assessment = assess_html(
+            "https://shop.example.com".to_string(),
+            12,
+            400,
+            6,
+            r#"<html><body><script src="/_Incapsula_Resource"></script><main><a href="/shop">Shop</a></main></body></html>"#,
         );
-        assert!(imperva.is_content());
 
-        let kasada = assess_html(
-            "https://realestate.com.au".to_string(),
-            60,
-            2_385,
-            "kpsdk checking your browser",
-        );
-        assert!(kasada.is_content());
+        assert!(assessment.is_content());
+        assert_eq!(assessment.challenge_type, None);
+        assert!(assessment.challenge_markers.is_empty());
     }
 
     #[test]
-    fn keeps_empty_challenge_shells_flagged() {
+    fn title_only_page_is_unresolved_interstitial() {
+        let assessment = assess_html(
+            "https://example.com".to_string(),
+            11,
+            0,
+            0,
+            "<html><head><title>Hold tight</title></head><body></body></html>",
+        );
+
+        assert!(assessment.is_unresolved_interstitial());
+        assert!(!assessment.is_content());
+    }
+
+    #[test]
+    fn low_body_no_interactive_page_is_unresolved_interstitial() {
+        let assessment = assess_html(
+            "https://example.com".to_string(),
+            5,
+            32,
+            0,
+            "<html><body>loading browser check</body></html>",
+        );
+
+        assert!(assessment.is_unresolved_interstitial());
+        assert!(!assessment.is_content());
+    }
+
+    #[test]
+    fn explicit_vendor_challenge_remains_blocking() {
         let imperva = assess_html(
             "https://coles.com.au".to_string(),
+            24,
+            80,
             0,
-            0,
-            "_incapsula_resource pardon our interruption",
+            "pardon our interruption _incapsula_resource",
         );
         assert_eq!(imperva.challenge_type, Some(ChallengeType::Imperva));
 
         let kasada = assess_html(
             "https://realestate.com.au".to_string(),
-            5,
-            100,
-            "kpsdk checking your browser",
+            24,
+            80,
+            0,
+            "kpsdk please enable javascript",
         );
         assert_eq!(kasada.challenge_type, Some(ChallengeType::Kasada));
     }
 
     #[test]
-    fn generic_challenge_pages_remain_flagged() {
-        let generic = assess_html(
-            "https://example.com".to_string(),
-            12,
-            150,
-            "verify you are human",
-        );
-        assert_eq!(
-            generic.challenge_type,
-            Some(ChallengeType::GenericChallenge)
-        );
-        assert!(!generic.is_content());
-    }
-
-    #[test]
-    fn patchright_fallback_gate_respects_enabled_sandbox_domain_and_challenge() {
+    fn fallback_gate_respects_enabled_sandbox_domain_and_challenge() {
         let mut cfg = ProtectionConfig {
             enabled: true,
             ..ProtectionConfig::default()
@@ -259,83 +269,58 @@ mod tests {
         cfg.domains = vec!["*.example.com".to_string()];
         cfg.triggers = vec![ProtectionTrigger::Kasada];
 
-        let kasada = ProtectionAssessment {
-            final_url: "https://shop.example.com/".to_string(),
-            title_len: 0,
-            body_text_len: 0,
-            html_len: 128,
-            challenge_type: Some(ChallengeType::Kasada),
-            challenge_markers: vec!["kpsdk".to_string()],
-        };
-
+        let diagnostics = assess_html(
+            "https://shop.example.com".to_string(),
+            5,
+            0,
+            0,
+            "kpsdk",
+        );
         assert_eq!(
-            protection_trigger_for_fallback(&kasada, false, "https://shop.example.com/", &cfg),
+            protection_trigger_for_fallback(&diagnostics, false, "https://shop.example.com/", &cfg),
             Some(ProtectionTrigger::Kasada)
         );
         assert_eq!(
-            protection_trigger_for_fallback(&kasada, true, "https://shop.example.com/", &cfg),
+            protection_trigger_for_fallback(&diagnostics, true, "https://shop.example.com/", &cfg),
             None
         );
         assert_eq!(
-            protection_trigger_for_fallback(&kasada, false, "https://www.other.com/", &cfg),
+            protection_trigger_for_fallback(&diagnostics, false, "https://other.example.net/", &cfg),
             None
-        );
-
-        let imperva = ProtectionAssessment {
-            challenge_type: Some(ChallengeType::Imperva),
-            challenge_markers: vec!["incapsula".to_string()],
-            ..kasada.clone()
-        };
-        assert_eq!(
-            protection_trigger_for_fallback(&imperva, false, "https://shop.example.com/", &cfg),
-            None
-        );
-
-        let empty_shell = ProtectionAssessment {
-            final_url: "https://shop.example.com/".to_string(),
-            title_len: 0,
-            body_text_len: 0,
-            html_len: 120,
-            challenge_type: None,
-            challenge_markers: Vec::new(),
-        };
-        cfg.triggers = vec![ProtectionTrigger::EmptyShell];
-        assert_eq!(
-            protection_trigger_for_fallback(&empty_shell, false, "https://shop.example.com/", &cfg),
-            Some(ProtectionTrigger::EmptyShell)
         );
     }
 
     #[test]
-    fn waits_for_challenge_resolution_on_empty_shell() {
-        let diagnostics = ProtectionAssessment {
-            final_url: "https://example.com".to_string(),
-            title_len: 0,
-            body_text_len: 0,
-            html_len: 120,
-            challenge_type: None,
-            challenge_markers: Vec::new(),
+    fn fallback_gate_supports_unresolved_interstitial_trigger() {
+        let mut cfg = ProtectionConfig {
+            enabled: true,
+            ..ProtectionConfig::default()
         };
+        cfg.triggers = vec![ProtectionTrigger::UnresolvedInterstitial];
+
+        let diagnostics = assess_html(
+            "https://shop.example.com".to_string(),
+            12,
+            0,
+            0,
+            "<html><title>Loading</title></html>",
+        );
+        assert_eq!(
+            protection_trigger_for_fallback(&diagnostics, false, "https://shop.example.com/", &cfg),
+            Some(ProtectionTrigger::UnresolvedInterstitial)
+        );
+    }
+
+    #[test]
+    fn waits_for_challenge_resolution_on_unresolved_interstitial() {
+        let diagnostics = assess_html(
+            "https://example.com".to_string(),
+            12,
+            0,
+            0,
+            "<html><title>Loading</title></html>",
+        );
+        assert!(diagnostics.is_unresolved_interstitial());
         assert!(should_wait_for_challenge_resolution(&diagnostics));
-        assert!(diagnostics.is_empty_shell());
-    }
-
-    #[test]
-    fn prefers_assessment_with_more_content() {
-        let baseline = ProtectionAssessment {
-            final_url: "https://example.com".to_string(),
-            title_len: 10,
-            body_text_len: 200,
-            html_len: 400,
-            challenge_type: Some(ChallengeType::Kasada),
-            challenge_markers: vec!["kpsdk".to_string()],
-        };
-        let richer = ProtectionAssessment {
-            title_len: 20,
-            body_text_len: 400,
-            ..baseline.clone()
-        };
-
-        assert!(richer.is_better_than(&baseline));
     }
 }

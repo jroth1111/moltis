@@ -52,9 +52,20 @@ use crate::{
 const NAV_DIAGNOSTICS_JS: &str = r#"
 (() => {
     const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+    const interactiveSelector = [
+        'a[href]',
+        'button',
+        'input:not([type="hidden"])',
+        'select',
+        'textarea',
+        '[role="button"]',
+        '[contenteditable="true"]',
+        'summary'
+    ].join(',');
     return {
         title_len: (document.title || '').trim().length,
-        body_text_len: text.length
+        body_text_len: text.length,
+        interactive_element_count: document.querySelectorAll(interactiveSelector).length
     };
 })()
 "#;
@@ -941,6 +952,7 @@ impl BrowserManager {
             capture.final_url,
             capture.title_len,
             capture.body_text_len,
+            capture.interactive_element_count,
             &capture.html,
         ))
     }
@@ -965,7 +977,8 @@ impl BrowserManager {
                 .collect_patchright_navigation_diagnostics(session_id)
                 .await?;
             let still_waiting = should_wait_for_challenge_resolution(&next);
-            let is_protected = next.challenge_type.is_some() || next.is_empty_shell();
+            let is_protected =
+                next.challenge_type.is_some() || next.is_unresolved_interstitial();
 
             if is_protected {
                 if previous_challenge_len == Some(next.html_len) {
@@ -1000,15 +1013,15 @@ impl BrowserManager {
                 challenge_type,
                 markers: diagnostics.challenge_markers.clone(),
             });
-        let verdict = if diagnostics.is_empty_shell() {
-            NavigationVerdict::EmptyShell
+        let verdict = if diagnostics.is_unresolved_interstitial() {
+            NavigationVerdict::UnresolvedInterstitial
         } else if challenge.is_some() {
             NavigationVerdict::Challenge
         } else {
             NavigationVerdict::Content
         };
-        let trigger = if diagnostics.is_empty_shell() {
-            NavigationTrigger::EmptyShell
+        let trigger = if diagnostics.is_unresolved_interstitial() {
+            NavigationTrigger::UnresolvedInterstitial
         } else if challenge.is_some() {
             NavigationTrigger::Challenge
         } else {
@@ -1019,6 +1032,7 @@ impl BrowserManager {
             final_url: diagnostics.final_url.clone(),
             title_len: diagnostics.title_len as u64,
             body_text_len: diagnostics.body_text_len as u64,
+            interactive_element_count: diagnostics.interactive_element_count as u64,
             challenge,
             trigger,
             verdict,
@@ -1045,7 +1059,7 @@ impl BrowserManager {
                     "navigated to {} challenge page",
                     challenge.challenge_type.as_str()
                 ),
-                None => "navigated to unresolved empty-shell page".to_string(),
+                None => "navigated to unresolved interstitial page".to_string(),
             });
         }
         response
@@ -1802,15 +1816,17 @@ impl BrowserManager {
                 markers = ?diagnostics.challenge_markers,
                 title_len = diagnostics.title_len,
                 body_text_len = diagnostics.body_text_len,
+                interactive_element_count = diagnostics.interactive_element_count,
                 "navigated to challenge/interstitial page"
             );
-        } else if diagnostics.is_empty_shell() {
+        } else if diagnostics.is_unresolved_interstitial() {
             warn!(
                 session_id = active_sid,
                 url = current_url,
                 title_len = diagnostics.title_len,
                 body_text_len = diagnostics.body_text_len,
-                "navigated to unresolved empty-shell page"
+                interactive_element_count = diagnostics.interactive_element_count,
+                "navigated to unresolved interstitial page"
             );
         } else {
             info!(
@@ -1818,6 +1834,7 @@ impl BrowserManager {
                 url = current_url,
                 title_len = diagnostics.title_len,
                 body_text_len = diagnostics.body_text_len,
+                interactive_element_count = diagnostics.interactive_element_count,
                 "navigated to URL"
             );
         }
@@ -1846,8 +1863,19 @@ impl BrowserManager {
             .and_then(|v| v.as_u64())
             .and_then(|v| usize::try_from(v).ok())
             .unwrap_or(0);
+        let interactive_element_count = metrics
+            .get("interactive_element_count")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(0);
         let html = page.content().await.unwrap_or_default();
-        assess_html(final_url, title_len, body_text_len, &html)
+        assess_html(
+            final_url,
+            title_len,
+            body_text_len,
+            interactive_element_count,
+            &html,
+        )
     }
 
     async fn wait_for_challenge_resolution_if_needed(&self, page: &Page) -> ProtectionAssessment {
@@ -1860,6 +1888,7 @@ impl BrowserManager {
             challenge_type = diagnostics.challenge_type.map(ChallengeType::as_str),
             title_len = diagnostics.title_len,
             body_text_len = diagnostics.body_text_len,
+            interactive_element_count = diagnostics.interactive_element_count,
             html_len = diagnostics.html_len,
             "starting adaptive challenge-resolution wait loop"
         );
@@ -1871,7 +1900,8 @@ impl BrowserManager {
             sleep(Duration::from_secs(1)).await;
             let next = self.collect_navigation_diagnostics(page).await;
             let still_waiting = should_wait_for_challenge_resolution(&next);
-            let is_challenge = next.challenge_type.is_some();
+            let is_challenge =
+                next.challenge_type.is_some() || next.is_unresolved_interstitial();
 
             if is_challenge {
                 if previous_challenge_len == Some(next.html_len) {

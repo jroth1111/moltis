@@ -17,6 +17,7 @@ pub struct PatchrightPageCapture {
     pub final_url: String,
     pub title_len: usize,
     pub body_text_len: usize,
+    pub interactive_element_count: usize,
     pub html: String,
 }
 
@@ -306,6 +307,11 @@ impl PatchrightSession {
             .and_then(Value::as_u64)
             .and_then(|v| usize::try_from(v).ok())
             .unwrap_or(0);
+        let interactive_element_count = value
+            .get("interactive_element_count")
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(0);
         let html = value
             .get("html")
             .and_then(Value::as_str)
@@ -315,6 +321,7 @@ impl PatchrightSession {
             final_url,
             title_len,
             body_text_len,
+            interactive_element_count,
             html,
         })
     }
@@ -781,15 +788,29 @@ with sync_playwright() as p:
             elif cmd == "capture_page":
                 page = current_page()
                 title = (page.evaluate("document.title || ''") or "").strip()
-                body_text = page.evaluate("""(() => {
+                diagnostics = page.evaluate("""(() => {
                     const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
-                    return text.length;
-                })()""") or 0
+                    const interactiveSelector = [
+                        'a[href]',
+                        'button',
+                        'input:not([type="hidden"])',
+                        'select',
+                        'textarea',
+                        '[role="button"]',
+                        '[contenteditable="true"]',
+                        'summary'
+                    ].join(',');
+                    return {
+                        body_text_len: text.length,
+                        interactive_element_count: document.querySelectorAll(interactiveSelector).length,
+                    };
+                })()""") or {}
                 _result(request_id, {
                     "final_url": page.url,
                     "title": title,
                     "title_len": len(title),
-                    "body_text_len": int(body_text),
+                    "body_text_len": int(diagnostics.get("body_text_len") or 0),
+                    "interactive_element_count": int(diagnostics.get("interactive_element_count") or 0),
                     "html": page.content(),
                 })
             elif cmd == "evaluate":
