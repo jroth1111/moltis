@@ -527,6 +527,14 @@ pub trait McpService: Send + Sync {
     async fn oauth_start(&self, params: Value) -> ServiceResult;
     /// Complete an MCP OAuth callback.
     async fn oauth_complete(&self, params: Value) -> ServiceResult;
+    /// Search tool summaries across running MCP servers.
+    async fn search_tools(&self, params: Value) -> ServiceResult;
+    /// Describe a specific tool with full schema.
+    async fn describe_tool(&self, params: Value) -> ServiceResult;
+    /// Enable/disable emergency legacy direct MCP bridge mode.
+    async fn legacy_direct_set(&self, params: Value) -> ServiceResult;
+    /// Get emergency legacy direct MCP bridge status.
+    async fn legacy_direct_status(&self) -> ServiceResult;
 }
 
 pub struct NoopMcpService;
@@ -578,6 +586,22 @@ impl McpService for NoopMcpService {
     }
 
     async fn oauth_complete(&self, _params: Value) -> ServiceResult {
+        Err("MCP not configured".into())
+    }
+
+    async fn search_tools(&self, _params: Value) -> ServiceResult {
+        Err("MCP not configured".into())
+    }
+
+    async fn describe_tool(&self, _params: Value) -> ServiceResult {
+        Err("MCP not configured".into())
+    }
+
+    async fn legacy_direct_set(&self, _params: Value) -> ServiceResult {
+        Err("MCP not configured".into())
+    }
+
+    async fn legacy_direct_status(&self) -> ServiceResult {
         Err("MCP not configured".into())
     }
 }

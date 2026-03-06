@@ -1,17 +1,54 @@
 //! Live MCP service implementation backed by `McpManager`.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use {
-    anyhow::Result, async_trait::async_trait, serde_json::Value, tokio::sync::RwLock, tracing::info,
+    anyhow::Result,
+    async_trait::async_trait,
+    serde_json::Value,
+    std::time::{Duration, SystemTime, UNIX_EPOCH},
+    tokio::{
+        sync::{Mutex, RwLock},
+        task::JoinHandle,
+        time::sleep,
+    },
+    tracing::info,
 };
 
 use {
     moltis_agents::tool_registry::{AgentTool, ToolRegistry},
+    moltis_mcp::ToolDetailLevel,
     moltis_mcp::tool_bridge::{McpAgentTool, McpToolBridge},
 };
 
 use crate::services::{McpService, ServiceError, ServiceResult};
+
+#[derive(Debug, Clone)]
+pub(crate) struct LegacyDirectState {
+    enabled_until: Option<SystemTime>,
+    allow_servers: HashSet<String>,
+}
+
+impl LegacyDirectState {
+    fn disabled() -> Self {
+        Self {
+            enabled_until: None,
+            allow_servers: HashSet::new(),
+        }
+    }
+
+    fn is_enabled(&self, now: SystemTime) -> bool {
+        self.enabled_until.map(|until| now < until).unwrap_or(false)
+    }
+
+    fn status_json(&self, now: SystemTime) -> Value {
+        serde_json::json!({
+            "enabled": self.is_enabled(now),
+            "enabledUntil": self.enabled_until.and_then(|dt| dt.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)),
+            "allowServers": self.allow_servers.iter().cloned().collect::<Vec<_>>(),
+        })
+    }
+}
 
 // ── McpToolAdapter: bridge McpAgentTool → AgentTool ─────────────────────────
 
@@ -45,26 +82,36 @@ impl AgentTool for McpToolAdapter {
 /// Synchronize MCP tool bridges into the shared `ToolRegistry`.
 ///
 /// Removes all existing `mcp__*` tools and re-registers current bridges.
-pub async fn sync_mcp_tools(
+pub(crate) async fn sync_mcp_tools(
     manager: &moltis_mcp::McpManager,
     registry: &Arc<RwLock<ToolRegistry>>,
+    legacy_direct: &LegacyDirectState,
 ) {
-    let bridges = manager.tool_bridges().await;
-
     let mut reg = registry.write().await;
 
     // Remove all MCP-sourced tools before re-registering current ones.
     reg.unregister_mcp();
 
+    if !legacy_direct.is_enabled(SystemTime::now()) {
+        return;
+    }
+
+    let bridges = manager.tool_bridges().await;
+
     // Register current bridges with their server name metadata.
-    let count = bridges.len();
+    let mut count = 0usize;
     for bridge in bridges {
         let server = bridge.server_name().to_string();
+        if !legacy_direct.allow_servers.is_empty() && !legacy_direct.allow_servers.contains(&server)
+        {
+            continue;
+        }
         reg.register_mcp(Box::new(McpToolAdapter(bridge)), server);
+        count += 1;
     }
 
     if count > 0 {
-        info!(tools = count, "MCP tools synced into tool registry");
+        info!(tools = count, "legacy direct MCP tools synced into tool registry");
     }
 }
 
@@ -185,6 +232,25 @@ fn parse_server_config(
     })
 }
 
+fn parse_tool_detail_level(params: &Value) -> Result<ToolDetailLevel, ServiceError> {
+    let raw = params
+        .get("detail_level")
+        .or_else(|| params.get("detailLevel"))
+        .and_then(Value::as_str)
+        .unwrap_or("summary")
+        .trim()
+        .to_ascii_lowercase();
+
+    match raw.as_str() {
+        "name" => Ok(ToolDetailLevel::Name),
+        "summary" => Ok(ToolDetailLevel::Summary),
+        "full" => Ok(ToolDetailLevel::Full),
+        other => Err(ServiceError::message(format!(
+            "invalid detail level '{other}', expected one of: name, summary, full"
+        ))),
+    }
+}
+
 // ── LiveMcpService ──────────────────────────────────────────────────────────
 
 /// Live MCP service delegating to `McpManager`.
@@ -192,15 +258,90 @@ pub struct LiveMcpService {
     manager: Arc<moltis_mcp::McpManager>,
     /// Shared tool registry for syncing MCP tools into the agent loop.
     /// Set after construction via `set_tool_registry`.
-    tool_registry: RwLock<Option<Arc<RwLock<ToolRegistry>>>>,
+    tool_registry: Arc<RwLock<Option<Arc<RwLock<ToolRegistry>>>>>,
+    /// Emergency state for legacy direct MCP bridges.
+    legacy_direct: Arc<RwLock<LegacyDirectState>>,
+    /// Background task that disables legacy direct mode at TTL expiry.
+    legacy_direct_expiry_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl LiveMcpService {
     pub fn new(manager: Arc<moltis_mcp::McpManager>) -> Self {
         Self {
             manager,
-            tool_registry: RwLock::new(None),
+            tool_registry: Arc::new(RwLock::new(None)),
+            legacy_direct: Arc::new(RwLock::new(LegacyDirectState::disabled())),
+            legacy_direct_expiry_task: Arc::new(Mutex::new(None)),
         }
+    }
+
+    async fn disable_legacy_direct_if_expired(&self, now: SystemTime) -> bool {
+        let mut state = self.legacy_direct.write().await;
+        if state.enabled_until.is_some() && !state.is_enabled(now) {
+            *state = LegacyDirectState::disabled();
+            return true;
+        }
+        false
+    }
+
+    async fn reschedule_legacy_direct_expiry(&self) {
+        let now = SystemTime::now();
+        let enabled_until = self.legacy_direct.read().await.enabled_until;
+
+        let mut task_slot = self.legacy_direct_expiry_task.lock().await;
+        if let Some(handle) = task_slot.take() {
+            handle.abort();
+        }
+
+        let Some(until) = enabled_until else {
+            return;
+        };
+
+        let Ok(delay) = until.duration_since(now) else {
+            drop(task_slot);
+            if self.disable_legacy_direct_if_expired(now).await {
+                self.sync_tools_if_ready().await;
+            }
+            return;
+        };
+
+        let manager = Arc::clone(&self.manager);
+        let tool_registry = Arc::clone(&self.tool_registry);
+        let legacy_direct = Arc::clone(&self.legacy_direct);
+        *task_slot = Some(tokio::spawn(async move {
+            sleep(delay).await;
+            let now = SystemTime::now();
+            let mut state = legacy_direct.write().await;
+            if state.enabled_until.is_some() && !state.is_enabled(now) {
+                *state = LegacyDirectState::disabled();
+                drop(state);
+
+                if let Some(registry) = tool_registry.read().await.clone() {
+                    let current = legacy_direct.read().await.clone();
+                    sync_mcp_tools(&manager, &registry, &current).await;
+                }
+            }
+        }));
+    }
+
+    /// Configure startup defaults for emergency legacy direct mode.
+    pub async fn configure_legacy_direct(
+        &self,
+        cfg: &moltis_config::schema::McpLegacyDirectConfig,
+    ) {
+        let now = SystemTime::now();
+        let ttl_minutes = cfg.ttl_minutes.clamp(1, i64::MAX as u64);
+        let enabled_until = if cfg.enabled {
+            Some(now + Duration::from_secs(ttl_minutes.saturating_mul(60)))
+        } else {
+            None
+        };
+        let allow_servers = cfg.allow_servers.iter().cloned().collect::<HashSet<_>>();
+        *self.legacy_direct.write().await = LegacyDirectState {
+            enabled_until,
+            allow_servers,
+        };
+        self.reschedule_legacy_direct_expiry().await;
     }
 
     /// Store a reference to the shared tool registry so MCP mutations
@@ -211,15 +352,24 @@ impl LiveMcpService {
 
     /// Sync MCP tools into the shared tool registry (if set).
     pub async fn sync_tools_if_ready(&self) {
+        let now = SystemTime::now();
+        let _expired = self.disable_legacy_direct_if_expired(now).await;
         let maybe_reg = self.tool_registry.read().await.clone();
         if let Some(reg) = maybe_reg {
-            sync_mcp_tools(&self.manager, &reg).await;
+            let legacy_state = self.legacy_direct.read().await.clone();
+            sync_mcp_tools(&self.manager, &reg, &legacy_state).await;
         }
     }
 
     /// Access the underlying manager.
     pub fn manager(&self) -> &Arc<moltis_mcp::McpManager> {
         &self.manager
+    }
+
+    async fn legacy_direct_status_value(&self) -> Value {
+        let now = SystemTime::now();
+        let _expired = self.disable_legacy_direct_if_expired(now).await;
+        self.legacy_direct.read().await.status_json(now)
     }
 }
 
@@ -514,11 +664,81 @@ impl McpService for LiveMcpService {
             "name": server_name
         }))
     }
+
+    async fn search_tools(&self, params: Value) -> ServiceResult {
+        let query = params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let server = params.get("server").and_then(|v| v.as_str());
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(25);
+        let detail_level = parse_tool_detail_level(&params)?;
+        let tools = self
+            .manager
+            .search_tools(query, server, limit, detail_level)
+            .await;
+        Ok(serde_json::json!({ "tools": tools }))
+    }
+
+    async fn describe_tool(&self, params: Value) -> ServiceResult {
+        let server = params
+            .get("server")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'server' parameter".to_string())?;
+        let tool = params
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'tool' parameter".to_string())?;
+        let described = self
+            .manager
+            .describe_tool(server, tool)
+            .await
+            .ok_or_else(|| format!("MCP tool '{tool}' not found for server '{server}'"))?;
+        Ok(serde_json::json!({ "tool": described }))
+    }
+
+    async fn legacy_direct_set(&self, params: Value) -> ServiceResult {
+        let enabled = params
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| "missing 'enabled' parameter".to_string())?;
+
+        let mut state = self.legacy_direct.write().await;
+        if enabled {
+            let ttl_minutes = params
+                .get("ttlMinutes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(15)
+                .clamp(1, i64::MAX as u64);
+            state.enabled_until = Some(SystemTime::now() + Duration::from_secs(ttl_minutes.saturating_mul(60)));
+            state.allow_servers = params
+                .get("allowServers")
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        } else {
+            *state = LegacyDirectState::disabled();
+        }
+        drop(state);
+
+        self.reschedule_legacy_direct_expiry().await;
+        self.sync_tools_if_ready().await;
+        Ok(self.legacy_direct_status_value().await)
+    }
+
+    async fn legacy_direct_status(&self) -> ServiceResult {
+        Ok(self.legacy_direct_status_value().await)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use {super::*, moltis_mcp::McpRegistry};
+    use {super::*, moltis_mcp::McpRegistry, tokio::time::Duration as TokioDuration};
 
     #[test]
     fn parse_server_config_allows_sse_without_command() {
@@ -646,7 +866,7 @@ mod tests {
         let manager = moltis_mcp::McpManager::new(McpRegistry::new());
         let registry = Arc::new(RwLock::new(ToolRegistry::new()));
 
-        sync_mcp_tools(&manager, &registry).await;
+        sync_mcp_tools(&manager, &registry, &LegacyDirectState::disabled()).await;
 
         let reg = registry.read().await;
         assert!(reg.list_schemas().is_empty());
@@ -667,7 +887,7 @@ mod tests {
         }
 
         // Sync should remove it since there are no running MCP servers.
-        sync_mcp_tools(&manager, &registry).await;
+        sync_mcp_tools(&manager, &registry, &LegacyDirectState::disabled()).await;
 
         let reg = registry.read().await;
         assert!(reg.get("mcp__old__tool").is_none());
@@ -683,10 +903,42 @@ mod tests {
             reg.register(Box::new(FakeTool("exec".into())));
         }
 
-        sync_mcp_tools(&manager, &registry).await;
+        sync_mcp_tools(&manager, &registry, &LegacyDirectState::disabled()).await;
 
         let reg = registry.read().await;
         assert!(reg.get("exec").is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_direct_expiry_task_unregisters_tools() {
+        let service = LiveMcpService::new(Arc::new(moltis_mcp::McpManager::new(McpRegistry::new())));
+        let registry = Arc::new(RwLock::new(ToolRegistry::new()));
+        service.set_tool_registry(Arc::clone(&registry)).await;
+
+        {
+            let mut reg = registry.write().await;
+            reg.register_mcp(
+                Box::new(FakeTool("mcp__old__tool".into())),
+                "old".to_string(),
+            );
+        }
+
+        {
+            let mut state = service.legacy_direct.write().await;
+            *state = LegacyDirectState {
+                enabled_until: Some(SystemTime::now() + Duration::from_millis(10)),
+                allow_servers: HashSet::new(),
+            };
+        }
+        service.reschedule_legacy_direct_expiry().await;
+
+        sleep(TokioDuration::from_millis(30)).await;
+
+        let status = service.legacy_direct_status_value().await;
+        assert_eq!(status["enabled"], Value::Bool(false));
+
+        let reg = registry.read().await;
+        assert!(reg.get("mcp__old__tool").is_none());
     }
 
     /// Minimal AgentTool implementation for testing.

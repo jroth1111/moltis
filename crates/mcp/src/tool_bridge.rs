@@ -10,28 +10,33 @@ use crate::{
     types::{McpToolDef, ToolContent},
 };
 
-/// Recursively strip null values from nested objects and arrays.
-///
-/// Top-level null stripping is handled by the caller; this recurses into
-/// values that are themselves objects or arrays.
-fn strip_nulls_recursive(map: &mut serde_json::Map<String, serde_json::Value>) {
-    for value in map.values_mut() {
-        match value {
-            serde_json::Value::Object(inner) => {
-                inner.retain(|_, v| !v.is_null());
-                strip_nulls_recursive(inner);
-            },
-            serde_json::Value::Array(arr) => {
-                for item in arr.iter_mut() {
-                    if let serde_json::Value::Object(inner) = item {
-                        inner.retain(|_, v| !v.is_null());
-                        strip_nulls_recursive(inner);
-                    }
-                }
-            },
-            _ => {},
-        }
+fn sanitize_value_recursive(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|key, inner| !key.starts_with('_') && !inner.is_null());
+            for inner in map.values_mut() {
+                sanitize_value_recursive(inner);
+            }
+        },
+        serde_json::Value::Array(items) => {
+            items.retain(|item| !item.is_null());
+            for item in items {
+                sanitize_value_recursive(item);
+            }
+        },
+        _ => {},
     }
+}
+
+/// Sanitize tool arguments before forwarding them to an MCP server.
+///
+/// This strips internal `_...` metadata and removes `null` values recursively
+/// so strict MCP servers do not reject agent-patched payloads.
+#[must_use]
+pub fn sanitize_tool_arguments(params: serde_json::Value) -> serde_json::Value {
+    let mut sanitized = params;
+    sanitize_value_recursive(&mut sanitized);
+    sanitized
 }
 
 /// An `AgentTool` implementation that delegates to an MCP server via `McpClient`.
@@ -122,14 +127,7 @@ impl McpAgentTool for McpToolBridge {
         // 2. Strip null values — these arise from strict-mode schema patching
         //    that makes optional properties nullable.  MCP servers expect
         //    optional fields to be absent, not null.
-        let params = match params {
-            serde_json::Value::Object(mut map) => {
-                map.retain(|k, v| !k.starts_with('_') && !v.is_null());
-                strip_nulls_recursive(&mut map);
-                serde_json::Value::Object(map)
-            },
-            other => other,
-        };
+        let params = sanitize_tool_arguments(params);
 
         let client = self.client.read().await;
         let result = client.call_tool(&self.original_name, params).await?;

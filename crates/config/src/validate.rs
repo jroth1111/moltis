@@ -3,7 +3,10 @@
 //! Validates TOML configuration files against the known schema, detects
 //! unknown/misspelled fields, and reports security warnings.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use crate::schema::MoltisConfig;
 
@@ -345,6 +348,40 @@ fn build_schema_map() -> KnownKeys {
         ]))
     };
 
+    let mcp_code = || {
+        Struct(HashMap::from([
+            ("enabled", Leaf),
+            ("timeout_ms", Leaf),
+            ("allow_servers", Leaf),
+            ("deny_servers", Leaf),
+            ("allow_tools", Leaf),
+            ("deny_tools", Leaf),
+            ("redact_pii", Leaf),
+            ("max_steps", Leaf),
+            ("max_tool_calls", Leaf),
+            ("max_stdout_bytes", Leaf),
+            ("max_result_bytes", Leaf),
+            ("tool_summary_cache_ttl_secs", Leaf),
+            ("default_retry_attempts", Leaf),
+            ("default_retry_backoff_ms", Leaf),
+            ("default_retry_max_backoff_ms", Leaf),
+            ("auto_promote_enabled", Leaf),
+            ("auto_promote_min_successes", Leaf),
+            ("auto_skill_prefix", Leaf),
+            ("search_server_priors", Map(Box::new(Leaf))),
+            ("search_success_weight", Leaf),
+            ("search_semantic_weight", Leaf),
+        ]))
+    };
+
+    let mcp_legacy_direct = || {
+        Struct(HashMap::from([
+            ("enabled", Leaf),
+            ("ttl_minutes", Leaf),
+            ("allow_servers", Leaf),
+        ]))
+    };
+
     let shell_hook_entry = || {
         Struct(HashMap::from([
             ("name", Leaf),
@@ -472,10 +509,11 @@ fn build_schema_map() -> KnownKeys {
         ),
         (
             "mcp",
-            Struct(HashMap::from([(
-                "servers",
-                Map(Box::new(mcp_server_entry())),
-            )])),
+            Struct(HashMap::from([
+                ("servers", Map(Box::new(mcp_server_entry()))),
+                ("code", mcp_code()),
+                ("legacy_direct", mcp_legacy_direct()),
+            ])),
         ),
         (
             "channels",
@@ -1003,6 +1041,17 @@ fn check_provider_names(
 
 /// Run semantic checks on a successfully parsed config.
 fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnostic>) {
+    fn valid_tool_selector(value: &str) -> bool {
+        let mut parts = value.split("::");
+        let Some(server) = parts.next() else {
+            return false;
+        };
+        let Some(tool) = parts.next() else {
+            return false;
+        };
+        parts.next().is_none() && !server.trim().is_empty() && !tool.trim().is_empty()
+    }
+
     let is_localhost = config.server.bind == "127.0.0.1"
         || config.server.bind == "localhost"
         || config.server.bind == "::1";
@@ -1112,6 +1161,131 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             message: format!(
                 "default preset \"{default_preset}\" is not defined in agents.presets"
             ),
+        });
+    }
+
+    for (idx, selector) in config.mcp.code.allow_tools.iter().enumerate() {
+        if !valid_tool_selector(selector) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                category: "invalid-value",
+                path: format!("mcp.code.allow_tools[{idx}]"),
+                message: format!("invalid tool selector \"{selector}\"; expected \"server::tool\""),
+            });
+        }
+    }
+
+    for (idx, selector) in config.mcp.code.deny_tools.iter().enumerate() {
+        if !valid_tool_selector(selector) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                category: "invalid-value",
+                path: format!("mcp.code.deny_tools[{idx}]"),
+                message: format!("invalid tool selector \"{selector}\"; expected \"server::tool\""),
+            });
+        }
+    }
+
+    let allow_servers: HashSet<&str> = config
+        .mcp
+        .code
+        .allow_servers
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for (idx, server) in config.mcp.code.deny_servers.iter().enumerate() {
+        if allow_servers.contains(server.as_str()) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                category: "invalid-value",
+                path: format!("mcp.code.deny_servers[{idx}]"),
+                message: format!(
+                    "server \"{server}\" appears in both allow_servers and deny_servers"
+                ),
+            });
+        }
+    }
+
+    let allow_tools: HashSet<&str> = config
+        .mcp
+        .code
+        .allow_tools
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for (idx, selector) in config.mcp.code.deny_tools.iter().enumerate() {
+        if allow_tools.contains(selector.as_str()) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                category: "invalid-value",
+                path: format!("mcp.code.deny_tools[{idx}]"),
+                message: format!(
+                    "tool selector \"{selector}\" appears in both allow_tools and deny_tools"
+                ),
+            });
+        }
+    }
+
+    if config.mcp.code.default_retry_attempts == 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "mcp.code.default_retry_attempts".into(),
+            message: "default_retry_attempts must be at least 1".into(),
+        });
+    }
+
+    if config.mcp.code.default_retry_backoff_ms == 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "mcp.code.default_retry_backoff_ms".into(),
+            message: "default_retry_backoff_ms must be at least 1".into(),
+        });
+    }
+
+    if config.mcp.code.default_retry_max_backoff_ms < config.mcp.code.default_retry_backoff_ms {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "mcp.code.default_retry_max_backoff_ms".into(),
+            message: "default_retry_max_backoff_ms must be >= default_retry_backoff_ms".into(),
+        });
+    }
+
+    if config.mcp.code.auto_promote_min_successes == 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "mcp.code.auto_promote_min_successes".into(),
+            message: "auto_promote_min_successes must be at least 1".into(),
+        });
+    }
+
+    if config.mcp.code.auto_skill_prefix.trim().is_empty() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "mcp.code.auto_skill_prefix".into(),
+            message: "auto_skill_prefix must not be empty".into(),
+        });
+    }
+
+    if config.mcp.code.search_success_weight < 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "mcp.code.search_success_weight".into(),
+            message: "search_success_weight must be >= 0".into(),
+        });
+    }
+
+    if config.mcp.code.search_semantic_weight < 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "mcp.code.search_semantic_weight".into(),
+            message: "search_semantic_weight must be >= 0".into(),
         });
     }
 
@@ -2611,5 +2785,92 @@ tool_mode = "{mode}"
                 result.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn mcp_code_invalid_tool_selector_warned() {
+        let toml = r#"
+[mcp.code]
+allow_tools = ["filesystem-read_file"]
+"#;
+        let result = validate_toml_str(toml);
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "mcp.code.allow_tools[0]" && d.category == "invalid-value");
+        assert!(
+            warning.is_some(),
+            "invalid tool selector should be warned, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn mcp_code_conflicting_allow_and_deny_warned() {
+        let toml = r#"
+[mcp.code]
+allow_servers = ["filesystem"]
+deny_servers = ["filesystem"]
+allow_tools = ["filesystem::read_file"]
+deny_tools = ["filesystem::read_file"]
+"#;
+        let result = validate_toml_str(toml);
+        let server_conflict = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "mcp.code.deny_servers[0]" && d.message.contains("allow_servers"));
+        let tool_conflict = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "mcp.code.deny_tools[0]" && d.message.contains("allow_tools"));
+        assert!(
+            server_conflict.is_some(),
+            "expected server allow/deny conflict warning, got: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            tool_conflict.is_some(),
+            "expected tool allow/deny conflict warning, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn mcp_code_retry_and_ranking_fields_validated() {
+        let toml = r#"
+[mcp.code]
+default_retry_attempts = 0
+default_retry_backoff_ms = 0
+default_retry_max_backoff_ms = 1
+auto_promote_min_successes = 0
+auto_skill_prefix = ""
+search_success_weight = -1
+search_semantic_weight = -2
+"#;
+        let result = validate_toml_str(toml);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.path == "mcp.code.default_retry_attempts"),
+            "missing retry attempts validation: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.path == "mcp.code.auto_skill_prefix"),
+            "missing auto_skill_prefix validation: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.path == "mcp.code.search_semantic_weight"),
+            "missing search_semantic_weight validation: {:?}",
+            result.diagnostics
+        );
     }
 }

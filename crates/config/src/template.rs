@@ -512,6 +512,38 @@ auto_load = []                    # Skills to always load without explicit activ
 # url = "http://localhost:8080/mcp"
 # enabled = true
 
+# Code-only MCP execution settings.
+[mcp.code]
+enabled = true                   # Force MCP workflows through the code executor
+timeout_ms = 45000              # Max runtime per code execution request
+allow_servers = []              # Optional server allowlist for code mode
+deny_servers = []               # Optional server denylist for code mode
+allow_tools = []                # Optional tool allowlist ("server::tool")
+deny_tools = []                 # Optional tool denylist ("server::tool")
+redact_pii = true               # Redact email/phone/SSN-like data from model-visible output
+max_steps = 32                  # Max orchestration steps
+max_tool_calls = 64             # Max MCP tool calls in one run
+max_stdout_bytes = 65536        # Max stdout bytes retained from execution
+max_result_bytes = 131072       # Max serialized result bytes returned to model
+tool_summary_cache_ttl_secs = 300 # Cached tools metadata TTL
+default_retry_attempts = 2      # Default retries for tool steps
+default_retry_backoff_ms = 250  # Initial retry backoff per step
+default_retry_max_backoff_ms = 4000 # Max exponential backoff per step
+auto_promote_enabled = true     # Persist repeated successful programs as reusable skills
+auto_promote_min_successes = 3  # Successes required before auto-promotion
+auto_skill_prefix = "auto"      # Prefix for generated skill names
+search_success_weight = 120     # Weight for historical success in tool ranking
+search_semantic_weight = 60     # Weight for semantic token overlap in tool ranking
+# [mcp.code.search_server_priors]
+# filesystem = 25
+# github = 10
+
+# Emergency legacy direct MCP bridge (disabled by default).
+[mcp.legacy_direct]
+enabled = false                 # Manual emergency only; do not enable in normal operation
+ttl_minutes = 15                # Expiry window when enabled manually
+allow_servers = []              # Optional server-name allowlist when enabled
+
 # ══════════════════════════════════════════════════════════════════════════════
 # METRICS
 # ══════════════════════════════════════════════════════════════════════════════

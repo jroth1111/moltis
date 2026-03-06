@@ -21,7 +21,7 @@ export default {
 	securityReview:
 		"<strong>Triple-check the source code</strong> of any MCP server before enabling it. Only install servers from authors you trust, and keep them updated.",
 	securityTokens:
-		"Each enabled server also adds tool definitions to every chat session's context, consuming tokens. Only enable servers you actively need.",
+		"Code-only mode loads MCP tool metadata on demand. Direct tool definitions enter chat context only when legacy direct bridge is enabled.",
 
 	// ── Featured servers section ─────────────────────────────
 	popularTitle: "Popular MCP Servers",

@@ -3036,6 +3036,32 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         }),
     );
     reg.register(
+        "mcp.tools.search",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .mcp
+                    .search_tools(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "mcp.tools.describe",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .mcp
+                    .describe_tool(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
         "mcp.restart",
         Box::new(|ctx| {
             Box::pin(async move {
@@ -3095,6 +3121,32 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .services
                     .mcp
                     .update(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "mcp.legacy_direct.set",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .mcp
+                    .legacy_direct_set(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "mcp.legacy_direct.status",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .mcp
+                    .legacy_direct_status()
                     .await
                     .map_err(ErrorShape::from)
             })

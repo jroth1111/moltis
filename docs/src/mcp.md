@@ -106,15 +106,31 @@ Moltis monitors MCP servers and automatically:
 
 ## Using MCP Tools
 
-Once connected, MCP tools appear alongside built-in tools. The agent can use them naturally:
+Moltis runs MCP in **code-only mode** by default. Instead of injecting every MCP tool schema into prompt context, the agent uses meta-tools:
+
+- `mcp_search_tools` to find relevant tools (`detail_level`: `name`, `summary`, `full`), ranked by lexical + semantic match, server priors, and historical success
+- `mcp_describe_tool` for exact schema details
+- `mcp_code_exec` to execute multi-step MCP programs in one call (v2 plan: `tool`, `if`, `for_each`, `retry`, `transform`)
+- `mcp_skill_run` to run saved programs from `~/.moltis/mcp/skills/<name>.json` before falling back to new planning
+
+`mcp_code_exec` persists run artifacts at `~/.moltis/mcp/runs/` and checkpoints/idempotency data in `~/.moltis/mcp/code_exec.sqlite`.  
+Each step can shape output (`select`, `map`, `limit`, `max_bytes`) to keep intermediate payloads small.  
+Successful repeated workflows are auto-promoted into reusable skills.
+
+The emergency `legacy_direct` bridge can still be enabled temporarily, but should remain off in normal operation.
+
+Example flow:
 
 ```
 User: Search GitHub for Rust async runtime projects
 
-Agent: I'll search GitHub for you.
-[Calling github.search_repositories with query="rust async runtime"]
+Agent: I will discover the right MCP tool first.
+[Calling mcp_search_tools query="github search repositories" detail_level="summary"]
 
-Found 15 repositories:
+Agent: Now I will execute the MCP workflow in one run.
+[Calling mcp_code_exec ...]
+
+Found repositories:
 1. tokio-rs/tokio - A runtime for writing reliable async applications
 2. async-std/async-std - Async version of the Rust standard library
 ...

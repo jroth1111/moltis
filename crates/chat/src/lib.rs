@@ -2006,7 +2006,15 @@ fn apply_runtime_tool_filters(
     mcp_disabled: bool,
 ) -> ToolRegistry {
     let base_registry = if mcp_disabled {
-        base.clone_without_mcp()
+        let without_mcp = base.clone_without_mcp();
+        without_mcp.clone_without(&[
+            "mcp_search_tools",
+            "mcp_describe_tool",
+            "mcp_code_exec",
+            "mcp_skill_run",
+        ])
+    } else if !config.mcp.code.enabled {
+        base.clone_without(&["mcp_code_exec", "mcp_skill_run"])
     } else {
         base.clone_without(&[])
     };
@@ -13648,6 +13656,87 @@ Do this.
         let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false);
         assert!(filtered.get("exec").is_none());
         assert!(filtered.get("web_fetch").is_some());
+    }
+
+    #[test]
+    fn runtime_filters_remove_mcp_meta_tools_when_mcp_disabled() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_search_tools".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_describe_tool".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_code_exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_skill_run".to_string(),
+        }));
+        registry.register_mcp(
+            Box::new(DummyTool {
+                name: "mcp__filesystem__read_file".to_string(),
+            }),
+            "filesystem".to_string(),
+        );
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.policy.allow = vec![
+            "exec".into(),
+            "mcp_search_tools".into(),
+            "mcp_describe_tool".into(),
+            "mcp_code_exec".into(),
+            "mcp_skill_run".into(),
+            "mcp__filesystem__read_file".into(),
+        ];
+
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], true);
+        assert!(filtered.get("exec").is_some());
+        assert!(filtered.get("mcp_search_tools").is_none());
+        assert!(filtered.get("mcp_describe_tool").is_none());
+        assert!(filtered.get("mcp_code_exec").is_none());
+        assert!(filtered.get("mcp_skill_run").is_none());
+        assert!(filtered.get("mcp__filesystem__read_file").is_none());
+    }
+
+    #[test]
+    fn runtime_filters_remove_mcp_code_tools_when_code_mode_disabled() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_search_tools".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_describe_tool".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_code_exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_skill_run".to_string(),
+        }));
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.mcp.code.enabled = false;
+        cfg.tools.policy.allow = vec![
+            "exec".into(),
+            "mcp_search_tools".into(),
+            "mcp_describe_tool".into(),
+            "mcp_code_exec".into(),
+            "mcp_skill_run".into(),
+        ];
+
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false);
+        assert!(filtered.get("exec").is_some());
+        assert!(filtered.get("mcp_search_tools").is_some());
+        assert!(filtered.get("mcp_describe_tool").is_some());
+        assert!(filtered.get("mcp_code_exec").is_none());
+        assert!(filtered.get("mcp_skill_run").is_none());
     }
 
     #[test]

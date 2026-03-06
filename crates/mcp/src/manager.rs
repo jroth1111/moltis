@@ -1,6 +1,10 @@
 //! McpManager: lifecycle management for multiple MCP server connections.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use {
     tokio::sync::RwLock,
@@ -14,7 +18,7 @@ use crate::{
     registry::{McpOAuthConfig, McpRegistry, McpServerConfig, TransportType},
     tool_bridge::McpToolBridge,
     traits::McpClientTrait,
-    types::{McpManagerError, McpToolDef, McpTransportError},
+    types::{McpManagerError, McpToolDef, McpTransportError, ToolsCallResult},
 };
 
 /// Status of a managed MCP server.
@@ -43,6 +47,9 @@ pub struct ServerStatus {
 pub struct McpManagerInner {
     pub clients: HashMap<String, Arc<RwLock<dyn McpClientTrait>>>,
     pub tools: HashMap<String, Vec<McpToolDef>>,
+    tool_outcomes: HashMap<String, ToolOutcomeStats>,
+    tool_search_cache: HashMap<SearchCacheKey, SearchCacheEntry>,
+    tool_describe_cache: HashMap<DescribeCacheKey, DescribeCacheEntry>,
     pub registry: McpRegistry,
     /// OAuth auth providers for SSE servers, keyed by server name.
     pub auth_providers: HashMap<String, SharedAuthProvider>,
@@ -51,18 +58,164 @@ pub struct McpManagerInner {
 /// Manages the lifecycle of multiple MCP server connections.
 pub struct McpManager {
     pub inner: RwLock<McpManagerInner>,
+    tool_cache_ttl: Duration,
+    search_server_priors: HashMap<String, i32>,
+    search_success_weight: i32,
+    search_semantic_weight: i32,
+}
+
+/// Manager options controlling runtime behavior.
+#[derive(Debug, Clone)]
+pub struct McpManagerOptions {
+    pub tool_summary_cache_ttl_secs: u64,
+    pub search_server_priors: HashMap<String, i32>,
+    pub search_success_weight: i32,
+    pub search_semantic_weight: i32,
+}
+
+impl Default for McpManagerOptions {
+    fn default() -> Self {
+        Self {
+            tool_summary_cache_ttl_secs: 300,
+            search_server_priors: HashMap::new(),
+            search_success_weight: 120,
+            search_semantic_weight: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolOutcomeStats {
+    success_count: u64,
+    failure_count: u64,
+}
+
+/// Detail level for MCP tool search responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDetailLevel {
+    Name,
+    Summary,
+    Full,
+}
+
+impl Default for ToolDetailLevel {
+    fn default() -> Self {
+        Self::Summary
+    }
+}
+
+/// A compact MCP tool descriptor for search/browse workflows.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpToolSummary {
+    pub server: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SearchCacheKey {
+    query: String,
+    server: Option<String>,
+    limit: usize,
+    detail_level: ToolDetailLevel,
+}
+
+#[derive(Debug, Clone)]
+struct SearchCacheEntry {
+    created_at: Instant,
+    tools: Vec<McpToolSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DescribeCacheKey {
+    server: String,
+    tool: String,
+}
+
+#[derive(Debug, Clone)]
+struct DescribeCacheEntry {
+    created_at: Instant,
+    described: Option<McpToolDef>,
 }
 
 impl McpManager {
     pub fn new(registry: McpRegistry) -> Self {
+        Self::new_with_options(registry, McpManagerOptions::default())
+    }
+
+    pub fn new_with_options(registry: McpRegistry, options: McpManagerOptions) -> Self {
+        let ttl_secs = options.tool_summary_cache_ttl_secs.max(1);
         Self {
             inner: RwLock::new(McpManagerInner {
                 clients: HashMap::new(),
                 tools: HashMap::new(),
+                tool_outcomes: HashMap::new(),
+                tool_search_cache: HashMap::new(),
+                tool_describe_cache: HashMap::new(),
                 registry,
                 auth_providers: HashMap::new(),
             }),
+            tool_cache_ttl: Duration::from_secs(ttl_secs),
+            search_server_priors: options.search_server_priors,
+            search_success_weight: options.search_success_weight.max(0),
+            search_semantic_weight: options.search_semantic_weight.max(0),
         }
+    }
+
+    fn cache_is_fresh(created_at: Instant, ttl: Duration) -> bool {
+        created_at.elapsed() <= ttl
+    }
+
+    fn clear_tool_caches(inner: &mut McpManagerInner) {
+        inner.tool_search_cache.clear();
+        inner.tool_describe_cache.clear();
+    }
+
+    fn semantic_tokenize(input: &str) -> HashSet<String> {
+        input
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|token| !token.trim().is_empty())
+            .map(|token| token.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn semantic_match_score(query: &str, text: &str) -> i32 {
+        let query_tokens = Self::semantic_tokenize(query);
+        if query_tokens.is_empty() {
+            return 0;
+        }
+        let text_tokens = Self::semantic_tokenize(text);
+        if text_tokens.is_empty() {
+            return 0;
+        }
+        let overlap = query_tokens.intersection(&text_tokens).count() as f64;
+        let union = query_tokens.union(&text_tokens).count() as f64;
+        if union <= 0.0 {
+            return 0;
+        }
+        ((overlap / union) * 100.0).round() as i32
+    }
+
+    fn tool_outcome_key(server: &str, tool: &str) -> String {
+        format!("{server}::{tool}")
+    }
+
+    pub async fn record_tool_outcome(&self, server: &str, tool: &str, success: bool) {
+        let mut inner = self.inner.write().await;
+        let key = Self::tool_outcome_key(server, tool);
+        let stats = inner.tool_outcomes.entry(key).or_default();
+        if success {
+            stats.success_count = stats.success_count.saturating_add(1);
+        } else {
+            stats.failure_count = stats.failure_count.saturating_add(1);
+        }
+        inner
+            .tool_search_cache
+            .retain(|_, entry| Self::cache_is_fresh(entry.created_at, self.tool_cache_ttl));
     }
 
     fn build_auth_provider(
@@ -220,6 +373,7 @@ impl McpManager {
         let mut inner = self.inner.write().await;
         inner.clients.insert(name.to_string(), client);
         inner.tools.insert(name.to_string(), tool_defs);
+        Self::clear_tool_caches(&mut inner);
 
         if let Some(auth) = auth_provider {
             inner.auth_providers.insert(name.to_string(), auth);
@@ -235,6 +389,7 @@ impl McpManager {
         let client = {
             let mut inner = self.inner.write().await;
             inner.tools.remove(name);
+            Self::clear_tool_caches(&mut inner);
             inner.clients.remove(name)
         };
         if let Some(client) = client {
@@ -407,6 +562,195 @@ impl McpManager {
         self.inner.read().await.tools.get(name).cloned()
     }
 
+    /// Search tools across running servers by name/description.
+    pub async fn search_tools(
+        &self,
+        query: &str,
+        server: Option<&str>,
+        limit: usize,
+        detail_level: ToolDetailLevel,
+    ) -> Vec<McpToolSummary> {
+        let q = query.trim().to_lowercase();
+        let server_filter = server
+            .map(str::trim)
+            .filter(|candidate| !candidate.is_empty())
+            .map(str::to_string);
+        let max = limit.clamp(1, 200);
+        let cache_key = SearchCacheKey {
+            query: q.clone(),
+            server: server_filter.clone(),
+            limit: max,
+            detail_level,
+        };
+
+        {
+            let inner = self.inner.read().await;
+            if let Some(entry) = inner.tool_search_cache.get(&cache_key)
+                && Self::cache_is_fresh(entry.created_at, self.tool_cache_ttl)
+            {
+                return entry.tools.clone();
+            }
+        }
+
+        let inner = self.inner.read().await;
+
+        let mut scored: Vec<(i32, McpToolSummary)> = Vec::new();
+        for (server_name, tools) in &inner.tools {
+            if let Some(filter_server) = server_filter.as_deref()
+                && filter_server != server_name
+            {
+                continue;
+            }
+            for tool in tools {
+                let desc = tool.description.as_deref().unwrap_or("");
+                let mut score = 0i32;
+                if q.is_empty() {
+                    score = 1;
+                } else {
+                    let name_l = tool.name.to_lowercase();
+                    let desc_l = desc.to_lowercase();
+                    if name_l == q {
+                        score += 1_000;
+                    }
+                    if name_l.starts_with(&q) {
+                        score += 250;
+                    }
+                    if name_l.contains(&q) {
+                        score += 100;
+                    }
+                    if desc_l.contains(&q) {
+                        score += 25;
+                    }
+                }
+                let semantic_score =
+                    Self::semantic_match_score(&q, format!("{} {}", tool.name, desc).as_str());
+                score += semantic_score.saturating_mul(self.search_semantic_weight) / 100;
+
+                let key = Self::tool_outcome_key(server_name, &tool.name);
+                if let Some(stats) = inner.tool_outcomes.get(&key) {
+                    let success = stats.success_count as i64;
+                    let failure = stats.failure_count as i64;
+                    let weighted = ((success * 3) - (failure * 2)).clamp(
+                        -(self.search_success_weight as i64),
+                        self.search_success_weight as i64,
+                    );
+                    score += weighted as i32;
+                }
+
+                score += self
+                    .search_server_priors
+                    .get(server_name)
+                    .copied()
+                    .unwrap_or_default();
+
+                if score > 0 {
+                    let description = match detail_level {
+                        ToolDetailLevel::Name => None,
+                        ToolDetailLevel::Summary | ToolDetailLevel::Full => {
+                            (!desc.is_empty()).then(|| desc.to_string())
+                        },
+                    };
+                    let input_schema = match detail_level {
+                        ToolDetailLevel::Full => Some(tool.input_schema.clone()),
+                        ToolDetailLevel::Name | ToolDetailLevel::Summary => None,
+                    };
+                    scored.push((
+                        score,
+                        McpToolSummary {
+                            server: server_name.clone(),
+                            name: tool.name.clone(),
+                            description,
+                            input_schema,
+                        },
+                    ));
+                }
+            }
+        }
+
+        scored.sort_by(|(score_a, tool_a), (score_b, tool_b)| {
+            score_b
+                .cmp(score_a)
+                .then_with(|| tool_a.server.cmp(&tool_b.server))
+                .then_with(|| tool_a.name.cmp(&tool_b.name))
+        });
+        let tools: Vec<McpToolSummary> = scored
+            .into_iter()
+            .take(max)
+            .map(|(_, summary)| summary)
+            .collect();
+
+        drop(inner);
+        let mut inner = self.inner.write().await;
+        inner
+            .tool_search_cache
+            .retain(|_, entry| Self::cache_is_fresh(entry.created_at, self.tool_cache_ttl));
+        inner.tool_search_cache.insert(
+            cache_key,
+            SearchCacheEntry {
+                created_at: Instant::now(),
+                tools: tools.clone(),
+            },
+        );
+
+        tools
+    }
+
+    /// Return the full schema for a specific server tool.
+    pub async fn describe_tool(&self, server: &str, tool: &str) -> Option<McpToolDef> {
+        let cache_key = DescribeCacheKey {
+            server: server.to_string(),
+            tool: tool.to_string(),
+        };
+
+        {
+            let inner = self.inner.read().await;
+            if let Some(entry) = inner.tool_describe_cache.get(&cache_key)
+                && Self::cache_is_fresh(entry.created_at, self.tool_cache_ttl)
+            {
+                return entry.described.clone();
+            }
+        }
+
+        let described = {
+            let inner = self.inner.read().await;
+            let tools = inner.tools.get(server)?;
+            tools.iter().find(|t| t.name == tool).cloned()
+        };
+
+        let mut inner = self.inner.write().await;
+        inner
+            .tool_describe_cache
+            .retain(|_, entry| Self::cache_is_fresh(entry.created_at, self.tool_cache_ttl));
+        inner.tool_describe_cache.insert(
+            cache_key,
+            DescribeCacheEntry {
+                created_at: Instant::now(),
+                described: described.clone(),
+            },
+        );
+        described
+    }
+
+    /// Call a tool by `(server, tool)` reference.
+    pub async fn call_server_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolsCallResult> {
+        let client =
+            {
+                let inner = self.inner.read().await;
+                inner.clients.get(server).cloned().ok_or_else(|| {
+                    McpManagerError::ServerNotFound {
+                        server: server.to_string(),
+                    }
+                })?
+            };
+        let c = client.read().await;
+        c.call_tool(tool, arguments).await
+    }
+
     // ── Registry operations ─────────────────────────────────────────
 
     /// Add a server to the registry and optionally start it.
@@ -493,6 +837,38 @@ impl McpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    struct FailingMcpClient;
+
+    #[async_trait]
+    impl McpClientTrait for FailingMcpClient {
+        fn server_name(&self) -> &str {
+            "failing"
+        }
+
+        fn state(&self) -> McpClientState {
+            McpClientState::Ready
+        }
+
+        fn tools(&self) -> &[McpToolDef] {
+            &[]
+        }
+
+        async fn list_tools(&mut self) -> Result<&[McpToolDef]> {
+            Ok(&[])
+        }
+
+        async fn call_tool(&self, _name: &str, _arguments: serde_json::Value) -> Result<ToolsCallResult> {
+            Err(Error::message("transport failed"))
+        }
+
+        async fn is_alive(&self) -> bool {
+            true
+        }
+
+        async fn shutdown(&mut self) {}
+    }
 
     #[test]
     fn test_manager_creation() {
@@ -603,5 +979,233 @@ mod tests {
             err,
             Error::Manager(McpManagerError::OAuthStateNotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_ranks_name_matches() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "filesystem".to_string(),
+                vec![
+                    McpToolDef {
+                        name: "read_file".to_string(),
+                        description: Some("Read file contents".to_string()),
+                        input_schema: serde_json::json!({ "type": "object" }),
+                    },
+                    McpToolDef {
+                        name: "write_file".to_string(),
+                        description: Some("Write file contents".to_string()),
+                        input_schema: serde_json::json!({ "type": "object" }),
+                    },
+                ],
+            );
+            inner.tools.insert(
+                "github".to_string(),
+                vec![McpToolDef {
+                    name: "search_code".to_string(),
+                    description: Some("Search source code".to_string()),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                }],
+            );
+        }
+
+        let results = mgr
+            .search_tools("read", None, 10, ToolDetailLevel::Summary)
+            .await;
+        assert!(!results.is_empty());
+        assert_eq!(results[0].server, "filesystem");
+        assert_eq!(results[0].name, "read_file");
+        assert_eq!(
+            results[0].description.as_deref(),
+            Some("Read file contents")
+        );
+        assert!(results[0].input_schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_name_level_omits_description_and_schema() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "filesystem".to_string(),
+                vec![McpToolDef {
+                    name: "read_file".to_string(),
+                    description: Some("Read file contents".to_string()),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                }],
+            );
+        }
+
+        let results = mgr
+            .search_tools("read", None, 10, ToolDetailLevel::Name)
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].description.is_none());
+        assert!(results[0].input_schema.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_full_level_includes_schema() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "filesystem".to_string(),
+                vec![McpToolDef {
+                    name: "read_file".to_string(),
+                    description: Some("Read file contents".to_string()),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                }],
+            );
+        }
+
+        let results = mgr
+            .search_tools("read", None, 10, ToolDetailLevel::Full)
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].description.as_deref(),
+            Some("Read file contents")
+        );
+        assert_eq!(
+            results[0].input_schema.as_ref().and_then(|v| v.get("type")),
+            Some(&serde_json::json!("object"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_describe_tool_returns_schema() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "filesystem".to_string(),
+                vec![McpToolDef {
+                    name: "read_file".to_string(),
+                    description: Some("Read file contents".to_string()),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } }
+                    }),
+                }],
+            );
+        }
+
+        let described = mgr.describe_tool("filesystem", "read_file").await;
+        assert!(described.is_some());
+        let Some(tool) = described else {
+            panic!("expected tool to be present");
+        };
+        assert_eq!(tool.name, "read_file");
+        assert_eq!(tool.input_schema["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn test_call_server_tool_missing_server() {
+        let mgr = McpManager::new(McpRegistry::new());
+        let err = mgr
+            .call_server_tool("missing", "tool", serde_json::json!({}))
+            .await
+            .expect_err("missing server should fail");
+        assert!(matches!(
+            err,
+            Error::Manager(McpManagerError::ServerNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_call_server_tool_does_not_double_record_failures() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.clients.insert(
+                "failing".to_string(),
+                Arc::new(RwLock::new(FailingMcpClient)),
+            );
+        }
+
+        let err = mgr
+            .call_server_tool("failing", "tool", serde_json::json!({}))
+            .await
+            .expect_err("call should fail");
+        assert!(matches!(err, Error::Message { .. }));
+
+        let inner = mgr.inner.read().await;
+        assert!(inner.tool_outcomes.get("failing::tool").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_historical_success_affects_rank() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "filesystem".to_string(),
+                vec![
+                    McpToolDef {
+                        name: "read_file".to_string(),
+                        description: Some("Read files".to_string()),
+                        input_schema: serde_json::json!({}),
+                    },
+                    McpToolDef {
+                        name: "search_file".to_string(),
+                        description: Some("Search file text".to_string()),
+                        input_schema: serde_json::json!({}),
+                    },
+                ],
+            );
+        }
+        mgr.record_tool_outcome("filesystem", "search_file", true)
+            .await;
+        mgr.record_tool_outcome("filesystem", "search_file", true)
+            .await;
+        mgr.record_tool_outcome("filesystem", "read_file", false)
+            .await;
+
+        let results = mgr
+            .search_tools("file", Some("filesystem"), 5, ToolDetailLevel::Summary)
+            .await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "search_file");
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_server_prior_affects_rank() {
+        let mut priors = HashMap::new();
+        priors.insert("preferred".to_string(), 50);
+        let mgr = McpManager::new_with_options(
+            McpRegistry::new(),
+            McpManagerOptions {
+                search_server_priors: priors,
+                ..McpManagerOptions::default()
+            },
+        );
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.tools.insert(
+                "preferred".to_string(),
+                vec![McpToolDef {
+                    name: "lookup".to_string(),
+                    description: Some("lookup".to_string()),
+                    input_schema: serde_json::json!({}),
+                }],
+            );
+            inner.tools.insert(
+                "other".to_string(),
+                vec![McpToolDef {
+                    name: "lookup".to_string(),
+                    description: Some("lookup".to_string()),
+                    input_schema: serde_json::json!({}),
+                }],
+            );
+        }
+        let results = mgr
+            .search_tools("lookup", None, 5, ToolDetailLevel::Name)
+            .await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].server, "preferred");
     }
 }

@@ -1443,10 +1443,21 @@ pub async fn prepare_gateway(
             }
         }
         mcp_configured_count = merged.servers.values().filter(|s| s.enabled).count();
-        let mcp_manager = Arc::new(moltis_mcp::McpManager::new(merged));
+        let mcp_manager = Arc::new(moltis_mcp::McpManager::new_with_options(
+            merged,
+            moltis_mcp::McpManagerOptions {
+                tool_summary_cache_ttl_secs: config.mcp.code.tool_summary_cache_ttl_secs,
+                search_server_priors: config.mcp.code.search_server_priors.clone(),
+                search_success_weight: config.mcp.code.search_success_weight,
+                search_semantic_weight: config.mcp.code.search_semantic_weight,
+            },
+        ));
         live_mcp = Arc::new(crate::mcp_service::LiveMcpService::new(Arc::clone(
             &mcp_manager,
         )));
+        live_mcp
+            .configure_legacy_direct(&config.mcp.legacy_direct)
+            .await;
         // Start enabled servers in the background; sync tools once done.
         let mgr = Arc::clone(&mcp_manager);
         let mcp_for_sync = Arc::clone(&live_mcp);
@@ -3382,6 +3393,21 @@ pub async fn prepare_gateway(
 
         tool_registry.register(Box::new(exec_tool));
         tool_registry.register(Box::new(moltis_tools::calc::CalcTool::new()));
+        let mcp_manager = Arc::clone(live_mcp.manager());
+        tool_registry.register(Box::new(crate::mcp_agent_tools::McpSearchToolsTool::new(
+            Arc::clone(&mcp_manager),
+        )));
+        tool_registry.register(Box::new(crate::mcp_agent_tools::McpDescribeToolTool::new(
+            Arc::clone(&mcp_manager),
+        )));
+        if config.mcp.code.enabled {
+            let mcp_code_exec =
+                crate::mcp_agent_tools::McpCodeExecTool::new(mcp_manager, &config.mcp.code);
+            tool_registry.register(Box::new(mcp_code_exec.clone()));
+            tool_registry.register(Box::new(crate::mcp_agent_tools::McpSkillRunTool::new(
+                mcp_code_exec,
+            )));
+        }
         #[cfg(feature = "wasm")]
         {
             let wasm_limits = sandbox_router
@@ -3931,7 +3957,7 @@ pub async fn prepare_gateway(
         live_mcp
             .set_tool_registry(Arc::clone(&shared_tool_registry))
             .await;
-        crate::mcp_service::sync_mcp_tools(live_mcp.manager(), &shared_tool_registry).await;
+        live_mcp.sync_tools_if_ready().await;
 
         // Log registered tools for debugging.
         let schemas = shared_tool_registry.read().await.list_schemas();
