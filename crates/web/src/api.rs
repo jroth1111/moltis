@@ -218,29 +218,26 @@ where
     {
         let _ = store.save(&manifest);
     }
-    Ok(manifest)
-        .map(|m| {
-            m.repos
-                .iter()
-                .flat_map(|repo| {
-                    let source = repo.source.clone();
-                    repo.skills.iter().filter(|s| s.is_runnable()).map(move |s| {
-                        serde_json::json!({
-                            "name": s.name,
-                            "source": source,
-                            "trusted": s.status.is_trusted(),
-                            "status": status_label(s.status),
-                            "quarantined": s.status == moltis_skills::types::SkillStatus::Quarantined,
-                            "quarantine_reason": s.quarantine_reason,
-                            "last_audited_ms": s.last_audited_ms,
-                            "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(s),
-                            "enabled": true,
-                        })
-                    })
+    manifest
+        .repos
+        .iter()
+        .flat_map(|repo| {
+            let source = repo.source.clone();
+            repo.skills.iter().filter(|s| s.is_runnable()).map(move |s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "source": source,
+                    "trusted": s.status.is_trusted(),
+                    "status": status_label(s.status),
+                    "quarantined": s.status == moltis_skills::types::SkillStatus::Quarantined,
+                    "quarantine_reason": s.quarantine_reason,
+                    "last_audited_ms": s.last_audited_ms,
+                    "integrity_ok": moltis_skills::integrity::integrity_matches_trusted_hash(s),
+                    "enabled": true,
                 })
-                .collect()
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 pub async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse {

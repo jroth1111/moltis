@@ -532,7 +532,7 @@ function SkillDetail(props) {
 		actionBusy.value = true;
 		sendRpc("skills.skill.delete", { source: props.repoSource, skill: d.name }).then((r) => {
 			actionBusy.value = false;
-			if (r?.deleted) {
+			if (r?.payload?.deleted === true) {
 				onClose();
 				fetchAll();
 				props.onReload?.();
@@ -562,7 +562,11 @@ function SkillDetail(props) {
 
 	function doRevalidate() {
 		actionBusy.value = true;
-		sendRpc("skills.skill.revalidate", { source: props.repoSource, skill: d.name }).then((res) => {
+		sendRpc("skills.skill.revalidate", {
+			source: props.repoSource,
+			skill: d.name,
+			confirm: true,
+		}).then((res) => {
 			actionBusy.value = false;
 			if (res?.ok) {
 				if (res?.passed === true) {

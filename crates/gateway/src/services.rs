@@ -1792,6 +1792,10 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
 }
 
 fn revalidate_skill(params: &Value) -> ServiceResult {
+    let confirm = params
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let source = params
         .get("source")
         .and_then(|v| v.as_str())
@@ -1877,7 +1881,14 @@ fn revalidate_skill(params: &Value) -> ServiceResult {
         .and_then(|repo| repo.skills.get_mut(skill_index))
         .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
     if decision.passed {
-        moltis_skills::integrity::trust_skill(skill, now_ms);
+        skill.status = moltis_skills::types::SkillStatus::Pending;
+        skill.enabled = false;
+        skill.trusted_hash = None;
+        skill.last_audited_ms = Some(now_ms);
+        skill.quarantine_reason = None;
+        if confirm {
+            moltis_skills::integrity::trust_skill(skill, now_ms);
+        }
     } else {
         skill.status = moltis_skills::types::SkillStatus::FailedValidation;
         skill.enabled = false;
@@ -1897,6 +1908,7 @@ fn revalidate_skill(params: &Value) -> ServiceResult {
             "source": source,
             "skill": skill_name,
             "passed": decision.passed,
+            "confirmed": confirm,
             "status": skill_status_label(status),
             "reason_count": decision.reasons.len(),
         }),
@@ -1907,6 +1919,7 @@ fn revalidate_skill(params: &Value) -> ServiceResult {
         "skill": skill_name,
         "status": skill_status_label(status),
         "passed": decision.passed,
+        "confirmed": confirm,
         "reasons": decision.reasons,
         "benchmark": decision.run.benchmark,
     }))
@@ -2345,7 +2358,7 @@ mod tests {
 
     fn strong_local_skill_markdown(name: &str) -> String {
         format!(
-            "---\nversion: 3\nname: {name}\ndescription: Create, update, and benchmark skills with a structured evaluation workflow.\ntriggers:\n  should_trigger:\n    - create a new skill\n    - improve an existing SKILL.md\n    - benchmark skill quality\n  should_not_trigger:\n    - simple translation request\n    - general brainstorming\n    - non-skill coding task\nevals:\n  path: evals/evals.json\n---\n## Purpose\n\nCreate, update, and benchmark skills with a structured evaluation workflow.\n\n## Inputs\n\n- The target skill or prompt to improve.\n- Relevant files and constraints.\n- Success criteria for the revised skill.\n\n## Workflow\n\n1. Read the target skill and identify gaps.\n2. Draft updated instructions and include examples.\n3. Validate with benchmark cases and check outputs.\n4. Confirm risky operations before running commands.\n\n## Failure Modes\n\n- Stop when the request is unrelated to skill authoring.\n- Ask for missing inputs before making changes.\n- Do not run risky commands without confirmation.\n\n## Examples\n\n- Create a new skill for release checklists.\n- Improve an existing SKILL.md with clearer triggers.\n- Benchmark skill quality against a baseline.\n"
+            "---\nversion: 3\nname: {name}\ndescription: Create a new skill, improve an existing SKILL.md, and benchmark skill quality with a structured evaluation workflow.\ntriggers:\n  should_trigger:\n    - create a new skill\n    - improve an existing SKILL.md\n    - benchmark skill quality\n  should_not_trigger:\n    - simple translation request\n    - general brainstorming\n    - non-skill coding task\nevals:\n  path: evals/evals.json\nallowed_tools:\n  - read_file\nrequires:\n  bins:\n    - rg\n---\n## Purpose\n\nCreate a new skill, improve an existing SKILL.md, and benchmark skill quality with a structured evaluation workflow.\n\n## Inputs\n\n- The target skill or prompt to improve.\n- Relevant files and constraints.\n- Success criteria for the revised skill.\n\n## Workflow\n\n1. Read the target skill and identify gaps.\n2. Draft updated instructions and include examples.\n3. Validate with benchmark cases and check outputs.\n4. Confirm risky operations before running commands.\n\n## Failure Modes\n\n- Stop when the request is unrelated to skill authoring.\n- Ask for missing inputs before making changes.\n- Do not run risky commands without confirmation.\n\n## Examples\n\n- Create a new skill for release checklists.\n- Improve an existing SKILL.md with clearer triggers.\n- Benchmark skill quality against a baseline.\n"
         )
     }
 
@@ -2906,12 +2919,14 @@ mod tests {
             let response = revalidate_skill(&serde_json::json!({
                 "source": "personal",
                 "skill": "demo",
+                "confirm": true,
             }))
             .expect("revalidation should succeed");
 
             assert_eq!(response["ok"], true);
             assert_eq!(response["status"], "trusted");
             assert_eq!(response["passed"], true);
+            assert_eq!(response["confirmed"], true);
 
             let store =
                 moltis_skills::manifest::ManifestStore::new(tmp.join("skills-manifest.json"));
