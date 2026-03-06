@@ -42,6 +42,7 @@ use {
     },
     moltis_tools::tool_names,
     serde_json::Value,
+    time::OffsetDateTime,
     tracing::{debug, info, warn},
 };
 
@@ -235,7 +236,7 @@ async fn process_intent(ctx: &DispatchContext, intent: Task) -> Result<bool, any
 
                 // Cooldown: don't start a new shift too soon after the last one.
                 if ctx.config.shift_cooldown_secs > 0 && intent_state.shift_count > 0 {
-                    let elapsed = (time::OffsetDateTime::now_utc().unix_timestamp()
+                    let elapsed = (OffsetDateTime::now_utc().unix_timestamp()
                         - intent_state.updated_at.unix_timestamp())
                     .max(0) as u64;
                     if elapsed < ctx.config.shift_cooldown_secs {
