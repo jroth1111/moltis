@@ -5922,6 +5922,7 @@ name = "moltis-browser"
 version = "0.10.6"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chromiumoxide",
  "futures",

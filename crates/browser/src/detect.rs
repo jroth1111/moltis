@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashSet,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -209,13 +210,52 @@ fn push_browser(
     path: PathBuf,
     source: DetectionSource,
 ) {
-    if !path.exists() {
+    if !is_usable_browser_path(&path) {
         return;
     }
     if !seen_paths.insert(path.clone()) {
         return;
     }
     browsers.push(DetectedBrowser { kind, path, source });
+}
+
+fn is_usable_browser_path(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+
+    if let Some(target) = wrapper_exec_target(path) {
+        return target.exists();
+    }
+
+    true
+}
+
+fn wrapper_exec_target(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?.to_str()?;
+    if !file_name.ends_with(".wrapper.sh") {
+        return None;
+    }
+
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(parse_wrapper_exec_line)
+}
+
+fn parse_wrapper_exec_line(line: &str) -> Option<PathBuf> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("exec ") {
+        return None;
+    }
+
+    let mut chars = trimmed["exec ".len()..].chars();
+    let quote = chars.next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+
+    let remainder = &trimmed["exec ".len() + quote.len_utf8()..];
+    let end = remainder.find(quote)?;
+    Some(PathBuf::from(&remainder[..end]))
 }
 
 /// Detect all Chromium-based browsers available on the system.
@@ -634,16 +674,13 @@ async fn auto_install_for_targets(targets: &[BrowserKind]) -> AutoInstallResult 
     let mut errors = Vec::new();
     for target in targets {
         for id in windows_package_ids(*target) {
-            let command = InstallCommand::new(
-                "winget",
-                &[
-                    "install",
-                    "--id",
-                    id,
-                    "--accept-package-agreements",
-                    "--accept-source-agreements",
-                ],
-            );
+            let command = InstallCommand::new("winget", &[
+                "install",
+                "--id",
+                id,
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ]);
 
             match run_command(&command).await {
                 Ok(()) => {
@@ -803,13 +840,13 @@ mod tests {
     fn test_detect_custom_path_takes_precedence() {
         let temp_dir = std::env::temp_dir();
         let fake_browser = temp_dir.join("fake-chrome-for-test");
-        std::fs::write(&fake_browser, "fake").unwrap();
+        fs::write(&fake_browser, "fake").unwrap();
 
         let result = detect_browser(Some(fake_browser.to_str().unwrap()));
         assert!(result.found());
         assert_eq!(result.browsers[0].path, fake_browser);
 
-        std::fs::remove_file(&fake_browser).unwrap();
+        fs::remove_file(&fake_browser).unwrap();
     }
 
     #[test]
@@ -880,6 +917,47 @@ mod tests {
 
         let selected = pick_browser(&browsers, Some(BrowserPreference::Chrome));
         assert!(selected.is_none());
+    }
+
+    #[test]
+    fn test_parse_wrapper_exec_line_extracts_target() {
+        let parsed = parse_wrapper_exec_line(
+            "exec '/Applications/Chromium.app/Contents/MacOS/Chromium' \"$@\"",
+        );
+        assert_eq!(
+            parsed,
+            Some(PathBuf::from(
+                "/Applications/Chromium.app/Contents/MacOS/Chromium"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_is_usable_browser_path_rejects_broken_wrapper() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wrapper = temp_dir.path().join("chromium.wrapper.sh");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nexec '/missing/Chromium.app/Contents/MacOS/Chromium' \"$@\"\n",
+        )
+        .unwrap();
+
+        assert!(!is_usable_browser_path(&wrapper));
+    }
+
+    #[test]
+    fn test_is_usable_browser_path_accepts_valid_wrapper() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let browser = temp_dir.path().join("Chromium");
+        let wrapper = temp_dir.path().join("chromium.wrapper.sh");
+        fs::write(&browser, "binary").unwrap();
+        fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", browser.display()),
+        )
+        .unwrap();
+
+        assert!(is_usable_browser_path(&wrapper));
     }
 
     #[test]

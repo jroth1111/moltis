@@ -216,6 +216,7 @@ impl BrowserPool {
     pub async fn get_page(&self, session_id: &str) -> Result<Page, Error> {
         let instances = self.instances.read().await;
         let instance = instances.get(session_id).ok_or(Error::ElementNotFound(0))?;
+        let instance_arc = Arc::clone(instance);
 
         let mut inst = instance.lock().await;
         inst.last_used = Instant::now();
@@ -276,6 +277,14 @@ impl BrowserPool {
         }
 
         inst.pages.insert("main".to_string(), page.clone());
+        let attach_api_capture =
+            inst.api_capture.config.is_some() && inst.api_capture.recorder.is_some();
+        drop(inst);
+        drop(instances);
+        if attach_api_capture {
+            self.attach_api_capture_to_page(instance_arc, page.clone())
+                .await?;
+        }
         Ok(page)
     }
 
@@ -344,13 +353,19 @@ impl BrowserPool {
                 let mut stream = paused_stream;
                 while let Some(event) = stream.next().await {
                     let extra_headers = {
-                        let inst = instance_arc.lock().await;
-                        if inst.interception.extra_headers.is_empty() {
+                        let mut inst = instance_arc.lock().await;
+                        let interception_headers = inst.interception.extra_headers.clone();
+                        if event.response_status_code.is_none()
+                            && let Some(network_id) = event.network_id.as_ref()
+                            && let Some(recorder) = inst.api_capture.recorder.as_mut()
+                        {
+                            recorder.merge_request_headers(network_id, &interception_headers);
+                        }
+                        if interception_headers.is_empty() {
                             None
                         } else {
                             Some(
-                                inst.interception
-                                    .extra_headers
+                                interception_headers
                                     .iter()
                                     .map(|(name, value)| (name.clone(), value.clone()))
                                     .collect::<Vec<_>>(),
@@ -422,6 +437,7 @@ impl BrowserPool {
             task.abort();
         }
         inst.api_capture.config = None;
+        inst.api_capture.attached_targets.clear();
 
         let mut recorder = inst.api_capture.recorder.take()?;
         recorder.finish();
@@ -513,6 +529,7 @@ impl BrowserPool {
         for task in inst.api_capture.tasks.drain(..) {
             task.abort();
         }
+        inst.api_capture.attached_targets.clear();
 
         let config = inst.api_capture.config.take()?;
         let recorder = inst.api_capture.recorder.take()?;
@@ -536,11 +553,51 @@ impl BrowserPool {
         config: crate::api_capture::ApiCaptureConfig,
         recorder: crate::api_capture::ApiCaptureRecorder,
     ) -> Result<(), Error> {
+        let _ = self.get_page(session_id).await?;
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let instance_arc = Arc::clone(instance);
+
+            let mut inst = instance.lock().await;
+            for task in inst.api_capture.tasks.drain(..) {
+                task.abort();
+            }
+            inst.api_capture.config = Some(config);
+            inst.api_capture.recorder = Some(recorder);
+            inst.api_capture.attached_targets.clear();
+            let pages: Vec<Page> = inst.pages.values().cloned().collect();
+            drop(inst);
+            drop(instances);
+
+            for page in pages {
+                self.attach_api_capture_to_page(Arc::clone(&instance_arc), page)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn attach_api_capture_to_page(
+        &self,
+        instance: Arc<Mutex<BrowserInstance>>,
+        page: Page,
+    ) -> Result<(), Error> {
         use chromiumoxide::cdp::browser_protocol::network::{
-            EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent, EventResponseReceived,
+            EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
+            EventResponseReceived, GetRequestPostDataParams,
         };
 
-        let page = self.get_active_page(session_id).await?;
+        let target_id = page.target_id().as_ref().to_string();
+        {
+            let inst = instance.lock().await;
+            if inst.api_capture.config.is_none()
+                || inst.api_capture.recorder.is_none()
+                || inst.api_capture.attached_targets.contains(&target_id)
+            {
+                return Ok(());
+            }
+        }
 
         let request_stream = page
             .event_listener::<EventRequestWillBeSent>()
@@ -559,72 +616,97 @@ impl BrowserPool {
             .await
             .map_err(|error| Error::Cdp(format!("loadingFinished event listener: {error}")))?;
 
-        let instances = self.instances.read().await;
-        if let Some(instance) = instances.get(session_id) {
-            let request_instance = Arc::clone(instance);
-            let response_instance = Arc::clone(instance);
-            let loading_failed_instance = Arc::clone(instance);
-            let loading_finished_instance = Arc::clone(instance);
+        let request_instance = Arc::clone(&instance);
+        let response_instance = Arc::clone(&instance);
+        let loading_failed_instance = Arc::clone(&instance);
+        let loading_finished_instance = Arc::clone(&instance);
 
-            let mut inst = instance.lock().await;
-            for task in inst.api_capture.tasks.drain(..) {
-                task.abort();
+        let request_task = tokio::spawn(async move {
+            let mut stream = request_stream;
+            while let Some(event) = stream.next().await {
+                let method_may_have_body = !matches!(event.request.method.as_str(), "GET" | "HEAD");
+                let fallback_request_body = if (event.request.has_post_data.unwrap_or(false)
+                    || method_may_have_body)
+                    && event
+                        .request
+                        .post_data_entries
+                        .as_ref()
+                        .is_none_or(Vec::is_empty)
+                {
+                    match page
+                        .execute(GetRequestPostDataParams::new(event.request_id.clone()))
+                        .await
+                    {
+                        Ok(response) => Some(response.result.post_data),
+                        Err(error) => {
+                            debug!(request_id = ?event.request_id, ?error, "getRequestPostData failed");
+                            None
+                        },
+                    }
+                } else {
+                    None
+                };
+                let mut inst = request_instance.lock().await;
+                if let Some(recorder) = inst.api_capture.recorder.as_mut() {
+                    recorder.record_request(&event, fallback_request_body);
+                }
             }
-            inst.api_capture.config = Some(config);
-            inst.api_capture.recorder = Some(recorder);
+            debug!("requestWillBeSent event stream closed");
+        });
 
-            let request_task = tokio::spawn(async move {
-                let mut stream = request_stream;
-                while let Some(event) = stream.next().await {
-                    let mut inst = request_instance.lock().await;
-                    let extra_headers = inst.interception.extra_headers.clone();
-                    if let Some(recorder) = inst.api_capture.recorder.as_mut() {
-                        recorder.record_request(&event);
-                        recorder.merge_request_headers(&event.request_id, &extra_headers);
-                    }
+        let response_task = tokio::spawn(async move {
+            let mut stream = response_stream;
+            while let Some(event) = stream.next().await {
+                let mut inst = response_instance.lock().await;
+                if let Some(recorder) = inst.api_capture.recorder.as_mut() {
+                    recorder.apply_response_received(&event);
                 }
-                debug!("requestWillBeSent event stream closed");
-            });
+            }
+            debug!("responseReceived event stream closed");
+        });
 
-            let response_task = tokio::spawn(async move {
-                let mut stream = response_stream;
-                while let Some(event) = stream.next().await {
-                    let mut inst = response_instance.lock().await;
-                    if let Some(recorder) = inst.api_capture.recorder.as_mut() {
-                        recorder.apply_response_received(&event);
-                    }
+        let loading_failed_task = tokio::spawn(async move {
+            let mut stream = loading_failed_stream;
+            while let Some(event) = stream.next().await {
+                let mut inst = loading_failed_instance.lock().await;
+                if let Some(recorder) = inst.api_capture.recorder.as_mut() {
+                    recorder.apply_loading_failed(&event);
                 }
-                debug!("responseReceived event stream closed");
-            });
+            }
+            debug!("loadingFailed event stream closed");
+        });
 
-            let loading_failed_task = tokio::spawn(async move {
-                let mut stream = loading_failed_stream;
-                while let Some(event) = stream.next().await {
-                    let mut inst = loading_failed_instance.lock().await;
-                    if let Some(recorder) = inst.api_capture.recorder.as_mut() {
-                        recorder.apply_loading_failed(&event);
-                    }
+        let loading_finished_task = tokio::spawn(async move {
+            let mut stream = loading_finished_stream;
+            while let Some(event) = stream.next().await {
+                let mut inst = loading_finished_instance.lock().await;
+                if let Some(recorder) = inst.api_capture.recorder.as_mut() {
+                    recorder.apply_loading_finished(&event.request_id);
                 }
-                debug!("loadingFailed event stream closed");
-            });
+            }
+            debug!("loadingFinished event stream closed");
+        });
 
-            let loading_finished_task = tokio::spawn(async move {
-                let mut stream = loading_finished_stream;
-                while let Some(event) = stream.next().await {
-                    let mut inst = loading_finished_instance.lock().await;
-                    if let Some(recorder) = inst.api_capture.recorder.as_mut() {
-                        recorder.apply_loading_finished(&event.request_id);
-                    }
-                }
-                debug!("loadingFinished event stream closed");
-            });
-
-            inst.api_capture.tasks = vec![
+        let mut inst = instance.lock().await;
+        if inst.api_capture.config.is_none() || inst.api_capture.recorder.is_none() {
+            request_task.abort();
+            response_task.abort();
+            loading_failed_task.abort();
+            loading_finished_task.abort();
+            return Ok(());
+        }
+        if inst.api_capture.attached_targets.insert(target_id) {
+            inst.api_capture.tasks.extend([
                 request_task,
                 response_task,
                 loading_failed_task,
                 loading_finished_task,
-            ];
+            ]);
+        } else {
+            request_task.abort();
+            response_task.abort();
+            loading_failed_task.abort();
+            loading_finished_task.abort();
         }
 
         Ok(())
@@ -710,6 +792,7 @@ impl BrowserPool {
     pub async fn new_tab(&self, session_id: &str, name: &str) -> Result<(), Error> {
         let instances = self.instances.read().await;
         let instance = instances.get(session_id).ok_or(Error::ElementNotFound(0))?;
+        let instance_arc = Arc::clone(instance);
 
         let mut inst = instance.lock().await;
         inst.last_used = Instant::now();
@@ -722,6 +805,16 @@ impl BrowserPool {
 
         inst.pages.insert(name.to_string(), page);
         inst.active_tab = name.to_string();
+        let page = inst.pages.get(name).cloned().ok_or_else(|| {
+            Error::LaunchFailed(format!("new_tab page '{name}' missing after creation"))
+        })?;
+        let attach_api_capture =
+            inst.api_capture.config.is_some() && inst.api_capture.recorder.is_some();
+        drop(inst);
+        drop(instances);
+        if attach_api_capture {
+            self.attach_api_capture_to_page(instance_arc, page).await?;
+        }
 
         Ok(())
     }
@@ -793,6 +886,7 @@ impl BrowserPool {
             for task in inst.api_capture.tasks.drain(..) {
                 task.abort();
             }
+            inst.api_capture.attached_targets.clear();
             // Pages are closed when browser is dropped
             drop(inst);
 
@@ -1244,7 +1338,23 @@ fn sandbox_profile_dir(profile_root: Option<PathBuf>, session_id: &str) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, Uri},
+            response::Html,
+            routing::{get, post},
+        },
+        serde_json::json,
+        std::sync::{Arc, Mutex as StdMutex},
+        tokio::{
+            net::TcpListener,
+            task::JoinHandle,
+            time::{Duration, sleep, timeout},
+        },
+    };
 
     #[test]
     fn test_generate_session_id() {
@@ -1372,5 +1482,264 @@ mod tests {
             "--window-size=1280,720".to_string(),
             "--disable-gpu".to_string()
         ]);
+    }
+
+    #[derive(Clone, Debug)]
+    struct SeenRequest {
+        path: String,
+        query: String,
+        auth: Option<String>,
+        method: String,
+    }
+
+    #[derive(Clone, Default)]
+    struct PracticalServerState {
+        seen: Arc<StdMutex<Vec<SeenRequest>>>,
+    }
+
+    async fn page_one() -> Html<&'static str> {
+        Html(
+            r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <link rel="icon" href="data:,">
+    <title>page one</title>
+  </head>
+  <body>
+    <script>
+      (async () => {
+        await fetch('/api/search?q=milk&filter=fresh&filter=organic');
+        await fetch('/graphql', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            operationName: 'SearchProducts',
+            query: 'query SearchProducts($query: String!, $page: Int!) { search(query: $query, page: $page) { id } }',
+            variables: { query: 'milk', page: 1 }
+          })
+        });
+        document.body.dataset.done = 'true';
+      })();
+    </script>
+  </body>
+</html>"#,
+        )
+    }
+
+    async fn page_two() -> Html<&'static str> {
+        Html(
+            r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <link rel="icon" href="data:,">
+    <title>page two</title>
+  </head>
+  <body>
+    <script>
+      (async () => {
+        await fetch('/api/suggest?term=bread&api_key=top-secret');
+        document.body.dataset.done = 'true';
+      })();
+    </script>
+  </body>
+</html>"#,
+        )
+    }
+
+    async fn record_get(
+        State(state): State<PracticalServerState>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Json<serde_json::Value> {
+        state.seen.lock().unwrap().push(SeenRequest {
+            path: uri.path().to_string(),
+            query: uri.query().unwrap_or_default().to_string(),
+            auth: headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            method: "GET".to_string(),
+        });
+        Json(json!({ "ok": true }))
+    }
+
+    async fn record_graphql(
+        State(state): State<PracticalServerState>,
+        uri: Uri,
+        headers: HeaderMap,
+        body: String,
+    ) -> Json<serde_json::Value> {
+        let _ = body;
+        state.seen.lock().unwrap().push(SeenRequest {
+            path: uri.path().to_string(),
+            query: uri.query().unwrap_or_default().to_string(),
+            auth: headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            method: "POST".to_string(),
+        });
+        Json(json!({ "data": { "search": [{ "id": 1 }] } }))
+    }
+
+    async fn start_practical_server() -> Result<
+        (std::net::SocketAddr, PracticalServerState, JoinHandle<()>),
+        Box<dyn std::error::Error>,
+    > {
+        let state = PracticalServerState::default();
+        let app = Router::new()
+            .route("/page1", get(page_one))
+            .route("/page2", get(page_two))
+            .route("/api/search", get(record_get))
+            .route("/api/suggest", get(record_get))
+            .route("/graphql", post(record_graphql))
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap_or_else(|error| panic!("practical server should run: {error}"));
+        });
+
+        Ok((addr, state, server))
+    }
+
+    async fn wait_for_page_done(page: &Page) -> Result<(), Box<dyn std::error::Error>> {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let result: serde_json::Value = page
+                    .evaluate("document.body.dataset.done || ''")
+                    .await?
+                    .into_value()?;
+                if result == serde_json::Value::String("true".to_string()) {
+                    return Ok(()) as Result<(), Box<dyn std::error::Error>>;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    fn find_endpoint<'a>(
+        catalog: &'a crate::api_capture::ApiCatalog,
+        path_template: &str,
+    ) -> &'a crate::api_capture::ApiEndpoint {
+        catalog
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.path_template == path_template)
+            .unwrap_or_else(|| panic!("endpoint '{path_template}' should be captured"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires local chromium"]
+    async fn api_capture_tracks_real_browser_session_usage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let (addr, state, server) = start_practical_server().await?;
+        let pool = BrowserPool::new(test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig::default())
+                .await?;
+            pool.enable_interception(&sid, vec!["*api/search*".to_string()], HashMap::new())
+                .await?;
+            pool.set_extra_headers(
+                &sid,
+                HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer secret-token".to_string(),
+                )]),
+            )
+            .await;
+
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("http://{addr}/page1")).await?;
+            wait_for_page_done(&page).await?;
+
+            pool.new_tab(&sid, "secondary").await?;
+            let secondary = pool.get_active_page(&sid).await?;
+            secondary.goto(&format!("http://{addr}/page2")).await?;
+            wait_for_page_done(&secondary).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("api capture should produce a catalog"));
+            pool.disable_interception(&sid).await?;
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>(catalog)
+        }
+        .await;
+
+        server.abort();
+
+        let catalog = outcome?;
+        let search = find_endpoint(&catalog, "/api/search");
+        let graphql = find_endpoint(&catalog, "/graphql");
+        let suggest = find_endpoint(&catalog, "/api/suggest");
+
+        assert!(
+            catalog.summary.captured_requests >= 3,
+            "expected at least 3 API requests, got {}",
+            catalog.summary.captured_requests
+        );
+        assert!(catalog.endpoints.iter().all(|endpoint| {
+            endpoint.path_template != "/page1" && endpoint.path_template != "/page2"
+        }));
+
+        assert!(search.auth.iter().any(|auth| auth.scheme == "bearer"));
+        assert!(
+            search
+                .query_params
+                .iter()
+                .any(|field| field.name == "filter" && field.required && field.repeated)
+        );
+        assert_eq!(
+            search.examples[0].query.get("filter"),
+            Some(&vec!["fresh".to_string(), "organic".to_string()])
+        );
+
+        assert_eq!(graphql.body_kind, "graphql");
+        assert_eq!(graphql.operation_name.as_deref(), Some("SearchProducts"));
+        assert!(graphql.auth.is_empty());
+
+        assert!(suggest.auth.iter().any(|auth| auth.scheme == "api_key"));
+        assert!(
+            suggest.examples[0]
+                .redacted_url
+                .contains("api_key=%5BREDACTED%5D")
+        );
+        assert!(!suggest.examples[0].redacted_url.contains("top-secret"));
+
+        let seen = state.seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|request| {
+            request.path == "/api/search"
+                && request.method == "GET"
+                && request.auth.as_deref() == Some("Bearer secret-token")
+                && request.query.contains("filter=fresh")
+        }));
+        assert!(seen.iter().any(|request| {
+            request.path == "/graphql" && request.method == "POST" && request.auth.is_none()
+        }));
+        assert!(seen.iter().any(|request| {
+            request.path == "/api/suggest"
+                && request.method == "GET"
+                && request.auth.is_none()
+                && request.query.contains("api_key=top-secret")
+        }));
+
+        Ok(())
     }
 }

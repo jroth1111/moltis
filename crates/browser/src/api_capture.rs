@@ -1,8 +1,9 @@
 //! Passive API traffic capture and endpoint catalog inference.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use {
+    base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD},
     chromiumoxide::cdp::browser_protocol::network::{
         self, EventLoadingFailed, EventRequestWillBeSent, EventResponseReceived,
     },
@@ -36,6 +37,7 @@ impl Default for ApiCaptureConfig {
 pub struct ApiCaptureRuntime {
     pub config: Option<ApiCaptureConfig>,
     pub recorder: Option<ApiCaptureRecorder>,
+    pub attached_targets: HashSet<String>,
     pub tasks: Vec<JoinHandle<()>>,
 }
 
@@ -91,6 +93,8 @@ pub struct ApiAuthShape {
 pub struct ApiFieldShape {
     pub name: String,
     pub required: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub repeated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -116,9 +120,11 @@ pub struct ApiResponseMeta {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ApiRequestExample {
+    pub redacted_url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub url: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub query: BTreeMap<String, String>,
+    pub query: BTreeMap<String, Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
 }
@@ -128,6 +134,9 @@ pub struct ApiCaptureRecorder {
     config: ApiCaptureConfig,
     observations: Vec<ObservedRequest>,
     pending_requests: HashMap<network::RequestId, ObservedRequest>,
+    pending_response_updates: HashMap<network::RequestId, ResponseUpdate>,
+    pending_header_overrides: HashMap<network::RequestId, HashMap<String, String>>,
+    terminal_requests: HashSet<network::RequestId>,
 }
 
 impl ApiCaptureRecorder {
@@ -136,11 +145,20 @@ impl ApiCaptureRecorder {
             config,
             observations: Vec::new(),
             pending_requests: HashMap::new(),
+            pending_response_updates: HashMap::new(),
+            pending_header_overrides: HashMap::new(),
+            terminal_requests: HashSet::new(),
         }
     }
 
-    pub fn record_request(&mut self, event: &EventRequestWillBeSent) {
-        let Some(observed) = ObservedRequest::from_request_event(event) else {
+    pub fn record_request(
+        &mut self,
+        event: &EventRequestWillBeSent,
+        fallback_request_body: Option<String>,
+    ) {
+        let request_id = event.request_id.clone();
+        let Some(mut observed) = ObservedRequest::from_request_event(event, fallback_request_body)
+        else {
             return;
         };
         if !should_capture_request(
@@ -150,8 +168,19 @@ impl ApiCaptureRecorder {
         ) {
             return;
         }
-        self.pending_requests
-            .insert(event.request_id.clone(), observed);
+
+        if let Some(header_overrides) = self.pending_header_overrides.remove(&request_id) {
+            observed.merge_request_headers(&header_overrides);
+        }
+        if let Some(update) = self.pending_response_updates.remove(&request_id) {
+            observed.apply_response_update(update);
+        }
+
+        if self.terminal_requests.remove(&request_id) {
+            self.observations.push(observed);
+        } else {
+            self.pending_requests.insert(request_id, observed);
+        }
     }
 
     pub fn merge_request_headers(
@@ -164,24 +193,58 @@ impl ApiCaptureRecorder {
         }
         if let Some(observed) = self.pending_requests.get_mut(request_id) {
             observed.merge_request_headers(extra_headers);
+            return;
         }
+        self.pending_header_overrides
+            .entry(request_id.clone())
+            .or_default()
+            .extend(extra_headers.clone());
     }
 
     pub fn apply_response_received(&mut self, event: &EventResponseReceived) {
+        let update = ResponseUpdate::from_event(event);
         if let Some(observed) = self.pending_requests.get_mut(&event.request_id) {
-            observed.apply_response_received(event);
+            observed.apply_response_update(update);
+            return;
         }
+        if let Some(observed) = self
+            .observations
+            .iter_mut()
+            .rev()
+            .find(|observed| observed.request_id == event.request_id)
+        {
+            observed.apply_response_update(update);
+            return;
+        }
+        self.pending_response_updates
+            .insert(event.request_id.clone(), update);
     }
 
     pub fn apply_loading_finished(&mut self, request_id: &network::RequestId) {
         if let Some(observed) = self.pending_requests.remove(request_id) {
             self.observations.push(observed);
+            return;
+        }
+        if !self
+            .observations
+            .iter()
+            .any(|observed| &observed.request_id == request_id)
+        {
+            self.terminal_requests.insert(request_id.clone());
         }
     }
 
     pub fn apply_loading_failed(&mut self, event: &EventLoadingFailed) {
         if let Some(observed) = self.pending_requests.remove(&event.request_id) {
             self.observations.push(observed);
+            return;
+        }
+        if !self
+            .observations
+            .iter()
+            .any(|observed| observed.request_id == event.request_id)
+        {
+            self.terminal_requests.insert(event.request_id.clone());
         }
     }
 
@@ -189,6 +252,9 @@ impl ApiCaptureRecorder {
         for (_, observed) in self.pending_requests.drain() {
             self.observations.push(observed);
         }
+        self.pending_response_updates.clear();
+        self.pending_header_overrides.clear();
+        self.terminal_requests.clear();
     }
 
     #[must_use]
@@ -239,8 +305,13 @@ fn grouped_endpoint_count(endpoints: &[ApiEndpoint]) -> usize {
     endpoints.len()
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone)]
 struct ObservedRequest {
+    request_id: network::RequestId,
     method: String,
     url: String,
     request_headers: Vec<(String, String)>,
@@ -251,8 +322,26 @@ struct ObservedRequest {
     response_content_type: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ResponseUpdate {
+    status: Option<u16>,
+    response_content_type: Option<String>,
+}
+
+impl ResponseUpdate {
+    fn from_event(event: &EventResponseReceived) -> Self {
+        Self {
+            status: Some(event.response.status.clamp(0, u16::MAX as i64) as u16),
+            response_content_type: Some(normalize_content_type(&event.response.mime_type)),
+        }
+    }
+}
+
 impl ObservedRequest {
-    fn from_request_event(event: &EventRequestWillBeSent) -> Option<Self> {
+    fn from_request_event(
+        event: &EventRequestWillBeSent,
+        fallback_request_body: Option<String>,
+    ) -> Option<Self> {
         let request_content_type = header_value(&event.request.headers, "content-type");
         let request_body = event
             .request
@@ -265,9 +354,12 @@ impl ObservedRequest {
                         bytes.to_string()
                     })
                 })
-            });
+            })
+            .or(fallback_request_body)
+            .map(|body| normalize_request_body(body, request_content_type.as_deref()));
 
         Some(Self {
+            request_id: event.request_id.clone(),
             method: event.request.method.clone(),
             url: event.request.url.clone(),
             request_headers: headers_to_pairs(&event.request.headers),
@@ -279,9 +371,9 @@ impl ObservedRequest {
         })
     }
 
-    fn apply_response_received(&mut self, event: &EventResponseReceived) {
-        self.status = Some(event.response.status.clamp(0, u16::MAX as i64) as u16);
-        self.response_content_type = Some(normalize_content_type(&event.response.mime_type));
+    fn apply_response_update(&mut self, update: ResponseUpdate) {
+        self.status = update.status;
+        self.response_content_type = update.response_content_type;
     }
 
     fn merge_request_headers(&mut self, extra_headers: &HashMap<String, String>) {
@@ -419,6 +511,7 @@ fn finalize_fields(
         .map(|(name, field)| ApiFieldShape {
             name,
             required: field.present_count == sample_count,
+            repeated: field.repeated,
             types: field.types.into_iter().collect(),
             semantic_hints: field.semantic_hints.into_iter().collect(),
         })
@@ -428,6 +521,7 @@ fn finalize_fields(
 #[derive(Debug, Default)]
 struct FieldAccumulator {
     present_count: usize,
+    repeated: bool,
     types: BTreeSet<String>,
     semantic_hints: BTreeSet<String>,
 }
@@ -435,6 +529,7 @@ struct FieldAccumulator {
 impl FieldAccumulator {
     fn record(&mut self, field: &ObservedField) {
         self.present_count = self.present_count.saturating_add(1);
+        self.repeated |= field.repeated;
         let _ = self.types.insert(field.value_type.clone());
         self.semantic_hints
             .extend(field.semantic_hints.iter().cloned());
@@ -466,10 +561,8 @@ impl ParsedObservation {
             .query_pairs()
             .map(|(name, value)| (name.into_owned(), value.into_owned()))
             .collect();
-        let query_fields = query_pairs
-            .iter()
-            .map(|(name, _)| ObservedField::new(name.clone(), "string"))
-            .collect::<Vec<_>>();
+        let query_fields =
+            observed_fields_from_grouped_params(group_param_pairs(&query_pairs), "string");
 
         let mut semantic_hints = collect_semantic_hints_for_path(path_template.as_str());
         for field in &query_fields {
@@ -501,7 +594,12 @@ impl ParsedObservation {
             .as_ref()
             .and_then(|parsed| parsed.operation_name.clone());
 
-        let example = build_request_example(&url, observed.request_body.as_deref(), body.as_ref());
+        let example = build_request_example(
+            &url,
+            &query_pairs,
+            observed.request_body.as_deref(),
+            body.as_ref(),
+        );
 
         Some(Self {
             method: observed.method.clone(),
@@ -532,12 +630,18 @@ struct ParsedBody {
 struct ObservedField {
     name: String,
     value_type: String,
+    repeated: bool,
     semantic_hints: BTreeSet<String>,
 }
 
 impl ObservedField {
     fn new(name: String, value_type: &str) -> Self {
+        Self::with_repeated(name, value_type, false)
+    }
+
+    fn with_repeated(name: String, value_type: &str, repeated: bool) -> Self {
         Self {
+            repeated,
             semantic_hints: collect_semantic_hints_for_name(&name),
             name,
             value_type: value_type.to_string(),
@@ -545,34 +649,69 @@ impl ObservedField {
     }
 }
 
+fn group_param_pairs(pairs: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
+    let mut grouped = BTreeMap::new();
+    for (name, value) in pairs {
+        grouped
+            .entry(name.clone())
+            .or_insert_with(Vec::new)
+            .push(value.clone());
+    }
+    grouped
+}
+
+fn observed_fields_from_grouped_params(
+    grouped: BTreeMap<String, Vec<String>>,
+    value_type: &str,
+) -> Vec<ObservedField> {
+    grouped
+        .into_iter()
+        .map(|(name, values)| ObservedField::with_repeated(name, value_type, values.len() > 1))
+        .collect()
+}
+
 fn build_request_example(
     url: &Url,
+    query_pairs: &[(String, String)],
     raw_body: Option<&str>,
     body: Option<&ParsedBody>,
 ) -> ApiRequestExample {
     let mut query = BTreeMap::new();
-    for (name, value) in url.query_pairs() {
-        let name = name.into_owned();
-        let redacted = if is_sensitive_name(&name) {
-            "[REDACTED]".to_string()
-        } else {
-            value.into_owned()
-        };
-        query.insert(name, redacted);
+    let mut redacted_url = url.clone();
+    redacted_url.set_query(None);
+    {
+        let mut serializer = redacted_url.query_pairs_mut();
+        for (name, value) in query_pairs {
+            let redacted = redact_example_value(name, value);
+            query
+                .entry(name.clone())
+                .or_insert_with(Vec::new)
+                .push(redacted.clone());
+            serializer.append_pair(name, &redacted);
+        }
     }
 
     let body = match body {
         Some(parsed) if parsed.kind == "text" => {
-            raw_body.map(|value| Value::String(value.to_string()))
+            raw_body.map(|_| Value::String("[OMITTED]".to_string()))
         },
         Some(_) => raw_body.and_then(redacted_body_example),
         None => None,
     };
 
     ApiRequestExample {
-        url: url.as_str().to_string(),
+        redacted_url: redacted_url.to_string(),
+        url: url.path().to_string(),
         query,
         body,
+    }
+}
+
+fn redact_example_value(name: &str, value: &str) -> String {
+    if is_sensitive_name(name) {
+        "[REDACTED]".to_string()
+    } else {
+        value.to_string()
     }
 }
 
@@ -586,12 +725,8 @@ fn redacted_body_example(body: &str) -> Option<Value> {
         let mut object = Map::new();
         for (name, value) in form_pairs {
             let name = name.into_owned();
-            let redacted = if is_sensitive_name(&name) {
-                "[REDACTED]".to_string()
-            } else {
-                value.into_owned()
-            };
-            object.insert(name, Value::String(redacted));
+            let redacted = redact_example_value(&name, value.as_ref());
+            insert_object_value(&mut object, name, Value::String(redacted));
         }
         return Some(Value::Object(object));
     }
@@ -601,6 +736,19 @@ fn redacted_body_example(body: &str) -> Option<Value> {
     }
 
     Some(Value::String(body.to_string()))
+}
+
+fn insert_object_value(object: &mut Map<String, Value>, name: String, value: Value) {
+    match object.get_mut(&name) {
+        Some(Value::Array(values)) => values.push(value),
+        Some(existing) => {
+            let previous = existing.take();
+            *existing = Value::Array(vec![previous, value]);
+        },
+        None => {
+            object.insert(name, value);
+        },
+    }
 }
 
 fn parse_request_body(
@@ -643,6 +791,47 @@ fn parse_request_body(
         operation_name: None,
         fields: Vec::new(),
     })
+}
+
+fn normalize_request_body(body: String, content_type: Option<&str>) -> String {
+    if body.trim().is_empty() || body_looks_structured(body.as_str(), content_type) {
+        return body;
+    }
+
+    let trimmed = body.trim();
+    let Ok(decoded) = BASE64_STANDARD.decode(trimmed) else {
+        return body;
+    };
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return body;
+    };
+    if body_looks_structured(decoded.as_str(), content_type) {
+        decoded
+    } else {
+        body
+    }
+}
+
+fn body_looks_structured(body: &str, content_type: Option<&str>) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if content_type.is_some_and(|value| value.contains("json") || value.contains("graphql")) {
+        return serde_json::from_str::<Value>(trimmed).is_ok();
+    }
+    if content_type.is_some_and(|value| value.contains("x-www-form-urlencoded")) {
+        return trimmed.contains('=');
+    }
+    if content_type.is_some_and(|value| value.contains("multipart/form-data")) {
+        return trimmed.contains("Content-Disposition:");
+    }
+
+    serde_json::from_str::<Value>(trimmed).is_ok()
+        || trimmed.contains('=')
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('[')
 }
 
 fn parse_json_body(body: &str, content_type: Option<String>) -> ParsedBody {
@@ -693,9 +882,12 @@ fn parse_graphql_body(body: &str, content_type: Option<String>) -> ParsedBody {
 }
 
 fn parse_form_urlencoded_body(body: &str, content_type: Option<String>) -> ParsedBody {
-    let fields = form_urlencoded::parse(body.as_bytes())
-        .map(|(name, _)| ObservedField::new(name.into_owned(), "string"))
-        .collect();
+    let grouped = group_param_pairs(
+        &form_urlencoded::parse(body.as_bytes())
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>(),
+    );
+    let fields = observed_fields_from_grouped_params(grouped, "string");
 
     ParsedBody {
         kind: "form_urlencoded".to_string(),
@@ -1283,8 +1475,8 @@ mod tests {
         let req_id_a = event_a.request_id.clone();
         let req_id_b = event_b.request_id.clone();
 
-        recorder.record_request(&event_a);
-        recorder.record_request(&event_b);
+        recorder.record_request(&event_a, None);
+        recorder.record_request(&event_b, None);
         complete_successful_request(
             &mut recorder,
             &req_id_a,
@@ -1323,6 +1515,13 @@ mod tests {
                 .any(|field| field.name == "page"
                     && field.semantic_hints.iter().any(|hint| hint == "page"))
         );
+        assert!(
+            endpoint
+                .examples
+                .first()
+                .and_then(|example| example.query.get("q"))
+                .is_some_and(|values| values == &vec!["milk".to_string()])
+        );
         assert_eq!(endpoint.response.statuses, vec![200]);
         assert_eq!(endpoint.response.content_types, vec!["application/json"]);
     }
@@ -1345,7 +1544,7 @@ mod tests {
         );
         let request_id = event.request_id.clone();
 
-        recorder.record_request(&event);
+        recorder.record_request(&event, None);
         complete_successful_request(
             &mut recorder,
             &request_id,
@@ -1381,6 +1580,10 @@ mod tests {
         let example = build_request_example(
             &Url::parse("https://api.example.com/search?api_key=secret&q=milk")
                 .unwrap_or_else(|error| panic!("url should parse: {error}")),
+            &[
+                ("api_key".to_string(), "secret".to_string()),
+                ("q".to_string(), "milk".to_string()),
+            ],
             Some(r#"{"password":"hunter2","query":"milk"}"#),
             parse_request_body(
                 Some(r#"{"password":"hunter2","query":"milk"}"#),
@@ -1393,8 +1596,8 @@ mod tests {
         drop(catalog);
 
         assert_eq!(
-            example.query.get("api_key").map(String::as_str),
-            Some("[REDACTED]")
+            example.query.get("api_key"),
+            Some(&vec!["[REDACTED]".to_string()])
         );
         assert_eq!(
             example
@@ -1410,6 +1613,9 @@ mod tests {
                 .and_then(|body| body["query"].as_str()),
             Some("milk")
         );
+        assert!(example.redacted_url.contains("api_key=%5BREDACTED%5D"));
+        assert!(!example.redacted_url.contains("api_key=secret"));
+        assert_eq!(example.url, "/search");
     }
 
     #[test]
@@ -1422,7 +1628,7 @@ mod tests {
             None,
         );
         let request_id = event.request_id.clone();
-        recorder.record_request(&event);
+        recorder.record_request(&event, None);
         recorder.apply_loading_failed(&loading_failed_event(request_id.as_ref()));
 
         let catalog = recorder.build_catalog();
@@ -1436,12 +1642,15 @@ mod tests {
             url_patterns: vec!["*graphql*".to_string()],
             ..ApiCaptureConfig::default()
         });
-        recorder.record_request(&request_event(
-            "https://api.example.com/search?q=milk",
-            "GET",
-            "Fetch",
+        recorder.record_request(
+            &request_event(
+                "https://api.example.com/search?q=milk",
+                "GET",
+                "Fetch",
+                None,
+            ),
             None,
-        ));
+        );
         recorder.finish();
 
         let catalog = recorder.build_catalog();
@@ -1455,7 +1664,7 @@ mod tests {
         let request_id = event.request_id.clone();
 
         let mut excluded = ApiCaptureRecorder::new(ApiCaptureConfig::default());
-        excluded.record_request(&event);
+        excluded.record_request(&event, None);
         complete_successful_request(
             &mut excluded,
             &request_id,
@@ -1471,7 +1680,7 @@ mod tests {
             include_document_requests: true,
             ..ApiCaptureConfig::default()
         });
-        included.record_request(&event);
+        included.record_request(&event, None);
         complete_successful_request(
             &mut included,
             &request_id,
@@ -1505,8 +1714,8 @@ mod tests {
         let req_id_a = event_a.request_id.clone();
         let req_id_b = event_b.request_id.clone();
 
-        recorder.record_request(&event_a);
-        recorder.record_request(&event_b);
+        recorder.record_request(&event_a, None);
+        recorder.record_request(&event_b, None);
         complete_successful_request(
             &mut recorder,
             &req_id_a,
@@ -1525,5 +1734,108 @@ mod tests {
         let catalog = recorder.build_catalog();
         assert_eq!(catalog.endpoints.len(), 1);
         assert_eq!(catalog.endpoints[0].examples.len(), 1);
+    }
+
+    #[test]
+    fn repeated_query_params_are_preserved_and_marked_repeated() {
+        let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
+        let event = request_event(
+            "https://api.example.com/search?q=milk&filter=fresh&filter=organic",
+            "GET",
+            "Fetch",
+            None,
+        );
+        let request_id = event.request_id.clone();
+
+        recorder.record_request(&event, None);
+        complete_successful_request(
+            &mut recorder,
+            &request_id,
+            "https://api.example.com/search?q=milk&filter=fresh&filter=organic",
+            "application/json",
+            200,
+        );
+
+        let catalog = recorder.build_catalog();
+        let endpoint = &catalog.endpoints[0];
+        assert!(
+            endpoint
+                .query_params
+                .iter()
+                .any(|field| field.name == "filter" && field.required && field.repeated)
+        );
+        assert_eq!(
+            endpoint.examples[0].query.get("filter"),
+            Some(&vec!["fresh".to_string(), "organic".to_string()])
+        );
+        assert!(endpoint.examples[0].redacted_url.contains("filter=fresh"));
+        assert!(endpoint.examples[0].redacted_url.contains("filter=organic"));
+    }
+
+    #[test]
+    fn out_of_order_events_are_reconciled() {
+        let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
+        let event = request_event(
+            "https://api.example.com/search?q=milk",
+            "GET",
+            "Fetch",
+            None,
+        );
+        let request_id = event.request_id.clone();
+
+        recorder.apply_response_received(&response_event(
+            request_id.as_ref(),
+            "https://api.example.com/search?q=milk",
+            "application/json",
+            200,
+        ));
+        recorder.apply_loading_finished(&request_id);
+        recorder.record_request(&event, None);
+
+        let catalog = recorder.build_catalog();
+        assert_eq!(catalog.summary.captured_requests, 1);
+        assert_eq!(catalog.endpoints.len(), 1);
+        assert_eq!(catalog.endpoints[0].response.statuses, vec![200]);
+        assert_eq!(catalog.endpoints[0].response.content_types, vec![
+            "application/json"
+        ]);
+    }
+
+    #[test]
+    fn fallback_request_body_infers_graphql_operation() {
+        let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig::default());
+        let mut event = request_event("https://api.example.com/graphql", "POST", "Fetch", None);
+        event.request.has_post_data = Some(true);
+        let request_id = event.request_id.clone();
+        let fallback_body = BASE64_STANDARD.encode(
+            serde_json::to_vec(&json!({
+                "query": "query SearchProducts($query: String!) { search(query: $query) { id } }",
+                "variables": {
+                    "query": "milk"
+                }
+            }))
+            .unwrap_or_else(|error| panic!("json body should serialize: {error}")),
+        );
+
+        recorder.record_request(&event, Some(fallback_body));
+        complete_successful_request(
+            &mut recorder,
+            &request_id,
+            "https://api.example.com/graphql",
+            "application/json",
+            200,
+        );
+
+        let catalog = recorder.build_catalog();
+        assert_eq!(catalog.endpoints.len(), 1);
+        let endpoint = &catalog.endpoints[0];
+        assert_eq!(endpoint.body_kind, "graphql");
+        assert_eq!(endpoint.operation_name.as_deref(), Some("SearchProducts"));
+        assert!(
+            endpoint
+                .body
+                .as_ref()
+                .is_some_and(|body| body.fields.iter().any(|field| field.name == "query"))
+        );
     }
 }
