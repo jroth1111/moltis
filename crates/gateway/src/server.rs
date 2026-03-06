@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context as _;
 use secrecy::ExposeSecret;
 
 use {
@@ -1507,14 +1508,14 @@ pub async fn prepare_gateway(
             std::str::FromStr,
         };
         let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
-            .expect("invalid database path")
+            .with_context(|| format!("invalid database path {}", db_path.display()))?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5));
         sqlx::SqlitePool::connect_with(options)
             .await
-            .expect("failed to open moltis.db")
+            .with_context(|| format!("failed to open {}", db_path.display()))?
     };
     let _ = HOOK_DB_POOL.set(Arc::new(db_pool.clone()));
     let _ = HOOK_ESTOP_FLAG.set(Arc::clone(&estop_flag));
@@ -1523,26 +1524,26 @@ pub async fn prepare_gateway(
     // Order matters: sessions depends on projects (FK reference).
     moltis_projects::run_migrations(&db_pool)
         .await
-        .expect("failed to run projects migrations");
+        .context("failed to run projects migrations")?;
     moltis_sessions::run_migrations(&db_pool)
         .await
-        .expect("failed to run sessions migrations");
+        .context("failed to run sessions migrations")?;
     moltis_cron::run_migrations(&db_pool)
         .await
-        .expect("failed to run cron migrations");
+        .context("failed to run cron migrations")?;
     // Gateway's own tables (auth, message_log, channels).
     crate::run_migrations(&db_pool)
         .await
-        .expect("failed to run gateway migrations");
+        .context("failed to run gateway migrations")?;
     moltis_tinder::run_migrations(&db_pool)
         .await
-        .expect("failed to run tinder migrations");
+        .context("failed to run tinder migrations")?;
 
     // Vault migrations (vault_metadata table).
     #[cfg(feature = "vault")]
     moltis_vault::run_migrations(&db_pool)
         .await
-        .expect("failed to run vault migrations");
+        .context("failed to run vault migrations")?;
 
     services.exec_approval = Arc::new(LiveExecApprovalService::new(
         Arc::clone(&approval_manager),
@@ -1583,13 +1584,13 @@ pub async fn prepare_gateway(
     let credential_store = Arc::new(
         auth::CredentialStore::with_vault(db_pool.clone(), &config.auth, vault.clone())
             .await
-            .expect("failed to init credential store"),
+            .context("failed to init credential store")?,
     );
     #[cfg(not(feature = "vault"))]
     let credential_store = Arc::new(
         auth::CredentialStore::new(db_pool.clone())
             .await
-            .expect("failed to init credential store"),
+            .context("failed to init credential store")?,
     );
 
     // Runtime env overrides from the settings UI (`/api/env`) layered after
@@ -3047,7 +3048,9 @@ pub async fn prepare_gateway(
             };
             let options =
                 SqliteConnectOptions::from_str(&format!("sqlite:{}", memory_db_path.display()))
-                    .expect("invalid memory database path")
+                    .with_context(|| {
+                        format!("invalid memory database path {}", memory_db_path.display())
+                    })?
                     .create_if_missing(true)
                     .journal_mode(SqliteJournalMode::Wal)
                     .synchronous(SqliteSynchronous::Normal)

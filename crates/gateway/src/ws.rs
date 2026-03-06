@@ -1,5 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use serde::Serialize;
 use {
     axum::extract::ws::{CloseFrame, Message, WebSocket},
     futures::{SinkExt, stream::StreamExt},
@@ -21,12 +22,61 @@ use crate::{
     state::{ConnectedClient, GatewayState, OutboundWsFrame},
 };
 
+const INTERNAL_ERROR_CLOSE_CODE: u16 = 1011;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundJsonError {
+    Serialize,
+    ChannelClosed,
+}
+
 fn top_level_param_keys(params: &Option<serde_json::Value>) -> Vec<String> {
     params
         .as_ref()
         .and_then(serde_json::Value::as_object)
         .map(|obj| obj.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+fn try_send_json_frame<T: Serialize>(
+    client_tx: &mpsc::Sender<OutboundWsFrame>,
+    value: &T,
+    conn_id: &str,
+    context: &'static str,
+) -> Result<(), OutboundJsonError> {
+    let payload = serde_json::to_string(value).map_err(|error| {
+        warn!(
+            conn_id,
+            context,
+            error = %error,
+            "ws: failed to serialize outbound frame"
+        );
+        OutboundJsonError::Serialize
+    })?;
+
+    client_tx
+        .try_send(OutboundWsFrame::Text(payload))
+        .map_err(|error| {
+            debug!(
+                conn_id,
+                context,
+                error = %error,
+                "ws: failed to queue outbound frame"
+            );
+            OutboundJsonError::ChannelClosed
+        })
+}
+
+fn send_internal_error_close(
+    client_tx: &mpsc::Sender<OutboundWsFrame>,
+    conn_id: &str,
+    context: &'static str,
+) {
+    let _ = client_tx.try_send(OutboundWsFrame::Close {
+        code: INTERNAL_ERROR_CLOSE_CODE,
+        reason: format!("internal server error: {context}"),
+    });
+    warn!(conn_id, context, "ws: closing connection after outbound serialization failure");
 }
 
 /// Handle a single WebSocket connection through its full lifecycle:
@@ -132,8 +182,7 @@ pub async fn handle_connection(
                 ),
             ),
         );
-        #[allow(clippy::unwrap_used)] // serializing known-valid struct
-        let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
+        let _ = try_send_json_frame(&client_tx, &err, &conn_id, "protocol mismatch response");
         drop(client_tx);
         write_handle.abort();
         return;
@@ -209,8 +258,7 @@ pub async fn handle_connection(
             &request_id,
             ErrorShape::new(error_codes::UNAUTHORIZED, "authentication failed"),
         );
-        #[allow(clippy::unwrap_used)] // serializing known-valid struct
-        let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
+        let _ = try_send_json_frame(&client_tx, &err, &conn_id, "unauthorized response");
         drop(client_tx);
         write_handle.abort();
         return;
@@ -236,8 +284,7 @@ pub async fn handle_connection(
                     "API key has no scopes — specify at least one scope when creating the key",
                 ),
             );
-            #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
+            let _ = try_send_json_frame(&client_tx, &err, &conn_id, "forbidden response");
             drop(client_tx);
             write_handle.abort();
             return;
@@ -286,11 +333,25 @@ pub async fn handle_connection(
         policy: Policy::default(),
         extensions: Extensions::new(),
     };
-    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-    let hello_val = serde_json::to_value(&hello).unwrap();
+    let hello_val = match serde_json::to_value(&hello) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(conn_id = %conn_id, error = %error, "ws: failed to serialize hello-ok payload");
+            send_internal_error_close(&client_tx, &conn_id, "hello-ok");
+            drop(client_tx);
+            write_handle.abort();
+            return;
+        },
+    };
     let resp = ResponseFrame::ok(&request_id, hello_val);
-    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-    let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&resp).unwrap()));
+    if let Err(error) = try_send_json_frame(&client_tx, &resp, &conn_id, "hello-ok response") {
+        if error == OutboundJsonError::Serialize {
+            send_internal_error_close(&client_tx, &conn_id, "hello-ok response");
+        }
+        drop(client_tx);
+        write_handle.abort();
+        return;
+    }
 
     info!(
         conn_id = %conn_id,
@@ -416,8 +477,14 @@ pub async fn handle_connection(
                 serde_json::json!({ "code": error_codes::PAYLOAD_TOO_LARGE, "message": "payload too large", "maxBytes": MAX_PAYLOAD_BYTES }),
                 state.next_seq(),
             );
-            #[allow(clippy::unwrap_used)] // serializing known-valid struct
-            let _ = client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
+            if let Err(error) =
+                try_send_json_frame(&client_tx, &err, &conn_id, "payload too large error")
+            {
+                if error == OutboundJsonError::Serialize {
+                    send_internal_error_close(&client_tx, &conn_id, "payload too large error");
+                }
+                break;
+            }
             continue;
         }
 
@@ -430,9 +497,14 @@ pub async fn handle_connection(
                     serde_json::json!({ "message": "invalid frame" }),
                     state.next_seq(),
                 );
-                #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let _ =
-                    client_tx.try_send(OutboundWsFrame::Text(serde_json::to_string(&err).unwrap()));
+                if let Err(error) =
+                    try_send_json_frame(&client_tx, &err, &conn_id, "invalid frame error")
+                {
+                    if error == OutboundJsonError::Serialize {
+                        send_internal_error_close(&client_tx, &conn_id, "invalid frame error");
+                    }
+                    break;
+                }
                 continue;
             },
         };
@@ -458,10 +530,17 @@ pub async fn handle_connection(
                             "gateway is shutting down; request rejected",
                         ),
                     );
-                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                    let _ = client_tx.try_send(OutboundWsFrame::Text(
-                        serde_json::to_string(&response).unwrap(),
-                    ));
+                    if let Err(error) = try_send_json_frame(
+                        &client_tx,
+                        &response,
+                        &conn_id,
+                        "shutdown response",
+                    ) {
+                        if error == OutboundJsonError::Serialize {
+                            send_internal_error_close(&client_tx, &conn_id, "shutdown response");
+                        }
+                        break;
+                    }
                     continue;
                 }
 
@@ -495,10 +574,14 @@ pub async fn handle_connection(
                         "ws: sent response frame"
                     );
                 }
-                #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let _ = client_tx.try_send(OutboundWsFrame::Text(
-                    serde_json::to_string(&response).unwrap(),
-                ));
+                if let Err(error) =
+                    try_send_json_frame(&client_tx, &response, &conn_id, "rpc response")
+                {
+                    if error == OutboundJsonError::Serialize {
+                        send_internal_error_close(&client_tx, &conn_id, "rpc response");
+                    }
+                    break;
+                }
             },
             GatewayFrame::Response(res) => {
                 // v4 bidirectional RPC: client responding to a server-initiated request.
@@ -610,4 +693,52 @@ async fn wait_for_connect(
         }
     }
     anyhow::bail!("connection closed before handshake")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutboundJsonError, try_send_json_frame};
+    use crate::state::OutboundWsFrame;
+    use serde::ser::{Error as _, Serialize, Serializer};
+    use tokio::sync::mpsc;
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(S::Error::custom("boom"))
+        }
+    }
+
+    #[tokio::test]
+    async fn try_send_json_frame_rejects_serialize_failures() {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let result = try_send_json_frame(&tx, &FailingSerialize, "conn-1", "test frame");
+
+        assert_eq!(result, Err(OutboundJsonError::Serialize));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn try_send_json_frame_enqueues_serialized_payload() {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let result = try_send_json_frame(
+            &tx,
+            &serde_json::json!({ "ok": true }),
+            "conn-2",
+            "test frame",
+        );
+
+        assert_eq!(result, Ok(()));
+        match rx.recv().await {
+            Some(OutboundWsFrame::Text(payload)) => assert_eq!(payload, r#"{"ok":true}"#),
+            Some(OutboundWsFrame::Close { .. }) => panic!("expected text frame"),
+            None => panic!("expected queued frame"),
+        }
+    }
 }
