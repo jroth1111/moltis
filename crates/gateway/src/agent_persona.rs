@@ -51,6 +51,57 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn serialize_tool_list(value: &[String]) -> Result<String> {
+    serde_json::to_string(value).map_err(|error| {
+        AgentError::InvalidRequest(format!("failed to encode tool list to JSON: {error}"))
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct AgentSpawnPolicyFile {
+    allowed_tools: Vec<String>,
+    denied_tools: Vec<String>,
+    delegate_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_prompt_suffix: Option<String>,
+}
+
+fn persist_spawn_policy_file(
+    agent_id: &str,
+    allowed_tools: &[String],
+    denied_tools: &[String],
+    delegate_only: bool,
+    system_prompt_suffix: Option<&String>,
+) -> Result<()> {
+    let dir = moltis_config::agent_workspace_dir(agent_id);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(".spawn-policy.json");
+
+    if allowed_tools.is_empty()
+        && denied_tools.is_empty()
+        && !delegate_only
+        && system_prompt_suffix.is_none()
+    {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(());
+    }
+
+    let payload = AgentSpawnPolicyFile {
+        allowed_tools: allowed_tools.to_vec(),
+        denied_tools: denied_tools.to_vec(),
+        delegate_only,
+        system_prompt_suffix: system_prompt_suffix.cloned(),
+    };
+    let content = serde_json::to_string_pretty(&payload)
+        .map_err(|error| AgentError::InvalidRequest(format!("failed to encode policy: {error}")))?;
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
 /// A persisted agent persona.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentPersona {
@@ -64,6 +115,14 @@ pub struct AgentPersona {
     pub theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+    #[serde(default)]
+    pub delegate_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt_suffix: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -79,6 +138,14 @@ pub struct CreateAgentParams {
     pub theme: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub denied_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub delegate_only: Option<bool>,
+    #[serde(default)]
+    pub system_prompt_suffix: Option<String>,
 }
 
 /// Parameters for updating an existing agent.
@@ -92,6 +159,14 @@ pub struct UpdateAgentParams {
     pub theme: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub denied_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub delegate_only: Option<bool>,
+    #[serde(default)]
+    pub system_prompt_suffix: Option<Option<String>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -102,8 +177,16 @@ struct AgentRow {
     emoji: Option<String>,
     theme: Option<String>,
     description: Option<String>,
+    allowed_tools: String,
+    denied_tools: String,
+    delegate_only: i64,
+    system_prompt_suffix: Option<String>,
     created_at: i64,
     updated_at: i64,
+}
+
+fn parse_tool_list(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
 impl From<AgentRow> for AgentPersona {
@@ -115,6 +198,10 @@ impl From<AgentRow> for AgentPersona {
             emoji: r.emoji,
             theme: r.theme,
             description: r.description,
+            allowed_tools: parse_tool_list(&r.allowed_tools),
+            denied_tools: parse_tool_list(&r.denied_tools),
+            delegate_only: r.delegate_only != 0,
+            system_prompt_suffix: r.system_prompt_suffix,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -245,17 +332,40 @@ impl AgentPersonaStore {
     /// Create a new agent persona and its workspace directory.
     pub async fn create(&self, params: CreateAgentParams) -> Result<AgentPersona> {
         validate_agent_id(&params.id)?;
+        let allowed_tools = params.allowed_tools.unwrap_or_default();
+        let denied_tools = params.denied_tools.unwrap_or_default();
+        let delegate_only = params.delegate_only.unwrap_or(false);
+        let system_prompt_suffix = params.system_prompt_suffix.clone();
 
         let now = now_ms();
+        let allowed_tools_json = serialize_tool_list(&allowed_tools)?;
+        let denied_tools_json = serialize_tool_list(&denied_tools)?;
         sqlx::query(
-            r#"INSERT INTO agents (id, name, is_default, emoji, theme, description, created_at, updated_at)
-               VALUES (?, ?, 0, ?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO agents (
+                   id,
+                   name,
+                   is_default,
+                   emoji,
+                   theme,
+                   description,
+                   allowed_tools,
+                   denied_tools,
+                   delegate_only,
+                   system_prompt_suffix,
+                   created_at,
+                   updated_at
+               )
+               VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&params.id)
         .bind(&params.name)
         .bind(&params.emoji)
         .bind(&params.theme)
         .bind(&params.description)
+        .bind(&allowed_tools_json)
+        .bind(&denied_tools_json)
+        .bind(delegate_only as i64)
+        .bind(&system_prompt_suffix)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -270,6 +380,13 @@ impl AgentPersonaStore {
             theme: params.theme.clone(),
         };
         moltis_config::save_identity_for_agent(&params.id, &identity)?;
+        persist_spawn_policy_file(
+            &params.id,
+            &allowed_tools,
+            &denied_tools,
+            delegate_only,
+            system_prompt_suffix.as_ref(),
+        )?;
 
         Ok(AgentPersona {
             id: params.id,
@@ -278,6 +395,10 @@ impl AgentPersonaStore {
             emoji: params.emoji,
             theme: params.theme,
             description: params.description,
+            allowed_tools,
+            denied_tools,
+            delegate_only,
+            system_prompt_suffix,
             created_at: now,
             updated_at: now,
         })
@@ -300,15 +421,27 @@ impl AgentPersonaStore {
         let emoji = params.emoji.or(existing.emoji);
         let theme = params.theme.or(existing.theme);
         let description = params.description.or(existing.description);
+        let allowed_tools = params.allowed_tools.unwrap_or(existing.allowed_tools);
+        let denied_tools = params.denied_tools.unwrap_or(existing.denied_tools);
+        let delegate_only = params.delegate_only.unwrap_or(existing.delegate_only);
+        let system_prompt_suffix = params
+            .system_prompt_suffix
+            .unwrap_or(existing.system_prompt_suffix);
         let now = now_ms();
+        let allowed_tools_json = serialize_tool_list(&allowed_tools)?;
+        let denied_tools_json = serialize_tool_list(&denied_tools)?;
 
         sqlx::query(
-            "UPDATE agents SET name = ?, emoji = ?, theme = ?, description = ?, updated_at = ? WHERE id = ?",
+            "UPDATE agents SET name = ?, emoji = ?, theme = ?, description = ?, allowed_tools = ?, denied_tools = ?, delegate_only = ?, system_prompt_suffix = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&name)
         .bind(&emoji)
         .bind(&theme)
         .bind(&description)
+        .bind(&allowed_tools_json)
+        .bind(&denied_tools_json)
+        .bind(delegate_only as i64)
+        .bind(&system_prompt_suffix)
         .bind(now)
         .bind(id)
         .execute(&self.pool)
@@ -321,6 +454,13 @@ impl AgentPersonaStore {
             theme: theme.clone(),
         };
         moltis_config::save_identity_for_agent(id, &identity)?;
+        persist_spawn_policy_file(
+            id,
+            &allowed_tools,
+            &denied_tools,
+            delegate_only,
+            system_prompt_suffix.as_ref(),
+        )?;
 
         Ok(AgentPersona {
             id: id.to_string(),
@@ -329,6 +469,10 @@ impl AgentPersonaStore {
             emoji,
             theme,
             description,
+            allowed_tools,
+            denied_tools,
+            delegate_only,
+            system_prompt_suffix,
             created_at: existing.created_at,
             updated_at: now,
         })
@@ -366,7 +510,13 @@ impl AgentPersonaStore {
                     error = %e,
                     "failed to archive agent workspace, removing instead"
                 );
-                let _ = std::fs::remove_dir_all(&workspace);
+                if let Err(remove_err) = std::fs::remove_dir_all(&workspace) {
+                    tracing::error!(
+                        agent_id = id,
+                        error = %remove_err,
+                        "failed to remove agent workspace after archive failure"
+                    );
+                }
             }
         }
 
@@ -395,6 +545,10 @@ fn synthesize_main_agent(is_default: bool) -> AgentPersona {
         emoji: identity.as_ref().and_then(|i| i.emoji.clone()),
         theme: identity.as_ref().and_then(|i| i.theme.clone()),
         description: Some("Default agent".to_string()),
+        allowed_tools: Vec::new(),
+        denied_tools: Vec::new(),
+        delegate_only: false,
+        system_prompt_suffix: None,
         created_at: 0,
         updated_at: 0,
     }
@@ -403,7 +557,15 @@ fn synthesize_main_agent(is_default: bool) -> AgentPersona {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        std::sync::{Mutex, OnceLock},
+    };
+
+    fn data_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_validate_agent_id() {
@@ -430,6 +592,10 @@ mod tests {
                 emoji       TEXT,
                 theme       TEXT,
                 description TEXT,
+                allowed_tools TEXT NOT NULL DEFAULT '[]',
+                denied_tools TEXT NOT NULL DEFAULT '[]',
+                delegate_only INTEGER NOT NULL DEFAULT 0,
+                system_prompt_suffix TEXT,
                 created_at  INTEGER NOT NULL,
                 updated_at  INTEGER NOT NULL
             )"#,
@@ -462,6 +628,7 @@ mod tests {
                 emoji: Some("🔬".to_string()),
                 theme: Some("analytical".to_string()),
                 description: Some("Helps with research tasks".to_string()),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -486,6 +653,7 @@ mod tests {
                 emoji: None,
                 theme: None,
                 description: None,
+                ..Default::default()
             })
             .await;
         assert!(result.is_err());
@@ -502,6 +670,7 @@ mod tests {
                 emoji: None,
                 theme: None,
                 description: None,
+                ..Default::default()
             })
             .await;
         assert!(result.is_err());
@@ -518,6 +687,7 @@ mod tests {
                 emoji: None,
                 theme: None,
                 description: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -530,6 +700,7 @@ mod tests {
                     emoji: Some("✍️".to_string()),
                     theme: None,
                     description: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -551,6 +722,7 @@ mod tests {
                     emoji: None,
                     theme: None,
                     description: None,
+                    ..Default::default()
                 },
             )
             .await;
@@ -568,6 +740,7 @@ mod tests {
                 emoji: None,
                 theme: None,
                 description: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -594,6 +767,7 @@ mod tests {
                 emoji: None,
                 theme: None,
                 description: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -615,6 +789,7 @@ mod tests {
                 emoji: None,
                 theme: None,
                 description: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -641,6 +816,7 @@ mod tests {
                 emoji: None,
                 theme: None,
                 description: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -652,6 +828,7 @@ mod tests {
                 emoji: None,
                 theme: None,
                 description: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -670,5 +847,64 @@ mod tests {
         let main = store.get("main").await.unwrap().unwrap();
         assert_eq!(main.id, "main");
         assert!(main.is_default);
+    }
+
+    #[tokio::test]
+    async fn test_create_persists_spawn_policy_file_and_update_clears_it() {
+        let _guard = data_dir_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let previous_data_dir = moltis_config::data_dir();
+        let temp = tempfile::tempdir().unwrap();
+        moltis_config::set_data_dir(temp.path().to_path_buf());
+
+        let pool = test_pool().await;
+        let store = AgentPersonaStore::new(pool);
+        let created = store
+            .create(CreateAgentParams {
+                id: "reviewer".to_string(),
+                name: "Reviewer".to_string(),
+                allowed_tools: Some(vec!["read_file".to_string()]),
+                denied_tools: Some(vec!["exec".to_string()]),
+                delegate_only: Some(true),
+                system_prompt_suffix: Some("Use strict review mode.".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(created.allowed_tools, vec!["read_file".to_string()]);
+        assert_eq!(created.denied_tools, vec!["exec".to_string()]);
+        assert!(created.delegate_only);
+        assert_eq!(
+            created.system_prompt_suffix.as_deref(),
+            Some("Use strict review mode.")
+        );
+
+        let policy_path = moltis_config::agent_workspace_dir("reviewer").join(".spawn-policy.json");
+        let content = std::fs::read_to_string(&policy_path).unwrap();
+        assert!(content.contains("\"allowed_tools\": ["));
+        assert!(content.contains("\"read_file\""));
+        assert!(content.contains("\"delegate_only\": true"));
+
+        let updated = store
+            .update(
+                "reviewer",
+                UpdateAgentParams {
+                    allowed_tools: Some(Vec::new()),
+                    denied_tools: Some(Vec::new()),
+                    delegate_only: Some(false),
+                    system_prompt_suffix: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(updated.allowed_tools.is_empty());
+        assert!(updated.denied_tools.is_empty());
+        assert!(!updated.delegate_only);
+        assert!(updated.system_prompt_suffix.is_none());
+        assert!(!policy_path.exists());
+
+        moltis_config::set_data_dir(previous_data_dir);
     }
 }

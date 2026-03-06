@@ -37,11 +37,10 @@ use {
     },
     moltis_providers::{ProviderRegistry, raw_model_id},
     moltis_sessions::{
-        ContentBlock, MessageContent, PersistedMessage,
+        ContentBlock, MessageContent, PersistedMessage, SessionResumeContext,
         metadata::{SessionEntry, SqliteSessionMetadata},
         state_store::SessionStateStore,
         store::SessionStore,
-        SessionResumeContext,
     },
     moltis_skills::discover::SkillDiscoverer,
     moltis_tools::policy::effective_tool_policy,
@@ -1378,7 +1377,9 @@ fn resolve_explicit_skill_invocation(
     discovered_skills: &[moltis_skills::types::SkillMetadata],
 ) -> Option<ExplicitSkillInvocation> {
     let (skill_name, arguments) = parse_explicit_skill_command(text)?;
-    let skill = discovered_skills.iter().find(|skill| skill.name == skill_name)?;
+    let skill = discovered_skills
+        .iter()
+        .find(|skill| skill.name == skill_name)?;
     let skill_body = load_skill_body(skill)?;
     let rendered_body = render_skill_body_with_arguments(&skill_body, &arguments);
     let rendered_prompt = format!(
@@ -3632,10 +3633,7 @@ async fn persist_handoff_context(
         return;
     };
 
-    if let Err(error) = store
-        .set_handoff(session_key, handoff)
-        .await
-    {
+    if let Err(error) = store.set_handoff(session_key, handoff).await {
         warn!(
             session = %session_key,
             error = %error,
@@ -3662,10 +3660,7 @@ async fn consume_inbound_handoff_context(
         },
     };
 
-    if let Err(error) = store
-        .clear_handoff(session_key)
-        .await
-    {
+    if let Err(error) = store.clear_handoff(session_key).await {
         warn!(
             session = %session_key,
             error = %error,
@@ -5329,7 +5324,8 @@ impl ChatService for LiveChatService {
                 Vec::new()
             },
         };
-        let explicit_skill_invocation = resolve_explicit_skill_invocation(&text, &discovered_skills);
+        let explicit_skill_invocation =
+            resolve_explicit_skill_invocation(&text, &discovered_skills);
         if let Some(invocation) = explicit_skill_invocation.as_ref() {
             info!(
                 session = %session_key,
@@ -8925,6 +8921,7 @@ async fn run_with_tools(
     if let Some(tid) = trace_id.as_deref() {
         tool_context["_trace_id"] = serde_json::json!(tid);
     }
+    tool_context["_agent_id"] = serde_json::json!(agent_id);
 
     // Research phase: gather context before the main agent turn when enabled.
     let _ = maybe_append_research_context(
