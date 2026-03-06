@@ -3206,6 +3206,14 @@ fn truncate_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    use axum::{Router, response::Html, routing::get};
+    use tokio::{
+        net::TcpListener,
+        sync::{Mutex, MutexGuard},
+        task::JoinHandle,
+    };
 
     fn sample_api_catalog() -> crate::api_capture::ApiCatalog {
         crate::api_capture::ApiCatalog {
@@ -3242,6 +3250,104 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn live_browser_test_mutex() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    async fn acquire_live_browser_test_guard() -> MutexGuard<'static, ()> {
+        live_browser_test_mutex().lock().await
+    }
+
+    fn live_test_manager() -> BrowserManager {
+        let mut config = BrowserConfig::default();
+        config.persist_profile = false;
+        config.protection.enabled = false;
+        config.protection.timeout_ms = 90_000;
+        BrowserManager::new(config)
+    }
+
+    async fn parity_vendor_script_page() -> Html<&'static str> {
+        Html(
+            r#"<!doctype html>
+<html>
+  <head>
+    <title>Storefront</title>
+    <script src="/_Incapsula_Resource"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Products</h1>
+      <p>This page is intentionally contentful and interactive.</p>
+      <a href="/shop">Shop now</a>
+      <button type="button">Add to cart</button>
+    </main>
+  </body>
+</html>"#,
+        )
+    }
+
+    async fn parity_unresolved_page() -> Html<&'static str> {
+        Html(
+            r#"<!doctype html>
+<html>
+  <head>
+    <title>Hold tight</title>
+  </head>
+  <body></body>
+</html>"#,
+        )
+    }
+
+    async fn parity_imperva_page() -> Html<&'static str> {
+        Html(
+            r#"<!doctype html>
+<html>
+  <head><title>Blocked</title></head>
+  <body>pardon our interruption _incapsula_resource</body>
+</html>"#,
+        )
+    }
+
+    async fn start_parity_server() -> Result<(String, JoinHandle<()>), Box<dyn std::error::Error>> {
+        let app = Router::new()
+            .route("/content", get(parity_vendor_script_page))
+            .route("/unresolved", get(parity_unresolved_page))
+            .route("/imperva", get(parity_imperva_page));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap_or_else(|error| panic!("parity server should run: {error}"));
+        });
+        Ok((origin, server))
+    }
+
+    async fn navigation_outcome_for_backend(
+        manager: &BrowserManager,
+        backend: BrowserBackendKind,
+        url: &str,
+    ) -> Result<NavigationOutcome, Error> {
+        let (sid, _) = manager
+            .create_session_for_backend(backend, BrowserPreference::Auto)
+            .await?;
+        let diagnostics = match backend {
+            BrowserBackendKind::Chromiumoxide => {
+                let page = manager.pool.get_page(&sid).await?;
+                page.goto(url)
+                    .await
+                    .map_err(|error| Error::NavigationFailed(error.to_string()))?;
+                let _ = page.wait_for_navigation().await;
+                manager.wait_for_challenge_resolution_if_needed(&page).await
+            },
+            BrowserBackendKind::Patchright => manager.navigate_patchright_and_assess(&sid, url).await?,
+        };
+        let outcome = manager.build_navigation_outcome(&diagnostics, backend, false);
+        manager.pool.close_session(&sid).await?;
+        Ok(outcome)
     }
 
     #[test]
@@ -3411,5 +3517,99 @@ mod tests {
             sanitize_evaluate_result(serde_json::json!({"text": "ke\u{200b}ep"})),
             serde_json::json!({"text": "ke\u{200b}ep"})
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_parity_contentful_vendor_script_page() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let _guard = acquire_live_browser_test_guard().await;
+        let (origin, server) = start_parity_server().await?;
+        let manager = live_test_manager();
+
+        let chromium = navigation_outcome_for_backend(
+            &manager,
+            BrowserBackendKind::Chromiumoxide,
+            &format!("{origin}/content"),
+        )
+        .await?;
+        let patchright = navigation_outcome_for_backend(
+            &manager,
+            BrowserBackendKind::Patchright,
+            &format!("{origin}/content"),
+        )
+        .await?;
+
+        server.abort();
+
+        assert_eq!(chromium.verdict, patchright.verdict);
+        assert_eq!(chromium.trigger, patchright.trigger);
+        assert_eq!(
+            chromium.challenge.as_ref().map(|value| value.challenge_type),
+            patchright.challenge.as_ref().map(|value| value.challenge_type)
+        );
+        assert_eq!(chromium.final_url, patchright.final_url);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_parity_unresolved_page() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = acquire_live_browser_test_guard().await;
+        let (origin, server) = start_parity_server().await?;
+        let manager = live_test_manager();
+
+        let chromium = navigation_outcome_for_backend(
+            &manager,
+            BrowserBackendKind::Chromiumoxide,
+            &format!("{origin}/unresolved"),
+        )
+        .await?;
+        let patchright = navigation_outcome_for_backend(
+            &manager,
+            BrowserBackendKind::Patchright,
+            &format!("{origin}/unresolved"),
+        )
+        .await?;
+
+        server.abort();
+
+        assert_eq!(chromium.verdict, patchright.verdict);
+        assert_eq!(chromium.trigger, patchright.trigger);
+        assert_eq!(
+            chromium.challenge.as_ref().map(|value| value.challenge_type),
+            patchright.challenge.as_ref().map(|value| value.challenge_type)
+        );
+        assert_eq!(chromium.final_url, patchright.final_url);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_parity_explicit_imperva_page() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = acquire_live_browser_test_guard().await;
+        let (origin, server) = start_parity_server().await?;
+        let manager = live_test_manager();
+
+        let chromium = navigation_outcome_for_backend(
+            &manager,
+            BrowserBackendKind::Chromiumoxide,
+            &format!("{origin}/imperva"),
+        )
+        .await?;
+        let patchright = navigation_outcome_for_backend(
+            &manager,
+            BrowserBackendKind::Patchright,
+            &format!("{origin}/imperva"),
+        )
+        .await?;
+
+        server.abort();
+
+        assert_eq!(chromium.verdict, patchright.verdict);
+        assert_eq!(chromium.trigger, patchright.trigger);
+        assert_eq!(
+            chromium.challenge.as_ref().map(|value| value.challenge_type),
+            patchright.challenge.as_ref().map(|value| value.challenge_type)
+        );
+        assert_eq!(chromium.final_url, patchright.final_url);
+        Ok(())
     }
 }
