@@ -303,14 +303,20 @@ fn flatten_tool_result(result: ToolsCallResult) -> Result<Value> {
     Ok(serde_json::json!({ "content": content_json }))
 }
 
-fn parse_selected_tools(params: &Value) -> HashSet<String> {
-    params
-        .get("selected_tools")
-        .and_then(|v| serde_json::from_value::<Vec<SelectedTool>>(v.clone()).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|entry| format!("{}::{}", entry.server, entry.tool))
-        .collect()
+fn parse_selected_tools(params: &Value) -> Result<HashSet<String>> {
+    let Some(raw) = params.get("selected_tools") else {
+        return Ok(HashSet::new());
+    };
+
+    let selected = serde_json::from_value::<Vec<SelectedTool>>(raw.clone())
+        .context("selected_tools must be an array of {server, tool} objects")?;
+    let mut selectors = HashSet::with_capacity(selected.len());
+    for entry in selected {
+        let selector = normalize_selector(&format!("{}::{}", entry.server, entry.tool))
+            .ok_or_else(|| anyhow!("selected_tools entries must include non-empty server and tool"))?;
+        selectors.insert(selector);
+    }
+    Ok(selectors)
 }
 
 fn parse_detail_level(raw: Option<&str>) -> Result<ToolDetailLevel> {
@@ -706,6 +712,7 @@ impl CodeExecStore {
                         updated_at INTEGER NOT NULL,
                         status TEXT NOT NULL,
                         program_json TEXT NOT NULL,
+                        program_hash TEXT,
                         tool_calls INTEGER NOT NULL DEFAULT 0,
                         result_json TEXT,
                         error_text TEXT
@@ -748,28 +755,88 @@ impl CodeExecStore {
                 )
                 .execute(&pool)
                 .await?;
+                let has_program_hash = sqlx::query("PRAGMA table_info(mcp_code_runs)")
+                    .fetch_all(&pool)
+                    .await?
+                    .iter()
+                    .any(|row| {
+                        row.try_get::<String, _>("name")
+                            .ok()
+                            .is_some_and(|name| name == "program_hash")
+                    });
+                if !has_program_hash {
+                    sqlx::query("ALTER TABLE mcp_code_runs ADD COLUMN program_hash TEXT")
+                        .execute(&pool)
+                        .await?;
+                }
                 Ok(pool)
             })
             .await
     }
 
-    async fn start_run(&self, run_id: &str, program: &Program) -> Result<()> {
+    async fn start_run(&self, run_id: &str, program: &Program) -> Result<String> {
         let pool = self.pool().await?;
         let now = now_unix_ts();
         let program_json = serde_json::to_string(program)?;
+        let program_hash = program_fingerprint(program)?;
+        let existing = sqlx::query(
+            r#"
+            SELECT program_hash, program_json
+            FROM mcp_code_runs
+            WHERE run_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(row) = existing {
+            let stored_program_json: String = row.try_get("program_json")?;
+            let stored_program_hash = if let Some(hash) = row.try_get::<Option<String>, _>("program_hash")? {
+                hash
+            } else {
+                let stored_program: Program = serde_json::from_str(&stored_program_json)
+                    .with_context(|| format!("stored program for run '{run_id}' is invalid"))?;
+                let hash = program_fingerprint(&stored_program)?;
+                sqlx::query(
+                    r#"
+                    UPDATE mcp_code_runs
+                    SET program_hash = ?, updated_at = ?
+                    WHERE run_id = ?
+                    "#,
+                )
+                .bind(&hash)
+                .bind(now)
+                .bind(run_id)
+                .execute(pool)
+                .await?;
+                hash
+            };
+
+            if stored_program_hash != program_hash {
+                return Err(anyhow!(
+                    "run_id '{run_id}' already exists for a different program"
+                ));
+            }
+
+            return Ok(program_hash);
+        }
+
         sqlx::query(
             r#"
-            INSERT OR IGNORE INTO mcp_code_runs (run_id, created_at, updated_at, status, program_json)
-            VALUES (?, ?, ?, 'running', ?)
+            INSERT INTO mcp_code_runs (run_id, created_at, updated_at, status, program_json, program_hash)
+            VALUES (?, ?, ?, 'running', ?, ?)
             "#,
         )
         .bind(run_id)
         .bind(now)
         .bind(now)
         .bind(program_json)
+        .bind(&program_hash)
         .execute(pool)
         .await?;
-        Ok(())
+        Ok(program_hash)
     }
 
     async fn mark_run_done(
@@ -853,17 +920,26 @@ impl CodeExecStore {
         Ok(())
     }
 
-    async fn load_successful_outputs(&self, run_id: &str) -> Result<Vec<(String, usize, Value)>> {
+    async fn load_successful_outputs(
+        &self,
+        run_id: &str,
+        program_hash: &str,
+    ) -> Result<Vec<(String, usize, Value)>> {
         let pool = self.pool().await?;
         let rows = sqlx::query(
             r#"
-            SELECT step_id, ordinal, output_json
-            FROM mcp_code_steps
-            WHERE run_id = ? AND status = 'success' AND output_json IS NOT NULL
-            ORDER BY ordinal ASC
+            SELECT steps.step_id, steps.ordinal, steps.output_json
+            FROM mcp_code_steps steps
+            JOIN mcp_code_runs runs ON runs.run_id = steps.run_id
+            WHERE steps.run_id = ?
+              AND runs.program_hash = ?
+              AND steps.status = 'success'
+              AND steps.output_json IS NOT NULL
+            ORDER BY steps.ordinal ASC
             "#,
         )
         .bind(run_id)
+        .bind(program_hash)
         .fetch_all(pool)
         .await?;
 
@@ -881,19 +957,26 @@ impl CodeExecStore {
     async fn lookup_idempotent_result(
         &self,
         run_id: &str,
+        program_hash: &str,
         step_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<Value>> {
         let pool = self.pool().await?;
         let row = sqlx::query(
             r#"
-            SELECT output_json
-            FROM mcp_code_steps
-            WHERE run_id = ? AND step_id = ? AND idempotency_key = ? AND status = 'success'
+            SELECT steps.output_json
+            FROM mcp_code_steps steps
+            JOIN mcp_code_runs runs ON runs.run_id = steps.run_id
+            WHERE steps.run_id = ?
+              AND runs.program_hash = ?
+              AND steps.step_id = ?
+              AND steps.idempotency_key = ?
+              AND steps.status = 'success'
             LIMIT 1
             "#,
         )
         .bind(run_id)
+        .bind(program_hash)
         .bind(step_id)
         .bind(idempotency_key)
         .fetch_optional(pool)
@@ -1296,6 +1379,7 @@ impl McpCodeExecTool {
     async fn execute_tool_with_retry(
         &self,
         run_id: &str,
+        program_hash: &str,
         step_id: &str,
         server: &str,
         tool: &str,
@@ -1306,7 +1390,7 @@ impl McpCodeExecTool {
         if let Some(ref key) = idempotency_key
             && let Some(cached) = self
                 .store
-                .lookup_idempotent_result(run_id, step_id, key)
+                .lookup_idempotent_result(run_id, program_hash, step_id, key)
                 .await?
         {
             return Ok((cached, 0, true));
@@ -1360,6 +1444,7 @@ impl McpCodeExecTool {
     fn execute_step<'a>(
         &'a self,
         run_id: &'a str,
+        program_hash: &'a str,
         step: &'a ProgramStep,
         selected_tools: &'a HashSet<String>,
         effective_max_steps: usize,
@@ -1419,6 +1504,7 @@ impl McpCodeExecTool {
                     let (value, attempts, reused) = self
                         .execute_tool_with_retry(
                             run_id,
+                            program_hash,
                             &step.id,
                             server,
                             tool,
@@ -1487,6 +1573,7 @@ impl McpCodeExecTool {
                     for nested in &branch_steps {
                         self.execute_step(
                             run_id,
+                            program_hash,
                             nested,
                             selected_tools,
                             effective_max_steps,
@@ -1549,6 +1636,7 @@ impl McpCodeExecTool {
                         for nested in &loop_steps {
                             self.execute_step(
                                 run_id,
+                                program_hash,
                                 nested,
                                 selected_tools,
                                 effective_max_steps,
@@ -1612,6 +1700,7 @@ impl McpCodeExecTool {
                     }
                     self.execute_step(
                         run_id,
+                        program_hash,
                         &cloned,
                         selected_tools,
                         effective_max_steps,
@@ -1631,6 +1720,7 @@ impl McpCodeExecTool {
     async fn execute_program(
         &self,
         run_id: &str,
+        program_hash: &str,
         program: &Program,
         selected_tools: &HashSet<String>,
         effective_max_steps: usize,
@@ -1642,7 +1732,10 @@ impl McpCodeExecTool {
         }
 
         let mut state = ExecutionState::default();
-        let persisted = self.store.load_successful_outputs(run_id).await?;
+        let persisted = self
+            .store
+            .load_successful_outputs(run_id, program_hash)
+            .await?;
         if !persisted.is_empty() {
             let resume_threshold = if let Some(from_step) = resume_from_step {
                 let maybe_ordinal = persisted
@@ -1667,6 +1760,7 @@ impl McpCodeExecTool {
             if let Err(error) = self
                 .execute_step(
                     run_id,
+                    program_hash,
                     step,
                     selected_tools,
                     effective_max_steps,
@@ -1773,7 +1867,7 @@ impl McpCodeExecTool {
         }
 
         let program = parse_program(&params)?;
-        let selected_tools = parse_selected_tools(&params);
+        let selected_tools = parse_selected_tools(&params)?;
 
         let run_id = params
             .get("run_id")
@@ -1784,7 +1878,7 @@ impl McpCodeExecTool {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let from_step = params.get("from_step").and_then(Value::as_str);
 
-        self.store.start_run(&run_id, &program).await?;
+        let program_hash = self.store.start_run(&run_id, &program).await?;
 
         let effective_max_steps = params
             .get("max_steps")
@@ -1805,6 +1899,7 @@ impl McpCodeExecTool {
             timeout_duration,
             self.execute_program(
                 &run_id,
+                &program_hash,
                 &program,
                 &selected_tools,
                 effective_max_steps,
@@ -2060,6 +2155,7 @@ impl AgentTool for McpSkillRunTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn resolve_refs_handles_nested_paths() {
@@ -2107,6 +2203,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_selected_tools_rejects_invalid_shape() {
+        let err = parse_selected_tools(&serde_json::json!({
+            "selected_tools": [{ "server": "filesystem" }]
+        }))
+        .expect_err("invalid selected_tools should fail");
+        assert!(err
+            .to_string()
+            .contains("selected_tools must be an array of {server, tool} objects"));
+    }
+
+    #[test]
     fn redact_pii_text_masks_common_patterns() {
         let input = "email alice@example.com phone +1-415-555-1212 ssn 123-45-6789";
         let redacted = redact_pii_text(input);
@@ -2136,6 +2243,87 @@ mod tests {
         assert!(normalize_skill_name("daily_sync").is_ok());
         assert!(normalize_skill_name("../daily_sync").is_err());
         assert!(normalize_skill_name("nested/path").is_err());
+    }
+
+    fn test_program(tool: &str) -> Program {
+        Program {
+            version: 2,
+            steps: vec![ProgramStep {
+                id: "step1".to_string(),
+                op: ProgramOp::Tool {
+                    server: "filesystem".to_string(),
+                    tool: tool.to_string(),
+                    arguments: Value::Null,
+                    retry: None,
+                    idempotency_key: None,
+                },
+                output: OutputShape::default(),
+            }],
+            return_step: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_run_rejects_run_id_reuse_with_different_program() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = CodeExecStore::new(temp_dir.path().join("code_exec.sqlite"));
+
+        let first = test_program("read_file");
+        let second = test_program("write_file");
+
+        let first_hash = store.start_run("run-1", &first).await.expect("start run");
+        assert_eq!(
+            first_hash,
+            program_fingerprint(&first).expect("fingerprint should compute")
+        );
+
+        let err = store
+            .start_run("run-1", &second)
+            .await
+            .expect_err("different program should be rejected");
+        assert!(err
+            .to_string()
+            .contains("run_id 'run-1' already exists for a different program"));
+    }
+
+    #[tokio::test]
+    async fn load_successful_outputs_are_scoped_by_program_hash() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = CodeExecStore::new(temp_dir.path().join("code_exec.sqlite"));
+
+        let program = test_program("read_file");
+        let other_program = test_program("write_file");
+        let program_hash = store.start_run("run-1", &program).await.expect("start run");
+
+        store
+            .upsert_step(
+                "run-1",
+                "step1",
+                1,
+                "tool",
+                Some("filesystem"),
+                Some("read_file"),
+                1,
+                Some("cache-key"),
+                Some(&serde_json::json!({ "ok": true })),
+                None,
+                "success",
+            )
+            .await
+            .expect("store step");
+
+        let matching = store
+            .load_successful_outputs("run-1", &program_hash)
+            .await
+            .expect("load matching outputs");
+        assert_eq!(matching.len(), 1);
+
+        let other_hash = program_fingerprint(&other_program).expect("fingerprint");
+        let mismatched = store
+            .load_successful_outputs("run-1", &other_hash)
+            .await
+            .expect("load mismatched outputs");
+        assert!(mismatched.is_empty());
     }
 
     #[test]

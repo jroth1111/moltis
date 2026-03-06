@@ -748,11 +748,7 @@ impl McpManager {
                 })?
             };
         let c = client.read().await;
-        let result = c.call_tool(tool, arguments).await;
-        if result.is_err() {
-            self.record_tool_outcome(server, tool, false).await;
-        }
-        result
+        c.call_tool(tool, arguments).await
     }
 
     // ── Registry operations ─────────────────────────────────────────
@@ -841,6 +837,38 @@ impl McpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    struct FailingMcpClient;
+
+    #[async_trait]
+    impl McpClientTrait for FailingMcpClient {
+        fn server_name(&self) -> &str {
+            "failing"
+        }
+
+        fn state(&self) -> McpClientState {
+            McpClientState::Ready
+        }
+
+        fn tools(&self) -> &[McpToolDef] {
+            &[]
+        }
+
+        async fn list_tools(&mut self) -> Result<&[McpToolDef]> {
+            Ok(&[])
+        }
+
+        async fn call_tool(&self, _name: &str, _arguments: serde_json::Value) -> Result<ToolsCallResult> {
+            Err(Error::message("transport failed"))
+        }
+
+        async fn is_alive(&self) -> bool {
+            true
+        }
+
+        async fn shutdown(&mut self) {}
+    }
 
     #[test]
     fn test_manager_creation() {
@@ -1086,6 +1114,27 @@ mod tests {
             err,
             Error::Manager(McpManagerError::ServerNotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_call_server_tool_does_not_double_record_failures() {
+        let mgr = McpManager::new(McpRegistry::new());
+        {
+            let mut inner = mgr.inner.write().await;
+            inner.clients.insert(
+                "failing".to_string(),
+                Arc::new(RwLock::new(FailingMcpClient)),
+            );
+        }
+
+        let err = mgr
+            .call_server_tool("failing", "tool", serde_json::json!({}))
+            .await
+            .expect_err("call should fail");
+        assert!(matches!(err, Error::Message { .. }));
+
+        let inner = mgr.inner.read().await;
+        assert!(inner.tool_outcomes.get("failing::tool").is_none());
     }
 
     #[tokio::test]

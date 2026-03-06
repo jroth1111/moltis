@@ -1875,6 +1875,8 @@ fn apply_runtime_tool_filters(
             "mcp_code_exec",
             "mcp_skill_run",
         ])
+    } else if !config.mcp.code.enabled {
+        base.clone_without(&["mcp_code_exec", "mcp_skill_run"])
     } else {
         base.clone_without(&[])
     };
@@ -13410,6 +13412,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_filters_remove_mcp_code_tools_when_code_mode_disabled() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_search_tools".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_describe_tool".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_code_exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "mcp_skill_run".to_string(),
+        }));
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.mcp.code.enabled = false;
+        cfg.tools.policy.allow = vec![
+            "exec".into(),
+            "mcp_search_tools".into(),
+            "mcp_describe_tool".into(),
+            "mcp_code_exec".into(),
+            "mcp_skill_run".into(),
+        ];
+
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &[], false);
+        assert!(filtered.get("exec").is_some());
+        assert!(filtered.get("mcp_search_tools").is_some());
+        assert!(filtered.get("mcp_describe_tool").is_some());
+        assert!(filtered.get("mcp_code_exec").is_none());
+        assert!(filtered.get("mcp_skill_run").is_none());
+    }
+
+    #[test]
     fn priority_models_pin_raw_model_ids_first() {
         let m1 = moltis_providers::ModelInfo {
             id: "openai-codex::gpt-5.2".into(),
@@ -14709,6 +14748,7 @@ mod tests {
                 text: self.response_text.clone(),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 
@@ -14757,6 +14797,7 @@ mod tests {
                 text: Some(text),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 
@@ -14805,6 +14846,7 @@ mod tests {
                 text: Some(text),
                 tool_calls: vec![],
                 usage: Default::default(),
+                confidence: None,
             })
         }
 
