@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-media"
+description       = "Image processing helpers for Moltis media attachments."
 version.workspace = true
 
 [dependencies]

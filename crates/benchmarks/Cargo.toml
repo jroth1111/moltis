@@ -2,6 +2,7 @@
 edition.workspace    = true
 license.workspace    = true
 name                 = "benchmarks"
+description          = "Benchmark harness for Moltis runtime paths."
 repository.workspace = true
 version.workspace    = true
 

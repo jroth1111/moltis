@@ -1,6 +1,7 @@
 [package]
 edition.workspace    = true
 name                 = "moltis-provider-setup"
+description          = "Provider detection and setup flows for Moltis."
 repository.workspace = true
 version.workspace    = true
 

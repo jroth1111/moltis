@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-wasm-web-fetch"
+description       = "WASM-packaged web fetch tool for Moltis."
 version.workspace = true
 
 [lib]

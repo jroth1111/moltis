@@ -1,6 +1,7 @@
 [package]
 edition.workspace    = true
 name                 = "moltis-tls"
+description          = "TLS certificate management and HTTPS support for Moltis."
 repository.workspace = true
 version.workspace    = true
 

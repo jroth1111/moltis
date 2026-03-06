@@ -1,6 +1,7 @@
 [package]
 edition.workspace    = true
 name                 = "moltis-schema-export"
+description          = "Schema export helper for Moltis GraphQL contracts."
 repository.workspace = true
 version.workspace    = true
 

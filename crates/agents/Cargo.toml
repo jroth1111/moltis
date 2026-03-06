@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-agents"
+description       = "LLM agent runtime for model selection, prompting, and tool execution."
 version.workspace = true
 
 [features]

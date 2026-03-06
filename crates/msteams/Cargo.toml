@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-msteams"
+description       = "Microsoft Teams channel plugin for Moltis."
 version.workspace = true
 
 [dependencies]

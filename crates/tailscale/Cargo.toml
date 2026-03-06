@@ -1,6 +1,7 @@
 [package]
 edition.workspace    = true
 name                 = "moltis-tailscale"
+description          = "Tailscale Serve and Funnel integration for Moltis."
 repository.workspace = true
 version.workspace    = true
 

@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-channels"
+description       = "Channel plugin system for Moltis."
 version.workspace = true
 
 [dependencies]

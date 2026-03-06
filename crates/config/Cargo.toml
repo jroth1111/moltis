@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-config"
+description       = "Configuration loading, validation, and env substitution for Moltis."
 version.workspace = true
 
 [dependencies]

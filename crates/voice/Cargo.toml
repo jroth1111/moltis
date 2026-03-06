@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-voice"
+description       = "Text-to-speech and speech-to-text support for Moltis."
 version.workspace = true
 
 [dependencies]

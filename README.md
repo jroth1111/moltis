@@ -27,7 +27,7 @@ Moltis recently hit [the front page of Hacker News](https://news.ycombinator.com
 
 **Full-featured** — Voice, memory, scheduling, Telegram, Discord, browser automation, MCP servers — all built-in. No plugin marketplace to get supply-chain attacked through.
 
-**Auditable** — The agent loop + provider model fits in ~5K lines. The core (excluding the optional web UI) is ~196K lines across 46 modular crates you can audit independently, with 3,100+ tests and zero `unsafe` code\*.
+**Auditable** — The runtime is split into dedicated Rust crates for the gateway, agents, tools, providers, sessions, memory, channels, and security. The core path stays in plain Rust with zero `unsafe` code\*.
 
 ## Installation
 
@@ -50,15 +50,14 @@ cargo install moltis --git https://github.com/moltis-org/moltis
 | | OpenClaw | PicoClaw | NanoClaw | ZeroClaw | **Moltis** |
 |---|---|---|---|---|---|
 | Language | TypeScript | Go | TypeScript | Rust | **Rust** |
-| Agent loop | ~430K LoC | Small | ~500 LoC | ~3.4K LoC | **~5K LoC** (`runner.rs` + `model.rs`) |
-| Full codebase | — | — | — | 1,000+ tests | **~124K LoC** (2,300+ tests) |
-| Runtime | Node.js + npm | Single binary | Node.js | Single binary (3.4 MB) | **Single binary (44 MB)** |
+| Code shape | Broad JS app | Narrow CLI | Minimal JS app | Small Rust app | **Layered Rust workspace** |
+| Runtime | Node.js + npm | Single binary | Node.js | Single binary | **Single binary** |
 | Sandbox | App-level | — | Docker | Docker | **Docker + Apple Container** |
 | Memory safety | GC | GC | GC | Ownership | **Ownership, zero `unsafe`\*** |
 | Auth | Basic | API keys | None | Token + OAuth | **Password + Passkey + API keys + Vault** |
-| Voice I/O | Plugin | — | — | — | **Built-in (15+ providers)** |
+| Voice I/O | Plugin | — | — | — | **Built-in** |
 | MCP | Yes | — | — | — | **Yes (stdio + HTTP/SSE)** |
-| Hooks | Yes (limited) | — | — | — | **15 event types** |
+| Hooks | Yes (limited) | — | — | — | **Yes** |
 | Skills | Yes (store) | Yes | Yes | Yes | **Yes (+ OpenClaw Store)** |
 | Memory/RAG | Plugin | — | Per-group | SQLite + FTS | **SQLite + FTS + vector** |
 
@@ -68,42 +67,21 @@ cargo install moltis --git https://github.com/moltis-org/moltis
 
 ## Architecture — Crate Map
 
-**Core** (always compiled):
+**Core runtime**
 
-| Crate | LoC | Role |
-|-------|-----|------|
-| `moltis` (cli) | 4.0K | Entry point, CLI commands |
-| `moltis-agents` | 9.6K | Agent loop, streaming, prompt assembly |
-| `moltis-providers` | 17.6K | LLM provider implementations |
-| `moltis-gateway` | 36.1K | HTTP/WS server, RPC, auth |
-| `moltis-chat` | 11.5K | Chat engine, agent orchestration |
-| `moltis-tools` | 21.9K | Tool execution, sandbox |
-| `moltis-config` | 7.0K | Configuration, validation |
-| `moltis-sessions` | 3.8K | Session persistence |
-| `moltis-plugins` | 1.9K | Hook dispatch, plugin formats |
-| `moltis-service-traits` | 1.3K | Shared service interfaces |
-| `moltis-common` | 1.1K | Shared utilities |
-| `moltis-protocol` | 0.8K | Wire protocol types |
+- `moltis` provides the CLI entrypoint and operational commands.
+- `moltis-gateway` owns the HTTP/WebSocket server, auth, lifecycle wiring, and service registration.
+- `moltis-chat`, `moltis-agents`, `moltis-tools`, and `moltis-providers` handle chat orchestration, the agent loop, tool execution, and provider adapters.
+- `moltis-config`, `moltis-sessions`, `moltis-common`, `moltis-protocol`, and `moltis-service-traits` provide configuration, persistence, shared types, wire contracts, and service boundaries.
 
-**Optional** (feature-gated or additive):
+**Additive crates**
 
-| Category | Crates | Combined LoC |
-|----------|--------|-------------|
-| Web UI | `moltis-web` | 4.5K |
-| GraphQL | `moltis-graphql` | 4.8K |
-| Voice | `moltis-voice` | 6.0K |
-| Memory | `moltis-memory`, `moltis-qmd` | 5.9K |
-| Channels | `moltis-telegram`, `moltis-whatsapp`, `moltis-discord`, `moltis-msteams`, `moltis-channels` | 14.9K |
-| Browser | `moltis-browser` | 5.1K |
-| Scheduling | `moltis-cron`, `moltis-caldav` | 5.2K |
-| Extensibility | `moltis-mcp`, `moltis-skills`, `moltis-wasm-tools` | 9.1K |
-| Auth & Security | `moltis-auth`, `moltis-oauth`, `moltis-onboarding`, `moltis-vault` | 6.6K |
-| Networking | `moltis-network-filter`, `moltis-tls`, `moltis-tailscale` | 3.5K |
-| Provider setup | `moltis-provider-setup` | 4.3K |
-| Import | `moltis-openclaw-import` | 7.6K |
-| Apple native | `moltis-swift-bridge` | 2.1K |
-| Metrics | `moltis-metrics` | 1.7K |
-| Other | `moltis-projects`, `moltis-media`, `moltis-schema-export`, `moltis-benchmarks` | 2.5K |
+- Web and API: `moltis-web`, `moltis-graphql`
+- Memory and retrieval: `moltis-memory`, `moltis-qmd`
+- Channels: `moltis-channels`, `moltis-telegram`, `moltis-discord`, `moltis-whatsapp`, `moltis-msteams`
+- Automation and integrations: `moltis-browser`, `moltis-mcp`, `moltis-skills`, `moltis-caldav`, `moltis-cron`
+- Security and operations: `moltis-auth`, `moltis-oauth`, `moltis-vault`, `moltis-tls`, `moltis-network-filter`, `moltis-tailscale`
+- Setup and native surfaces: `moltis-provider-setup`, `moltis-openclaw-import`, `moltis-swift-bridge`, `moltis-projects`, `moltis-media`, `moltis-schema-export`, `benchmarks`
 
 Use `--no-default-features --features lightweight` for constrained devices (Raspberry Pi, etc.).
 
@@ -122,9 +100,9 @@ See [Security Architecture](https://docs.moltis.org/security.html) for details.
 ## Features
 
 - **AI Gateway** — Multi-provider LLM support (OpenAI Codex, GitHub Copilot, Local), streaming responses, agent loop with sub-agent delegation, parallel tool execution
-- **Communication** — Web UI, Telegram, Microsoft Teams, Discord, API access, voice I/O (8 TTS + 7 STT providers), mobile PWA with push notifications
+- **Communication** — Web UI, Telegram, Microsoft Teams, Discord, API access, voice I/O, mobile PWA with push notifications
 - **Memory & Context** — Per-agent memory workspaces, embeddings-powered long-term memory, hybrid vector + full-text search, session persistence with auto-compaction, project context
-- **Extensibility** — MCP servers (stdio + HTTP/SSE), skill system, 15 lifecycle hook events with circuit breaker, destructive command guard
+- **Extensibility** — MCP servers (stdio + HTTP/SSE), skill system, lifecycle hooks with circuit breaker, destructive command guard
 - **Security** — Encryption-at-rest vault (XChaCha20-Poly1305 + Argon2id), password + passkey + API key auth, sandbox isolation, SSRF/CSWSH protection
 - **Operations** — Cron scheduling, OpenTelemetry tracing, Prometheus metrics, cloud deploy (Fly.io, DigitalOcean), Tailscale integration
 

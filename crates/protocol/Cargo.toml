@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-protocol"
+description       = "Gateway WebSocket and RPC protocol types for Moltis."
 version.workspace = true
 
 [dependencies]

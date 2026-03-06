@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-network-filter"
+description       = "Domain filtering, proxying, and network audit logging for Moltis."
 version.workspace = true
 
 [features]

@@ -1,6 +1,7 @@
 [package]
 edition.workspace    = true
 name                 = "moltis-gateway"
+description          = "Central HTTP and WebSocket gateway server for Moltis."
 repository.workspace = true
 version.workspace    = true
 

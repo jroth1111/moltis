@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-common"
+description       = "Shared types, errors, and utilities for Moltis."
 version.workspace = true
 
 [dependencies]

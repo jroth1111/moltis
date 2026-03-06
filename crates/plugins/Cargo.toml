@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-plugins"
+description       = "Plugin hooks and bundled hook implementations for Moltis."
 version.workspace = true
 
 [dependencies]

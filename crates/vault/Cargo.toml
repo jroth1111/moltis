@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-vault"
+description       = "Encryption-at-rest vault for Moltis secrets."
 version.workspace = true
 
 [features]

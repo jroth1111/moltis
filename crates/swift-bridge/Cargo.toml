@@ -2,6 +2,7 @@
 edition.workspace      = true
 license.workspace      = true
 name                   = "moltis-swift-bridge"
+description            = "C ABI bridge for embedding Moltis in Swift apps."
 repository.workspace   = true
 rust-version.workspace = true
 version.workspace      = true

@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-tools"
+description       = "Tool implementations and sandbox policy enforcement for Moltis."
 version.workspace = true
 
 [features]

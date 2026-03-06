@@ -1,6 +1,7 @@
 [package]
 edition.workspace    = true
 name                 = "moltis-chat"
+description          = "Chat orchestration engine for Moltis."
 repository.workspace = true
 version.workspace    = true
 

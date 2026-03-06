@@ -1,6 +1,7 @@
 [package]
 edition.workspace    = true
 name                 = "moltis-service-traits"
+description          = "Service trait interfaces for Moltis domain services."
 repository.workspace = true
 version.workspace    = true
 

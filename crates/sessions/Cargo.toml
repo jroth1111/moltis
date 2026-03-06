@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-sessions"
+description       = "Session storage and management for Moltis."
 version.workspace = true
 
 [features]

@@ -1,6 +1,7 @@
 [package]
 edition.workspace    = true
 name                 = "moltis-providers"
+description          = "LLM provider implementations and registry for Moltis."
 repository.workspace = true
 version.workspace    = true
 

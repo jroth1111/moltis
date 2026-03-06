@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-telegram"
+description       = "Telegram channel plugin for Moltis."
 version.workspace = true
 
 [dependencies]

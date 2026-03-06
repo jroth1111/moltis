@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-browser"
+description       = "Managed Chromium automation with CDP and isolated profiles."
 version.workspace = true
 
 [dependencies]

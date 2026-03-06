@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-projects"
+description       = "Project and worktree management for Moltis."
 version.workspace = true
 
 [dependencies]

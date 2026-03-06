@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-tasks"
+description       = "Task orchestration for multi-agent coordination in Moltis."
 version.workspace = true
 
 [features]

@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-skills"
+description       = "Skill discovery, parsing, and installation for Moltis."
 version.workspace = true
 
 [dependencies]
