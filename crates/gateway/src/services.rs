@@ -2631,6 +2631,98 @@ mod tests {
     }
 
     #[test]
+    fn skill_detail_discovered_reflects_persisted_local_trust_state() {
+        with_temp_data_dir(|data_dir| {
+            let markdown = strong_local_skill_markdown("demo");
+            let content_hash = moltis_skills::integrity::hash_skill_markdown(&markdown);
+            write_local_skill("personal", "demo", &markdown);
+
+            let manifest = SkillsManifest {
+                version: 3,
+                repos: vec![RepoEntry {
+                    source: "personal".into(),
+                    repo_name: "__local-personal__".into(),
+                    installed_at_ms: 0,
+                    commit_sha: None,
+                    format: PluginFormat::Skill,
+                    skills: vec![SkillState {
+                        name: "demo".into(),
+                        relative_path: "demo".into(),
+                        status: SkillStatus::Trusted,
+                        quarantine_reason: None,
+                        last_audited_ms: Some(42),
+                        content_hash: Some(content_hash.clone()),
+                        trusted_hash: Some(content_hash),
+                        enabled: false,
+                    }],
+                }],
+            };
+            let store = moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
+            store.save(&manifest).unwrap();
+
+            let detail =
+                skill_detail_discovered("personal", "demo").expect("local skill detail should load");
+
+            assert_eq!(detail["status"], "trusted");
+            assert_eq!(detail["trusted"], true);
+            assert_eq!(detail["enabled"], false);
+            assert_eq!(detail["integrity_ok"], true);
+            assert_eq!(detail["last_audited_ms"], 42);
+        });
+    }
+
+    #[test]
+    fn toggle_skill_rejects_local_content_drift_until_revalidated() {
+        with_temp_data_dir(|data_dir| {
+            let trusted_markdown = strong_local_skill_markdown("demo");
+            let drifted_markdown =
+                trusted_markdown.replace("structured evaluation workflow", "rewritten workflow");
+            let trusted_hash = moltis_skills::integrity::hash_skill_markdown(&trusted_markdown);
+
+            write_local_skill("personal", "demo", &drifted_markdown);
+
+            let manifest = SkillsManifest {
+                version: 3,
+                repos: vec![RepoEntry {
+                    source: "personal".into(),
+                    repo_name: "__local-personal__".into(),
+                    installed_at_ms: 0,
+                    commit_sha: None,
+                    format: PluginFormat::Skill,
+                    skills: vec![SkillState {
+                        name: "demo".into(),
+                        relative_path: "demo".into(),
+                        status: SkillStatus::Trusted,
+                        quarantine_reason: None,
+                        last_audited_ms: Some(42),
+                        content_hash: Some(trusted_hash.clone()),
+                        trusted_hash: Some(trusted_hash),
+                        enabled: false,
+                    }],
+                }],
+            };
+            let store = moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
+            store.save(&manifest).unwrap();
+
+            let error = toggle_skill(
+                &serde_json::json!({
+                    "source": "personal",
+                    "skill": "demo",
+                }),
+                true,
+            )
+            .expect_err("drifted local skill should require revalidation");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed since last validation"),
+                "unexpected error: {error}"
+            );
+        });
+    }
+
+    #[test]
     fn scan_parser_extracts_nested_severity_findings() {
         let results = serde_json::json!({
             "results": [
