@@ -1263,6 +1263,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_rejects_foreign_owner() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
+
+        t.execute(json!({ "action": "claim", "id": id, "owner": "owner-a" }))
+            .await
+            .unwrap();
+
+        let result = t
+            .execute(json!({
+                "action": "fail",
+                "id": id,
+                "owner": "owner-b",
+                "failure_class": "tool_error"
+            }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("owned by 'owner-a'"), "unexpected error: {err}");
+        assert!(err.contains("owner-b"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
     async fn update_allows_owner_subject_description_change() {
         let tmp = TempDir::new().unwrap();
         let t = tool(&tmp).await;
