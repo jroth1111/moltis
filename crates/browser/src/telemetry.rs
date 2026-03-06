@@ -632,12 +632,39 @@ impl TlsJa4SidecarProcess {
     pub fn load_summary(&self) -> Result<TlsJa4Summary, TelemetryError> {
         Ok(summarize_tls_ja4_observations(&self.load_observations()?))
     }
+
+    pub fn ensure_running(&mut self) -> Result<(), TelemetryError> {
+        if let Some(status) = self.child.try_wait()? {
+            return Err(TelemetryError::TlsJa4SidecarExited(status.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn stop_and_load_summary(mut self) -> Result<TlsJa4Summary, TelemetryError> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+            let _ = self.child.wait()?;
+        }
+        if !self.output_path.exists() {
+            return Err(TelemetryError::TlsJa4SidecarNoOutput(self.output_path));
+        }
+        let observations = load_tls_ja4_observations(&self.output_path)?;
+        if observations.is_empty() {
+            return Err(TelemetryError::TlsJa4SidecarEmptyOutput(self.output_path));
+        }
+        Ok(summarize_tls_ja4_observations(&observations))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeDriftThresholds {
     pub mean_gap_ratio: f64,
     pub max_gap_ratio: f64,
+    pub behavior_count_ratio: f64,
+    pub behavior_path_ratio: f64,
+    pub behavior_straightness_ratio: f64,
+    pub behavior_mean_dt_ratio: f64,
+    pub behavior_event_rate_ratio: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -702,6 +729,11 @@ impl Default for ProbeDriftThresholds {
         Self {
             mean_gap_ratio: 0.35,
             max_gap_ratio: 0.50,
+            behavior_count_ratio: 0.35,
+            behavior_path_ratio: 0.35,
+            behavior_straightness_ratio: 0.20,
+            behavior_mean_dt_ratio: 0.35,
+            behavior_event_rate_ratio: 0.35,
         }
     }
 }
@@ -709,11 +741,14 @@ impl Default for ProbeDriftThresholds {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeDriftKind {
+    BrowserKindChanged,
     BrowserFamilyChanged,
     BrowserVersionChanged,
     BackendChanged,
     HeadlessChanged,
     ProxyModeChanged,
+    BrowserBinaryChanged,
+    LaunchProfileHashChanged,
     UserAgentChanged,
     AcceptLanguageChanged,
     WebdriverChanged,
@@ -722,6 +757,11 @@ pub enum ProbeDriftKind {
     ScreenChanged,
     HardwareConcurrencyChanged,
     DeviceMemoryChanged,
+    BehaviorCountDrift,
+    BehaviorPathDrift,
+    BehaviorStraightnessDrift,
+    BehaviorMeanDtDrift,
+    BehaviorEventRateDrift,
     RequestCountChanged,
     PathSequenceChanged,
     MeanGapDrift,
@@ -1000,6 +1040,15 @@ pub fn compare_probe_run_with_thresholds(
 ) -> ProbeRunDrift {
     let mut issues = Vec::new();
 
+    if baseline.profile.browser_kind != current.profile.browser_kind {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::BrowserKindChanged,
+            detail: format!(
+                "browser kind changed from {} to {}",
+                baseline.profile.browser_kind, current.profile.browser_kind
+            ),
+        });
+    }
     if baseline.profile.browser_family != current.profile.browser_family {
         issues.push(ProbeDriftIssue {
             kind: ProbeDriftKind::BrowserFamilyChanged,
@@ -1042,6 +1091,24 @@ pub fn compare_probe_run_with_thresholds(
             detail: format!(
                 "proxy mode changed from {:?} to {:?}",
                 baseline.profile.proxy_mode, current.profile.proxy_mode
+            ),
+        });
+    }
+    if baseline.profile.browser_binary_basename != current.profile.browser_binary_basename {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::BrowserBinaryChanged,
+            detail: format!(
+                "browser binary changed from {} to {}",
+                baseline.profile.browser_binary_basename, current.profile.browser_binary_basename
+            ),
+        });
+    }
+    if baseline.profile.launch_profile_hash != current.profile.launch_profile_hash {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::LaunchProfileHashChanged,
+            detail: format!(
+                "launch profile hash changed from {} to {}",
+                baseline.profile.launch_profile_hash, current.profile.launch_profile_hash
             ),
         });
     }
@@ -1119,6 +1186,62 @@ pub fn compare_probe_run_with_thresholds(
             ),
         });
     }
+
+    push_optional_drift_issue(
+        &mut issues,
+        ProbeDriftKind::BehaviorCountDrift,
+        format!(
+            "behavior event count drifted from {} to {}",
+            baseline.behavior.count, current.behavior.count
+        ),
+        Some(baseline.behavior.count as f64),
+        Some(current.behavior.count as f64),
+        thresholds.behavior_count_ratio,
+    );
+    push_optional_drift_issue(
+        &mut issues,
+        ProbeDriftKind::BehaviorPathDrift,
+        format!(
+            "behavior path length drifted from {} to {}",
+            baseline.behavior.path_len_px, current.behavior.path_len_px
+        ),
+        Some(baseline.behavior.path_len_px),
+        Some(current.behavior.path_len_px),
+        thresholds.behavior_path_ratio,
+    );
+    push_optional_drift_issue(
+        &mut issues,
+        ProbeDriftKind::BehaviorStraightnessDrift,
+        format!(
+            "behavior straightness drifted from {:?} to {:?}",
+            baseline.behavior.straightness, current.behavior.straightness
+        ),
+        baseline.behavior.straightness,
+        current.behavior.straightness,
+        thresholds.behavior_straightness_ratio,
+    );
+    push_optional_drift_issue(
+        &mut issues,
+        ProbeDriftKind::BehaviorMeanDtDrift,
+        format!(
+            "behavior mean dt drifted from {:?} to {:?}",
+            baseline.behavior.mean_dt_s, current.behavior.mean_dt_s
+        ),
+        baseline.behavior.mean_dt_s,
+        current.behavior.mean_dt_s,
+        thresholds.behavior_mean_dt_ratio,
+    );
+    push_optional_drift_issue(
+        &mut issues,
+        ProbeDriftKind::BehaviorEventRateDrift,
+        format!(
+            "behavior event rate drifted from {:?} to {:?}",
+            baseline.behavior.event_rate_hz, current.behavior.event_rate_hz
+        ),
+        baseline.behavior.event_rate_hz,
+        current.behavior.event_rate_hz,
+        thresholds.behavior_event_rate_ratio,
+    );
 
     if baseline.request_sequence.request_count != current.request_sequence.request_count {
         issues.push(ProbeDriftIssue {
@@ -1346,6 +1469,7 @@ mod tests {
         std::{
             collections::{BTreeMap, HashMap},
             path::PathBuf,
+            process::Command,
             sync::{Arc, Mutex as StdMutex, OnceLock},
             time::Instant,
         },
@@ -2266,6 +2390,28 @@ mod tests {
     }
 
     #[test]
+    fn probe_canary_spec_rejects_http_origin_when_tls_capture_requested() {
+        let spec = ProbeCanarySpec {
+            origin: "http://127.0.0.1:8080".to_string(),
+            browser: BrowserPreference::Auto,
+            backends: Vec::new(),
+            policy: ProbeTelemetryPolicy::default(),
+            tls_sidecar: Some(TlsJa4SidecarConfig {
+                command: "ja4-sidecar".to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                working_dir: None,
+                output_dir: None,
+            }),
+        };
+
+        assert!(matches!(
+            spec.validated_origin(),
+            Err(TelemetryError::InvalidProbeOrigin(_))
+        ));
+    }
+
+    #[test]
     fn load_tls_ja4_observations_reads_jsonl() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let path = dir.path().join("capture.jsonl");
@@ -2286,6 +2432,45 @@ mod tests {
             vec!["ja4-a".to_string(), "ja4-b".to_string()]
         );
         assert_eq!(summary.distinct_ja4s, vec!["ja4s-a".to_string()]);
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tls_ja4_sidecar_process_reports_early_exit() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()?;
+        std::thread::sleep(Duration::from_millis(50));
+        let mut process = TlsJa4SidecarProcess {
+            child,
+            output_path: dir.path().join("capture.jsonl"),
+        };
+
+        let error = process.ensure_running().unwrap_err();
+        assert!(matches!(error, TelemetryError::TlsJa4SidecarExited(_)));
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tls_ja4_sidecar_process_requires_non_empty_output() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()?;
+        let process = TlsJa4SidecarProcess {
+            child,
+            output_path: dir.path().join("capture.jsonl"),
+        };
+
+        let error = process.stop_and_load_summary().unwrap_err();
+        assert!(matches!(error, TelemetryError::TlsJa4SidecarNoOutput(_)));
 
         Ok(())
     }
@@ -2340,10 +2525,13 @@ mod tests {
     fn compare_probe_run_reports_identity_and_profile_drift() {
         let baseline = sample_probe_run_evidence();
         let mut current = baseline.clone();
+        current.profile.browser_kind = BrowserKind::Brave;
         current.profile.browser_version = "124.0.0.0".to_string();
         current.profile.backend = BrowserBackendKind::Chromiumoxide;
         current.profile.headless = false;
         current.profile.proxy_mode = ProbeProxyMode::Residential;
+        current.profile.browser_binary_basename = "Brave Browser".to_string();
+        current.profile.launch_profile_hash = "deadbeefdeadbeef".to_string();
         current.fingerprint.user_agent = "Mozilla/5.0 Chrome/124".to_string();
         current.headers.accept_language = Some("en-US,en;q=0.9".to_string());
         current.fingerprint.platform = Some("Win32".to_string());
@@ -2352,6 +2540,10 @@ mod tests {
         let drift = compare_probe_run(&baseline, &current);
 
         assert!(!drift.consistent());
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BrowserKindChanged));
         assert!(drift
             .issues
             .iter()
@@ -2371,6 +2563,14 @@ mod tests {
         assert!(drift
             .issues
             .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BrowserBinaryChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::LaunchProfileHashChanged));
+        assert!(drift
+            .issues
+            .iter()
             .any(|issue| issue.kind == ProbeDriftKind::UserAgentChanged));
         assert!(drift
             .issues
@@ -2384,6 +2584,41 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.kind == ProbeDriftKind::TimezoneChanged));
+    }
+
+    #[test]
+    fn compare_probe_run_reports_behavior_drift() {
+        let baseline = sample_probe_run_evidence();
+        let mut current = baseline.clone();
+        current.behavior.count = 20;
+        current.behavior.path_len_px = 480.0;
+        current.behavior.straightness = Some(0.1);
+        current.behavior.mean_dt_s = Some(0.7);
+        current.behavior.event_rate_hz = Some(2.0);
+
+        let drift = compare_probe_run(&baseline, &current);
+
+        assert!(!drift.consistent());
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BehaviorCountDrift));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BehaviorPathDrift));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BehaviorStraightnessDrift));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BehaviorMeanDtDrift));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BehaviorEventRateDrift));
     }
 
     #[test]
@@ -2401,6 +2636,7 @@ mod tests {
             &ProbeDriftThresholds {
                 mean_gap_ratio: 0.25,
                 max_gap_ratio: 0.25,
+                ..ProbeDriftThresholds::default()
             },
         );
 

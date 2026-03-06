@@ -110,6 +110,13 @@ impl BrowserManager {
 
     pub async fn run_probe_canary(&self, spec: ProbeCanarySpec) -> Result<ProbeCanaryReport, Error> {
         let origin = spec.validated_origin()?;
+        let capture_plan = spec.policy.capture_plan(spec.tls_sidecar.is_some());
+        if capture_plan.capture_tls_ja4 && spec.tls_sidecar.is_none() {
+            return Err(crate::telemetry::TelemetryError::MissingProbeData(
+                "tls/ja4 capture requested but no sidecar is configured".to_string(),
+            )
+            .into());
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(self.config.navigation_timeout_ms))
             .build()
@@ -119,7 +126,13 @@ impl BrowserManager {
         for backend in spec.effective_backends() {
             let started = Instant::now();
             let report = match self
-                .run_probe_canary_backend(&client, &origin, &spec, backend)
+                .run_probe_canary_backend(
+                    &client,
+                    &origin,
+                    &spec,
+                    backend,
+                    capture_plan.capture_tls_ja4,
+                )
                 .await
             {
                 Ok(mut report) => {
@@ -151,18 +164,45 @@ impl BrowserManager {
         origin: &reqwest::Url,
         spec: &ProbeCanarySpec,
         backend: BrowserBackendKind,
+        capture_tls_ja4: bool,
     ) -> Result<ProbeBackendReport, Error> {
         let (session_id, selected) = self
             .create_session_for_backend(backend, spec.browser)
             .await?;
         let baseline_store = ProbeBaselineStore::default();
+        let mut sidecar = if capture_tls_ja4 {
+            let run_id = format!("probe_canary_{backend}_{}", uuid::Uuid::new_v4());
+            let mut process = spec
+                .tls_sidecar
+                .as_ref()
+                .ok_or_else(|| {
+                    crate::telemetry::TelemetryError::MissingProbeData(
+                        "tls/ja4 capture requested but no sidecar is configured".to_string(),
+                    )
+                })?
+                .spawn(&run_id)?;
+            process.ensure_running()?;
+            Some(process)
+        } else {
+            None
+        };
 
         let run_result = self
             .collect_probe_canary_evidence(client, origin, spec, backend, &session_id, &selected)
             .await;
+        let tls_ja4 = if let Some(sidecar) = sidecar.take() {
+            if run_result.is_ok() {
+                Some(sidecar.stop_and_load_summary()?)
+            } else {
+                let _ = sidecar.stop();
+                None
+            }
+        } else {
+            None
+        };
         let close_result = self.pool.close_session(&session_id).await;
 
-        let evidence = match run_result {
+        let mut evidence = match run_result {
             Ok(evidence) => evidence,
             Err(error) => {
                 let _ = close_result;
@@ -170,6 +210,7 @@ impl BrowserManager {
             },
         };
         close_result?;
+        evidence.tls_ja4 = tls_ja4;
 
         let baseline = spec
             .policy
