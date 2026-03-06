@@ -54,3 +54,24 @@
   - `cargo check -p moltis-browser --quiet`
   - `cargo test -p moltis-browser --lib --quiet`
   - `cargo test -p moltis-browser --test real_sites_test --no-run --quiet`
+- Added request-sequence telemetry in `crates/browser/src/telemetry.rs`:
+  - typed `RequestSequenceEvent` and `RequestSequenceSummary`
+  - owned probe routes that preserve `run_id` across page and fetch requests
+  - backend coverage for both `BrowserManager` and `PatchrightSession`
+- Validation for the request-sequence step:
+  - `cargo test -p moltis-browser --lib telemetry::tests:: -- --nocapture`
+    - exit `0`
+    - `6 passed`
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `125 passed, 0 failed, 8 ignored`
+  - `cargo test -p moltis-browser --test real_sites_test --no-run --quiet`
+    - exit `0`
+  - `CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' MOLTIS_DATA_DIR=$(mktemp -d) cargo test -p moltis-browser --test real_sites_test -- --nocapture --test-threads=1`
+    - exit `0`
+    - `5 passed`
+    - Summary:
+      - Google PASS (`chromiumoxide`)
+      - Woolworths PASS (`patchright`)
+      - Coles PASS (`patchright`)
+      - Realestate PASS (`patchright`)

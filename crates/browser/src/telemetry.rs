@@ -111,6 +111,47 @@ impl BehaviorBatchSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestSequenceEvent {
+    pub run_id: String,
+    pub request_index: usize,
+    pub request_ts_ms: f64,
+    pub path: String,
+    pub method: String,
+    pub status_code: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestSequenceSummary {
+    pub request_count: usize,
+    #[serde(default)]
+    pub first_path: Option<String>,
+    #[serde(default)]
+    pub last_path: Option<String>,
+    pub distinct_path_count: usize,
+    #[serde(default)]
+    pub path_sequence: Vec<String>,
+    #[serde(default)]
+    pub mean_gap_ms: Option<f64>,
+    #[serde(default)]
+    pub max_gap_ms: Option<f64>,
+}
+
+impl RequestSequenceSummary {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            request_count: 0,
+            first_path: None,
+            last_path: None,
+            distinct_path_count: 0,
+            path_sequence: Vec::new(),
+            mean_gap_ms: None,
+            max_gap_ms: None,
+        }
+    }
+}
+
 #[must_use]
 pub fn summarize_behavior_points(points: &[BehaviorPoint]) -> BehaviorBatchSummary {
     if points.is_empty() {
@@ -179,6 +220,40 @@ pub fn summarize_behavior_points(points: &[BehaviorPoint]) -> BehaviorBatchSumma
     }
 }
 
+#[must_use]
+pub fn summarize_request_sequence(events: &[RequestSequenceEvent]) -> RequestSequenceSummary {
+    if events.is_empty() {
+        return RequestSequenceSummary::empty();
+    }
+
+    let mut sorted = events.to_vec();
+    sorted.sort_by(|left, right| left.request_index.cmp(&right.request_index));
+
+    let path_sequence: Vec<String> = sorted.iter().map(|event| event.path.clone()).collect();
+    let mut distinct_paths = std::collections::BTreeSet::new();
+    for path in &path_sequence {
+        distinct_paths.insert(path.clone());
+    }
+
+    let gaps_ms: Vec<f64> = sorted
+        .windows(2)
+        .map(|window| (window[1].request_ts_ms - window[0].request_ts_ms).max(0.0))
+        .collect();
+    let mean_gap_ms = (!gaps_ms.is_empty())
+        .then_some(gaps_ms.iter().sum::<f64>() / gaps_ms.len() as f64);
+    let max_gap_ms = gaps_ms.iter().copied().reduce(f64::max);
+
+    RequestSequenceSummary {
+        request_count: sorted.len(),
+        first_path: sorted.first().map(|event| event.path.clone()),
+        last_path: sorted.last().map(|event| event.path.clone()),
+        distinct_path_count: distinct_paths.len(),
+        path_sequence,
+        mean_gap_ms,
+        max_gap_ms,
+    }
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
@@ -192,17 +267,19 @@ mod tests {
         axum::{
             Json, Router,
             extract::State,
-            http::HeaderMap,
+            http::{HeaderMap, Uri},
             response::Html,
             routing::{get, post},
         },
         serde_json::json,
         std::{
             collections::HashMap,
-            sync::{Arc, Mutex as StdMutex},
+            sync::{Arc, Mutex as StdMutex, OnceLock},
+            time::Instant,
         },
         tokio::{
             net::TcpListener,
+            sync::{Mutex, OwnedMutexGuard},
             task::JoinHandle,
             time::{Duration, sleep},
         },
@@ -220,13 +297,24 @@ mod tests {
         sample: Vec<BehaviorPoint>,
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct ProbeState {
+        started_at: Instant,
         fingerprints: Arc<StdMutex<HashMap<String, CapturedFingerprint>>>,
         behaviors: Arc<StdMutex<HashMap<String, Vec<CapturedBehavior>>>>,
+        requests: Arc<StdMutex<HashMap<String, Vec<RequestSequenceEvent>>>>,
     }
 
     impl ProbeState {
+        fn new() -> Self {
+            Self {
+                started_at: Instant::now(),
+                fingerprints: Arc::new(StdMutex::new(HashMap::new())),
+                behaviors: Arc::new(StdMutex::new(HashMap::new())),
+                requests: Arc::new(StdMutex::new(HashMap::new())),
+            }
+        }
+
         fn fingerprint(&self, session_id: &str) -> Option<CapturedFingerprint> {
             self.fingerprints.lock().unwrap().get(session_id).cloned()
         }
@@ -252,6 +340,19 @@ mod tests {
         fn first_behavior_session(&self) -> Option<String> {
             self.behaviors.lock().unwrap().keys().next().cloned()
         }
+
+        fn requests(&self, run_id: &str) -> Vec<RequestSequenceEvent> {
+            self.requests
+                .lock()
+                .unwrap()
+                .get(run_id)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn request_summary(&self, run_id: &str) -> RequestSequenceSummary {
+            summarize_request_sequence(&self.requests(run_id))
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -262,15 +363,54 @@ mod tests {
         points: Vec<BehaviorPoint>,
     }
 
-    async fn new_session() -> Json<serde_json::Value> {
+    fn query_value(uri: &Uri, name: &str) -> Option<String> {
+        uri.query()?.split('&').find_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            let value = parts.next().unwrap_or_default();
+            (key == name).then_some(value.to_string())
+        })
+    }
+
+    fn record_request(
+        state: &ProbeState,
+        uri: &Uri,
+        method: &str,
+        status_code: u16,
+    ) {
+        let Some(run_id) = query_value(uri, "run_id") else {
+            return;
+        };
+
+        let request_ts_ms = state.started_at.elapsed().as_secs_f64() * 1000.0;
+        let mut requests = state.requests.lock().unwrap();
+        let events = requests.entry(run_id.clone()).or_default();
+        let request_index = events.len() + 1;
+        events.push(RequestSequenceEvent {
+            run_id,
+            request_index,
+            request_ts_ms,
+            path: uri.path().to_string(),
+            method: method.to_string(),
+            status_code,
+        });
+    }
+
+    async fn new_session(
+        State(state): State<ProbeState>,
+        uri: Uri,
+    ) -> Json<serde_json::Value> {
+        record_request(&state, &uri, "GET", 200);
         Json(json!({ "session_id": uuid::Uuid::new_v4().to_string() }))
     }
 
     async fn collect_fp(
         State(state): State<ProbeState>,
+        uri: Uri,
         headers: HeaderMap,
         Json(payload): Json<FingerprintSnapshot>,
     ) -> Json<serde_json::Value> {
+        record_request(&state, &uri, "POST", 200);
         let headers = FingerprintHeaders {
             user_agent: headers
                 .get("user-agent")
@@ -311,8 +451,10 @@ mod tests {
 
     async fn collect_behavior(
         State(state): State<ProbeState>,
+        uri: Uri,
         Json(batch): Json<BehaviorBatch>,
     ) -> Json<serde_json::Value> {
+        record_request(&state, &uri, "POST", 200);
         let summary = summarize_behavior_points(&batch.points);
         state
             .behaviors
@@ -328,7 +470,11 @@ mod tests {
         Json(json!({ "ok": true, "summary": summary }))
     }
 
-    async fn fingerprint_probe_page() -> Html<&'static str> {
+    async fn fingerprint_probe_page(
+        State(state): State<ProbeState>,
+        uri: Uri,
+    ) -> Html<&'static str> {
+        record_request(&state, &uri, "GET", 200);
         Html(
             r#"<!doctype html>
 <html>
@@ -341,7 +487,7 @@ mod tests {
     <p id="payload"></p>
     <script>
       async function getSessionId() {
-        const response = await fetch('/session');
+        const response = await fetch(`/session${location.search}`);
         return (await response.json()).session_id;
       }
 
@@ -388,7 +534,7 @@ mod tests {
           ...getWebGLInfo()
         };
 
-        await fetch('/fp', {
+        await fetch(`/fp${location.search}`, {
           method: 'POST',
           headers: {'content-type': 'application/json'},
           body: JSON.stringify(payload)
@@ -402,7 +548,11 @@ mod tests {
         )
     }
 
-    async fn behavior_probe_page() -> Html<&'static str> {
+    async fn behavior_probe_page(
+        State(state): State<ProbeState>,
+        uri: Uri,
+    ) -> Html<&'static str> {
+        record_request(&state, &uri, "GET", 200);
         Html(
             r#"<!doctype html>
 <html>
@@ -434,7 +584,7 @@ mod tests {
       let lastFlush = performance.now();
 
       async function init() {
-        const response = await fetch('/session');
+        const response = await fetch(`/session${location.search}`);
         sessionId = (await response.json()).session_id;
         window.__probeSessionId = sessionId;
         document.body.dataset.behaviorReady = 'true';
@@ -457,7 +607,7 @@ mod tests {
         const batch = points;
         points = [];
         lastFlush = now;
-        await fetch('/behavior', {
+        await fetch(`/behavior${location.search}`, {
           method: 'POST',
           headers: {'content-type': 'application/json'},
           body: JSON.stringify({
@@ -481,14 +631,68 @@ mod tests {
         )
     }
 
+    async fn sequence_step(
+        State(state): State<ProbeState>,
+        uri: Uri,
+    ) -> Json<serde_json::Value> {
+        record_request(&state, &uri, "GET", 200);
+        Json(json!({
+            "ok": true,
+            "step": query_value(&uri, "step"),
+        }))
+    }
+
+    async fn sequence_probe_page(
+        State(state): State<ProbeState>,
+        uri: Uri,
+    ) -> Html<&'static str> {
+        record_request(&state, &uri, "GET", 200);
+        Html(
+            r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Sequence Probe</title>
+  </head>
+  <body>
+    <h1>Sequence Probe</h1>
+    <script>
+      function withSearch(path) {
+        return `${path}${location.search}`;
+      }
+
+      async function runStep(step, delayMs) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        await fetch(`${withSearch('/sequence-step')}&step=${step}`);
+      }
+
+      (async () => {
+        const response = await fetch(withSearch('/session'));
+        const session = await response.json();
+        window.__probeSessionId = session.session_id;
+
+        await runStep('alpha', 40);
+        await runStep('bravo', 70);
+        await runStep('target', 110);
+
+        document.body.dataset.sequenceReady = 'true';
+      })();
+    </script>
+  </body>
+</html>"#,
+        )
+    }
+
     async fn start_probe_server() -> Result<(String, ProbeState, JoinHandle<()>), Box<dyn std::error::Error>> {
-        let state = ProbeState::default();
+        let state = ProbeState::new();
         let app = Router::new()
             .route("/session", get(new_session))
             .route("/fp", post(collect_fp))
             .route("/behavior", post(collect_behavior))
+            .route("/sequence-step", get(sequence_step))
             .route("/fp-probe", get(fingerprint_probe_page))
             .route("/behavior-probe", get(behavior_probe_page))
+            .route("/sequence-probe", get(sequence_probe_page))
             .with_state(state.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -545,6 +749,15 @@ mod tests {
         protection::build_patchright_launch_profile_for_browser(config, selected.as_ref())
     }
 
+    fn live_browser_test_lock() -> Arc<Mutex<()>> {
+        static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+        Arc::clone(LOCK.get_or_init(|| Arc::new(Mutex::new(()))))
+    }
+
+    async fn acquire_live_browser_test_guard() -> OwnedMutexGuard<()> {
+        live_browser_test_lock().lock_owned().await
+    }
+
     async fn wait_for_patchright_session_id(
         state: &ProbeState,
         kind: &str,
@@ -579,9 +792,64 @@ mod tests {
         assert!(summary.mean_speed_px_s.unwrap() > 300.0);
     }
 
+    #[test]
+    fn summarize_request_sequence_reports_path_and_gap_metrics() {
+        let summary = summarize_request_sequence(&[
+            RequestSequenceEvent {
+                run_id: "run-1".into(),
+                request_index: 3,
+                request_ts_ms: 180.0,
+                path: "/sequence-step".into(),
+                method: "GET".into(),
+                status_code: 200,
+            },
+            RequestSequenceEvent {
+                run_id: "run-1".into(),
+                request_index: 1,
+                request_ts_ms: 20.0,
+                path: "/sequence-probe".into(),
+                method: "GET".into(),
+                status_code: 200,
+            },
+            RequestSequenceEvent {
+                run_id: "run-1".into(),
+                request_index: 2,
+                request_ts_ms: 70.0,
+                path: "/session".into(),
+                method: "GET".into(),
+                status_code: 200,
+            },
+            RequestSequenceEvent {
+                run_id: "run-1".into(),
+                request_index: 4,
+                request_ts_ms: 320.0,
+                path: "/sequence-step".into(),
+                method: "GET".into(),
+                status_code: 200,
+            },
+        ]);
+
+        assert_eq!(summary.request_count, 4);
+        assert_eq!(summary.first_path.as_deref(), Some("/sequence-probe"));
+        assert_eq!(summary.last_path.as_deref(), Some("/sequence-step"));
+        assert_eq!(summary.distinct_path_count, 3);
+        assert_eq!(
+            summary.path_sequence,
+            vec![
+                "/sequence-probe".to_string(),
+                "/session".to_string(),
+                "/sequence-step".to_string(),
+                "/sequence-step".to_string(),
+            ]
+        );
+        assert_eq!(summary.mean_gap_ms, Some(100.0));
+        assert_eq!(summary.max_gap_ms, Some(140.0));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn browser_manager_probe_captures_identity_behavior_and_sanitizes_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
         let manager = BrowserManager::new(test_browser_config());
 
@@ -748,6 +1016,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn patchright_probe_captures_identity_and_behavior() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
         let config = test_browser_config();
         let profile = patchright_profile(&config);
@@ -821,6 +1090,101 @@ mod tests {
             .iter()
             .any(|batch| batch.summary.straightness.is_some()));
         assert!(!behavior_batches[0].sample.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_manager_probe_captures_request_sequence() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = acquire_live_browser_test_guard().await;
+        let (origin, state, server) = start_probe_server().await?;
+        let manager = BrowserManager::new(test_browser_config());
+        let run_id = uuid::Uuid::new_v4().to_string();
+
+        let navigate = manager
+            .handle_request(request(
+                None,
+                BrowserAction::Navigate {
+                    url: format!("{origin}/sequence-probe?run_id={run_id}"),
+                },
+                30_000,
+            ))
+            .await;
+        assert!(navigate.success, "{navigate:?}");
+
+        let wait = manager
+            .handle_request(request(
+                Some(navigate.session_id),
+                BrowserAction::Wait {
+                    selector: Some("body[data-sequence-ready='true']".to_string()),
+                    ref_: None,
+                    timeout_ms: 10_000,
+                },
+                12_000,
+            ))
+            .await;
+        assert!(wait.success, "{wait:?}");
+
+        manager.shutdown().await;
+        server.abort();
+
+        let summary = state.request_summary(&run_id);
+        assert_eq!(summary.request_count, 5);
+        assert_eq!(summary.first_path.as_deref(), Some("/sequence-probe"));
+        assert_eq!(summary.last_path.as_deref(), Some("/sequence-step"));
+        assert_eq!(summary.distinct_path_count, 3);
+        assert_eq!(
+            summary.path_sequence,
+            vec![
+                "/sequence-probe".to_string(),
+                "/session".to_string(),
+                "/sequence-step".to_string(),
+                "/sequence-step".to_string(),
+                "/sequence-step".to_string(),
+            ]
+        );
+        assert!(summary.mean_gap_ms.is_some_and(|gap| gap > 0.0));
+        assert!(summary.max_gap_ms.is_some_and(|gap| gap >= 40.0));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patchright_probe_captures_request_sequence() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = acquire_live_browser_test_guard().await;
+        let (origin, state, server) = start_probe_server().await?;
+        let config = test_browser_config();
+        let profile = patchright_profile(&config);
+        let mut session = PatchrightSession::start(&config.protection, &profile).await?;
+        let run_id = uuid::Uuid::new_v4().to_string();
+
+        session
+            .goto(&format!("{origin}/sequence-probe?run_id={run_id}"))
+            .await?;
+        assert!(session
+            .wait_selector("body[data-sequence-ready='true']", 10_000)
+            .await?);
+
+        session.close().await?;
+        server.abort();
+
+        let summary = state.request_summary(&run_id);
+        assert_eq!(summary.request_count, 5);
+        assert_eq!(summary.first_path.as_deref(), Some("/sequence-probe"));
+        assert_eq!(summary.last_path.as_deref(), Some("/sequence-step"));
+        assert_eq!(summary.distinct_path_count, 3);
+        assert_eq!(
+            summary.path_sequence,
+            vec![
+                "/sequence-probe".to_string(),
+                "/session".to_string(),
+                "/sequence-step".to_string(),
+                "/sequence-step".to_string(),
+                "/sequence-step".to_string(),
+            ]
+        );
+        assert!(summary.mean_gap_ms.is_some_and(|gap| gap > 0.0));
+        assert!(summary.max_gap_ms.is_some_and(|gap| gap >= 40.0));
 
         Ok(())
     }
