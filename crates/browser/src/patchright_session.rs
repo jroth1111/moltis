@@ -108,6 +108,16 @@ enum PatchrightRequest {
     Refresh {
         id: u64,
     },
+    StartApiCapture {
+        id: u64,
+        allowed_hosts: Vec<String>,
+        url_patterns: Vec<String>,
+        include_document_requests: bool,
+        max_examples_per_endpoint: usize,
+    },
+    StopApiCapture {
+        id: u64,
+    },
     NewTab {
         id: u64,
         name: String,
@@ -212,6 +222,8 @@ impl PatchrightSession {
             | PatchrightRequest::Back { id }
             | PatchrightRequest::Forward { id }
             | PatchrightRequest::Refresh { id }
+            | PatchrightRequest::StartApiCapture { id, .. }
+            | PatchrightRequest::StopApiCapture { id }
             | PatchrightRequest::NewTab { id, .. }
             | PatchrightRequest::ListTabs { id }
             | PatchrightRequest::SwitchTab { id, .. }
@@ -470,6 +482,40 @@ impl PatchrightSession {
             .map(|_| ())
     }
 
+    pub async fn start_api_capture(
+        &mut self,
+        config: &crate::api_capture::ApiCaptureConfig,
+    ) -> Result<(), Error> {
+        let id = self.next_id();
+        self.send(PatchrightRequest::StartApiCapture {
+            id,
+            allowed_hosts: config.allowed_hosts.clone(),
+            url_patterns: config.url_patterns.clone(),
+            include_document_requests: config.include_document_requests,
+            max_examples_per_endpoint: config.max_examples_per_endpoint,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn stop_api_capture(
+        &mut self,
+    ) -> Result<Vec<crate::api_capture::CapturedRequestRecord>, Error> {
+        let id = self.next_id();
+        let value = self.send(PatchrightRequest::StopApiCapture { id }).await?;
+        serde_json::from_value(
+            value
+                .get("records")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )
+        .map_err(|error| {
+            Error::NavigationFailed(format!(
+                "invalid patchright api capture records payload: {error}"
+            ))
+        })
+    }
+
     pub async fn new_tab(&mut self, name: &str) -> Result<(), Error> {
         let id = self.next_id();
         self.send(PatchrightRequest::NewTab {
@@ -523,9 +569,11 @@ impl PatchrightSession {
 
 const PATCHRIGHT_SESSION_PY: &str = r#"
 import base64
+import fnmatch
 import json
 import platform
 import sys
+from urllib.parse import urlparse
 
 launch_options = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
 channel = launch_options.get("channel")
@@ -600,9 +648,123 @@ with sync_playwright() as p:
     tabs = {}
     tabs["main"] = context.new_page()
     active_tab = "main"
+    capture_config = None
+    capture_pending = {}
+    capture_completed = []
+    capture_attached_pages = set()
 
     def current_page():
         return tabs[active_tab]
+
+    def _normalize_allowed_host(host):
+        return (host or "").strip().strip(".").lower()
+
+    def _host_allowed(url, allowed_hosts):
+        if not allowed_hosts:
+            return True
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+        for candidate in (_normalize_allowed_host(value) for value in allowed_hosts):
+            if not candidate:
+                continue
+            if host == candidate:
+                return True
+            if ":" not in candidate and host.endswith("." + candidate):
+                return True
+        return False
+
+    def _matches_patterns(url, patterns):
+        if not patterns:
+            return True
+        return any(fnmatch.fnmatch(url, pattern) for pattern in patterns)
+
+    def _should_capture_request(request):
+        if capture_config is None:
+            return False
+        resource_type = (getattr(request, "resource_type", "") or "").lower()
+        if resource_type == "document":
+            if not capture_config.get("include_document_requests"):
+                return False
+        elif resource_type not in ("fetch", "xhr", "eventsource", "other", ""):
+            return False
+        return _host_allowed(request.url, capture_config.get("allowed_hosts") or []) and _matches_patterns(
+            request.url,
+            capture_config.get("url_patterns") or [],
+        )
+
+    def _request_headers(request):
+        try:
+            headers = request.headers or {}
+        except Exception:
+            headers = {}
+        return [[str(name), str(value)] for name, value in headers.items()]
+
+    def _request_content_type(headers):
+        for name, value in headers:
+            if str(name).lower() == "content-type":
+                return str(value)
+        return None
+
+    def _record_from_request(request):
+        headers = _request_headers(request)
+        try:
+            body = request.post_data
+        except Exception:
+            body = None
+        return {
+            "request_id": f"pw-{id(request)}",
+            "method": str(request.method),
+            "url": str(request.url),
+            "request_headers": headers,
+            "request_body": body,
+            "request_content_type": _request_content_type(headers),
+            "resource_type": getattr(request, "resource_type", None),
+            "status": None,
+            "response_content_type": None,
+        }
+
+    def _capture_key(request):
+        return str(id(request))
+
+    def _on_request(request):
+        if not _should_capture_request(request):
+            return
+        capture_pending[_capture_key(request)] = _record_from_request(request)
+
+    def _on_response(response):
+        request = response.request
+        record = capture_pending.get(_capture_key(request))
+        if record is None:
+            return
+        try:
+            headers = response.headers or {}
+        except Exception:
+            headers = {}
+        record["status"] = int(getattr(response, "status", 0) or 0) or None
+        record["response_content_type"] = headers.get("content-type")
+
+    def _finalize_request(request):
+        record = capture_pending.pop(_capture_key(request), None)
+        if record is not None:
+            capture_completed.append(record)
+
+    def _attach_capture_page(page):
+        page_key = str(id(page))
+        if page_key in capture_attached_pages:
+            return
+        capture_attached_pages.add(page_key)
+        page.on("request", _on_request)
+        page.on("response", _on_response)
+        page.on("requestfinished", _finalize_request)
+        page.on("requestfailed", _finalize_request)
+
+    context.on("page", _attach_capture_page)
+    _attach_capture_page(tabs["main"])
 
     for raw in sys.stdin:
         raw = raw.strip()
@@ -618,7 +780,7 @@ with sync_playwright() as p:
                 _result(id)
             elif cmd == "capture_page":
                 page = current_page()
-                title = (page.title() or "").strip()
+                title = (page.evaluate("document.title || ''") or "").strip()
                 body_text = page.evaluate("""(() => {
                     const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
                     return text.length;
@@ -637,8 +799,8 @@ with sync_playwright() as p:
                 _result(id, {"data_base64": base64.b64encode(data).decode("ascii")})
             elif cmd == "wait_selector":
                 try:
-                    current_page().wait_for_selector(
-                        req["selector"],
+                    current_page().locator(req["selector"]).wait_for(
+                        state="attached",
                         timeout=int(req.get("timeout_ms") or 30000),
                     )
                     _result(id, {"found": True})
@@ -678,7 +840,7 @@ with sync_playwright() as p:
             elif cmd == "get_url":
                 _result(id, {"url": current_page().url})
             elif cmd == "get_title":
-                _result(id, {"title": current_page().title() or ""})
+                _result(id, {"title": current_page().evaluate("document.title || ''") or ""})
             elif cmd == "back":
                 current_page().go_back(wait_until="domcontentloaded", timeout=45000)
                 _result(id)
@@ -688,11 +850,29 @@ with sync_playwright() as p:
             elif cmd == "refresh":
                 current_page().reload(wait_until="domcontentloaded", timeout=45000)
                 _result(id)
+            elif cmd == "start_api_capture":
+                capture_config = {
+                    "allowed_hosts": req.get("allowed_hosts") or [],
+                    "url_patterns": req.get("url_patterns") or [],
+                    "include_document_requests": bool(req.get("include_document_requests")),
+                    "max_examples_per_endpoint": int(req.get("max_examples_per_endpoint") or 3),
+                }
+                capture_pending = {}
+                capture_completed = []
+                for page in tabs.values():
+                    _attach_capture_page(page)
+                _result(id)
+            elif cmd == "stop_api_capture":
+                capture_completed.extend(capture_pending.values())
+                capture_pending = {}
+                capture_config = None
+                _result(id, {"records": capture_completed})
             elif cmd == "new_tab":
                 name = req["name"]
                 if name in tabs:
                     raise RuntimeError(f"tab '{name}' already exists")
                 tabs[name] = context.new_page()
+                _attach_capture_page(tabs[name])
                 active_tab = name
                 _result(id)
             elif cmd == "list_tabs":

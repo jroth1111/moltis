@@ -49,6 +49,7 @@ pub fn build_http_client(proxy_url: Option<&str>) -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 pub mod browser;
+pub mod browser_api_catalog;
 pub mod calc;
 pub mod cron_tool;
 #[cfg(feature = "wasm")]

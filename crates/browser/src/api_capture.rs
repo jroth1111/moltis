@@ -7,17 +7,22 @@ use {
     chromiumoxide::cdp::browser_protocol::network::{
         self, EventLoadingFailed, EventRequestWillBeSent, EventResponseReceived,
     },
-    serde::Serialize,
+    serde::{Deserialize, Serialize},
     serde_json::{Map, Value},
     tokio::task::JoinHandle,
-    url::{Url, form_urlencoded},
+    url::{Host, Url, form_urlencoded},
     uuid::Uuid,
 };
 
 const DEFAULT_MAX_EXAMPLES_PER_ENDPOINT: usize = 3;
+const MAX_AGENT_SUMMARY_HOSTS: usize = 5;
+const MAX_AGENT_SUMMARY_ENDPOINTS: usize = 25;
+const MAX_AGENT_SUMMARY_FIELDS: usize = 20;
+const MAX_AGENT_SUMMARY_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ApiCaptureConfig {
+    pub allowed_hosts: Vec<String>,
     pub url_patterns: Vec<String>,
     pub include_document_requests: bool,
     pub max_examples_per_endpoint: usize,
@@ -26,6 +31,7 @@ pub struct ApiCaptureConfig {
 impl Default for ApiCaptureConfig {
     fn default() -> Self {
         Self {
+            allowed_hosts: Vec::new(),
             url_patterns: Vec::new(),
             include_document_requests: false,
             max_examples_per_endpoint: DEFAULT_MAX_EXAMPLES_PER_ENDPOINT,
@@ -35,6 +41,7 @@ impl Default for ApiCaptureConfig {
 
 #[derive(Debug, Default)]
 pub struct ApiCaptureRuntime {
+    pub handle: Option<String>,
     pub config: Option<ApiCaptureConfig>,
     pub recorder: Option<ApiCaptureRecorder>,
     pub attached_targets: HashSet<String>,
@@ -43,6 +50,7 @@ pub struct ApiCaptureRuntime {
 
 #[derive(Debug)]
 pub struct ApiCaptureSnapshot {
+    pub handle: String,
     pub config: ApiCaptureConfig,
     pub recorder: ApiCaptureRecorder,
 }
@@ -51,6 +59,25 @@ pub struct ApiCaptureSnapshot {
 pub struct ApiCatalog {
     pub summary: ApiCatalogSummary,
     pub endpoints: Vec<ApiEndpoint>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ApiCatalogOmittedCounts {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hosts: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub endpoints: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fields: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ApiCatalogAgentSummary {
+    pub summary: ApiCatalogSummary,
+    pub endpoints: Vec<ApiEndpoint>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "omitted_counts_is_empty")]
+    pub omitted_counts: ApiCatalogOmittedCounts,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -129,14 +156,42 @@ pub struct ApiRequestExample {
     pub body: Option<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturedRequestRecord {
+    #[serde(default)]
+    pub request_id: String,
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub request_headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub request_body: Option<String>,
+    #[serde(default)]
+    pub request_content_type: Option<String>,
+    #[serde(default)]
+    pub resource_type: Option<String>,
+    #[serde(default)]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub response_content_type: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct ApiCaptureRecorder {
     config: ApiCaptureConfig,
-    observations: Vec<ObservedRequest>,
+    observations: Vec<CapturedRequestRecord>,
     pending_requests: HashMap<network::RequestId, ObservedRequest>,
     pending_response_updates: HashMap<network::RequestId, ResponseUpdate>,
     pending_header_overrides: HashMap<network::RequestId, HashMap<String, String>>,
     terminal_requests: HashSet<network::RequestId>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn omitted_counts_is_empty(counts: &ApiCatalogOmittedCounts) -> bool {
+    counts.hosts == 0 && counts.endpoints == 0 && counts.fields == 0
 }
 
 impl ApiCaptureRecorder {
@@ -177,7 +232,7 @@ impl ApiCaptureRecorder {
         }
 
         if self.terminal_requests.remove(&request_id) {
-            self.observations.push(observed);
+            self.observations.push(observed.into_record());
         } else {
             self.pending_requests.insert(request_id, observed);
         }
@@ -211,9 +266,10 @@ impl ApiCaptureRecorder {
             .observations
             .iter_mut()
             .rev()
-            .find(|observed| observed.request_id == event.request_id)
+            .find(|observed| observed.request_id == event.request_id.as_ref())
         {
-            observed.apply_response_update(update);
+            observed.status = update.status;
+            observed.response_content_type = update.response_content_type;
             return;
         }
         self.pending_response_updates
@@ -222,13 +278,13 @@ impl ApiCaptureRecorder {
 
     pub fn apply_loading_finished(&mut self, request_id: &network::RequestId) {
         if let Some(observed) = self.pending_requests.remove(request_id) {
-            self.observations.push(observed);
+            self.observations.push(observed.into_record());
             return;
         }
         if !self
             .observations
             .iter()
-            .any(|observed| &observed.request_id == request_id)
+            .any(|observed| observed.request_id == request_id.as_ref())
         {
             self.terminal_requests.insert(request_id.clone());
         }
@@ -236,13 +292,13 @@ impl ApiCaptureRecorder {
 
     pub fn apply_loading_failed(&mut self, event: &EventLoadingFailed) {
         if let Some(observed) = self.pending_requests.remove(&event.request_id) {
-            self.observations.push(observed);
+            self.observations.push(observed.into_record());
             return;
         }
         if !self
             .observations
             .iter()
-            .any(|observed| observed.request_id == event.request_id)
+            .any(|observed| observed.request_id == event.request_id.as_ref())
         {
             self.terminal_requests.insert(event.request_id.clone());
         }
@@ -250,11 +306,15 @@ impl ApiCaptureRecorder {
 
     pub fn finish(&mut self) {
         for (_, observed) in self.pending_requests.drain() {
-            self.observations.push(observed);
+            self.observations.push(observed.into_record());
         }
         self.pending_response_updates.clear();
         self.pending_header_overrides.clear();
         self.terminal_requests.clear();
+    }
+
+    pub fn append_records(&mut self, records: impl IntoIterator<Item = CapturedRequestRecord>) {
+        self.observations.extend(records);
     }
 
     #[must_use]
@@ -263,7 +323,7 @@ impl ApiCaptureRecorder {
         let mut hosts = BTreeSet::new();
 
         for observed in &self.observations {
-            let Some(parsed) = ParsedObservation::from_observed(observed) else {
+            let Some(parsed) = ParsedObservation::from_record(observed) else {
                 continue;
             };
 
@@ -391,6 +451,20 @@ impl ObservedRequest {
             if name.eq_ignore_ascii_case("content-type") {
                 self.request_content_type = Some(normalize_content_type(value));
             }
+        }
+    }
+
+    fn into_record(self) -> CapturedRequestRecord {
+        CapturedRequestRecord {
+            request_id: self.request_id.as_ref().to_string(),
+            method: self.method,
+            url: self.url,
+            request_headers: self.request_headers,
+            request_body: self.request_body,
+            request_content_type: self.request_content_type,
+            resource_type: self.resource_type,
+            status: self.status,
+            response_content_type: self.response_content_type,
         }
     }
 }
@@ -553,7 +627,7 @@ struct ParsedObservation {
 }
 
 impl ParsedObservation {
-    fn from_observed(observed: &ObservedRequest) -> Option<Self> {
+    fn from_record(observed: &CapturedRequestRecord) -> Option<Self> {
         let url = Url::parse(&observed.url).ok()?;
         let origin = url.origin().ascii_serialization();
         let path_template = normalize_path_template(&url);
@@ -616,6 +690,98 @@ impl ParsedObservation {
             example,
         })
     }
+}
+
+impl ApiCatalog {
+    #[must_use]
+    pub fn to_agent_summary(&self) -> ApiCatalogAgentSummary {
+        let mut omitted_counts = ApiCatalogOmittedCounts::default();
+        let mut summary_hosts = self.summary.hosts.clone();
+        if summary_hosts.len() > MAX_AGENT_SUMMARY_HOSTS {
+            omitted_counts.hosts = summary_hosts.len() - MAX_AGENT_SUMMARY_HOSTS;
+            summary_hosts.truncate(MAX_AGENT_SUMMARY_HOSTS);
+        }
+
+        let mut endpoints = self
+            .endpoints
+            .iter()
+            .cloned()
+            .map(|mut endpoint| {
+                endpoint.examples.clear();
+                endpoint.query_params =
+                    truncate_fields(endpoint.query_params, &mut omitted_counts.fields);
+                if let Some(body) = endpoint.body.as_mut() {
+                    body.fields = truncate_fields(
+                        std::mem::take(&mut body.fields),
+                        &mut omitted_counts.fields,
+                    );
+                }
+                endpoint
+            })
+            .collect::<Vec<_>>();
+
+        if endpoints.len() > MAX_AGENT_SUMMARY_ENDPOINTS {
+            omitted_counts.endpoints = endpoints.len() - MAX_AGENT_SUMMARY_ENDPOINTS;
+            endpoints.truncate(MAX_AGENT_SUMMARY_ENDPOINTS);
+        }
+
+        let mut summary = ApiCatalogAgentSummary {
+            summary: ApiCatalogSummary {
+                captured_requests: self.summary.captured_requests,
+                endpoint_count: self.summary.endpoint_count,
+                hosts: summary_hosts,
+            },
+            endpoints,
+            truncated: !omitted_counts_is_empty(&omitted_counts),
+            omitted_counts,
+        };
+
+        while serde_json::to_vec(&summary)
+            .ok()
+            .is_some_and(|bytes| bytes.len() > MAX_AGENT_SUMMARY_BYTES)
+        {
+            if let Some(endpoint) = summary.endpoints.pop() {
+                summary.omitted_counts.endpoints =
+                    summary.omitted_counts.endpoints.saturating_add(1);
+                summary.omitted_counts.fields = summary
+                    .omitted_counts
+                    .fields
+                    .saturating_add(endpoint.query_params.len());
+                if let Some(body) = endpoint.body {
+                    summary.omitted_counts.fields = summary
+                        .omitted_counts
+                        .fields
+                        .saturating_add(body.fields.len());
+                }
+                summary.truncated = true;
+                continue;
+            }
+
+            if let Some(host) = summary.summary.hosts.pop() {
+                let _ = host;
+                summary.omitted_counts.hosts = summary.omitted_counts.hosts.saturating_add(1);
+                summary.truncated = true;
+                continue;
+            }
+
+            break;
+        }
+
+        summary.truncated = summary.truncated || !omitted_counts_is_empty(&summary.omitted_counts);
+        summary
+    }
+}
+
+fn truncate_fields(
+    mut fields: Vec<ApiFieldShape>,
+    omitted_field_count: &mut usize,
+) -> Vec<ApiFieldShape> {
+    if fields.len() > MAX_AGENT_SUMMARY_FIELDS {
+        *omitted_field_count =
+            omitted_field_count.saturating_add(fields.len() - MAX_AGENT_SUMMARY_FIELDS);
+        fields.truncate(MAX_AGENT_SUMMARY_FIELDS);
+    }
+    fields
 }
 
 #[derive(Debug, Clone)]
@@ -1204,6 +1370,9 @@ fn should_capture_request(
     url: &str,
     resource_type: Option<&str>,
 ) -> bool {
+    if !matches_allowed_hosts(url, &config.allowed_hosts) {
+        return false;
+    }
     if !matches_url_patterns(url, &config.url_patterns) {
         return false;
     }
@@ -1212,6 +1381,43 @@ fn should_capture_request(
         Some("Fetch" | "XHR" | "EventSource" | "Other") | None => true,
         Some("Document") => config.include_document_requests,
         _ => false,
+    }
+}
+
+fn matches_allowed_hosts(url: &str, allowed_hosts: &[String]) -> bool {
+    if allowed_hosts.is_empty() {
+        return true;
+    }
+
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host() else {
+        return false;
+    };
+
+    allowed_hosts
+        .iter()
+        .filter_map(|candidate| normalize_allowed_host(candidate))
+        .any(|candidate| host_matches_allowed(&host, candidate.as_str()))
+}
+
+fn normalize_allowed_host(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+fn host_matches_allowed(host: &Host<&str>, candidate: &str) -> bool {
+    match host {
+        Host::Domain(domain) => {
+            let domain = domain.to_ascii_lowercase();
+            domain == candidate || domain.ends_with(&format!(".{candidate}"))
+        },
+        Host::Ipv4(ip) => ip.to_string() == candidate,
+        Host::Ipv6(ip) => ip.to_string().to_ascii_lowercase() == candidate,
     }
 }
 
@@ -1796,9 +2002,10 @@ mod tests {
         assert_eq!(catalog.summary.captured_requests, 1);
         assert_eq!(catalog.endpoints.len(), 1);
         assert_eq!(catalog.endpoints[0].response.statuses, vec![200]);
-        assert_eq!(catalog.endpoints[0].response.content_types, vec![
-            "application/json"
-        ]);
+        assert_eq!(
+            catalog.endpoints[0].response.content_types,
+            vec!["application/json"]
+        );
     }
 
     #[test]
@@ -1837,5 +2044,125 @@ mod tests {
                 .as_ref()
                 .is_some_and(|body| body.fields.iter().any(|field| field.name == "query"))
         );
+    }
+
+    #[test]
+    fn allowed_hosts_filter_capture() {
+        let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig {
+            allowed_hosts: vec!["api.example.com".to_string()],
+            ..ApiCaptureConfig::default()
+        });
+        recorder.record_request(
+            &request_event(
+                "https://api.example.com/search?q=milk",
+                "GET",
+                "Fetch",
+                None,
+            ),
+            None,
+        );
+        recorder.record_request(
+            &request_event(
+                "https://cdn.example.net/search?q=milk",
+                "GET",
+                "Fetch",
+                None,
+            ),
+            None,
+        );
+        recorder.finish();
+
+        let catalog = recorder.build_catalog();
+        assert_eq!(catalog.summary.captured_requests, 1);
+        assert_eq!(catalog.summary.hosts, vec!["https://api.example.com"]);
+    }
+
+    #[test]
+    fn agent_summary_is_bounded_and_shape_only() {
+        let catalog = ApiCatalog {
+            summary: ApiCatalogSummary {
+                captured_requests: 64,
+                endpoint_count: MAX_AGENT_SUMMARY_ENDPOINTS + 5,
+                hosts: (0..(MAX_AGENT_SUMMARY_HOSTS + 2))
+                    .map(|index| format!("https://api-{index}.example.com"))
+                    .collect(),
+            },
+            endpoints: (0..(MAX_AGENT_SUMMARY_ENDPOINTS + 5))
+                .map(|index| ApiEndpoint {
+                    method: "GET".to_string(),
+                    origin: format!("https://api-{}.example.com", index % 7),
+                    path_template: format!("/v1/resource/{index}"),
+                    body_kind: "json".to_string(),
+                    operation_name: None,
+                    auth: Vec::new(),
+                    query_params: (0..(MAX_AGENT_SUMMARY_FIELDS + 3))
+                        .map(|field_index| ApiFieldShape {
+                            name: format!("query_{field_index}"),
+                            required: true,
+                            repeated: false,
+                            types: vec!["string".to_string()],
+                            semantic_hints: Vec::new(),
+                        })
+                        .collect(),
+                    body: Some(ApiBodyShape {
+                        kind: "json".to_string(),
+                        content_types: vec!["application/json".to_string()],
+                        fields: (0..(MAX_AGENT_SUMMARY_FIELDS + 4))
+                            .map(|field_index| ApiFieldShape {
+                                name: format!("body_{field_index}"),
+                                required: false,
+                                repeated: false,
+                                types: vec!["string".to_string()],
+                                semantic_hints: Vec::new(),
+                            })
+                            .collect(),
+                    }),
+                    response: ApiResponseMeta {
+                        statuses: vec![200],
+                        content_types: vec!["application/json".to_string()],
+                    },
+                    semantic_hints: Vec::new(),
+                    examples: vec![ApiRequestExample {
+                        redacted_url: format!("https://api.example.com/v1/resource/{index}"),
+                        url: format!("/v1/resource/{index}"),
+                        query: BTreeMap::from([(
+                            "token".to_string(),
+                            vec!["[REDACTED]".to_string()],
+                        )]),
+                        body: Some(json!({ "token": "[REDACTED]" })),
+                    }],
+                })
+                .collect(),
+        };
+
+        let summary = catalog.to_agent_summary();
+        let encoded = serde_json::to_vec(&summary)
+            .unwrap_or_else(|error| panic!("summary should serialize: {error}"));
+
+        assert!(summary.truncated);
+        assert!(summary.endpoints.len() <= MAX_AGENT_SUMMARY_ENDPOINTS);
+        assert!(summary.summary.hosts.len() <= MAX_AGENT_SUMMARY_HOSTS);
+        assert!(
+            summary
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.examples.is_empty())
+        );
+        assert!(
+            summary
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.query_params.len() <= MAX_AGENT_SUMMARY_FIELDS)
+        );
+        assert!(summary.endpoints.iter().all(|endpoint| {
+            endpoint
+                .body
+                .as_ref()
+                .is_none_or(|body| body.fields.len() <= MAX_AGENT_SUMMARY_FIELDS)
+        }));
+        assert!(summary.omitted_counts.hosts > 0);
+        assert!(summary.omitted_counts.endpoints > 0);
+        assert!(summary.omitted_counts.fields > 0);
+        assert!(encoded.len() <= MAX_AGENT_SUMMARY_BYTES);
     }
 }

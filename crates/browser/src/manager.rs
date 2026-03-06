@@ -1,6 +1,6 @@
 //! Browser manager providing high-level browser automation actions.
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use {
     base64::{Engine, engine::general_purpose::STANDARD as BASE64},
@@ -14,7 +14,11 @@ use {
             page::CaptureScreenshotFormat,
         },
     },
-    tokio::time::{Duration, sleep, timeout},
+    tokio::{
+        fs,
+        sync::RwLock,
+        time::{Duration, sleep, timeout},
+    },
     tracing::{debug, info, warn},
 };
 
@@ -35,8 +39,8 @@ use crate::{
     telemetry::{
         ProbeBackendReport, ProbeBaselineStore, ProbeCanaryReport, ProbeCanarySpec,
         ProbeCanaryVerdict, ProbeRunEvidence, ProbeRunProfile, browser_version_from_user_agent,
-        fetch_probe_behavior_report, fetch_probe_fingerprint_report,
-        fetch_probe_sequence_report, probe_browser_family, stable_hex_hash,
+        fetch_probe_behavior_report, fetch_probe_fingerprint_report, fetch_probe_sequence_report,
+        probe_browser_family, stable_hex_hash,
     },
     types::{
         BrowserAction, BrowserBackendKind, BrowserConfig, BrowserPreference, BrowserRequest,
@@ -82,6 +86,7 @@ fn sanitize_evaluate_result(value: serde_json::Value) -> serde_json::Value {
 pub struct BrowserManager {
     pool: Arc<BrowserPool>,
     config: BrowserConfig,
+    catalogs: Arc<RwLock<HashMap<String, crate::api_capture::ApiCatalog>>>,
 }
 
 impl Default for BrowserManager {
@@ -114,6 +119,7 @@ impl BrowserManager {
         Self {
             pool: Arc::new(BrowserPool::new(config.clone())),
             config,
+            catalogs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -122,7 +128,10 @@ impl BrowserManager {
         self.config.enabled
     }
 
-    pub async fn run_probe_canary(&self, spec: ProbeCanarySpec) -> Result<ProbeCanaryReport, Error> {
+    pub async fn run_probe_canary(
+        &self,
+        spec: ProbeCanarySpec,
+    ) -> Result<ProbeCanaryReport, Error> {
         let origin = spec.validated_origin()?;
         let capture_plan = spec.policy.capture_plan(spec.tls_sidecar.is_some());
         if capture_plan.capture_tls_ja4 && spec.tls_sidecar.is_none() {
@@ -268,7 +277,8 @@ impl BrowserManager {
             .run_probe_sequence_flow(session_id, origin, spec.browser)
             .await?;
 
-        let fingerprint = fetch_probe_fingerprint_report(client, origin, &fingerprint_session).await?;
+        let fingerprint =
+            fetch_probe_fingerprint_report(client, origin, &fingerprint_session).await?;
         let behavior = fetch_probe_behavior_report(client, origin, &behavior_session).await?;
         let sequence = fetch_probe_sequence_report(client, origin, &sequence_run_id).await?;
 
@@ -310,7 +320,9 @@ impl BrowserManager {
                 self.pool.get_or_create(None, false, Some(browser)).await?
             },
             BrowserBackendKind::Patchright => {
-                self.pool.get_or_create_patchright(None, Some(browser)).await?
+                self.pool
+                    .get_or_create_patchright(None, Some(browser))
+                    .await?
             },
         };
         Ok((session_id, selected))
@@ -354,13 +366,8 @@ impl BrowserManager {
     ) -> Result<String, Error> {
         self.run_probe_navigate(session_id, origin, "/fp-probe", browser)
             .await?;
-        self.run_probe_wait(
-            session_id,
-            "body[data-probe-fp='ready']",
-            10_000,
-            browser,
-        )
-        .await?;
+        self.run_probe_wait(session_id, "body[data-probe-fp='ready']", 10_000, browser)
+            .await?;
         self.run_probe_session_lookup(session_id, browser).await
     }
 
@@ -507,8 +514,9 @@ impl BrowserManager {
             .run_probe_action(
                 Some(session_id.to_string()),
                 BrowserAction::Evaluate {
-                    code: "(window.__probeSessionId || document.body?.dataset?.probeSessionId || '')"
-                        .to_string(),
+                    code:
+                        "(window.__probeSessionId || document.body?.dataset?.probeSessionId || '')"
+                            .to_string(),
                 },
                 10_000,
                 browser,
@@ -757,12 +765,14 @@ impl BrowserManager {
                     .await
             },
             BrowserAction::StartApiCapture {
+                allowed_hosts,
                 url_patterns,
                 include_document_requests,
                 max_examples_per_endpoint,
             } => {
                 self.start_api_capture(
                     session_id,
+                    allowed_hosts,
                     url_patterns,
                     include_document_requests,
                     max_examples_per_endpoint,
@@ -1147,6 +1157,24 @@ impl BrowserManager {
                 self.patchright_upload(&sid, ref_, &path, sandbox).await
             },
             BrowserAction::Clear { ref_ } => self.patchright_clear(&sid, ref_, sandbox).await,
+            BrowserAction::StartApiCapture {
+                allowed_hosts,
+                url_patterns,
+                include_document_requests,
+                max_examples_per_endpoint,
+            } => {
+                self.start_api_capture(
+                    Some(&sid),
+                    allowed_hosts,
+                    url_patterns,
+                    include_document_requests,
+                    max_examples_per_endpoint,
+                    sandbox,
+                    None,
+                )
+                .await
+            },
+            BrowserAction::StopApiCapture => self.stop_api_capture(Some(&sid), sandbox, None).await,
             BrowserAction::TabNew { name } => self.patchright_tab_new(&sid, &name, sandbox).await,
             BrowserAction::TabList => self.patchright_tab_list(&sid, sandbox).await,
             BrowserAction::TabSwitch { name } => {
@@ -1160,8 +1188,6 @@ impl BrowserManager {
             | BrowserAction::InterceptRequests { .. }
             | BrowserAction::StopIntercept
             | BrowserAction::SetExtraHeaders { .. }
-            | BrowserAction::StartApiCapture { .. }
-            | BrowserAction::StopApiCapture
             | BrowserAction::SaveState { .. }
             | BrowserAction::LoadState { .. }
             | BrowserAction::ListStates
@@ -2213,7 +2239,8 @@ impl BrowserManager {
         let sid = require_session(session_id, "get_title")?;
 
         let page = self.pool.get_page(&sid).await?;
-        let title = sanitize_string_response(page.get_title().await.ok().flatten().unwrap_or_default());
+        let title =
+            sanitize_string_response(page.get_title().await.ok().flatten().unwrap_or_default());
 
         Ok((
             sid.clone(),
@@ -2674,7 +2701,7 @@ impl BrowserManager {
     async fn set_extra_headers(
         &self,
         session_id: Option<&str>,
-        headers: std::collections::HashMap<String, String>,
+        headers: HashMap<String, String>,
         sandbox: bool,
         browser: Option<BrowserPreference>,
     ) -> Result<(String, BrowserResponse), Error> {
@@ -2692,29 +2719,41 @@ impl BrowserManager {
     async fn start_api_capture(
         &self,
         session_id: Option<&str>,
+        allowed_hosts: Vec<String>,
         url_patterns: Vec<String>,
         include_document_requests: bool,
         max_examples_per_endpoint: u32,
         sandbox: bool,
         browser: Option<BrowserPreference>,
     ) -> Result<(String, BrowserResponse), Error> {
+        if allowed_hosts.is_empty() {
+            return Err(Error::InvalidAction(
+                "start_api_capture requires at least one allowed_hosts entry".into(),
+            ));
+        }
         let sid = self
             .pool
             .get_or_create(session_id, sandbox, browser)
             .await?;
         let start = Instant::now();
-        self.pool
-            .start_api_capture(&sid, crate::api_capture::ApiCaptureConfig {
-                url_patterns,
-                include_document_requests,
-                max_examples_per_endpoint: usize::try_from(max_examples_per_endpoint)
-                    .ok()
-                    .filter(|value| *value > 0)
-                    .unwrap_or(3),
-            })
+        let handle = self
+            .pool
+            .start_api_capture(
+                &sid,
+                crate::api_capture::ApiCaptureConfig {
+                    allowed_hosts,
+                    url_patterns,
+                    include_document_requests,
+                    max_examples_per_endpoint: usize::try_from(max_examples_per_endpoint)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .unwrap_or(3),
+                },
+            )
             .await?;
         let resp =
-            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
+            BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox)
+                .with_result(serde_json::json!({ "catalog_handle": handle }));
         Ok((sid, resp))
     }
 
@@ -2726,13 +2765,53 @@ impl BrowserManager {
     ) -> Result<(String, BrowserResponse), Error> {
         let sid = require_session(session_id, "stop_api_capture")?;
         let start = Instant::now();
-        let catalog = self.pool.stop_api_capture(&sid).await;
+        let catalog = self.pool.stop_api_capture_with_handle(&sid).await?;
         let mut resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
-        if let Some(api_catalog) = catalog {
-            resp = resp.with_result(serde_json::json!({ "api_catalog": api_catalog }));
+        if let Some((handle, api_catalog)) = catalog {
+            self.catalogs
+                .write()
+                .await
+                .insert(handle.clone(), api_catalog.clone());
+            let summary = api_catalog.to_agent_summary();
+            resp = resp.with_result(serde_json::json!({
+                "catalog_handle": handle,
+                "summary": summary,
+                "truncated": summary.truncated,
+                "omitted_counts": summary.omitted_counts,
+            }));
         }
         Ok((sid, resp))
+    }
+
+    pub async fn get_api_catalog_summary(&self, handle: &str) -> Result<serde_json::Value, Error> {
+        let catalogs = self.catalogs.read().await;
+        let catalog = catalogs
+            .get(handle)
+            .ok_or_else(|| Error::InvalidAction(format!("unknown api catalog handle: {handle}")))?;
+        Ok(serde_json::json!({
+            "catalog_handle": handle,
+            "summary": catalog.to_agent_summary(),
+        }))
+    }
+
+    pub async fn export_api_catalog(&self, handle: &str) -> Result<(PathBuf, u64), Error> {
+        let catalog = {
+            let catalogs = self.catalogs.read().await;
+            catalogs.get(handle).cloned().ok_or_else(|| {
+                Error::InvalidAction(format!("unknown api catalog handle: {handle}"))
+            })?
+        };
+        let export_dir = moltis_config::data_dir()
+            .join("browser")
+            .join("api_catalogs");
+        fs::create_dir_all(&export_dir).await?;
+        let path = export_dir.join(format!("{handle}.json"));
+        let bytes = serde_json::to_vec_pretty(&catalog).map_err(|error| {
+            Error::InvalidAction(format!("failed to encode api catalog: {error}"))
+        })?;
+        fs::write(&path, &bytes).await?;
+        Ok((path, bytes.len() as u64))
     }
 
     // ── Phase 6: Session state ──────────────────────────────────────────────
@@ -3101,6 +3180,43 @@ fn truncate_url(url: &str) -> String {
 mod tests {
     use super::*;
 
+    fn sample_api_catalog() -> crate::api_capture::ApiCatalog {
+        crate::api_capture::ApiCatalog {
+            summary: crate::api_capture::ApiCatalogSummary {
+                captured_requests: 1,
+                endpoint_count: 1,
+                hosts: vec!["https://api.example.com".to_string()],
+            },
+            endpoints: vec![crate::api_capture::ApiEndpoint {
+                method: "GET".to_string(),
+                origin: "https://api.example.com".to_string(),
+                path_template: "/v1/items".to_string(),
+                body_kind: "none".to_string(),
+                operation_name: None,
+                auth: Vec::new(),
+                query_params: vec![crate::api_capture::ApiFieldShape {
+                    name: "q".to_string(),
+                    required: true,
+                    repeated: false,
+                    types: vec!["string".to_string()],
+                    semantic_hints: vec!["search".to_string()],
+                }],
+                body: None,
+                response: crate::api_capture::ApiResponseMeta {
+                    statuses: vec![200],
+                    content_types: vec!["application/json".to_string()],
+                },
+                semantic_hints: vec!["search".to_string()],
+                examples: vec![crate::api_capture::ApiRequestExample {
+                    redacted_url: "https://api.example.com/v1/items?q=milk".to_string(),
+                    url: "/v1/items".to_string(),
+                    query: std::collections::BTreeMap::new(),
+                    body: None,
+                }],
+            }],
+        }
+    }
+
     #[test]
     fn test_default_config() {
         let config = BrowserConfig::default();
@@ -3187,6 +3303,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_catalog_summary_requires_known_handle() {
+        let manager = BrowserManager::default();
+        let error = manager
+            .get_api_catalog_summary("missing")
+            .await
+            .expect_err("unknown handles should fail");
+        assert!(error.to_string().contains("unknown api catalog handle"));
+    }
+
+    #[tokio::test]
+    async fn manager_exports_catalogs_by_handle() {
+        let temp =
+            tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir should work: {error}"));
+        let previous_data_dir = moltis_config::data_dir();
+        moltis_config::set_data_dir(temp.path().to_path_buf());
+
+        let manager = BrowserManager::default();
+        manager
+            .catalogs
+            .write()
+            .await
+            .insert("catalog-1".to_string(), sample_api_catalog());
+
+        let summary = manager
+            .get_api_catalog_summary("catalog-1")
+            .await
+            .unwrap_or_else(|error| panic!("summary should succeed: {error}"));
+        assert_eq!(summary["catalog_handle"], "catalog-1");
+        assert_eq!(summary["summary"]["summary"]["captured_requests"], 1);
+
+        let (path, bytes) = manager
+            .export_api_catalog("catalog-1")
+            .await
+            .unwrap_or_else(|error| panic!("export should succeed: {error}"));
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("exported file should be readable: {error}"));
+
+        moltis_config::set_data_dir(previous_data_dir);
+
+        assert!(bytes > 0);
+        assert!(path.ends_with("catalog-1.json"));
+        assert!(contents.contains("\"captured_requests\": 1"));
+        assert!(contents.contains("\"path_template\": \"/v1/items\""));
+    }
+
+    #[tokio::test]
     async fn cleanup_stale_session_returns_connection_closed() {
         let manager = BrowserManager::default();
         let err = manager.cleanup_stale_session("sess-42", "screenshot").await;
@@ -3204,7 +3366,10 @@ mod tests {
 
     #[test]
     fn sanitize_string_response_strips_invisible_unicode() {
-        assert_eq!(sanitize_string_response("Ti\u{200b}tle\u{2060}".to_string()), "Title");
+        assert_eq!(
+            sanitize_string_response("Ti\u{200b}tle\u{2060}".to_string()),
+            "Title"
+        );
     }
 
     #[test]

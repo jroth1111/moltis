@@ -3461,13 +3461,23 @@ pub async fn prepare_gateway(
             };
             tool_registry.register(Box::new(t));
         }
-        if let Some(t) = moltis_tools::browser::BrowserTool::from_config(&config.tools.browser) {
+        if config.tools.browser.enabled {
+            let browser_manager = Arc::new(moltis_browser::BrowserManager::new(
+                moltis_browser::BrowserConfig::from(&config.tools.browser),
+            ));
+            let t = moltis_tools::browser::BrowserTool::from_manager(
+                Arc::clone(&browser_manager),
+                &config.tools.browser,
+            );
             let t = if sandbox_router.backend_name() != "none" {
                 t.with_sandbox_router(Arc::clone(&sandbox_router))
             } else {
                 t
             };
             tool_registry.register(Box::new(t));
+            tool_registry.register(Box::new(
+                moltis_tools::browser_api_catalog::BrowserApiCatalogTool::new(browser_manager),
+            ));
         }
 
         #[cfg(feature = "caldav")]

@@ -52,6 +52,26 @@ impl BrowserTool {
         }
     }
 
+    pub fn with_domain_policies(
+        mut self,
+        allowed_domains: Vec<String>,
+        autonomous_allowed_domains: Vec<String>,
+    ) -> Self {
+        self.allowed_domains = allowed_domains;
+        self.autonomous_allowed_domains = autonomous_allowed_domains;
+        self
+    }
+
+    pub fn from_manager(
+        manager: Arc<BrowserManager>,
+        config: &moltis_config::schema::BrowserConfig,
+    ) -> Self {
+        Self::new(manager).with_domain_policies(
+            config.allowed_domains.clone(),
+            config.autonomous_allowed_domains.clone(),
+        )
+    }
+
     /// Attach a sandbox router for per-session sandbox mode resolution.
     pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
         self.sandbox_router = Some(router);
@@ -65,13 +85,7 @@ impl BrowserTool {
         }
         let browser_config = moltis_browser::BrowserConfig::from(config);
         let manager = Arc::new(BrowserManager::new(browser_config));
-        Some(Self {
-            manager,
-            sandbox_router: None,
-            allowed_domains: config.allowed_domains.clone(),
-            autonomous_allowed_domains: config.autonomous_allowed_domains.clone(),
-            last_session_ids: RwLock::new(HashMap::new()),
-        })
+        Some(Self::from_manager(manager, config))
     }
 
     /// Clear the tracked session ID (e.g., after explicit close).
@@ -176,7 +190,7 @@ impl AgentTool for BrowserTool {
          - {\"action\": \"upload\", \"ref_\": N, \"path\": \"/abs/path/file.pdf\"} - file upload\n\
          - {\"action\": \"clear\", \"ref_\": N} - clear an input field\n\
          - {\"action\": \"intercept_requests\", \"url_patterns\": [\"*api*\"]} - inspect or modify matching requests\n\
-         - {\"action\": \"start_api_capture\", \"url_patterns\": [\"*api*\"], \"max_examples_per_endpoint\": 3} / {\"action\": \"stop_api_capture\"} - infer reusable backend request shapes\n\
+         - {\"action\": \"start_api_capture\", \"allowed_hosts\": [\"api.example.com\"], \"url_patterns\": [\"*api*\"], \"max_examples_per_endpoint\": 3} / {\"action\": \"stop_api_capture\"} - infer reusable backend request shapes\n\
          - {\"action\": \"save_state\", \"name\": \"mysession\"} - persist cookies+storage\n\
          - {\"action\": \"set_device\", \"width\": 375, \"height\": 812, \"mobile\": true} - emulate device\n\
          - {\"action\": \"tab_new\", \"tab_name\": \"sidebar\"} - open new tab"
@@ -276,6 +290,11 @@ impl AgentTool for BrowserTool {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "URL glob patterns to match (empty = all requests). For 'intercept_requests' and 'start_api_capture'."
+                },
+                "allowed_hosts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Allowed hostname list for API capture. Required for 'start_api_capture'; only matching hosts are surfaced back to the agent."
                 },
                 "headers": {
                     "type": "object",

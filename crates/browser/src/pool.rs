@@ -16,6 +16,7 @@ use {
     sysinfo::System,
     tokio::sync::{Mutex, RwLock, broadcast},
     tracing::{debug, info, warn},
+    uuid::Uuid,
 };
 
 use crate::{
@@ -111,6 +112,13 @@ pub(crate) struct PatchrightInstance {
     last_used: Instant,
     #[allow(dead_code)]
     patchright_launch_profile: PatchrightLaunchProfile,
+    api_capture: Option<PatchrightApiCaptureState>,
+}
+
+struct PatchrightApiCaptureState {
+    handle: String,
+    config: crate::api_capture::ApiCaptureConfig,
+    recorder: crate::api_capture::ApiCaptureRecorder,
 }
 
 /// Pool of browser instances for reuse.
@@ -232,6 +240,7 @@ impl BrowserPool {
             session: PatchrightSession::start(&self.config.protection, &launch_profile).await?,
             last_used: Instant::now(),
             patchright_launch_profile: launch_profile,
+            api_capture: None,
         };
         let instance = Arc::new(Mutex::new(instance));
 
@@ -439,10 +448,7 @@ impl BrowserPool {
         Ok(instance)
     }
 
-    pub(crate) async fn replace_with_patchright(
-        &self,
-        session_id: &str,
-    ) -> Result<(), Error> {
+    pub(crate) async fn replace_with_patchright(&self, session_id: &str) -> Result<(), Error> {
         let launch_profile = {
             let instances = self.instances.read().await;
             let instance = instances
@@ -455,6 +461,7 @@ impl BrowserPool {
             session: PatchrightSession::start(&self.config.protection, &launch_profile).await?,
             last_used: Instant::now(),
             patchright_launch_profile: launch_profile,
+            api_capture: None,
         };
         let instance = Arc::new(Mutex::new(instance));
 
@@ -462,7 +469,7 @@ impl BrowserPool {
             let mut instances = self.instances.write().await;
             instances.remove(session_id)
         };
-        if let Some(old) = old {
+        let api_capture_snapshot = if let Some(old) = old {
             let mut inst = old.lock().await;
             for task in inst.interception.tasks.drain(..) {
                 task.abort();
@@ -472,10 +479,31 @@ impl BrowserPool {
                 task.abort();
             }
             inst.api_capture.attached_targets.clear();
-        }
+            match (
+                inst.api_capture.handle.take(),
+                inst.api_capture.config.take(),
+                inst.api_capture.recorder.take(),
+            ) {
+                (Some(handle), Some(config), Some(recorder)) => {
+                    Some(crate::api_capture::ApiCaptureSnapshot {
+                        handle,
+                        config,
+                        recorder,
+                    })
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         let mut patchright_instances = self.patchright_instances.write().await;
         patchright_instances.insert(session_id.to_string(), instance);
+        drop(patchright_instances);
+        if let Some(snapshot) = api_capture_snapshot {
+            self.restore_api_capture_snapshot(session_id, snapshot)
+                .await?;
+        }
         Ok(())
     }
 
@@ -606,13 +634,16 @@ impl BrowserPool {
         &self,
         session_id: &str,
         config: crate::api_capture::ApiCaptureConfig,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
+        let handle = new_api_capture_handle();
         self.configure_api_capture(
             session_id,
+            handle.clone(),
             config.clone(),
             crate::api_capture::ApiCaptureRecorder::new(config),
         )
-        .await
+        .await?;
+        Ok(handle)
     }
 
     /// Stop passive API capture and return the inferred API catalog.
@@ -620,23 +651,60 @@ impl BrowserPool {
         &self,
         session_id: &str,
     ) -> Option<crate::api_capture::ApiCatalog> {
+        self.stop_api_capture_with_handle(session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, catalog)| catalog)
+    }
+
+    /// Stop passive API capture and return the catalog handle plus inferred API catalog.
+    pub async fn stop_api_capture_with_handle(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, crate::api_capture::ApiCatalog)>, Error> {
+        if let Some(instance) = self
+            .patchright_instances
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            let mut inst = instance.lock().await;
+            let Some(state) = inst.api_capture.take() else {
+                return Ok(None);
+            };
+            let mut recorder = state.recorder;
+            let records = inst.session.stop_api_capture().await?;
+            recorder.append_records(records);
+            recorder.finish();
+            return Ok(Some((state.handle, recorder.build_catalog())));
+        }
+
         let instances = self.instances.read().await;
-        let instance = instances.get(session_id)?;
+        let Some(instance) = instances.get(session_id) else {
+            return Ok(None);
+        };
         let mut inst = instance.lock().await;
 
         for task in inst.api_capture.tasks.drain(..) {
             task.abort();
         }
+        let Some(handle) = inst.api_capture.handle.take() else {
+            return Ok(None);
+        };
         inst.api_capture.config = None;
         inst.api_capture.attached_targets.clear();
 
-        let mut recorder = inst.api_capture.recorder.take()?;
+        let Some(mut recorder) = inst.api_capture.recorder.take() else {
+            return Ok(None);
+        };
         recorder.finish();
 
         #[cfg(feature = "metrics")]
         moltis_metrics::counter!(moltis_metrics::browser::API_CAPTURES_TOTAL).increment(1);
 
-        Some(recorder.build_catalog())
+        Ok(Some((handle, recorder.build_catalog())))
     }
 
     /// Update extra headers for a session's interception state.
@@ -709,11 +777,30 @@ impl BrowserPool {
         &self,
         session_id: &str,
     ) -> Option<crate::api_capture::ApiCaptureSnapshot> {
+        if let Some(instance) = self
+            .patchright_instances
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            let mut inst = instance.lock().await;
+            let state = inst.api_capture.take()?;
+            return Some(crate::api_capture::ApiCaptureSnapshot {
+                handle: state.handle,
+                config: state.config,
+                recorder: state.recorder,
+            });
+        }
+
         let instances = self.instances.read().await;
         let instance = instances.get(session_id)?;
         let mut inst = instance.lock().await;
 
-        if inst.api_capture.config.is_none() || inst.api_capture.recorder.is_none() {
+        if inst.api_capture.handle.is_none()
+            || inst.api_capture.config.is_none()
+            || inst.api_capture.recorder.is_none()
+        {
             return None;
         }
 
@@ -722,10 +809,15 @@ impl BrowserPool {
         }
         inst.api_capture.attached_targets.clear();
 
+        let handle = inst.api_capture.handle.take()?;
         let config = inst.api_capture.config.take()?;
         let recorder = inst.api_capture.recorder.take()?;
 
-        Some(crate::api_capture::ApiCaptureSnapshot { config, recorder })
+        Some(crate::api_capture::ApiCaptureSnapshot {
+            handle,
+            config,
+            recorder,
+        })
     }
 
     /// Restore API capture state onto an already-created session.
@@ -734,16 +826,39 @@ impl BrowserPool {
         session_id: &str,
         snapshot: crate::api_capture::ApiCaptureSnapshot,
     ) -> Result<(), Error> {
-        self.configure_api_capture(session_id, snapshot.config, snapshot.recorder)
-            .await
+        self.configure_api_capture(
+            session_id,
+            snapshot.handle,
+            snapshot.config,
+            snapshot.recorder,
+        )
+        .await
     }
 
     async fn configure_api_capture(
         &self,
         session_id: &str,
+        handle: String,
         config: crate::api_capture::ApiCaptureConfig,
         recorder: crate::api_capture::ApiCaptureRecorder,
     ) -> Result<(), Error> {
+        if let Some(instance) = self
+            .patchright_instances
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            let mut inst = instance.lock().await;
+            inst.session.start_api_capture(&config).await?;
+            inst.api_capture = Some(PatchrightApiCaptureState {
+                handle,
+                config,
+                recorder,
+            });
+            return Ok(());
+        }
+
         let _ = self.get_page(session_id).await?;
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(session_id) {
@@ -753,6 +868,7 @@ impl BrowserPool {
             for task in inst.api_capture.tasks.drain(..) {
                 task.abort();
             }
+            inst.api_capture.handle = Some(handle);
             inst.api_capture.config = Some(config);
             inst.api_capture.recorder = Some(recorder);
             inst.api_capture.attached_targets.clear();
@@ -1500,6 +1616,10 @@ fn generate_session_id() -> String {
     format!("browser-{:016x}", id)
 }
 
+fn new_api_capture_handle() -> String {
+    format!("api-catalog-{}", Uuid::new_v4().simple())
+}
+
 /// Sanitize a session identifier to a filesystem-safe single path segment.
 fn sanitize_session_component(session_id: &str) -> String {
     let sanitized: String = session_id
@@ -1666,10 +1786,13 @@ mod tests {
             "--window-size=1280,720".to_string(),
         ];
         let result = sanitize_user_chrome_args(&input, false);
-        assert_eq!(result, vec![
-            "--enable-automation".to_string(),
-            "--window-size=1280,720".to_string()
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                "--enable-automation".to_string(),
+                "--window-size=1280,720".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1680,10 +1803,13 @@ mod tests {
             "--disable-gpu".to_string(),
         ];
         let result = sanitize_user_chrome_args(&input, true);
-        assert_eq!(result, vec![
-            "--window-size=1280,720".to_string(),
-            "--disable-gpu".to_string()
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                "--window-size=1280,720".to_string(),
+                "--disable-gpu".to_string()
+            ]
+        );
     }
 
     #[derive(Clone, Debug)]
@@ -2102,19 +2228,22 @@ self.addEventListener('fetch', event => {
         headers: HeaderMap,
     ) -> impl IntoResponse {
         record_seen_request(&state.shared, "OPTIONS", &uri, &headers, "");
-        (StatusCode::NO_CONTENT, [
-            (ACCESS_CONTROL_ALLOW_ORIGIN, state.app_origin),
-            (
-                ACCESS_CONTROL_ALLOW_METHODS,
-                "GET, POST, PUT, DELETE, PATCH, OPTIONS".to_string(),
-            ),
-            (
-                ACCESS_CONTROL_ALLOW_HEADERS,
-                "content-type,x-test-mode".to_string(),
-            ),
-            (ACCESS_CONTROL_ALLOW_CREDENTIALS, "true".to_string()),
-            (ACCESS_CONTROL_MAX_AGE, "3600".to_string()),
-        ])
+        (
+            StatusCode::NO_CONTENT,
+            [
+                (ACCESS_CONTROL_ALLOW_ORIGIN, state.app_origin),
+                (
+                    ACCESS_CONTROL_ALLOW_METHODS,
+                    "GET, POST, PUT, DELETE, PATCH, OPTIONS".to_string(),
+                ),
+                (
+                    ACCESS_CONTROL_ALLOW_HEADERS,
+                    "content-type,x-test-mode".to_string(),
+                ),
+                (ACCESS_CONTROL_ALLOW_CREDENTIALS, "true".to_string()),
+                (ACCESS_CONTROL_MAX_AGE, "3600".to_string()),
+            ],
+        )
     }
 
     async fn cors_preflight_post(
@@ -2448,10 +2577,13 @@ self.addEventListener('fetch', event => {
             let sid = pool
                 .get_or_create(None, false, Some(BrowserPreference::Auto))
                 .await?;
-            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig {
-                url_patterns: vec!["*httpbin.org/*".to_string()],
-                ..crate::api_capture::ApiCaptureConfig::default()
-            })
+            pool.start_api_capture(
+                &sid,
+                crate::api_capture::ApiCaptureConfig {
+                    url_patterns: vec!["*httpbin.org/*".to_string()],
+                    ..crate::api_capture::ApiCaptureConfig::default()
+                },
+            )
             .await?;
 
             let page = pool.get_page(&sid).await?;
@@ -2513,10 +2645,13 @@ self.addEventListener('fetch', event => {
             let sid = pool
                 .get_or_create(None, false, Some(BrowserPreference::Auto))
                 .await?;
-            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig {
-                url_patterns: vec!["*countries.trevorblades.com*".to_string()],
-                ..crate::api_capture::ApiCaptureConfig::default()
-            })
+            pool.start_api_capture(
+                &sid,
+                crate::api_capture::ApiCaptureConfig {
+                    url_patterns: vec!["*countries.trevorblades.com*".to_string()],
+                    ..crate::api_capture::ApiCaptureConfig::default()
+                },
+            )
             .await?;
 
             let page = pool.get_page(&sid).await?;

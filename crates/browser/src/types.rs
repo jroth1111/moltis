@@ -324,6 +324,9 @@ pub enum BrowserAction {
 
     /// Begin passively capturing API traffic into a reusable endpoint catalog.
     StartApiCapture {
+        /// Allowed hostnames for capture (required for agent-facing summaries).
+        #[serde(default)]
+        allowed_hosts: Vec<String>,
         /// URL glob patterns to capture (empty = all matching API-like traffic).
         #[serde(default)]
         url_patterns: Vec<String>,
@@ -335,7 +338,7 @@ pub enum BrowserAction {
         max_examples_per_endpoint: u32,
     },
 
-    /// Stop API capture and return the inferred endpoint catalog in `response.result`.
+    /// Stop API capture and return a catalog handle plus bounded summary in `response.result`.
     StopApiCapture,
 
     // ── Phase 6: Session state ─────────────────────────────────────────────
@@ -592,12 +595,14 @@ impl fmt::Display for BrowserAction {
                 write!(f, "set_extra_headers(count={})", headers.len())
             },
             Self::StartApiCapture {
+                allowed_hosts,
                 url_patterns,
                 include_document_requests,
                 max_examples_per_endpoint,
             } => write!(
                 f,
-                "start_api_capture(patterns={}, documents={}, max_examples={})",
+                "start_api_capture(hosts={}, patterns={}, documents={}, max_examples={})",
+                allowed_hosts.len(),
                 url_patterns.len(),
                 include_document_requests,
                 max_examples_per_endpoint
