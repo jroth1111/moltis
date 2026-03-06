@@ -899,6 +899,11 @@ impl BrowserManager {
                 self.tab_close(session_id, &name, sandbox, browser).await
             },
             BrowserAction::Close => self.close(session_id, sandbox).await,
+            // API reconnaissance
+            BrowserAction::ApiRecon { sub } => {
+                self.handle_api_recon(session_id, sub, sandbox, browser)
+                    .await
+            },
         };
 
         // Detect stale connections for all non-Navigate actions
@@ -1249,6 +1254,9 @@ impl BrowserManager {
             BrowserAction::SetExtraHeaders { headers } => {
                 self.set_extra_headers(Some(&sid), headers, sandbox, None)
                     .await
+            },
+            BrowserAction::ApiRecon { sub } => {
+                self.handle_api_recon(Some(&sid), sub, sandbox, None).await
             },
         }
     }
@@ -2881,6 +2889,376 @@ impl BrowserManager {
         })?;
         fs::write(&path, &bytes).await?;
         Ok((path, bytes.len() as u64))
+    }
+
+    // ── API Reconnaissance ────────────────────────────────────────────────
+
+    async fn handle_api_recon(
+        &self,
+        session_id: Option<&str>,
+        action: crate::types::BrowserApiAction,
+        sandbox: bool,
+        _browser: Option<BrowserPreference>,
+    ) -> Result<(String, BrowserResponse), Error> {
+        use crate::types::BrowserApiAction;
+
+        let sid = require_session(session_id, "api_recon")?;
+        let start = Instant::now();
+
+        match action {
+            BrowserApiAction::Status => {
+                let status = self.pool.api_recon_status(&sid).await?;
+                let mut resp = BrowserResponse::success(
+                    sid.clone(),
+                    start.elapsed().as_millis() as u64,
+                    sandbox,
+                );
+                resp = resp.with_result(serde_json::to_value(&status).unwrap_or_default());
+                Ok((sid, resp))
+            },
+            BrowserApiAction::SetMode { mode, reset } => {
+                self.pool.set_api_recon_mode(&sid, mode, reset).await?;
+                let mut resp = BrowserResponse::success(
+                    sid.clone(),
+                    start.elapsed().as_millis() as u64,
+                    sandbox,
+                );
+                resp = resp.with_result(serde_json::json!({ "mode": mode.to_string() }));
+                Ok((sid, resp))
+            },
+            BrowserApiAction::Mark { label } => {
+                let marker = self.pool.api_recon_mark(&sid, label).await?;
+                let mut resp = BrowserResponse::success(
+                    sid.clone(),
+                    start.elapsed().as_millis() as u64,
+                    sandbox,
+                );
+                resp = resp.with_result(serde_json::to_value(&marker).unwrap_or_default());
+                Ok((sid, resp))
+            },
+            BrowserApiAction::WaitForIdle {
+                since,
+                quiet_ms,
+                timeout_ms,
+            } => {
+                self.pool
+                    .api_recon_wait_for_idle(&sid, since.as_deref(), quiet_ms, timeout_ms)
+                    .await?;
+                let resp = BrowserResponse::success(
+                    sid.clone(),
+                    start.elapsed().as_millis() as u64,
+                    sandbox,
+                );
+                Ok((sid, resp))
+            },
+            BrowserApiAction::Diff { since } => {
+                let delta = self.pool.api_recon_diff(&sid, &since).await?;
+                let mut resp = BrowserResponse::success(
+                    sid.clone(),
+                    start.elapsed().as_millis() as u64,
+                    sandbox,
+                );
+                resp = resp.with_result(serde_json::to_value(&delta).unwrap_or_default());
+                Ok((sid, resp))
+            },
+            BrowserApiAction::ListDataSources { since, limit } => {
+                let list = self
+                    .pool
+                    .api_recon_list_endpoints(&sid, since.as_deref(), limit)
+                    .await?;
+                let mut resp = BrowserResponse::success(
+                    sid.clone(),
+                    start.elapsed().as_millis() as u64,
+                    sandbox,
+                );
+                resp = resp.with_result(serde_json::to_value(&list).unwrap_or_default());
+                Ok((sid, resp))
+            },
+            BrowserApiAction::GetEndpoint { endpoint_id } => {
+                let contract = self
+                    .pool
+                    .api_recon_endpoint_contract(&sid, &endpoint_id)
+                    .await?;
+                let mut resp = BrowserResponse::success(
+                    sid.clone(),
+                    start.elapsed().as_millis() as u64,
+                    sandbox,
+                );
+                resp = resp.with_result(serde_json::to_value(&contract).unwrap_or_default());
+                Ok((sid, resp))
+            },
+            BrowserApiAction::Call {
+                endpoint_id,
+                overrides,
+                extract,
+            } => {
+                self.handle_api_recon_call(&sid, &endpoint_id, overrides, extract, sandbox, start)
+                    .await
+            },
+            BrowserApiAction::Collect {
+                endpoint_id,
+                overrides,
+                pagination,
+                extract,
+                max_pages,
+                max_items,
+            } => {
+                self.handle_api_recon_collect(
+                    &sid,
+                    &endpoint_id,
+                    overrides,
+                    pagination,
+                    extract,
+                    max_pages,
+                    max_items,
+                    sandbox,
+                    start,
+                )
+                .await
+            },
+        }
+    }
+
+    async fn handle_api_recon_call(
+        &self,
+        sid: &str,
+        endpoint_id: &str,
+        overrides: Option<crate::api_recon_types::ApiCallOverrides>,
+        extract: Option<crate::api_recon_types::ApiExtractPlan>,
+        sandbox: bool,
+        start: Instant,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let template = self
+            .pool
+            .api_recon_endpoint_template(sid, endpoint_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidAction(format!(
+                    "no request template found for endpoint: {endpoint_id}"
+                ))
+            })?;
+        let summary = self
+            .pool
+            .api_recon_endpoint_summary(sid, endpoint_id)
+            .await?
+            .ok_or_else(|| Error::InvalidAction(format!("unknown endpoint: {endpoint_id}")))?;
+
+        let overrides = overrides.unwrap_or_default();
+        let method = overrides.method.as_deref().unwrap_or(&template.method);
+        let url = if overrides.query.is_empty() {
+            template.url.clone()
+        } else {
+            crate::api_recon::merge_query_pairs(&template.url, &overrides.query)
+                .unwrap_or_else(|| template.url.clone())
+        };
+
+        let client = reqwest::Client::new();
+        let mut req = client.request(method.parse().unwrap_or(reqwest::Method::GET), &url);
+        for (key, value) in &template.headers {
+            req = req.header(key, value);
+        }
+        for (key, value) in &overrides.headers {
+            req = req.header(key, value);
+        }
+        let body = overrides.body.or(template.body);
+        if let Some(body) = &body {
+            req = req.json(body);
+        }
+
+        let response = req
+            .send()
+            .await
+            .map_err(|e| Error::InvalidAction(format!("API call failed: {e}")))?;
+        let status = Some(response.status().as_u16());
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let response_body: Option<serde_json::Value> = response.json().await.ok();
+
+        let extracted = extract.as_ref().and_then(|plan| {
+            response_body
+                .as_ref()
+                .and_then(|b| crate::api_recon::json_pointer_get(b, plan.json_pointer.as_deref()))
+        });
+
+        let result = crate::api_recon_types::ApiCallResult {
+            endpoint: summary,
+            status,
+            content_type,
+            body: response_body,
+            extracted,
+        };
+
+        let mut resp =
+            BrowserResponse::success(sid.to_string(), start.elapsed().as_millis() as u64, sandbox);
+        resp = resp.with_result(serde_json::to_value(&result).unwrap_or_default());
+        Ok((sid.to_string(), resp))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_api_recon_collect(
+        &self,
+        sid: &str,
+        endpoint_id: &str,
+        overrides: Option<crate::api_recon_types::ApiCallOverrides>,
+        pagination: Option<crate::api_recon_types::ApiPaginationPlan>,
+        extract: Option<crate::api_recon_types::ApiExtractPlan>,
+        max_pages: u32,
+        max_items: usize,
+        sandbox: bool,
+        start: Instant,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let template = self
+            .pool
+            .api_recon_endpoint_template(sid, endpoint_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidAction(format!(
+                    "no request template found for endpoint: {endpoint_id}"
+                ))
+            })?;
+        let summary = self
+            .pool
+            .api_recon_endpoint_summary(sid, endpoint_id)
+            .await?
+            .ok_or_else(|| Error::InvalidAction(format!("unknown endpoint: {endpoint_id}")))?;
+
+        let overrides = overrides.unwrap_or_default();
+        let client = reqwest::Client::new();
+        let mut all_items = Vec::new();
+        let mut pages_fetched: u32 = 0;
+        let mut truncated = false;
+        let mut next_cursor: Option<String> = None;
+        let item_pointer = extract
+            .as_ref()
+            .and_then(|e| e.json_pointer.clone())
+            .or_else(|| pagination.as_ref().and_then(|p| p.item_pointer.clone()));
+
+        for page_num in 0..max_pages {
+            let method = overrides.method.as_deref().unwrap_or(&template.method);
+            let mut query = overrides.query.clone();
+
+            if let Some(ref pag) = pagination {
+                match pag.style {
+                    crate::api_recon_types::ApiPaginationStyle::Cursor => {
+                        if let Some(ref cursor) = next_cursor {
+                            let param = pag.cursor_param.as_deref().unwrap_or("cursor");
+                            query.insert(
+                                param.to_string(),
+                                serde_json::Value::String(cursor.clone()),
+                            );
+                        }
+                    },
+                    crate::api_recon_types::ApiPaginationStyle::Page => {
+                        let param = pag.page_param.as_deref().unwrap_or("page");
+                        query.insert(
+                            param.to_string(),
+                            serde_json::Value::Number((page_num + 1).into()),
+                        );
+                    },
+                    crate::api_recon_types::ApiPaginationStyle::OffsetLimit => {
+                        let offset_param = pag.offset_param.as_deref().unwrap_or("offset");
+                        let limit_param = pag.limit_param.as_deref().unwrap_or("limit");
+                        let page_size = 100u32;
+                        query.insert(
+                            offset_param.to_string(),
+                            serde_json::Value::Number((page_num * page_size).into()),
+                        );
+                        query.insert(
+                            limit_param.to_string(),
+                            serde_json::Value::Number(page_size.into()),
+                        );
+                    },
+                    crate::api_recon_types::ApiPaginationStyle::Unknown => {},
+                }
+            }
+
+            let url = if query.is_empty() {
+                template.url.clone()
+            } else {
+                crate::api_recon::merge_query_pairs(&template.url, &query)
+                    .unwrap_or_else(|| template.url.clone())
+            };
+
+            let mut req = client.request(method.parse().unwrap_or(reqwest::Method::GET), &url);
+            for (key, value) in &template.headers {
+                req = req.header(key, value);
+            }
+            for (key, value) in &overrides.headers {
+                req = req.header(key, value);
+            }
+            let body = overrides.body.clone().or_else(|| template.body.clone());
+            if let Some(body) = &body {
+                req = req.json(body);
+            }
+
+            let response = req.send().await.map_err(|e| {
+                Error::InvalidAction(format!("API collect page {page_num} failed: {e}"))
+            })?;
+            let response_body: Option<serde_json::Value> = response.json().await.ok();
+            pages_fetched += 1;
+
+            if let Some(ref body) = response_body {
+                let items_value = item_pointer
+                    .as_deref()
+                    .and_then(|ptr| crate::api_recon::json_pointer_get(body, Some(ptr)))
+                    .unwrap_or_else(|| body.clone());
+
+                if let Some(arr) = items_value.as_array() {
+                    for item in arr {
+                        if all_items.len() >= max_items {
+                            truncated = true;
+                            break;
+                        }
+                        all_items.push(item.clone());
+                    }
+                    if arr.is_empty() {
+                        break;
+                    }
+                }
+
+                if let Some(ref pag) = pagination {
+                    if let Some(ref ptr) = pag.next_cursor_pointer {
+                        next_cursor = body
+                            .pointer(ptr)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        if next_cursor.is_none() {
+                            break;
+                        }
+                    }
+                    if let Some(ref ptr) = pag.has_more_pointer {
+                        let has_more = body.pointer(ptr).and_then(|v| v.as_bool()).unwrap_or(false);
+                        if !has_more {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+
+            if truncated {
+                break;
+            }
+        }
+
+        let result = crate::api_recon_types::ApiCollectResult {
+            endpoint: summary,
+            pages_fetched,
+            item_count: all_items.len(),
+            truncated,
+            items: all_items,
+            next_cursor,
+            item_path: item_pointer,
+        };
+
+        let mut resp =
+            BrowserResponse::success(sid.to_string(), start.elapsed().as_millis() as u64, sandbox);
+        resp = resp.with_result(serde_json::to_value(&result).unwrap_or_default());
+        Ok((sid.to_string(), resp))
     }
 
     // ── Phase 6: Session state ──────────────────────────────────────────────

@@ -4,6 +4,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api_recon_types::{ApiCallOverrides, ApiExtractPlan, ApiPaginationPlan, ApiReconMode};
+
 /// Stealth / anti-bot configuration.
 ///
 /// These settings control the JS evasions injected before each navigation,
@@ -198,6 +200,118 @@ impl Default for ProtectionConfig {
             ],
             domains: Vec::new(),
             max_retries: 2,
+        }
+    }
+}
+
+/// API reconnaissance sub-actions.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "api_action", rename_all = "snake_case")]
+pub enum BrowserApiAction {
+    Status,
+    SetMode {
+        mode: ApiReconMode,
+        #[serde(default)]
+        reset: bool,
+    },
+    Mark {
+        #[serde(default)]
+        label: Option<String>,
+    },
+    WaitForIdle {
+        #[serde(default)]
+        since: Option<String>,
+        #[serde(default = "default_quiet_ms")]
+        quiet_ms: u64,
+        #[serde(default = "default_idle_timeout_ms")]
+        timeout_ms: u64,
+    },
+    Diff {
+        since: String,
+    },
+    ListDataSources {
+        #[serde(default)]
+        since: Option<String>,
+        #[serde(default = "default_list_limit")]
+        limit: u32,
+    },
+    GetEndpoint {
+        endpoint_id: String,
+    },
+    Call {
+        endpoint_id: String,
+        #[serde(default)]
+        overrides: Option<ApiCallOverrides>,
+        #[serde(default)]
+        extract: Option<ApiExtractPlan>,
+    },
+    Collect {
+        endpoint_id: String,
+        #[serde(default)]
+        overrides: Option<ApiCallOverrides>,
+        #[serde(default)]
+        pagination: Option<ApiPaginationPlan>,
+        #[serde(default)]
+        extract: Option<ApiExtractPlan>,
+        #[serde(default = "default_max_pages")]
+        max_pages: u32,
+        #[serde(default = "default_max_items")]
+        max_items: usize,
+    },
+}
+
+fn default_quiet_ms() -> u64 {
+    2000
+}
+
+fn default_idle_timeout_ms() -> u64 {
+    15000
+}
+
+fn default_list_limit() -> u32 {
+    50
+}
+
+fn default_max_pages() -> u32 {
+    10
+}
+
+fn default_max_items() -> usize {
+    5000
+}
+
+impl fmt::Display for BrowserApiAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status => write!(f, "api_recon.status"),
+            Self::SetMode { mode, reset } => {
+                write!(f, "api_recon.set_mode(mode={mode}, reset={reset})")
+            },
+            Self::Mark { label } => match label {
+                Some(l) => write!(f, "api_recon.mark(label={l})"),
+                None => write!(f, "api_recon.mark"),
+            },
+            Self::WaitForIdle {
+                quiet_ms,
+                timeout_ms,
+                ..
+            } => write!(
+                f,
+                "api_recon.wait_for_idle(quiet={quiet_ms}ms, timeout={timeout_ms}ms)"
+            ),
+            Self::Diff { since } => write!(f, "api_recon.diff(since={since})"),
+            Self::ListDataSources { limit, .. } => {
+                write!(f, "api_recon.list_data_sources(limit={limit})")
+            },
+            Self::GetEndpoint { endpoint_id } => {
+                write!(f, "api_recon.get_endpoint({endpoint_id})")
+            },
+            Self::Call { endpoint_id, .. } => {
+                write!(f, "api_recon.call({endpoint_id})")
+            },
+            Self::Collect { endpoint_id, .. } => {
+                write!(f, "api_recon.collect({endpoint_id})")
+            },
         }
     }
 }
@@ -420,6 +534,12 @@ pub enum BrowserAction {
 
     /// Close the browser session.
     Close,
+
+    /// API reconnaissance actions.
+    ApiRecon {
+        #[serde(flatten)]
+        sub: BrowserApiAction,
+    },
 }
 
 fn default_device_scale_factor() -> f64 {
@@ -637,6 +757,7 @@ impl fmt::Display for BrowserAction {
             Self::TabSwitch { name } => write!(f, "tab_switch(name={name})"),
             Self::TabClose { name } => write!(f, "tab_close(name={name})"),
             Self::Close => write!(f, "close"),
+            Self::ApiRecon { sub } => write!(f, "{sub}"),
         }
     }
 }

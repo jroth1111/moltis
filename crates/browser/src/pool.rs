@@ -14,6 +14,7 @@ use {
     },
     futures::StreamExt,
     sysinfo::System,
+    time::OffsetDateTime,
     tokio::sync::{Mutex, RwLock, broadcast},
     tracing::{debug, info, warn},
     uuid::Uuid,
@@ -105,6 +106,12 @@ struct BrowserInstance {
     /// Optional virtual display backing headful runs without visible UI.
     #[allow(dead_code)]
     virtual_display: Option<VirtualDisplay>,
+    /// API reconnaissance mode.
+    api_recon_mode: crate::api_recon_types::ApiReconMode,
+    /// API reconnaissance store (typed schema inference).
+    api_recon: crate::api_recon::ApiReconStore,
+    /// Pending recon request count (in-flight CDP body fetches).
+    pending_recon_count: usize,
 }
 
 pub(crate) struct PatchrightInstance {
@@ -712,6 +719,160 @@ impl BrowserPool {
         moltis_metrics::counter!(moltis_metrics::browser::API_CAPTURES_TOTAL).increment(1);
 
         Ok(Some((handle, recorder.build_catalog())))
+    }
+
+    // ── API Reconnaissance delegate methods ───────────────────────────────
+
+    pub async fn api_recon_status(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::api_recon_types::ApiReconStatus, Error> {
+        let instances = self.instances.read().await;
+        let instance = instances
+            .get(session_id)
+            .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
+        let inst = instance.lock().await;
+        Ok(inst
+            .api_recon
+            .status(inst.api_recon_mode, inst.pending_recon_count))
+    }
+
+    pub async fn set_api_recon_mode(
+        &self,
+        session_id: &str,
+        mode: crate::api_recon_types::ApiReconMode,
+        reset: bool,
+    ) -> Result<(), Error> {
+        let instances = self.instances.read().await;
+        let instance = instances
+            .get(session_id)
+            .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
+        let mut inst = instance.lock().await;
+        inst.api_recon_mode = mode;
+        if reset {
+            inst.api_recon.clear();
+        }
+        Ok(())
+    }
+
+    pub async fn api_recon_mark(
+        &self,
+        session_id: &str,
+        label: Option<String>,
+    ) -> Result<crate::api_recon_types::ApiObservationMarker, Error> {
+        let instances = self.instances.read().await;
+        let instance = instances
+            .get(session_id)
+            .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
+        let mut inst = instance.lock().await;
+        let tab_id = inst.active_tab.clone();
+        Ok(inst.api_recon.mark(&tab_id, label))
+    }
+
+    pub async fn api_recon_wait_for_idle(
+        &self,
+        session_id: &str,
+        _since: Option<&str>,
+        quiet_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<(), Error> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let _quiet = Duration::from_millis(quiet_ms);
+        loop {
+            {
+                let instances = self.instances.read().await;
+                let instance = instances.get(session_id).ok_or_else(|| {
+                    Error::InvalidAction(format!("session not found: {session_id}"))
+                })?;
+                let inst = instance.lock().await;
+                if inst.pending_recon_count == 0 {
+                    if let Some(last) = inst.api_recon.last_network_activity_at() {
+                        let elapsed = OffsetDateTime::now_utc() - last;
+                        if elapsed >= time::Duration::milliseconds(quiet_ms as i64) {
+                            return Ok(());
+                        }
+                    } else {
+                        return Ok(());
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout(format!(
+                    "api_recon wait_for_idle timed out after {timeout_ms}ms"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub async fn api_recon_diff(
+        &self,
+        session_id: &str,
+        marker_id: &str,
+    ) -> Result<crate::api_recon_types::ApiObservationDelta, Error> {
+        let instances = self.instances.read().await;
+        let instance = instances
+            .get(session_id)
+            .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
+        let inst = instance.lock().await;
+        inst.api_recon
+            .diff(marker_id)
+            .ok_or_else(|| Error::InvalidAction(format!("unknown marker: {marker_id}")))
+    }
+
+    pub async fn api_recon_list_endpoints(
+        &self,
+        session_id: &str,
+        since: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::api_recon_types::ApiEndpointList, Error> {
+        let instances = self.instances.read().await;
+        let instance = instances
+            .get(session_id)
+            .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
+        let inst = instance.lock().await;
+        Ok(inst.api_recon.list_endpoints(since, limit, true))
+    }
+
+    pub async fn api_recon_endpoint_contract(
+        &self,
+        session_id: &str,
+        endpoint_id: &str,
+    ) -> Result<crate::api_recon_types::ApiEndpointContract, Error> {
+        let instances = self.instances.read().await;
+        let instance = instances
+            .get(session_id)
+            .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
+        let inst = instance.lock().await;
+        inst.api_recon
+            .endpoint_contract(endpoint_id)
+            .ok_or_else(|| Error::InvalidAction(format!("unknown endpoint: {endpoint_id}")))
+    }
+
+    pub async fn api_recon_endpoint_template(
+        &self,
+        session_id: &str,
+        endpoint_id: &str,
+    ) -> Result<Option<crate::api_recon_types::ApiRequestTemplate>, Error> {
+        let instances = self.instances.read().await;
+        let instance = instances
+            .get(session_id)
+            .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
+        let inst = instance.lock().await;
+        Ok(inst.api_recon.endpoint_template(endpoint_id))
+    }
+
+    pub async fn api_recon_endpoint_summary(
+        &self,
+        session_id: &str,
+        endpoint_id: &str,
+    ) -> Result<Option<crate::api_recon_types::ApiEndpointSummary>, Error> {
+        let instances = self.instances.read().await;
+        let instance = instances
+            .get(session_id)
+            .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
+        let inst = instance.lock().await;
+        Ok(inst.api_recon.endpoint_summary(endpoint_id))
     }
 
     /// Update extra headers for a session's interception state.
@@ -1655,6 +1816,9 @@ impl BrowserPool {
             api_capture: crate::api_capture::ApiCaptureRuntime::default(),
             screencast_handle: None,
             virtual_display: None,
+            api_recon_mode: crate::api_recon_types::ApiReconMode::default(),
+            api_recon: crate::api_recon::ApiReconStore::default(),
+            pending_recon_count: 0,
         })
     }
 
@@ -1812,6 +1976,9 @@ impl BrowserPool {
             api_capture: crate::api_capture::ApiCaptureRuntime::default(),
             screencast_handle: None,
             virtual_display,
+            api_recon_mode: crate::api_recon_types::ApiReconMode::default(),
+            api_recon: crate::api_recon::ApiReconStore::default(),
+            pending_recon_count: 0,
         })
     }
 }

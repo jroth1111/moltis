@@ -31,6 +31,9 @@
 
 pub mod actions;
 mod api_capture;
+pub mod api_recon;
+mod api_recon_inference;
+pub mod api_recon_types;
 pub mod challenge;
 pub mod container;
 pub mod detect;
@@ -61,8 +64,8 @@ pub use {
         TlsJa4CollectionMode, TlsJa4SidecarConfig,
     },
     types::{
-        BrowserAction, BrowserBackendKind, BrowserConfig, BrowserKind, BrowserPreference,
-        BrowserRequest, BrowserResponse, ChallengeEvidence, NavigationOutcome, NavigationTrigger,
-        NavigationVerdict, ProtectionConfig, ProtectionTrigger, StealthConfig,
+        BrowserAction, BrowserApiAction, BrowserBackendKind, BrowserConfig, BrowserKind,
+        BrowserPreference, BrowserRequest, BrowserResponse, ChallengeEvidence, NavigationOutcome,
+        NavigationTrigger, NavigationVerdict, ProtectionConfig, ProtectionTrigger, StealthConfig,
     },
 };
