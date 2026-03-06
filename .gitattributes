@@ -1,3 +1,6 @@
 
 # Use bd merge for beads JSONL files
 .beads/issues.jsonl merge=beads
+.claude export-ignore
+.code-state export-ignore
+prompts export-ignore
