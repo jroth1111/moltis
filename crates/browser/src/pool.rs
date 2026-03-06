@@ -122,6 +122,12 @@ struct PatchrightApiCaptureState {
     recorder: crate::api_capture::ApiCaptureRecorder,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct SessionTransferState {
+    interception: Option<crate::network::InterceptionSnapshot>,
+    api_capture: Option<crate::api_capture::ApiCaptureSnapshot>,
+}
+
 /// Pool of browser instances for reuse.
 pub struct BrowserPool {
     config: BrowserConfig,
@@ -459,34 +465,16 @@ impl BrowserPool {
             let inst = instance.lock().await;
             inst.patchright_launch_profile.clone()
         };
-        let interception_snapshot = self.take_interception_snapshot(session_id).await;
-        let api_capture_snapshot = self.take_api_capture_snapshot(session_id).await;
-        let instance = PatchrightInstance {
+        let staged = PatchrightInstance {
             session: PatchrightSession::start(&self.config.protection, &launch_profile).await?,
             last_used: Instant::now(),
             patchright_launch_profile: launch_profile,
             interception: crate::network::InterceptionState::default(),
             api_capture: None,
         };
-        let instance = Arc::new(Mutex::new(instance));
-
-        {
-            let mut instances = self.instances.write().await;
-            instances.remove(session_id);
-        }
-
-        let mut patchright_instances = self.patchright_instances.write().await;
-        patchright_instances.insert(session_id.to_string(), instance);
-        drop(patchright_instances);
-        if let Some(snapshot) = interception_snapshot {
-            self.restore_interception_snapshot(session_id, snapshot)
-                .await?;
-        }
-        if let Some(snapshot) = api_capture_snapshot {
-            self.restore_api_capture_snapshot(session_id, snapshot)
-                .await?;
-        }
-        Ok(())
+        let transfer_state = self.take_transfer_state_from_chromium(session_id).await;
+        self.complete_patchright_replacement(session_id, staged, transfer_state)
+            .await
     }
 
     // ── Mouse position tracking ──────────────────────────────────────────────
@@ -749,6 +737,126 @@ impl BrowserPool {
             let mut inst = instance.lock().await;
             inst.interception.extra_headers = headers;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn take_transfer_state_from_chromium(
+        &self,
+        session_id: &str,
+    ) -> SessionTransferState {
+        SessionTransferState {
+            interception: self.take_interception_snapshot(session_id).await,
+            api_capture: self.take_api_capture_snapshot(session_id).await,
+        }
+    }
+
+    pub(crate) async fn restore_transfer_state_to_chromium(
+        &self,
+        session_id: &str,
+        transfer_state: SessionTransferState,
+    ) -> Result<(), Error> {
+        if let Some(snapshot) = transfer_state.interception {
+            self.restore_interception_snapshot(session_id, snapshot).await?;
+        }
+        if let Some(snapshot) = transfer_state.api_capture {
+            self.restore_api_capture_snapshot(session_id, snapshot).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_transfer_state_to_patchright(
+        &self,
+        instance: &mut PatchrightInstance,
+        transfer_state: SessionTransferState,
+    ) -> Result<(), (Error, SessionTransferState)> {
+        let SessionTransferState {
+            interception,
+            api_capture,
+        } = transfer_state;
+        if let Some(snapshot) = interception {
+            let crate::network::InterceptionSnapshot {
+                enabled,
+                url_patterns,
+                extra_headers,
+            } = snapshot;
+            if enabled
+                && let Err(error) = instance
+                    .session
+                    .enable_interception(url_patterns.clone(), extra_headers.clone())
+                    .await
+            {
+                return Err((
+                    error,
+                    SessionTransferState {
+                        interception: Some(crate::network::InterceptionSnapshot {
+                            enabled,
+                            url_patterns,
+                            extra_headers,
+                        }),
+                        api_capture,
+                    },
+                ));
+            }
+            instance.interception.enabled = enabled;
+            instance.interception.url_patterns = url_patterns;
+            instance.interception.extra_headers = extra_headers;
+            instance.interception.paused_tx = None;
+            instance.interception.tasks.clear();
+        }
+
+        if let Some(snapshot) = api_capture {
+            if let Err(error) = instance.session.start_api_capture(&snapshot.config).await {
+                return Err((
+                    error,
+                    SessionTransferState {
+                        interception: None,
+                        api_capture: Some(snapshot),
+                    },
+                ));
+            }
+            instance.api_capture = Some(PatchrightApiCaptureState {
+                handle: snapshot.handle,
+                config: snapshot.config,
+                recorder: snapshot.recorder,
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn complete_patchright_replacement(
+        &self,
+        session_id: &str,
+        mut staged: PatchrightInstance,
+        transfer_state: SessionTransferState,
+    ) -> Result<(), Error> {
+        if let Err((error, rollback_state)) = self
+            .apply_transfer_state_to_patchright(&mut staged, transfer_state)
+            .await
+        {
+            let rollback_result = self
+                .restore_transfer_state_to_chromium(session_id, rollback_state)
+                .await;
+            let _ = staged.session.close().await;
+            return match rollback_result {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(Error::InvalidAction(format!(
+                    "patchright replacement failed ({error}) and rollback to chromium failed ({rollback_error})"
+                ))),
+            };
+        }
+
+        let staged = Arc::new(Mutex::new(staged));
+        let original = {
+            let mut instances = self.instances.write().await;
+            let original = instances
+                .remove(session_id)
+                .ok_or_else(|| Error::ElementNotFound(0))?;
+            let mut patchright_instances = self.patchright_instances.write().await;
+            patchright_instances.insert(session_id.to_string(), staged);
+            original
+        };
+        drop(original);
         Ok(())
     }
 
@@ -2692,6 +2800,109 @@ self.addEventListener('fetch', event => {
             request.path == "/api/suggest"
                 && request.method == "GET"
                 && request.auth.as_deref() == Some("Bearer patchright-token")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replace_with_patchright_rolls_back_when_restore_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let (addr, state, server) = start_practical_server().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig::default())
+                .await?;
+            pool.enable_interception(
+                &sid,
+                vec!["*api/search*".to_string(), "*api/suggest*".to_string()],
+                HashMap::new(),
+            )
+            .await?;
+            pool.set_extra_headers(
+                &sid,
+                HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer rollback-token".to_string(),
+                )]),
+            )
+            .await?;
+
+            let launch_profile = {
+                let instances = pool.instances.read().await;
+                let instance = instances
+                    .get(&sid)
+                    .unwrap_or_else(|| panic!("chromium instance should exist"));
+                let inst = instance.lock().await;
+                inst.patchright_launch_profile.clone()
+            };
+            let transfer_state = pool.take_transfer_state_from_chromium(&sid).await;
+            let mut staged = PatchrightInstance {
+                session: PatchrightSession::start(&pool.config.protection, &launch_profile).await?,
+                last_used: Instant::now(),
+                patchright_launch_profile: launch_profile,
+                interception: crate::network::InterceptionState::default(),
+                api_capture: None,
+            };
+            staged.session.close().await?;
+
+            let error = pool
+                .complete_patchright_replacement(&sid, staged, transfer_state)
+                .await
+                .expect_err("staged patchright replacement should fail");
+            assert!(!pool.session_uses_patchright(&sid).await);
+            assert!(matches!(
+                error,
+                Error::ConnectionClosed(_)
+                    | Error::BrowserClosed
+                    | Error::Cdp(_)
+                    | Error::NavigationFailed(_)
+                    | Error::Timeout(_)
+                    | Error::InvalidAction(_)
+            ));
+
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("http://{addr}/page1")).await?;
+            wait_for_page_done(&page).await?;
+            page.goto(&format!("http://{addr}/page2")).await?;
+            wait_for_page_done(&page).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("api capture should still produce a catalog"));
+            pool.disable_interception(&sid).await?;
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>(catalog)
+        }
+        .await;
+
+        server.abort();
+
+        let catalog = outcome?;
+        let search = find_endpoint(&catalog, "/api/search");
+        let suggest = find_endpoint(&catalog, "/api/suggest");
+
+        assert!(search.auth.iter().any(|auth| auth.scheme == "bearer"));
+        assert!(suggest.auth.iter().any(|auth| auth.scheme == "bearer"));
+
+        let seen = state.seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|request| {
+            request.path == "/api/search"
+                && request.method == "GET"
+                && request.auth.as_deref() == Some("Bearer rollback-token")
+        }));
+        assert!(seen.iter().any(|request| {
+            request.path == "/api/suggest"
+                && request.method == "GET"
+                && request.auth.as_deref() == Some("Bearer rollback-token")
         }));
 
         Ok(())
