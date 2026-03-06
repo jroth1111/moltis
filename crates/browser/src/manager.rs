@@ -343,8 +343,24 @@ impl BrowserManager {
                 self.set_extra_headers(session_id, headers, sandbox, browser)
                     .await
             },
-            BrowserAction::StartHar => self.start_har(session_id, sandbox, browser).await,
-            BrowserAction::StopHar => self.stop_har(session_id, sandbox, browser).await,
+            BrowserAction::StartApiCapture {
+                url_patterns,
+                include_document_requests,
+                max_examples_per_endpoint,
+            } => {
+                self.start_api_capture(
+                    session_id,
+                    url_patterns,
+                    include_document_requests,
+                    max_examples_per_endpoint,
+                    sandbox,
+                    browser,
+                )
+                .await
+            },
+            BrowserAction::StopApiCapture => {
+                self.stop_api_capture(session_id, sandbox, browser).await
+            },
             // Phase 6: Session state
             BrowserAction::SaveState { name, encrypt } => {
                 self.save_state(session_id, &name, encrypt, sandbox, browser)
@@ -471,6 +487,7 @@ impl BrowserManager {
                     "browser connection dead, closing session and retrying"
                 );
                 let interception_snapshot = self.pool.take_interception_snapshot(&active_sid).await;
+                let api_capture_snapshot = self.pool.take_api_capture_snapshot(&active_sid).await;
                 let _ = self.pool.close_session(&active_sid).await;
                 // Retry with a fresh session (use same sandbox mode)
                 let new_sid = self.pool.get_or_create(None, sandbox, browser).await?;
@@ -478,6 +495,11 @@ impl BrowserManager {
                 if let Some(snapshot) = interception_snapshot {
                     self.pool
                         .restore_interception_snapshot(&new_sid, snapshot)
+                        .await?;
+                }
+                if let Some(snapshot) = api_capture_snapshot {
+                    self.pool
+                        .restore_api_capture_snapshot(&new_sid, snapshot)
                         .await?;
                 }
                 new_page
@@ -1725,9 +1747,12 @@ impl BrowserManager {
         Ok((sid, resp))
     }
 
-    async fn start_har(
+    async fn start_api_capture(
         &self,
         session_id: Option<&str>,
+        url_patterns: Vec<String>,
+        include_document_requests: bool,
+        max_examples_per_endpoint: u32,
         sandbox: bool,
         browser: Option<BrowserPreference>,
     ) -> Result<(String, BrowserResponse), Error> {
@@ -1736,25 +1761,34 @@ impl BrowserManager {
             .get_or_create(session_id, sandbox, browser)
             .await?;
         let start = Instant::now();
-        self.pool.start_har(&sid).await?;
+        self.pool
+            .start_api_capture(&sid, crate::api_capture::ApiCaptureConfig {
+                url_patterns,
+                include_document_requests,
+                max_examples_per_endpoint: usize::try_from(max_examples_per_endpoint)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .unwrap_or(3),
+            })
+            .await?;
         let resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
         Ok((sid, resp))
     }
 
-    async fn stop_har(
+    async fn stop_api_capture(
         &self,
         session_id: Option<&str>,
         sandbox: bool,
         _browser: Option<BrowserPreference>,
     ) -> Result<(String, BrowserResponse), Error> {
-        let sid = require_session(session_id, "stop_har")?;
+        let sid = require_session(session_id, "stop_api_capture")?;
         let start = Instant::now();
-        let har = self.pool.stop_har(&sid).await;
+        let catalog = self.pool.stop_api_capture(&sid).await;
         let mut resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
-        if let Some(har_json) = har {
-            resp = resp.with_result(har_json);
+        if let Some(api_catalog) = catalog {
+            resp = resp.with_result(serde_json::json!({ "api_catalog": api_catalog }));
         }
         Ok((sid, resp))
     }

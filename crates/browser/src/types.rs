@@ -233,7 +233,7 @@ pub enum BrowserAction {
     /// the change, then fires `input` + `change` events.
     Clear { ref_: u32 },
 
-    // ── Phase 5: Network interception & HAR ────────────────────────────────
+    // ── Phase 5: Network interception & API capture ───────────────────────
     /// Enable CDP `Fetch` domain to intercept matching requests.
     ///
     /// `url_patterns` is a list of URL wildcard patterns (e.g. `["*api*"]`).
@@ -243,7 +243,7 @@ pub enum BrowserAction {
         url_patterns: Vec<String>,
     },
 
-    /// Disable request interception (stops a running intercept + HAR session).
+    /// Disable request interception.
     StopIntercept,
 
     /// Inject extra HTTP headers into every subsequent intercepted request.
@@ -251,11 +251,21 @@ pub enum BrowserAction {
         headers: std::collections::HashMap<String, String>,
     },
 
-    /// Begin accumulating network requests into a HAR 1.2 log.
-    StartHar,
+    /// Begin passively capturing API traffic into a reusable endpoint catalog.
+    StartApiCapture {
+        /// URL glob patterns to capture (empty = all matching API-like traffic).
+        #[serde(default)]
+        url_patterns: Vec<String>,
+        /// Whether full document navigations should also be included.
+        #[serde(default)]
+        include_document_requests: bool,
+        /// Maximum number of redacted examples stored per inferred endpoint.
+        #[serde(default = "default_max_examples_per_endpoint")]
+        max_examples_per_endpoint: u32,
+    },
 
-    /// Stop HAR recording and return the captured HAR JSON in `response.result`.
-    StopHar,
+    /// Stop API capture and return the inferred endpoint catalog in `response.result`.
+    StopApiCapture,
 
     // ── Phase 6: Session state ─────────────────────────────────────────────
     /// Capture cookies + storage and save them to disk.
@@ -358,6 +368,10 @@ fn default_every_nth() -> u32 {
 
 fn default_wait_timeout_ms() -> u64 {
     30000
+}
+
+fn default_max_examples_per_endpoint() -> u32 {
+    3
 }
 
 /// Known Chromium-family browser engines we can launch.
@@ -482,8 +496,18 @@ impl fmt::Display for BrowserAction {
             Self::SetExtraHeaders { headers } => {
                 write!(f, "set_extra_headers(count={})", headers.len())
             },
-            Self::StartHar => write!(f, "start_har"),
-            Self::StopHar => write!(f, "stop_har"),
+            Self::StartApiCapture {
+                url_patterns,
+                include_document_requests,
+                max_examples_per_endpoint,
+            } => write!(
+                f,
+                "start_api_capture(patterns={}, documents={}, max_examples={})",
+                url_patterns.len(),
+                include_document_requests,
+                max_examples_per_endpoint
+            ),
+            Self::StopApiCapture => write!(f, "stop_api_capture"),
             Self::SaveState { name, .. } => write!(f, "save_state(name={name})"),
             Self::LoadState { name } => write!(f, "load_state(name={name})"),
             Self::ListStates => write!(f, "list_states"),

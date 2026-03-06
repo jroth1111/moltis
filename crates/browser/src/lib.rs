@@ -30,6 +30,7 @@
 //! ```
 
 pub mod actions;
+mod api_capture;
 pub mod challenge;
 pub mod container;
 pub mod detect;

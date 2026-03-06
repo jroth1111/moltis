@@ -304,7 +304,7 @@ pub mod browser {
     /// Total network interception sessions enabled
     pub const INTERCEPTIONS_TOTAL: &str = "moltis_browser_interceptions_total";
     /// Total HAR recordings completed
-    pub const HAR_RECORDINGS_TOTAL: &str = "moltis_browser_har_recordings_total";
+    pub const API_CAPTURES_TOTAL: &str = "moltis_browser_api_captures_total";
     /// Total session states saved to disk
     pub const STATE_SAVES_TOTAL: &str = "moltis_browser_state_saves_total";
     /// Total session states loaded from disk

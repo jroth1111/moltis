@@ -92,8 +92,10 @@ struct BrowserInstance {
     active_tab: String,
     /// Last known mouse cursor position (x, y) for bezier movement continuity.
     current_mouse_pos: (f64, f64),
-    /// Network interception and HAR recording state.
+    /// Active request interception state.
     interception: crate::network::InterceptionState,
+    /// Passive API capture state for request-shape inference.
+    api_capture: crate::api_capture::ApiCaptureRuntime,
     /// Active screencast handle (if screencast is running).
     screencast_handle: Option<crate::screencast::ScreencastHandle>,
     /// Optional virtual display backing headful runs without visible UI.
@@ -298,27 +300,19 @@ impl BrowserPool {
         }
     }
 
-    // ── Network interception ─────────────────────────────────────────────────
+    // ── Network interception & API capture ──────────────────────────────────
 
-    /// Enable network interception and optionally HAR recording for a session.
+    /// Enable network interception for a session.
     ///
-    /// Calls `Fetch.enable` on the active page, subscribes to `EventRequestPaused`
-    /// events, and spawns a background task that auto-continues each paused request
-    /// (so they are never left hanging) and feeds data into the HAR recorder if one
-    /// is active.
+    /// Calls `Fetch.enable` on the current page, subscribes to paused-request
+    /// events, and auto-continues them after broadcasting each event to callers.
     pub async fn enable_interception(
         &self,
         session_id: &str,
         patterns: Vec<String>,
         extra_headers: HashMap<String, String>,
     ) -> Result<(), Error> {
-        use chromiumoxide::cdp::browser_protocol::{
-            fetch::EventRequestPaused,
-            network::{
-                EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
-                EventResponseReceived,
-            },
-        };
+        use chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused;
 
         let page = self.get_page(session_id).await?;
 
@@ -327,29 +321,12 @@ impl BrowserPool {
             .event_listener::<EventRequestPaused>()
             .await
             .map_err(|e| Error::Cdp(format!("intercept event listener: {e}")))?;
-        let response_stream = page
-            .event_listener::<EventResponseReceived>()
-            .await
-            .map_err(|e| Error::Cdp(format!("response event listener: {e}")))?;
-        let request_stream = page
-            .event_listener::<EventRequestWillBeSent>()
-            .await
-            .map_err(|e| Error::Cdp(format!("requestWillBeSent event listener: {e}")))?;
-        let loading_finished_stream = page
-            .event_listener::<EventLoadingFinished>()
-            .await
-            .map_err(|e| Error::Cdp(format!("loadingFinished event listener: {e}")))?;
-        let loading_failed_stream = page
-            .event_listener::<EventLoadingFailed>()
-            .await
-            .map_err(|e| Error::Cdp(format!("loadingFailed event listener: {e}")))?;
 
         crate::network::enable_interception(&page, patterns.clone()).await?;
 
         let (paused_tx, _rx) = broadcast::channel::<Arc<EventRequestPaused>>(32);
         let paused_tx_clone = paused_tx.clone();
         let paused_page = page.clone();
-        let loading_finished_page = page.clone();
 
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(session_id) {
@@ -366,17 +343,8 @@ impl BrowserPool {
             let paused_task = tokio::spawn(async move {
                 let mut stream = paused_stream;
                 while let Some(event) = stream.next().await {
-                    // Record into HAR if active and capture latest header overrides.
-                    // Keep lock scope short and always release before CDP awaits.
                     let extra_headers = {
-                        let mut inst = instance_arc.lock().await;
-                        if let Some(ref mut rec) = inst.interception.recorder {
-                            if event.response_status_code.is_some() {
-                                rec.apply_fetch_response(&event);
-                            } else {
-                                rec.record_request(&event);
-                            }
-                        }
+                        let inst = instance_arc.lock().await;
                         if inst.interception.extra_headers.is_empty() {
                             None
                         } else {
@@ -401,86 +369,7 @@ impl BrowserPool {
                 }
                 debug!("intercept event stream closed");
             });
-
-            let response_instance = Arc::clone(instance);
-            let response_task = tokio::spawn(async move {
-                let mut stream = response_stream;
-                while let Some(event) = stream.next().await {
-                    let mut inst = response_instance.lock().await;
-                    if let Some(ref mut rec) = inst.interception.recorder {
-                        rec.apply_response_received(&event);
-                    }
-                }
-                debug!("response event stream closed");
-            });
-
-            let request_instance = Arc::clone(instance);
-            let request_task = tokio::spawn(async move {
-                let mut stream = request_stream;
-                while let Some(event) = stream.next().await {
-                    let mut inst = request_instance.lock().await;
-                    if let Some(ref mut rec) = inst.interception.recorder {
-                        rec.apply_request_will_be_sent(&event);
-                    }
-                }
-                debug!("requestWillBeSent event stream closed");
-            });
-
-            let loading_finished_instance = Arc::clone(instance);
-            let loading_finished_task = tokio::spawn(async move {
-                let mut stream = loading_finished_stream;
-                while let Some(event) = stream.next().await {
-                    let capture_body = {
-                        let inst = loading_finished_instance.lock().await;
-                        if let Some(rec) = inst.interception.recorder.as_ref() {
-                            rec.should_capture_body(&event.request_id).unwrap_or(true)
-                        } else {
-                            false
-                        }
-                    };
-
-                    let body = if capture_body {
-                        crate::network::get_response_body(
-                            &loading_finished_page,
-                            event.request_id.clone(),
-                        )
-                        .await
-                        .ok()
-                    } else {
-                        None
-                    };
-
-                    let mut inst = loading_finished_instance.lock().await;
-                    if let Some(ref mut rec) = inst.interception.recorder {
-                        rec.apply_loading_finished(
-                            &event.request_id,
-                            *event.timestamp.inner(),
-                            body,
-                        );
-                    }
-                }
-                debug!("loadingFinished event stream closed");
-            });
-
-            let loading_failed_instance = Arc::clone(instance);
-            let loading_failed_task = tokio::spawn(async move {
-                let mut stream = loading_failed_stream;
-                while let Some(event) = stream.next().await {
-                    let mut inst = loading_failed_instance.lock().await;
-                    if let Some(ref mut rec) = inst.interception.recorder {
-                        rec.apply_loading_failed(&event);
-                    }
-                }
-                debug!("loadingFailed event stream closed");
-            });
-
-            inst.interception.tasks = vec![
-                paused_task,
-                response_task,
-                request_task,
-                loading_finished_task,
-                loading_failed_task,
-            ];
+            inst.interception.tasks = vec![paused_task];
         }
 
         Ok(())
@@ -500,37 +389,47 @@ impl BrowserPool {
             inst.interception.paused_tx = None;
             inst.interception.enabled = false;
             inst.interception.url_patterns.clear();
+            inst.interception.extra_headers.clear();
         }
 
         Ok(())
     }
 
-    /// Start HAR recording for a session.
-    pub async fn start_har(&self, session_id: &str) -> Result<(), Error> {
-        let instances = self.instances.read().await;
-        if let Some(instance) = instances.get(session_id) {
-            let mut inst = instance.lock().await;
-            inst.interception.recorder = Some(crate::network::HarRecorder::new());
-        }
-        Ok(())
+    /// Start passive API capture for the active page in a session.
+    pub async fn start_api_capture(
+        &self,
+        session_id: &str,
+        config: crate::api_capture::ApiCaptureConfig,
+    ) -> Result<(), Error> {
+        self.configure_api_capture(
+            session_id,
+            config.clone(),
+            crate::api_capture::ApiCaptureRecorder::new(config),
+        )
+        .await
     }
 
-    /// Stop HAR recording and return the HAR JSON document.
-    ///
-    /// Returns `None` if HAR recording was not active.
-    pub async fn stop_har(&self, session_id: &str) -> Option<serde_json::Value> {
+    /// Stop passive API capture and return the inferred API catalog.
+    pub async fn stop_api_capture(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::api_capture::ApiCatalog> {
         let instances = self.instances.read().await;
-        if let Some(instance) = instances.get(session_id) {
-            let mut inst = instance.lock().await;
-            if let Some(mut recorder) = inst.interception.recorder.take() {
-                recorder.finish();
-                #[cfg(feature = "metrics")]
-                moltis_metrics::counter!(moltis_metrics::browser::HAR_RECORDINGS_TOTAL)
-                    .increment(1);
-                return Some(recorder.to_har_json());
-            }
+        let instance = instances.get(session_id)?;
+        let mut inst = instance.lock().await;
+
+        for task in inst.api_capture.tasks.drain(..) {
+            task.abort();
         }
-        None
+        inst.api_capture.config = None;
+
+        let mut recorder = inst.api_capture.recorder.take()?;
+        recorder.finish();
+
+        #[cfg(feature = "metrics")]
+        moltis_metrics::counter!(moltis_metrics::browser::API_CAPTURES_TOTAL).increment(1);
+
+        Some(recorder.build_catalog())
     }
 
     /// Update extra headers for a session's interception state.
@@ -542,7 +441,7 @@ impl BrowserPool {
         }
     }
 
-    /// Take interception/HAR state out of a session so it can be restored onto
+    /// Take interception state out of a session so it can be restored onto
     /// a replacement session after a stale-connection retry.
     pub async fn take_interception_snapshot(
         &self,
@@ -552,19 +451,23 @@ impl BrowserPool {
         let instance = instances.get(session_id)?;
         let mut inst = instance.lock().await;
 
-        if !inst.interception.enabled && inst.interception.recorder.is_none() {
+        if !inst.interception.enabled {
             return None;
         }
+
+        for task in inst.interception.tasks.drain(..) {
+            task.abort();
+        }
+        inst.interception.paused_tx = None;
 
         Some(crate::network::InterceptionSnapshot {
             enabled: inst.interception.enabled,
             url_patterns: inst.interception.url_patterns.clone(),
             extra_headers: inst.interception.extra_headers.clone(),
-            recorder: inst.interception.recorder.take(),
         })
     }
 
-    /// Restore interception/HAR state onto an already-created session.
+    /// Restore interception state onto an already-created session.
     pub async fn restore_interception_snapshot(
         &self,
         session_id: &str,
@@ -574,7 +477,6 @@ impl BrowserPool {
             enabled,
             url_patterns,
             extra_headers,
-            recorder,
         } = snapshot;
 
         if enabled {
@@ -589,7 +491,140 @@ impl BrowserPool {
                 inst.interception.url_patterns = url_patterns;
                 inst.interception.extra_headers = extra_headers;
             }
-            inst.interception.recorder = recorder;
+        }
+
+        Ok(())
+    }
+
+    /// Take API capture state out of a session so it can be restored onto
+    /// a replacement session after a stale-connection retry.
+    pub async fn take_api_capture_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::api_capture::ApiCaptureSnapshot> {
+        let instances = self.instances.read().await;
+        let instance = instances.get(session_id)?;
+        let mut inst = instance.lock().await;
+
+        if inst.api_capture.config.is_none() || inst.api_capture.recorder.is_none() {
+            return None;
+        }
+
+        for task in inst.api_capture.tasks.drain(..) {
+            task.abort();
+        }
+
+        let config = inst.api_capture.config.take()?;
+        let recorder = inst.api_capture.recorder.take()?;
+
+        Some(crate::api_capture::ApiCaptureSnapshot { config, recorder })
+    }
+
+    /// Restore API capture state onto an already-created session.
+    pub async fn restore_api_capture_snapshot(
+        &self,
+        session_id: &str,
+        snapshot: crate::api_capture::ApiCaptureSnapshot,
+    ) -> Result<(), Error> {
+        self.configure_api_capture(session_id, snapshot.config, snapshot.recorder)
+            .await
+    }
+
+    async fn configure_api_capture(
+        &self,
+        session_id: &str,
+        config: crate::api_capture::ApiCaptureConfig,
+        recorder: crate::api_capture::ApiCaptureRecorder,
+    ) -> Result<(), Error> {
+        use chromiumoxide::cdp::browser_protocol::network::{
+            EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent, EventResponseReceived,
+        };
+
+        let page = self.get_active_page(session_id).await?;
+
+        let request_stream = page
+            .event_listener::<EventRequestWillBeSent>()
+            .await
+            .map_err(|error| Error::Cdp(format!("requestWillBeSent event listener: {error}")))?;
+        let response_stream = page
+            .event_listener::<EventResponseReceived>()
+            .await
+            .map_err(|error| Error::Cdp(format!("responseReceived event listener: {error}")))?;
+        let loading_failed_stream = page
+            .event_listener::<EventLoadingFailed>()
+            .await
+            .map_err(|error| Error::Cdp(format!("loadingFailed event listener: {error}")))?;
+        let loading_finished_stream = page
+            .event_listener::<EventLoadingFinished>()
+            .await
+            .map_err(|error| Error::Cdp(format!("loadingFinished event listener: {error}")))?;
+
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let request_instance = Arc::clone(instance);
+            let response_instance = Arc::clone(instance);
+            let loading_failed_instance = Arc::clone(instance);
+            let loading_finished_instance = Arc::clone(instance);
+
+            let mut inst = instance.lock().await;
+            for task in inst.api_capture.tasks.drain(..) {
+                task.abort();
+            }
+            inst.api_capture.config = Some(config);
+            inst.api_capture.recorder = Some(recorder);
+
+            let request_task = tokio::spawn(async move {
+                let mut stream = request_stream;
+                while let Some(event) = stream.next().await {
+                    let mut inst = request_instance.lock().await;
+                    let extra_headers = inst.interception.extra_headers.clone();
+                    if let Some(recorder) = inst.api_capture.recorder.as_mut() {
+                        recorder.record_request(&event);
+                        recorder.merge_request_headers(&event.request_id, &extra_headers);
+                    }
+                }
+                debug!("requestWillBeSent event stream closed");
+            });
+
+            let response_task = tokio::spawn(async move {
+                let mut stream = response_stream;
+                while let Some(event) = stream.next().await {
+                    let mut inst = response_instance.lock().await;
+                    if let Some(recorder) = inst.api_capture.recorder.as_mut() {
+                        recorder.apply_response_received(&event);
+                    }
+                }
+                debug!("responseReceived event stream closed");
+            });
+
+            let loading_failed_task = tokio::spawn(async move {
+                let mut stream = loading_failed_stream;
+                while let Some(event) = stream.next().await {
+                    let mut inst = loading_failed_instance.lock().await;
+                    if let Some(recorder) = inst.api_capture.recorder.as_mut() {
+                        recorder.apply_loading_failed(&event);
+                    }
+                }
+                debug!("loadingFailed event stream closed");
+            });
+
+            let loading_finished_task = tokio::spawn(async move {
+                let mut stream = loading_finished_stream;
+                while let Some(event) = stream.next().await {
+                    let mut inst = loading_finished_instance.lock().await;
+                    if let Some(recorder) = inst.api_capture.recorder.as_mut() {
+                        recorder.apply_loading_finished(&event.request_id);
+                    }
+                }
+                debug!("loadingFinished event stream closed");
+            });
+
+            inst.api_capture.tasks = vec![
+                request_task,
+                response_task,
+                loading_failed_task,
+                loading_finished_task,
+            ];
         }
 
         Ok(())
@@ -755,6 +790,9 @@ impl BrowserPool {
                 task.abort();
             }
             inst.interception.paused_tx = None;
+            for task in inst.api_capture.tasks.drain(..) {
+                task.abort();
+            }
             // Pages are closed when browser is dropped
             drop(inst);
 
@@ -949,6 +987,7 @@ impl BrowserPool {
             active_tab: "main".to_string(),
             current_mouse_pos: (0.0, 0.0),
             interception: crate::network::InterceptionState::default(),
+            api_capture: crate::api_capture::ApiCaptureRuntime::default(),
             screencast_handle: None,
             virtual_display: None,
         })
@@ -1150,6 +1189,7 @@ impl BrowserPool {
             active_tab: "main".to_string(),
             current_mouse_pos: (0.0, 0.0),
             interception: crate::network::InterceptionState::default(),
+            api_capture: crate::api_capture::ApiCaptureRuntime::default(),
             screencast_handle: None,
             virtual_display,
         })
@@ -1314,13 +1354,10 @@ mod tests {
             "--window-size=1280,720".to_string(),
         ];
         let result = sanitize_user_chrome_args(&input, false);
-        assert_eq!(
-            result,
-            vec![
-                "--enable-automation".to_string(),
-                "--window-size=1280,720".to_string()
-            ]
-        );
+        assert_eq!(result, vec![
+            "--enable-automation".to_string(),
+            "--window-size=1280,720".to_string()
+        ]);
     }
 
     #[test]
@@ -1331,12 +1368,9 @@ mod tests {
             "--disable-gpu".to_string(),
         ];
         let result = sanitize_user_chrome_args(&input, true);
-        assert_eq!(
-            result,
-            vec![
-                "--window-size=1280,720".to_string(),
-                "--disable-gpu".to_string()
-            ]
-        );
+        assert_eq!(result, vec![
+            "--window-size=1280,720".to_string(),
+            "--disable-gpu".to_string()
+        ]);
     }
 }
