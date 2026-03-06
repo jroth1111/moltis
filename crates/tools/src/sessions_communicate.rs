@@ -296,10 +296,13 @@ impl AgentTool for SessionsSendTool {
             message
         };
 
-        let explicit_resume_context = if let Some(value) = params
-            .get("resume_context")
-            .or_else(|| params.get("resumeContext"))
-        {
+        if params.get("handoff_context").is_some() || params.get("handoffContext").is_some() {
+            return Err(
+                Error::message("handoff_context was removed; use resume_context instead").into(),
+            );
+        }
+
+        let explicit_resume_context = if let Some(value) = params.get("resume_context") {
             Some(
                 serde_json::from_value::<SessionResumeContext>(value.clone()).map_err(|error| {
                     Error::message(format!("invalid resume_context payload: {error}"))
@@ -317,8 +320,8 @@ impl AgentTool for SessionsSendTool {
             None
         };
 
-        let handoff_attached = resume_context.is_some();
-        let mut handoff_persisted = false;
+        let resume_context_attached = resume_context.is_some();
+        let mut resume_context_persisted = false;
         if let Some(resume_context) = resume_context
             && let Some(store) = &self.state_store
         {
@@ -326,10 +329,10 @@ impl AgentTool for SessionsSendTool {
                 warn!(
                     session = %key,
                     error = %error,
-                    "sessions_send: failed to persist inbound handoff context"
+                    "sessions_send: failed to persist inbound resume context"
                 );
             } else {
-                handoff_persisted = true;
+                resume_context_persisted = true;
             }
         }
 
@@ -347,8 +350,8 @@ impl AgentTool for SessionsSendTool {
             "label": entry.label,
             "sent": true,
             "waitForReply": wait_for_reply,
-            "handoffAttached": handoff_attached,
-            "handoffPersisted": handoff_persisted,
+            "resumeContextAttached": resume_context_attached,
+            "resumeContextPersisted": resume_context_persisted,
             "result": result,
         }))
     }
@@ -607,13 +610,13 @@ mod tests {
             .await?;
 
         assert_eq!(result["sent"], true);
-        assert_eq!(result["handoffAttached"], true);
-        assert_eq!(result["handoffPersisted"], true);
+        assert_eq!(result["resumeContextAttached"], true);
+        assert_eq!(result["resumeContextPersisted"], true);
 
         let persisted = state_store
             .get_handoff("session:target")
             .await?
-            .ok_or_else(|| std::io::Error::other("expected inbound handoff"))?;
+            .ok_or_else(|| std::io::Error::other("expected inbound resume context"))?;
         assert_eq!(persisted.last_action.as_deref(), Some("attempted migration"));
         assert!(!persisted.dead_ends.is_empty());
         Ok(())
@@ -627,6 +630,17 @@ mod tests {
             .await?;
 
         let state_store = test_state_store().await?;
+        let mut resume_context = SessionResumeContext::new(
+            Some("finish rollout".into()),
+            vec!["deploy production".into()],
+            None,
+            None,
+            vec!["staging is green".into()],
+        );
+        resume_context.last_action = Some("validated staging".into());
+        resume_context.dead_ends = vec!["deploy: previous canary failed".into()];
+        resume_context.next_step_hint = Some("deploy production carefully".into());
+        resume_context.estimated_tokens = Some(321);
         let send_fn: SendToSessionFn = Arc::new(move |_req| {
             Box::pin(async move { Ok(serde_json::json!({ "text": "ok" })) })
         });
@@ -637,34 +651,50 @@ mod tests {
             .execute(serde_json::json!({
                 "key": "session:target",
                 "message": "Continue the task",
-                "resume_context": {
-                    "last_goal": "finish rollout",
-                    "last_action": "validated staging",
-                    "pending_tasks": ["deploy production"],
-                    "last_error": null,
-                    "working_directory": null,
-                    "key_facts": ["staging is green"],
-                    "dead_ends": ["deploy: previous canary failed"],
-                    "next_step_hint": "deploy production carefully",
-                    "estimated_tokens": 321,
-                    "created_at": 1_234
-                }
+                "resume_context": serde_json::to_value(&resume_context)?
             }))
             .await?;
 
-        assert_eq!(result["handoffAttached"], true);
-        assert_eq!(result["handoffPersisted"], true);
+        assert_eq!(result["resumeContextAttached"], true);
+        assert_eq!(result["resumeContextPersisted"], true);
 
         let persisted = state_store
             .get_handoff("session:target")
             .await?
-            .ok_or_else(|| std::io::Error::other("expected inbound handoff"))?;
+            .ok_or_else(|| std::io::Error::other("expected inbound resume context"))?;
         assert_eq!(persisted.last_goal.as_deref(), Some("finish rollout"));
         assert_eq!(persisted.pending_tasks, vec!["deploy production"]);
         assert_eq!(
             persisted.next_step_hint.as_deref(),
             Some("deploy production carefully")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sessions_send_rejects_removed_handoff_context_param() -> TestResult<()> {
+        let metadata = Arc::new(SqliteSessionMetadata::new(test_pool().await?));
+        metadata
+            .upsert("session:target", Some("Target".to_string()))
+            .await?;
+
+        let send_fn: SendToSessionFn = Arc::new(move |_req| {
+            Box::pin(async move { Ok(serde_json::json!({ "text": "ok" })) })
+        });
+        let tool = SessionsSendTool::new(metadata, send_fn);
+
+        let error = tool
+            .execute(serde_json::json!({
+                "key": "session:target",
+                "message": "Continue the task",
+                "handoff_context": {
+                    "last_action": "old payload"
+                }
+            }))
+            .await
+            .expect_err("removed handoff_context should fail");
+
+        assert!(error.to_string().contains("use resume_context instead"));
         Ok(())
     }
 
