@@ -932,7 +932,7 @@ mod tests {
         }
         service.reschedule_legacy_direct_expiry().await;
 
-        tokio::time::sleep(TokioDuration::from_millis(30)).await;
+        sleep(TokioDuration::from_millis(30)).await;
 
         let status = service.legacy_direct_status_value().await;
         assert_eq!(status["enabled"], Value::Bool(false));
