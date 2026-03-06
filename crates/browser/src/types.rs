@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub struct StealthConfig {
     /// Master switch — disables all stealth when false.
     pub enabled: bool,
-    /// Inject the 16-evasion JS script via `addScriptToEvaluateOnNewDocument`.
+    /// Inject the 20-evasion JS script via `addScriptToEvaluateOnNewDocument`.
     pub js_evasion: bool,
     /// Add the 19 stealth Chrome launch flags.
     pub stealth_args: bool,

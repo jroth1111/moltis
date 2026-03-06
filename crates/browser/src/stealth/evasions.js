@@ -742,4 +742,106 @@
       return Math.floor(lastNow);
     };
   } catch (e) {}
+
+  // WebRTC IP leak protection
+  try {
+    const RTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+    if (RTCPeerConnection) {
+      const OriginalRTCPeerConnection = RTCPeerConnection;
+      const RelayOnlyRTCPeerConnection = function (config, constraints) {
+        const baseConfig =
+          config && typeof config === 'object' && !Array.isArray(config) ? config : {};
+        return new OriginalRTCPeerConnection(
+          {
+            ...baseConfig,
+            iceTransportPolicy: 'relay',
+          },
+          constraints
+        );
+      };
+      RelayOnlyRTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
+      Object.setPrototypeOf(RelayOnlyRTCPeerConnection, OriginalRTCPeerConnection);
+      window.RTCPeerConnection = RelayOnlyRTCPeerConnection;
+      if (window.webkitRTCPeerConnection) {
+        window.webkitRTCPeerConnection = RelayOnlyRTCPeerConnection;
+      }
+    }
+  } catch (e) {}
+
+  // Canvas fingerprint noise
+  try {
+    const originalToBlob = HTMLCanvasElement.prototype.toBlob;
+    const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+
+    const addCanvasNoise = (canvas) => {
+      const ctx = canvas.getContext('2d');
+      if (!ctx || canvas.width === 0 || canvas.height === 0) return;
+      const imageData = originalGetImageData.call(ctx, 0, 0, canvas.width, canvas.height);
+      for (let i = 0; i < imageData.data.length; i += 4) {
+        if (Math.random() < 0.01) {
+          imageData.data[i] = Math.max(
+            0,
+            Math.min(255, imageData.data[i] + Math.floor(Math.random() * 3) - 1)
+          );
+        }
+      }
+      ctx.putImageData(imageData, 0, 0);
+    };
+
+    HTMLCanvasElement.prototype.toBlob = function (...args) {
+      addCanvasNoise(this);
+      return originalToBlob.apply(this, args);
+    };
+    HTMLCanvasElement.prototype.toDataURL = function (...args) {
+      addCanvasNoise(this);
+      return originalToDataURL.apply(this, args);
+    };
+  } catch (e) {}
+
+  // AudioContext fingerprint randomization
+  try {
+    const audioContext = window.AudioContext || window.webkitAudioContext;
+    if (audioContext) {
+      const OriginalAudioContext = audioContext;
+      const originalGetChannelData = AudioBuffer.prototype.getChannelData;
+      if (originalGetChannelData && !AudioBuffer.prototype.__stealthGetChannelDataWrapped) {
+        AudioBuffer.prototype.getChannelData = function (channel) {
+          const data = originalGetChannelData.call(this, channel);
+          for (let i = 0; i < data.length; i += 100) {
+            data[i] += Math.random() * 0.0001 - 0.00005;
+          }
+          return data;
+        };
+        Object.defineProperty(AudioBuffer.prototype, '__stealthGetChannelDataWrapped', {
+          value: true,
+          configurable: false,
+          enumerable: false,
+          writable: false,
+        });
+      }
+      const WrappedAudioContext = function (...args) {
+        return new OriginalAudioContext(...args);
+      };
+      WrappedAudioContext.prototype = OriginalAudioContext.prototype;
+      Object.setPrototypeOf(WrappedAudioContext, OriginalAudioContext);
+      window.AudioContext = WrappedAudioContext;
+      if (window.webkitAudioContext) {
+        window.webkitAudioContext = WrappedAudioContext;
+      }
+    }
+  } catch (e) {}
+
+  // Font enumeration protection
+  try {
+    if (window.FontFace) {
+      const OriginalFontFace = window.FontFace;
+      const WrappedFontFace = function (family, source, descriptors) {
+        return new OriginalFontFace(family, source, descriptors);
+      };
+      WrappedFontFace.prototype = OriginalFontFace.prototype;
+      Object.setPrototypeOf(WrappedFontFace, OriginalFontFace);
+      window.FontFace = WrappedFontFace;
+    }
+  } catch (e) {}
 })();

@@ -1,6 +1,6 @@
 //! Stealth evasion for chromiumoxide — anti-bot detection via JS injection and Chrome flags.
 //!
-//! Ports the 16-evasion strategy from `agent-browser-stealth/src/stealth-native.ts`
+//! Ports the 20-evasion strategy from `agent-browser-stealth/src/stealth-native.ts`
 //! to pure Rust + CDP. No Node.js dependency.
 //!
 //! # What this does
@@ -233,10 +233,10 @@ mod tests {
     }
 
     #[test]
-    fn build_evasion_script_contains_all_16_evasion_markers() {
+    fn build_evasion_script_contains_all_20_evasion_markers() {
         let script = build_evasion_script(&default_config());
 
-        // Each marker corresponds to one of the 16 enumerated evasions
+        // Each marker corresponds to one of the 20 enumerated evasions
         let markers = [
             "navigator.webdriver",
             "chrome.runtime",
@@ -254,6 +254,10 @@ mod tests {
             "canPlayType",
             "STEALTH_DEVICE_MEMORY",
             "navigator.connection",
+            "RTCPeerConnection",
+            "HTMLCanvasElement.prototype.toDataURL",
+            "AudioBuffer.prototype.getChannelData",
+            "window.FontFace = WrappedFontFace",
         ];
 
         for marker in markers {
