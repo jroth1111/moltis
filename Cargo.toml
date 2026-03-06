@@ -3,11 +3,9 @@ default-members = [
   "apps/courier",
   "crates/agents",
   "crates/auth",
-  "crates/auto-reply",
   "crates/benchmarks",
   "crates/browser",
   "crates/caldav",
-  "crates/canvas",
   "crates/channels",
   "crates/chat",
   "crates/cli",
@@ -33,7 +31,6 @@ default-members = [
   "crates/provider-setup",
   "crates/providers",
   "crates/qmd",
-  "crates/routing",
   "crates/service-traits",
   "crates/sessions",
   "crates/skills",
@@ -55,11 +52,9 @@ members = [
   "apps/courier",
   "crates/agents",
   "crates/auth",
-  "crates/auto-reply",
   "crates/benchmarks",
   "crates/browser",
   "crates/caldav",
-  "crates/canvas",
   "crates/channels",
   "crates/chat",
   "crates/cli",
@@ -85,7 +80,6 @@ members = [
   "crates/provider-setup",
   "crates/providers",
   "crates/qmd",
-  "crates/routing",
   "crates/schema-export",
   "crates/service-traits",
   "crates/sessions",
@@ -290,10 +284,8 @@ zeroize       = { features = ["derive"], version = "1" }
 moltis                 = { path = "crates/cli" }
 moltis-agents          = { path = "crates/agents" }
 moltis-auth            = { path = "crates/auth" }
-moltis-auto-reply      = { path = "crates/auto-reply" }
 moltis-browser         = { path = "crates/browser" }
 moltis-caldav          = { path = "crates/caldav" }
-moltis-canvas          = { path = "crates/canvas" }
 moltis-channels        = { path = "crates/channels" }
 moltis-chat            = { path = "crates/chat" }
 moltis-common          = { path = "crates/common" }
@@ -317,7 +309,6 @@ moltis-protocol        = { path = "crates/protocol" }
 moltis-provider-setup  = { path = "crates/provider-setup" }
 moltis-providers       = { features = ["provider-github-copilot", "provider-kimi-code", "provider-openai-codex"], path = "crates/providers" }
 moltis-qmd             = { path = "crates/qmd" }
-moltis-routing         = { path = "crates/routing" }
 moltis-schema-export   = { path = "crates/schema-export" }
 moltis-service-traits  = { path = "crates/service-traits" }
 moltis-sessions        = { path = "crates/sessions" }

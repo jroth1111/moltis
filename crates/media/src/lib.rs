@@ -1,10 +1,6 @@
-//! Media pipeline: download, store, MIME detect, image resize, audio transcription, serve, TTL cleanup.
+//! Image processing helpers for media attachments and share previews.
 
-pub mod cleanup;
 pub mod error;
 pub mod image_ops;
-pub mod mime;
-pub mod server;
-pub mod store;
 
 pub use error::{Error, Result};

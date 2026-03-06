@@ -5914,21 +5914,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moltis-auto-reply"
-version = "0.10.6"
-dependencies = [
- "moltis-agents",
- "moltis-common",
- "moltis-metrics",
- "moltis-routing",
- "moltis-sessions",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "moltis-browser"
 version = "0.10.6"
 dependencies = [
@@ -5980,18 +5965,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "moltis-canvas"
-version = "0.10.6"
-dependencies = [
- "axum",
- "moltis-common",
- "moltis-metrics",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -6174,7 +6147,6 @@ dependencies = [
  "moltis-auth",
  "moltis-browser",
  "moltis-caldav",
- "moltis-canvas",
  "moltis-channels",
  "moltis-chat",
  "moltis-common",
@@ -6197,7 +6169,6 @@ dependencies = [
  "moltis-provider-setup",
  "moltis-providers",
  "moltis-qmd",
- "moltis-routing",
  "moltis-service-traits",
  "moltis-sessions",
  "moltis-skills",
@@ -6292,13 +6263,9 @@ name = "moltis-media"
 version = "0.10.6"
 dependencies = [
  "image",
- "moltis-common",
  "moltis-metrics",
- "reqwest 0.12.28",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -6586,19 +6553,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moltis-routing"
-version = "0.10.6"
-dependencies = [
- "moltis-common",
- "moltis-config",
- "moltis-metrics",
- "moltis-sessions",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "moltis-schema-export"
 version = "0.10.6"
 dependencies = [
@@ -6728,7 +6682,6 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "moltis-auto-reply",
  "moltis-channels",
  "moltis-common",
  "moltis-media",

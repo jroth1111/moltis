@@ -1,6 +1,5 @@
 //! LLM agent runtime: model selection, prompt building, tool execution, streaming.
 
-pub mod auth_profiles;
 pub mod classify;
 pub mod cross_session;
 pub mod intent_tracker;

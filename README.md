@@ -103,7 +103,7 @@ cargo install moltis --git https://github.com/moltis-org/moltis
 | Import | `moltis-openclaw-import` | 7.6K |
 | Apple native | `moltis-swift-bridge` | 2.1K |
 | Metrics | `moltis-metrics` | 1.7K |
-| Other | `moltis-projects`, `moltis-media`, `moltis-routing`, `moltis-canvas`, `moltis-auto-reply`, `moltis-schema-export`, `moltis-benchmarks` | 2.5K |
+| Other | `moltis-projects`, `moltis-media`, `moltis-schema-export`, `moltis-benchmarks` | 2.5K |
 
 Use `--no-default-features --features lightweight` for constrained devices (Raspberry Pi, etc.).
 

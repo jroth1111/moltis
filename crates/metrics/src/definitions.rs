@@ -265,24 +265,6 @@ pub mod system {
     pub const CONNECTED_CLIENTS: &str = "moltis_connected_clients";
 }
 
-/// Auto-reply pipeline metrics
-pub mod auto_reply {
-    /// Total messages received for processing
-    pub const MESSAGES_RECEIVED_TOTAL: &str = "moltis_auto_reply_messages_received_total";
-    /// Message processing duration in seconds
-    pub const PROCESSING_DURATION_SECONDS: &str = "moltis_auto_reply_processing_duration_seconds";
-    /// Queue size by mode (per_message, batch, debounce)
-    pub const QUEUE_SIZE: &str = "moltis_auto_reply_queue_size";
-    /// Messages dropped due to policy
-    pub const MESSAGES_DROPPED_TOTAL: &str = "moltis_auto_reply_messages_dropped_total";
-    /// Directive parse errors
-    pub const DIRECTIVE_PARSE_ERRORS_TOTAL: &str = "moltis_auto_reply_directive_parse_errors_total";
-    /// Response chunk operations
-    pub const CHUNK_OPERATIONS_TOTAL: &str = "moltis_auto_reply_chunk_operations_total";
-    /// Delivery failures by channel type
-    pub const DELIVERY_FAILURES_TOTAL: &str = "moltis_auto_reply_delivery_failures_total";
-}
-
 /// Browser automation metrics
 pub mod browser {
     /// Active browser instances
@@ -313,24 +295,6 @@ pub mod browser {
     pub const BEHAVIORAL_CLICKS_TOTAL: &str = "moltis_browser_behavioral_clicks_total";
     /// Total behavioral (randomised-delay) keyboard types performed
     pub const BEHAVIORAL_TYPES_TOTAL: &str = "moltis_browser_behavioral_types_total";
-}
-
-/// Canvas (A2UI) metrics
-pub mod canvas {
-    /// Active WebSocket connections
-    pub const CONNECTIONS_ACTIVE: &str = "moltis_canvas_connections_active";
-    /// Total messages received from UI
-    pub const MESSAGES_RECEIVED_TOTAL: &str = "moltis_canvas_messages_received_total";
-    /// Total messages sent to UI
-    pub const MESSAGES_SENT_TOTAL: &str = "moltis_canvas_messages_sent_total";
-    /// Message round-trip latency in seconds
-    pub const MESSAGE_LATENCY_SECONDS: &str = "moltis_canvas_message_latency_seconds";
-    /// Page serve duration in seconds
-    pub const PAGE_SERVE_DURATION_SECONDS: &str = "moltis_canvas_page_serve_duration_seconds";
-    /// WebSocket errors
-    pub const WEBSOCKET_ERRORS_TOTAL: &str = "moltis_canvas_websocket_errors_total";
-    /// Content size in bytes
-    pub const CONTENT_SIZE_BYTES: &str = "moltis_canvas_content_size_bytes";
 }
 
 /// Media pipeline metrics
@@ -440,20 +404,6 @@ pub mod protocol {
     pub const DEDUPE_OPERATIONS_TOTAL: &str = "moltis_protocol_dedupe_operations_total";
     /// Frame rate exceeded events
     pub const FRAME_RATE_EXCEEDED_TOTAL: &str = "moltis_protocol_frame_rate_exceeded_total";
-}
-
-/// Routing metrics
-pub mod routing {
-    /// Route resolutions by binding level
-    pub const RESOLUTIONS_TOTAL: &str = "moltis_routing_resolutions_total";
-    /// Resolution duration in seconds
-    pub const RESOLUTION_DURATION_SECONDS: &str = "moltis_routing_resolution_duration_seconds";
-    /// Resolution errors by type
-    pub const RESOLUTION_ERRORS_TOTAL: &str = "moltis_routing_resolution_errors_total";
-    /// Fallback to default agent
-    pub const FALLBACK_TO_DEFAULT_TOTAL: &str = "moltis_routing_fallback_to_default_total";
-    /// Session key generations
-    pub const SESSION_KEY_GENERATIONS_TOTAL: &str = "moltis_routing_session_key_generations_total";
 }
 
 /// Skills metrics

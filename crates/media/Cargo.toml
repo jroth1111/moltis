@@ -5,13 +5,9 @@ version.workspace = true
 
 [dependencies]
 image          = { workspace = true }
-moltis-common  = { workspace = true }
 moltis-metrics = { optional = true, workspace = true }
-reqwest        = { workspace = true }
 thiserror      = { workspace = true }
-tokio          = { workspace = true }
 tracing        = { workspace = true }
-uuid           = { workspace = true }
 
 [features]
 default = []
