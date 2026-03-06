@@ -5,6 +5,7 @@
 //! fields (created_at, model, provider, tokens, channel).
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// A message stored in a session JSONL file.
 ///
@@ -34,7 +35,7 @@ pub enum PersistedMessage {
         audio: Option<String>,
         /// Channel metadata for UI display (e.g., Telegram sender info).
         #[serde(skip_serializing_if = "Option::is_none")]
-        channel: Option<serde_json::Value>,
+        channel: Option<Value>,
         /// Client-assigned sequence number for ordering diagnostics.
         #[serde(skip_serializing_if = "Option::is_none")]
         seq: Option<u64>,
@@ -74,7 +75,7 @@ pub enum PersistedMessage {
         reasoning: Option<String>,
         /// Raw provider API payload captured during streaming for debugging.
         #[serde(rename = "llmApiResponse", skip_serializing_if = "Option::is_none")]
-        llm_api_response: Option<serde_json::Value>,
+        llm_api_response: Option<Value>,
         /// Relative media path for TTS audio (e.g. "media/main/run_abc.ogg").
         #[serde(skip_serializing_if = "Option::is_none")]
         audio: Option<String>,
@@ -100,10 +101,10 @@ pub enum PersistedMessage {
         tool_call_id: String,
         tool_name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        arguments: Option<serde_json::Value>,
+        arguments: Option<Value>,
         success: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<serde_json::Value>,
+        result: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
         /// Provider reasoning/thinking text that preceded this tool call.
@@ -169,7 +170,7 @@ impl PersistedMessage {
     }
 
     /// Create a user message with plain text and channel metadata.
-    pub fn user_with_channel(text: impl Into<String>, channel: serde_json::Value) -> Self {
+    pub fn user_with_channel(text: impl Into<String>, channel: Value) -> Self {
         Self::User {
             content: MessageContent::Text(text.into()),
             created_at: Some(now_ms()),
@@ -195,7 +196,7 @@ impl PersistedMessage {
     /// Create a user message with multimodal content and channel metadata.
     pub fn user_multimodal_with_channel(
         blocks: Vec<ContentBlock>,
-        channel: serde_json::Value,
+        channel: Value,
     ) -> Self {
         Self::User {
             content: MessageContent::Multimodal(blocks),
@@ -264,9 +265,9 @@ impl PersistedMessage {
     pub fn tool_result(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
-        arguments: Option<serde_json::Value>,
+        arguments: Option<Value>,
         success: bool,
-        result: Option<serde_json::Value>,
+        result: Option<Value>,
         error: Option<String>,
     ) -> Self {
         Self::ToolResult {
@@ -286,9 +287,9 @@ impl PersistedMessage {
     pub fn tool_result_with_reasoning(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
-        arguments: Option<serde_json::Value>,
+        arguments: Option<Value>,
         success: bool,
-        result: Option<serde_json::Value>,
+        result: Option<Value>,
         error: Option<String>,
         reasoning: Option<String>,
     ) -> Self {
@@ -309,9 +310,9 @@ impl PersistedMessage {
     pub fn tool_result_with_run_id(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
-        arguments: Option<serde_json::Value>,
+        arguments: Option<Value>,
         success: bool,
-        result: Option<serde_json::Value>,
+        result: Option<Value>,
         error: Option<String>,
         run_id: impl Into<String>,
     ) -> Self {
@@ -332,9 +333,111 @@ impl PersistedMessage {
     ///
     /// This cannot fail because `PersistedMessage` only contains types with
     /// infallible serialization (strings, numbers, booleans, vecs, options).
-    #[allow(clippy::expect_used)]
-    pub fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("PersistedMessage serialization cannot fail")
+    pub fn to_value(&self) -> Value {
+        let mut object = Map::new();
+
+        match self {
+            Self::System {
+                content,
+                created_at,
+            } => {
+                object.insert("role".to_string(), Value::String("system".to_string()));
+                object.insert("content".to_string(), Value::String(content.clone()));
+                insert_optional_u64(&mut object, "created_at", *created_at);
+            },
+            Self::Notice {
+                content,
+                created_at,
+            } => {
+                object.insert("role".to_string(), Value::String("notice".to_string()));
+                object.insert("content".to_string(), Value::String(content.clone()));
+                insert_optional_u64(&mut object, "created_at", *created_at);
+            },
+            Self::User {
+                content,
+                created_at,
+                audio,
+                channel,
+                seq,
+                run_id,
+            } => {
+                object.insert("role".to_string(), Value::String("user".to_string()));
+                object.insert("content".to_string(), message_content_to_value(content));
+                insert_optional_u64(&mut object, "created_at", *created_at);
+                insert_optional_string(&mut object, "audio", audio.as_ref());
+                insert_optional_value(&mut object, "channel", channel.as_ref());
+                insert_optional_u64(&mut object, "seq", *seq);
+                insert_optional_string(&mut object, "run_id", run_id.as_ref());
+            },
+            Self::Assistant {
+                content,
+                created_at,
+                model,
+                provider,
+                input_tokens,
+                output_tokens,
+                duration_ms,
+                request_input_tokens,
+                request_output_tokens,
+                tool_calls,
+                reasoning,
+                llm_api_response,
+                audio,
+                seq,
+                run_id,
+            } => {
+                object.insert("role".to_string(), Value::String("assistant".to_string()));
+                object.insert("content".to_string(), Value::String(content.clone()));
+                insert_optional_u64(&mut object, "created_at", *created_at);
+                insert_optional_string(&mut object, "model", model.as_ref());
+                insert_optional_string(&mut object, "provider", provider.as_ref());
+                insert_optional_u32(&mut object, "inputTokens", *input_tokens);
+                insert_optional_u32(&mut object, "outputTokens", *output_tokens);
+                insert_optional_u64(&mut object, "durationMs", *duration_ms);
+                insert_optional_u32(&mut object, "requestInputTokens", *request_input_tokens);
+                insert_optional_u32(&mut object, "requestOutputTokens", *request_output_tokens);
+                insert_optional_tool_calls(&mut object, tool_calls.as_ref());
+                insert_optional_string(&mut object, "reasoning", reasoning.as_ref());
+                insert_optional_value(&mut object, "llmApiResponse", llm_api_response.as_ref());
+                insert_optional_string(&mut object, "audio", audio.as_ref());
+                insert_optional_u64(&mut object, "seq", *seq);
+                insert_optional_string(&mut object, "run_id", run_id.as_ref());
+            },
+            Self::Tool {
+                tool_call_id,
+                content,
+                created_at,
+            } => {
+                object.insert("role".to_string(), Value::String("tool".to_string()));
+                object.insert("tool_call_id".to_string(), Value::String(tool_call_id.clone()));
+                object.insert("content".to_string(), Value::String(content.clone()));
+                insert_optional_u64(&mut object, "created_at", *created_at);
+            },
+            Self::ToolResult {
+                tool_call_id,
+                tool_name,
+                arguments,
+                success,
+                result,
+                error,
+                reasoning,
+                created_at,
+                run_id,
+            } => {
+                object.insert("role".to_string(), Value::String("tool_result".to_string()));
+                object.insert("tool_call_id".to_string(), Value::String(tool_call_id.clone()));
+                object.insert("tool_name".to_string(), Value::String(tool_name.clone()));
+                insert_optional_value(&mut object, "arguments", arguments.as_ref());
+                object.insert("success".to_string(), Value::Bool(*success));
+                insert_optional_value(&mut object, "result", result.as_ref());
+                insert_optional_string(&mut object, "error", error.as_ref());
+                insert_optional_string(&mut object, "reasoning", reasoning.as_ref());
+                insert_optional_u64(&mut object, "created_at", *created_at);
+                insert_optional_string(&mut object, "run_id", run_id.as_ref());
+            },
+        }
+
+        Value::Object(object)
     }
 }
 
@@ -359,6 +462,95 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn message_content_to_value(content: &MessageContent) -> Value {
+    match content {
+        MessageContent::Text(text) => Value::String(text.clone()),
+        MessageContent::Multimodal(blocks) => {
+            Value::Array(blocks.iter().map(content_block_to_value).collect())
+        },
+    }
+}
+
+fn content_block_to_value(block: &ContentBlock) -> Value {
+    let mut object = Map::new();
+    match block {
+        ContentBlock::Text { text } => {
+            object.insert("type".to_string(), Value::String("text".to_string()));
+            object.insert("text".to_string(), Value::String(text.clone()));
+        },
+        ContentBlock::ImageUrl { image_url } => {
+            object.insert("type".to_string(), Value::String("image_url".to_string()));
+            object.insert(
+                "image_url".to_string(),
+                Value::Object(Map::from_iter([(
+                    "url".to_string(),
+                    Value::String(image_url.url.clone()),
+                )])),
+            );
+        },
+    }
+    Value::Object(object)
+}
+
+fn tool_call_to_value(tool_call: &PersistedToolCall) -> Value {
+    Value::Object(Map::from_iter([
+        ("id".to_string(), Value::String(tool_call.id.clone())),
+        (
+            "type".to_string(),
+            Value::String(tool_call.call_type.clone()),
+        ),
+        (
+            "function".to_string(),
+            Value::Object(Map::from_iter([
+                (
+                    "name".to_string(),
+                    Value::String(tool_call.function.name.clone()),
+                ),
+                (
+                    "arguments".to_string(),
+                    Value::String(tool_call.function.arguments.clone()),
+                ),
+            ])),
+        ),
+    ]))
+}
+
+fn insert_optional_string(object: &mut Map<String, Value>, key: &str, value: Option<&String>) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), Value::String(value.clone()));
+    }
+}
+
+fn insert_optional_u32(object: &mut Map<String, Value>, key: &str, value: Option<u32>) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), Value::from(value));
+    }
+}
+
+fn insert_optional_u64(object: &mut Map<String, Value>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), Value::from(value));
+    }
+}
+
+fn insert_optional_value(object: &mut Map<String, Value>, key: &str, value: Option<&Value>) {
+    if let Some(value) = value {
+        object.insert(key.to_string(), value.clone());
+    }
+}
+
+fn insert_optional_tool_calls(
+    object: &mut Map<String, Value>,
+    tool_calls: Option<&Vec<PersistedToolCall>>,
+) {
+    if let Some(tool_calls) = tool_calls {
+        object.insert(
+            "tool_calls".to_string(),
+            Value::Array(tool_calls.iter().map(tool_call_to_value).collect()),
+        );
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -783,5 +975,66 @@ mod tests {
         let json = msg.to_value();
         // reasoning field should not be present when None.
         assert!(json.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn manual_to_value_matches_serde_shape() {
+        let cases = vec![
+            PersistedMessage::system("system prompt"),
+            PersistedMessage::notice("ui-only notice"),
+            PersistedMessage::User {
+                content: MessageContent::Multimodal(vec![
+                    ContentBlock::text("describe this"),
+                    ContentBlock::image_base64("image/png", "abc123"),
+                ]),
+                created_at: Some(42),
+                audio: Some("media/main/voice.webm".to_string()),
+                channel: Some(serde_json::json!({"sender": "alice"})),
+                seq: Some(7),
+                run_id: Some("run-1".to_string()),
+            },
+            PersistedMessage::Assistant {
+                content: "done".to_string(),
+                created_at: Some(99),
+                model: Some("gpt-5".to_string()),
+                provider: Some("openai".to_string()),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                duration_ms: Some(123),
+                request_input_tokens: Some(9),
+                request_output_tokens: Some(4),
+                tool_calls: Some(vec![PersistedToolCall {
+                    id: "call-1".to_string(),
+                    call_type: "function".to_string(),
+                    function: PersistedFunction {
+                        name: "calc".to_string(),
+                        arguments: "{\"x\":1}".to_string(),
+                    },
+                }]),
+                reasoning: Some("thinking".to_string()),
+                llm_api_response: Some(serde_json::json!({"raw": true})),
+                audio: Some("media/main/reply.ogg".to_string()),
+                seq: Some(8),
+                run_id: Some("run-2".to_string()),
+            },
+            PersistedMessage::tool("call-2", "stdout"),
+            PersistedMessage::ToolResult {
+                tool_call_id: "call-3".to_string(),
+                tool_name: "exec".to_string(),
+                arguments: Some(serde_json::json!({"command": "pwd"})),
+                success: false,
+                result: Some(serde_json::json!({"stderr": "boom"})),
+                error: Some("boom".to_string()),
+                reasoning: Some("need shell".to_string()),
+                created_at: Some(77),
+                run_id: Some("run-3".to_string()),
+            },
+        ];
+
+        for message in cases {
+            let manual = message.to_value();
+            let derived = serde_json::to_value(&message).unwrap();
+            assert_eq!(manual, derived);
+        }
     }
 }
