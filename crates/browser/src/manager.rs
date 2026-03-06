@@ -22,15 +22,17 @@ use {
 use crate::{
     challenge::ChallengeType,
     error::Error,
-    patchright::{PatchrightLaunchOptions, PatchrightProbe, run_patchright_probe_with_retry},
+    patchright::{PatchrightProbe, run_patchright_probe_with_retry},
     pool::BrowserPool,
+    protection::{
+        ProtectionAssessment, assess_html, assess_patchright_probe,
+        build_patchright_launch_profile, should_attempt_patchright_fallback,
+        should_wait_for_challenge_resolution,
+    },
     snapshot::{
         extract_snapshot, find_element_by_ref, focus_element_by_ref, scroll_element_into_view,
     },
-    types::{
-        BrowserAction, BrowserConfig, BrowserKind, BrowserPreference, BrowserRequest,
-        BrowserResponse,
-    },
+    types::{BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest, BrowserResponse},
 };
 
 const NAV_DIAGNOSTICS_JS: &str = r#"
@@ -45,79 +47,6 @@ const NAV_DIAGNOSTICS_JS: &str = r#"
 
 const CHALLENGE_WAIT_MAX_SECONDS: usize = 30;
 const CHALLENGE_STABLE_READ_THRESHOLD: usize = 20;
-const CONTENTFUL_CHALLENGE_BODY_THRESHOLD: usize = 1_000;
-const CONTENTFUL_CHALLENGE_TITLE_THRESHOLD: usize = 20;
-const CONTENTFUL_CHALLENGE_SOFT_BODY_THRESHOLD: usize = 400;
-
-#[derive(Debug, Clone)]
-struct NavigationDiagnostics {
-    final_url: String,
-    title_len: usize,
-    body_text_len: usize,
-    html_len: usize,
-    challenge_type: Option<ChallengeType>,
-    challenge_markers: Vec<String>,
-}
-
-fn should_suppress_challenge(
-    challenge_type: Option<ChallengeType>,
-    title_len: usize,
-    body_text_len: usize,
-) -> bool {
-    match challenge_type {
-        Some(ChallengeType::GenericChallenge) => title_len > 0 || body_text_len > 80,
-        Some(ChallengeType::Imperva)
-        | Some(ChallengeType::Kasada)
-        | Some(ChallengeType::Cloudflare)
-        | Some(ChallengeType::GenericBrowserCheck) => {
-            body_text_len >= CONTENTFUL_CHALLENGE_BODY_THRESHOLD
-                || (title_len >= CONTENTFUL_CHALLENGE_TITLE_THRESHOLD
-                    && body_text_len >= CONTENTFUL_CHALLENGE_SOFT_BODY_THRESHOLD)
-        },
-        _ => false,
-    }
-}
-
-fn is_patchright_challenge_allowed(
-    challenge_type: ChallengeType,
-    challenge_allowlist: &[String],
-) -> bool {
-    if challenge_allowlist.is_empty() {
-        return true;
-    }
-    let challenge = challenge_type.as_str();
-    challenge_allowlist
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(challenge))
-}
-
-fn should_attempt_patchright_fallback(
-    challenge_type: Option<ChallengeType>,
-    sandbox: bool,
-    url: &str,
-    config: &crate::types::PatchrightFallbackConfig,
-) -> bool {
-    if !config.enabled || sandbox {
-        return false;
-    }
-    if !crate::types::is_domain_allowed(url, &config.domains) {
-        return false;
-    }
-    match challenge_type {
-        Some(kind) => is_patchright_challenge_allowed(kind, &config.challenge_types),
-        None => false,
-    }
-}
-
-fn patchright_channel_for_browser(kind: BrowserKind) -> Option<&'static str> {
-    match kind {
-        BrowserKind::Chrome => Some("chrome"),
-        BrowserKind::Chromium => Some("chromium"),
-        BrowserKind::Edge => Some("msedge"),
-        BrowserKind::Brave | BrowserKind::Opera | BrowserKind::Vivaldi | BrowserKind::Arc => None,
-        BrowserKind::Custom => None,
-    }
-}
 
 /// Extract session_id or return an error for actions that require an existing session.
 fn require_session(session_id: Option<&str>, action: &str) -> Result<String, Error> {
@@ -570,64 +499,7 @@ impl BrowserManager {
         Ok((active_sid, response))
     }
 
-    fn diagnostics_from_html(
-        final_url: String,
-        title_len: usize,
-        body_text_len: usize,
-        html: &str,
-    ) -> NavigationDiagnostics {
-        let html_len = html.len();
-        let detection = crate::challenge::detect_challenge(html);
-        let mut challenge_type = detection.challenge_type;
-        let mut challenge_markers: Vec<String> = detection
-            .markers
-            .into_iter()
-            .map(ToString::to_string)
-            .collect();
-        if should_suppress_challenge(challenge_type, title_len, body_text_len) {
-            challenge_type = None;
-            challenge_markers.clear();
-        }
-        NavigationDiagnostics {
-            final_url,
-            title_len,
-            body_text_len,
-            html_len,
-            challenge_type,
-            challenge_markers,
-        }
-    }
-
-    fn diagnostics_from_patchright_probe(probe: &PatchrightProbe) -> NavigationDiagnostics {
-        let title_len = if probe.title_len > 0 {
-            probe.title_len
-        } else {
-            probe
-                .title
-                .as_deref()
-                .map(str::trim)
-                .map(str::len)
-                .unwrap_or(0)
-        };
-        let body_text_len = if probe.body_text_len > 0 {
-            probe.body_text_len
-        } else {
-            probe
-                .body_text
-                .as_deref()
-                .map(str::trim)
-                .map(str::len)
-                .unwrap_or(0)
-        };
-        Self::diagnostics_from_html(
-            probe.final_url.clone(),
-            title_len,
-            body_text_len,
-            probe.html.as_deref().unwrap_or_default(),
-        )
-    }
-
-    async fn collect_navigation_diagnostics(&self, page: &Page) -> NavigationDiagnostics {
+    async fn collect_navigation_diagnostics(&self, page: &Page) -> ProtectionAssessment {
         let final_url = page.url().await.ok().flatten().unwrap_or_default();
         let metrics: serde_json::Value = page
             .evaluate(NAV_DIAGNOSTICS_JS)
@@ -646,19 +518,12 @@ impl BrowserManager {
             .and_then(|v| usize::try_from(v).ok())
             .unwrap_or(0);
         let html = page.content().await.unwrap_or_default();
-        Self::diagnostics_from_html(final_url, title_len, body_text_len, &html)
+        assess_html(final_url, title_len, body_text_len, &html)
     }
 
-    fn should_wait_for_challenge_resolution(diagnostics: &NavigationDiagnostics) -> bool {
-        diagnostics.challenge_type.is_some()
-            || (diagnostics.title_len == 0
-                && diagnostics.body_text_len == 0
-                && diagnostics.html_len > 0)
-    }
-
-    async fn wait_for_challenge_resolution_if_needed(&self, page: &Page) -> NavigationDiagnostics {
+    async fn wait_for_challenge_resolution_if_needed(&self, page: &Page) -> ProtectionAssessment {
         let mut diagnostics = self.collect_navigation_diagnostics(page).await;
-        if !Self::should_wait_for_challenge_resolution(&diagnostics) {
+        if !should_wait_for_challenge_resolution(&diagnostics) {
             return diagnostics;
         }
 
@@ -676,7 +541,7 @@ impl BrowserManager {
         for _ in 0..CHALLENGE_WAIT_MAX_SECONDS {
             sleep(Duration::from_secs(1)).await;
             let next = self.collect_navigation_diagnostics(page).await;
-            let still_waiting = Self::should_wait_for_challenge_resolution(&next);
+            let still_waiting = should_wait_for_challenge_resolution(&next);
             let is_challenge = next.challenge_type.is_some();
 
             if is_challenge {
@@ -702,56 +567,6 @@ impl BrowserManager {
         }
 
         diagnostics
-    }
-
-    fn patchright_launch_options(
-        &self,
-        browser: Option<BrowserPreference>,
-    ) -> PatchrightLaunchOptions {
-        let locale = self
-            .config
-            .stealth
-            .languages
-            .as_ref()
-            .and_then(|languages| languages.first().cloned())
-            .unwrap_or_else(|| "en-US".to_string());
-        let user_agent = self
-            .config
-            .user_agent
-            .clone()
-            .or_else(|| self.config.stealth.user_agent.clone());
-        let detection = crate::detect::detect_browser(self.config.chrome_path.as_deref());
-        let selected = crate::detect::pick_browser(&detection.browsers, browser);
-
-        let (channel, executable_path) = if let Some(selected) = selected {
-            let use_channel = !matches!(
-                selected.source,
-                crate::detect::DetectionSource::CustomPath | crate::detect::DetectionSource::EnvVar
-            );
-            let channel = if use_channel {
-                patchright_channel_for_browser(selected.kind).map(ToString::to_string)
-            } else {
-                None
-            };
-            let executable_path = if channel.is_none() {
-                Some(selected.path.to_string_lossy().into_owned())
-            } else {
-                None
-            };
-            (channel, executable_path)
-        } else {
-            (None, None)
-        };
-
-        PatchrightLaunchOptions {
-            channel,
-            executable_path,
-            viewport_width: self.config.viewport_width,
-            viewport_height: self.config.viewport_height,
-            device_scale_factor: self.config.device_scale_factor,
-            locale,
-            user_agent,
-        }
     }
 
     async fn mirror_patchright_probe(
@@ -868,11 +683,11 @@ impl BrowserManager {
     async fn retry_with_patchright_if_needed(
         &self,
         page: &Page,
-        diagnostics: NavigationDiagnostics,
+        diagnostics: ProtectionAssessment,
         url: &str,
         sandbox: bool,
         browser: Option<BrowserPreference>,
-    ) -> NavigationDiagnostics {
+    ) -> ProtectionAssessment {
         if !should_attempt_patchright_fallback(
             diagnostics.challenge_type,
             sandbox,
@@ -891,20 +706,20 @@ impl BrowserManager {
 
         let mut best = diagnostics;
         let fallback = &self.config.patchright_fallback;
-        let launch_options = self.patchright_launch_options(browser);
+        let launch_profile = build_patchright_launch_profile(&self.config, browser);
 
         match run_patchright_probe_with_retry(
             url,
             fallback,
             fallback.headless,
-            &launch_options,
+            &launch_profile,
             fallback.max_retries,
         )
         .await
         {
             Ok(probe) => {
-                let direct = Self::diagnostics_from_patchright_probe(&probe);
-                if direct.challenge_type.is_none() {
+                let direct = assess_patchright_probe(&probe);
+                if direct.is_content() {
                     self.mirror_patchright_probe(page, &probe, url, "primary")
                         .await;
                     info!(
@@ -916,9 +731,7 @@ impl BrowserManager {
                         "patchright direct navigation resolved challenge"
                     );
                     best = direct;
-                } else if direct.body_text_len > best.body_text_len
-                    || direct.title_len > best.title_len
-                {
+                } else if direct.is_better_than(&best) {
                     best = direct;
                 }
             },
@@ -1762,14 +1575,17 @@ impl BrowserManager {
             .await?;
         let start = Instant::now();
         self.pool
-            .start_api_capture(&sid, crate::api_capture::ApiCaptureConfig {
-                url_patterns,
-                include_document_requests,
-                max_examples_per_endpoint: usize::try_from(max_examples_per_endpoint)
-                    .ok()
-                    .filter(|value| *value > 0)
-                    .unwrap_or(3),
-            })
+            .start_api_capture(
+                &sid,
+                crate::api_capture::ApiCaptureConfig {
+                    url_patterns,
+                    include_document_requests,
+                    max_examples_per_endpoint: usize::try_from(max_examples_per_endpoint)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .unwrap_or(3),
+                },
+            )
             .await?;
         let resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
@@ -2221,108 +2037,6 @@ mod tests {
         assert_eq!(prefix.len(), 99);
         assert!(!prefix.contains('л'));
         assert!(prefix.ends_with('a'));
-    }
-
-    #[test]
-    fn suppresses_contentful_challenge_pages() {
-        assert!(should_suppress_challenge(
-            Some(ChallengeType::GenericChallenge),
-            12,
-            0
-        ));
-        assert!(should_suppress_challenge(
-            Some(ChallengeType::GenericChallenge),
-            0,
-            120
-        ));
-        assert!(should_suppress_challenge(
-            Some(ChallengeType::Imperva),
-            41,
-            6_316
-        ));
-        assert!(should_suppress_challenge(
-            Some(ChallengeType::Kasada),
-            60,
-            2_385
-        ));
-    }
-
-    #[test]
-    fn keeps_generic_challenge_for_empty_shells() {
-        assert!(!should_suppress_challenge(
-            Some(ChallengeType::GenericChallenge),
-            0,
-            0
-        ));
-        assert!(!should_suppress_challenge(
-            Some(ChallengeType::Imperva),
-            0,
-            0
-        ));
-        assert!(!should_suppress_challenge(
-            Some(ChallengeType::Kasada),
-            5,
-            100
-        ));
-    }
-
-    #[test]
-    fn patchright_challenge_allowlist_matches_case_insensitively() {
-        let allow = vec!["KASADA".to_string(), "imperva".to_string()];
-        assert!(is_patchright_challenge_allowed(
-            ChallengeType::Kasada,
-            &allow
-        ));
-        assert!(is_patchright_challenge_allowed(
-            ChallengeType::Imperva,
-            &allow
-        ));
-        assert!(!is_patchright_challenge_allowed(
-            ChallengeType::Cloudflare,
-            &allow
-        ));
-    }
-
-    #[test]
-    fn patchright_fallback_gate_respects_enabled_sandbox_domain_and_challenge() {
-        let mut cfg = crate::types::PatchrightFallbackConfig {
-            enabled: true,
-            ..crate::types::PatchrightFallbackConfig::default()
-        };
-        cfg.domains = vec!["*.example.com".to_string()];
-        cfg.challenge_types = vec!["kasada".to_string()];
-
-        assert!(should_attempt_patchright_fallback(
-            Some(ChallengeType::Kasada),
-            false,
-            "https://shop.example.com/",
-            &cfg
-        ));
-
-        assert!(!should_attempt_patchright_fallback(
-            Some(ChallengeType::Kasada),
-            true,
-            "https://shop.example.com/",
-            &cfg
-        ));
-        assert!(!should_attempt_patchright_fallback(
-            Some(ChallengeType::Kasada),
-            false,
-            "https://www.other.com/",
-            &cfg
-        ));
-        assert!(!should_attempt_patchright_fallback(
-            Some(ChallengeType::Imperva),
-            false,
-            "https://shop.example.com/",
-            &cfg
-        ));
-        assert!(!should_attempt_patchright_fallback(
-            None,
-            false,
-            "https://shop.example.com/",
-            &cfg
-        ));
     }
 
     #[tokio::test]

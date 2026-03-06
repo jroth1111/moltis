@@ -40,6 +40,7 @@ pub mod manager;
 pub mod network;
 mod patchright;
 pub mod pool;
+mod protection;
 pub mod screencast;
 pub mod session_state;
 pub mod snapshot;

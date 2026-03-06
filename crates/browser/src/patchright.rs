@@ -3,11 +3,11 @@
 use std::process::Stdio;
 
 use {
-    serde::{Deserialize, Serialize},
+    serde::Deserialize,
     tokio::{process::Command, time::Duration},
 };
 
-use crate::{error::Error, types::PatchrightFallbackConfig};
+use crate::{error::Error, protection::PatchrightLaunchProfile, types::PatchrightFallbackConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PatchrightCookie {
@@ -26,17 +26,6 @@ pub struct PatchrightCookie {
 
 fn default_cookie_path() -> String {
     "/".to_string()
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub(crate) struct PatchrightLaunchOptions {
-    pub channel: Option<String>,
-    pub executable_path: Option<String>,
-    pub viewport_width: u32,
-    pub viewport_height: u32,
-    pub device_scale_factor: f64,
-    pub locale: String,
-    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,11 +70,11 @@ pub async fn run_patchright_probe(
     url: &str,
     config: &PatchrightFallbackConfig,
     headless: bool,
-    launch_options: &PatchrightLaunchOptions,
+    launch_profile: &PatchrightLaunchProfile,
 ) -> Result<PatchrightProbe, Error> {
     let mut cmd = Command::new(config.python_binary.trim());
     cmd.kill_on_drop(true);
-    let launch_options = serde_json::to_string(launch_options).map_err(|e| {
+    let launch_options = serde_json::to_string(launch_profile).map_err(|e| {
         Error::NavigationFailed(format!("failed to encode patchright options: {e}"))
     })?;
     cmd.arg("-c")
@@ -154,7 +143,7 @@ pub async fn run_patchright_probe_with_retry(
     url: &str,
     config: &PatchrightFallbackConfig,
     headless: bool,
-    launch_options: &PatchrightLaunchOptions,
+    launch_profile: &PatchrightLaunchProfile,
     max_retries: u32,
 ) -> Result<PatchrightProbe, Error> {
     let mut last_error = None;
@@ -165,7 +154,7 @@ pub async fn run_patchright_probe_with_retry(
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
 
-        match run_patchright_probe(url, config, headless, launch_options).await {
+        match run_patchright_probe(url, config, headless, launch_profile).await {
             Ok(probe) => return Ok(probe),
             Err(e) => {
                 last_error = Some(e);
