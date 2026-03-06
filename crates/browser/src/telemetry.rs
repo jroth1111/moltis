@@ -4,8 +4,28 @@
 //! identity and interaction distributions so regressions can be detected
 //! before anti-bot changes reach production targets.
 
-use crate::types::BrowserBackendKind;
-use serde::{Deserialize, Serialize};
+use {
+    crate::types::BrowserBackendKind,
+    serde::{Deserialize, Serialize},
+    std::{
+        fs,
+        path::{Path, PathBuf},
+    },
+    thiserror::Error,
+    time::{OffsetDateTime, format_description::well_known::Rfc3339},
+};
+
+#[derive(Debug, Error)]
+pub enum TelemetryError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    #[error(transparent)]
+    TimeFormat(#[from] time::error::Format),
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FingerprintScreen {
@@ -182,12 +202,138 @@ pub struct ProbeRunProfile {
     pub proxy_mode: ProbeProxyMode,
 }
 
+impl ProbeBrowserFamily {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::Chromium => "chromium",
+            Self::Edge => "edge",
+            Self::Brave => "brave",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl ProbeProxyMode {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Residential => "residential",
+            Self::Datacenter => "datacenter",
+            Self::Socks5 => "socks5",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl ProbeRunProfile {
+    #[must_use]
+    pub fn storage_key(&self) -> String {
+        let headless = if self.headless { "headless" } else { "headed" };
+        format!(
+            "{}-{}-{}-{}-{}",
+            self.browser_family.as_str(),
+            sanitize_storage_component(&self.browser_version),
+            self.backend,
+            headless,
+            self.proxy_mode.as_str(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeRunEvidence {
     pub profile: ProbeRunProfile,
     pub fingerprint: FingerprintSnapshot,
     pub headers: FingerprintHeaders,
     pub request_sequence: RequestSequenceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeBaselineRecord {
+    pub key: String,
+    pub saved_at: String,
+    pub evidence: ProbeRunEvidence,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProbeBaselineStore {
+    root: PathBuf,
+}
+
+impl Default for ProbeBaselineStore {
+    fn default() -> Self {
+        Self::new(default_probe_baseline_dir())
+    }
+}
+
+impl ProbeBaselineStore {
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn baseline_path(&self, profile: &ProbeRunProfile) -> PathBuf {
+        self.root.join(format!("{}.json", profile.storage_key()))
+    }
+
+    pub fn save(&self, evidence: &ProbeRunEvidence) -> Result<ProbeBaselineRecord, TelemetryError> {
+        fs::create_dir_all(&self.root)?;
+        let record = ProbeBaselineRecord {
+            key: evidence.profile.storage_key(),
+            saved_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
+            evidence: evidence.clone(),
+        };
+        fs::write(
+            self.baseline_path(&evidence.profile),
+            serde_json::to_vec_pretty(&record)?,
+        )?;
+        Ok(record)
+    }
+
+    pub fn load(
+        &self,
+        profile: &ProbeRunProfile,
+    ) -> Result<Option<ProbeBaselineRecord>, TelemetryError> {
+        let path = self.baseline_path(profile);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let record = serde_json::from_slice(&fs::read(path)?)?;
+        Ok(Some(record))
+    }
+
+    pub fn compare_with_thresholds(
+        &self,
+        current: &ProbeRunEvidence,
+        thresholds: &ProbeDriftThresholds,
+    ) -> Result<Option<ProbeRunDrift>, TelemetryError> {
+        let Some(baseline) = self.load(&current.profile)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(compare_probe_run_with_thresholds(
+            &baseline.evidence,
+            current,
+            thresholds,
+        )))
+    }
+
+    pub fn compare(
+        &self,
+        current: &ProbeRunEvidence,
+    ) -> Result<Option<ProbeRunDrift>, TelemetryError> {
+        self.compare_with_thresholds(current, &ProbeDriftThresholds::default())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,6 +389,31 @@ impl ProbeRunDrift {
     pub fn consistent(&self) -> bool {
         self.issues.is_empty()
     }
+}
+
+fn sanitize_storage_component(component: &str) -> String {
+    let mut sanitized = String::with_capacity(component.len());
+    let mut last_was_separator = false;
+
+    for ch in component.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            sanitized.push('_');
+            last_was_separator = true;
+        }
+    }
+
+    sanitized.trim_matches('_').to_string()
+}
+
+#[must_use]
+pub fn default_probe_baseline_dir() -> PathBuf {
+    moltis_config::data_dir()
+        .join("browser")
+        .join("telemetry")
+        .join("probe-baselines")
 }
 
 fn relative_delta(baseline: f64, current: f64) -> f64 {
@@ -576,6 +747,7 @@ mod tests {
             sync::{Arc, Mutex as StdMutex, OnceLock},
             time::Instant,
         },
+        tempfile::tempdir,
         tokio::{
             net::TcpListener,
             sync::{Mutex, OwnedMutexGuard},
@@ -1201,6 +1373,78 @@ mod tests {
                 max_gap_ms: Some(120.0),
             },
         }
+    }
+
+    #[test]
+    fn probe_run_profile_storage_key_is_backend_headless_proxy_specific() {
+        let baseline = sample_probe_run_evidence().profile;
+        let mut headed = baseline.clone();
+        headed.headless = false;
+        let mut chromium = baseline.clone();
+        chromium.backend = BrowserBackendKind::Chromiumoxide;
+        let mut residential = baseline.clone();
+        residential.proxy_mode = ProbeProxyMode::Residential;
+
+        assert_eq!(
+            baseline.storage_key(),
+            "chrome-123_0_0_0-patchright-headless-none"
+        );
+        assert_ne!(baseline.storage_key(), headed.storage_key());
+        assert_ne!(baseline.storage_key(), chromium.storage_key());
+        assert_ne!(baseline.storage_key(), residential.storage_key());
+    }
+
+    #[test]
+    fn probe_baseline_store_round_trips_saved_evidence() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let store = ProbeBaselineStore::new(dir.path().join("probe-baselines"));
+        let evidence = sample_probe_run_evidence();
+
+        let saved = store.save(&evidence)?;
+        let loaded = store.load(&evidence.profile)?.unwrap();
+
+        assert_eq!(saved.key, evidence.profile.storage_key());
+        assert_eq!(loaded.evidence, evidence);
+        assert_eq!(loaded.key, saved.key);
+        assert!(store.baseline_path(&loaded.evidence.profile).exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn probe_baseline_store_keys_by_profile() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let store = ProbeBaselineStore::new(dir.path().join("probe-baselines"));
+        let evidence = sample_probe_run_evidence();
+        store.save(&evidence)?;
+
+        let mut missing_profile = evidence.profile.clone();
+        missing_profile.proxy_mode = ProbeProxyMode::Residential;
+
+        assert!(store.load(&missing_profile)?.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn probe_baseline_store_compares_saved_baseline() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let store = ProbeBaselineStore::new(dir.path().join("probe-baselines"));
+        let baseline = sample_probe_run_evidence();
+        store.save(&baseline)?;
+
+        let mut current = baseline.clone();
+        current.headers.accept_language = Some("en-US,en;q=0.9".to_string());
+
+        let drift = store.compare(&current)?.unwrap();
+
+        assert!(!drift.consistent());
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::AcceptLanguageChanged));
+
+        Ok(())
     }
 
     #[test]

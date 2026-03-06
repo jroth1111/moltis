@@ -98,3 +98,26 @@
       - Woolworths PASS (`patchright`)
       - Coles PASS (`patchright`)
       - Realestate PASS (`patchright`)
+- Added probe baseline persistence in `crates/browser/src/telemetry.rs`:
+  - stable storage keys that include browser family/version plus backend/headless/proxy
+  - file-backed baseline records under `data_dir()/browser/telemetry/probe-baselines`
+  - load/save/compare helpers for persisted probe evidence
+- Validation for the baseline persistence step:
+  - `cargo check -p moltis-browser --quiet`
+    - exit `0`
+  - `cargo test -p moltis-browser --lib telemetry::tests:: -- --nocapture`
+    - exit `0`
+    - `13 passed`
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `132 passed, 0 failed, 8 ignored`
+  - `cargo test -p moltis-browser --test real_sites_test --no-run --quiet`
+    - exit `0`
+  - `CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' MOLTIS_DATA_DIR=$(mktemp -d) cargo test -p moltis-browser --test real_sites_test -- --nocapture --test-threads=1`
+    - exit `0`
+    - `5 passed`
+    - Summary:
+      - Google PASS (`chromiumoxide`)
+      - Woolworths PASS (`patchright`)
+      - Coles PASS (`patchright`)
+      - Realestate PASS (`patchright`)
