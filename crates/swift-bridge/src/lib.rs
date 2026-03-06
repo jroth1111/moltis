@@ -42,7 +42,7 @@ struct BridgeState {
 }
 
 impl BridgeState {
-    fn new() -> Self {
+    fn try_new() -> Result<Self, String> {
         emit_log(
             "INFO",
             "bridge",
@@ -52,7 +52,7 @@ impl BridgeState {
             .worker_threads(2)
             .enable_all()
             .build()
-            .unwrap_or_else(|e| panic!("failed to create tokio runtime: {e}"));
+            .map_err(|error| format!("failed to create tokio runtime: {error}"))?;
 
         let registry = build_registry();
 
@@ -77,13 +77,13 @@ impl BridgeState {
                 std::str::FromStr,
             };
             let opts = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
-                .expect("invalid moltis.db path")
+                .map_err(|error| format!("invalid moltis.db path {}: {error}", db_path.display()))?
                 .create_if_missing(true)
                 .journal_mode(SqliteJournalMode::Wal)
                 .synchronous(SqliteSynchronous::Normal);
             let pool = sqlx::SqlitePool::connect_with(opts)
                 .await
-                .unwrap_or_else(|e| panic!("failed to open moltis.db: {e}"));
+                .map_err(|error| format!("failed to open {}: {error}", db_path.display()))?;
             // Run migrations so the sessions table exists even if the gateway
             // hasn't been started yet. Order: projects first (FK dependency).
             if let Err(e) = moltis_projects::run_migrations(&pool).await {
@@ -120,19 +120,20 @@ impl BridgeState {
             .await
             {
                 Ok(store) => Arc::new(store),
-                Err(e) => panic!("failed to init credential store: {e}"),
+                Err(error) => return Err(format!("failed to init credential store: {error}")),
             }
         });
+        let credential_store = credential_store?;
 
         emit_log("INFO", "bridge", "Bridge initialized successfully");
-        Self {
+        Ok(Self {
             runtime,
             registry: RwLock::new(registry),
             session_store,
             session_metadata,
             credential_store,
             sandbox_default_image_override: RwLock::new(None),
-        }
+        })
     }
 }
 
@@ -144,7 +145,23 @@ fn build_registry() -> ProviderRegistry {
     ProviderRegistry::from_env_with_config_and_overrides(&effective, &env_overrides)
 }
 
-static BRIDGE: LazyLock<BridgeState> = LazyLock::new(BridgeState::new);
+static BRIDGE: LazyLock<Result<BridgeState, String>> = LazyLock::new(BridgeState::try_new);
+
+fn bridge_state() -> Result<&'static BridgeState, String> {
+    match &*BRIDGE {
+        Ok(state) => Ok(state),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+macro_rules! bridge_or_return_error {
+    () => {
+        match bridge_state() {
+            Ok(bridge) => bridge,
+            Err(error) => return encode_error("bridge_init_failed", &error),
+        }
+    };
+}
 
 // ── HTTP Server ──────────────────────────────────────────────────────────
 
@@ -927,17 +944,21 @@ fn data_dir_string() -> String {
 }
 
 fn vault_status_string() -> String {
-    let Some(vault) = BRIDGE.credential_store.vault() else {
+    let Ok(bridge) = bridge_state() else {
+        return "error".to_owned();
+    };
+    let Some(vault) = bridge.credential_store.vault() else {
         return "disabled".to_owned();
     };
-    match BRIDGE.runtime.block_on(async { vault.status().await }) {
+    match bridge.runtime.block_on(async { vault.status().await }) {
         Ok(status) => format!("{status:?}").to_lowercase(),
         Err(_) => "error".to_owned(),
     }
 }
 
 fn sandbox_effective_default_image(config: &moltis_config::MoltisConfig) -> String {
-    if let Some(value) = BRIDGE
+    if let Ok(bridge) = bridge_state()
+        && let Some(value) = bridge
         .sandbox_default_image_override
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -1005,7 +1026,18 @@ fn resolve_provider(request: &ChatRequest) -> Option<std::sync::Arc<dyn LlmProvi
 }
 
 fn resolve_provider_for_model(model: Option<&str>) -> Option<std::sync::Arc<dyn LlmProvider>> {
-    let registry = BRIDGE.registry.read().unwrap_or_else(|e| e.into_inner());
+    let bridge = match bridge_state() {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            emit_log(
+                "ERROR",
+                "bridge",
+                &format!("Bridge initialization failed: {error}"),
+            );
+            return None;
+        },
+    };
+    let registry = bridge.registry.read().unwrap_or_else(|e| e.into_inner());
 
     // Try explicit model first
     if let Some(model_id) = model
@@ -1049,6 +1081,11 @@ fn build_chat_response(request: ChatRequest) -> String {
     );
     let validation = build_validation_summary(request.config_toml.as_deref());
 
+    let bridge = match bridge_state() {
+        Ok(bridge) => bridge,
+        Err(error) => return encode_error("bridge_init_failed", &error),
+    };
+
     let (reply, model, provider_name, input_tokens, output_tokens, duration_ms) =
         match resolve_provider(&request) {
             Some(provider) => {
@@ -1064,7 +1101,7 @@ fn build_chat_response(request: ChatRequest) -> String {
                     &format!("Calling {}/{}", provider_name, model_id),
                 );
                 let start = std::time::Instant::now();
-                match BRIDGE.runtime.block_on(provider.complete(&messages, &[])) {
+                match bridge.runtime.block_on(provider.complete(&messages, &[])) {
                     Ok(response) => {
                         let elapsed = start.elapsed().as_millis() as u64;
                         let text = response
@@ -1254,6 +1291,13 @@ pub unsafe extern "C" fn moltis_chat_stream(
         callback,
         user_data,
     };
+    let bridge = match bridge_state() {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            send_error(error);
+            return;
+        },
+    };
 
     emit_log(
         "INFO",
@@ -1261,7 +1305,7 @@ pub unsafe extern "C" fn moltis_chat_stream(
         &format!("Starting stream: {}/{}", provider_name, model_id),
     );
 
-    BRIDGE.runtime.spawn(async move {
+    bridge.runtime.spawn(async move {
         let start = std::time::Instant::now();
 
         let result = catch_unwind(AssertUnwindSafe(|| provider.stream(messages)));
@@ -1515,7 +1559,8 @@ pub extern "C" fn moltis_list_models() -> *mut c_char {
 
     with_ffi_boundary(|| {
         emit_log("DEBUG", "bridge", "Listing models from registry");
-        let registry = BRIDGE.registry.read().unwrap_or_else(|e| e.into_inner());
+        let bridge = bridge_or_return_error!();
+        let registry = bridge.registry.read().unwrap_or_else(|e| e.into_inner());
         let models: Vec<BridgeModelInfo> = registry
             .list_models()
             .iter()
@@ -1541,7 +1586,8 @@ pub extern "C" fn moltis_refresh_registry() -> *mut c_char {
     with_ffi_boundary(|| {
         emit_log("INFO", "bridge", "Refreshing provider registry");
         let new_registry = build_registry();
-        let mut guard = BRIDGE.registry.write().unwrap_or_else(|e| e.into_inner());
+        let bridge = bridge_or_return_error!();
+        let mut guard = bridge.registry.write().unwrap_or_else(|e| e.into_inner());
         *guard = new_registry;
         emit_log("INFO", "bridge", "Provider registry rebuilt");
         encode_json(&OkResponse { ok: true })
@@ -1593,14 +1639,29 @@ pub unsafe extern "C" fn moltis_set_log_callback(callback: LogCallback) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moltis_set_session_event_callback(callback: SessionEventCallback) {
     if SESSION_EVENT_CALLBACK.set(callback).is_ok() {
+        let bridge = match bridge_state() {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                emit_log(
+                    "ERROR",
+                    "bridge.session_events",
+                    &format!("Bridge initialization failed: {error}"),
+                );
+                return;
+            },
+        };
         // Spawn a background task that subscribes to session events and
         // invokes the callback for each one.
-        let bus = BRIDGE
-            .session_metadata
-            .event_bus()
-            .expect("bridge session_metadata must have an event bus");
+        let Some(bus) = bridge.session_metadata.event_bus() else {
+            emit_log(
+                "ERROR",
+                "bridge.session_events",
+                "Bridge session event bus unavailable",
+            );
+            return;
+        };
         let mut rx = bus.subscribe();
-        BRIDGE.runtime.spawn(async move {
+        bridge.runtime.spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(event) => emit_session_event(&event),
@@ -1646,6 +1707,7 @@ pub extern "C" fn moltis_start_httpd(request_json: *const c_char) -> *mut c_char
     trace_call("moltis_start_httpd");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request: StartHttpdRequest = if request_json.is_null() {
             StartHttpdRequest {
                 host: default_httpd_host(),
@@ -1689,7 +1751,7 @@ pub extern "C" fn moltis_start_httpd(request_json: *const c_char) -> *mut c_char
         // background tasks). This runs on the bridge runtime via block_on —
         // valid because this is an extern "C" fn, not async.
         let prepared =
-            match BRIDGE
+            match bridge
                 .runtime
                 .block_on(moltis_gateway::server::prepare_gateway_embedded(
                     &request.host,
@@ -1699,7 +1761,7 @@ pub extern "C" fn moltis_start_httpd(request_json: *const c_char) -> *mut c_char
                     request.config_dir.map(std::path::PathBuf::from),
                     request.data_dir.map(std::path::PathBuf::from),
                     Some(moltis_web::web_routes), // full web UI
-                    BRIDGE.session_metadata.event_bus().cloned(), // share bus with gateway
+                    bridge.session_metadata.event_bus().cloned(), // share bus with gateway
                 )) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1715,7 +1777,7 @@ pub extern "C" fn moltis_start_httpd(request_json: *const c_char) -> *mut c_char
         let gateway_state = prepared.state;
 
         // Bind the TCP listener synchronously so we can report errors immediately.
-        let listener = match BRIDGE
+        let listener = match bridge
             .runtime
             .block_on(tokio::net::TcpListener::bind(&bind_addr))
         {
@@ -1735,7 +1797,7 @@ pub extern "C" fn moltis_start_httpd(request_json: *const c_char) -> *mut c_char
         // and forward entries to Swift via the registered callback.
         if let Some(ref audit_buf) = prepared.audit_buffer {
             let mut audit_rx = audit_buf.subscribe();
-            BRIDGE.runtime.spawn(async move {
+            bridge.runtime.spawn(async move {
                 loop {
                     match audit_rx.recv().await {
                         Ok(entry) => emit_network_audit(&entry),
@@ -1750,7 +1812,7 @@ pub extern "C" fn moltis_start_httpd(request_json: *const c_char) -> *mut c_char
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let app = prepared.app;
 
-        BRIDGE.runtime.spawn(async move {
+        bridge.runtime.spawn(async move {
             let server = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1908,7 +1970,8 @@ pub extern "C" fn moltis_list_sessions() -> *mut c_char {
     trace_call("moltis_list_sessions");
 
     with_ffi_boundary(|| {
-        let all = BRIDGE.runtime.block_on(BRIDGE.session_metadata.list());
+        let bridge = bridge_or_return_error!();
+        let all = bridge.runtime.block_on(bridge.session_metadata.list());
         let entries: Vec<BridgeSessionEntry> = all.iter().map(BridgeSessionEntry::from).collect();
         emit_log(
             "DEBUG",
@@ -1928,6 +1991,7 @@ pub extern "C" fn moltis_switch_session(request_json: *const c_char) -> *mut c_c
     trace_call("moltis_switch_session");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request = match parse_ffi_request::<SwitchSessionRequest>(
             "moltis_switch_session",
             request_json,
@@ -1937,9 +2001,9 @@ pub extern "C" fn moltis_switch_session(request_json: *const c_char) -> *mut c_c
         };
 
         // Ensure metadata entry exists.
-        if let Err(e) = BRIDGE
+        if let Err(e) = bridge
             .runtime
-            .block_on(BRIDGE.session_metadata.upsert(&request.key, None))
+            .block_on(bridge.session_metadata.upsert(&request.key, None))
         {
             emit_log(
                 "WARN",
@@ -1949,9 +2013,9 @@ pub extern "C" fn moltis_switch_session(request_json: *const c_char) -> *mut c_c
         }
 
         // Read message history from JSONL.
-        let messages = match BRIDGE
+        let messages = match bridge
             .runtime
-            .block_on(BRIDGE.session_store.read(&request.key))
+            .block_on(bridge.session_store.read(&request.key))
         {
             Ok(msgs) => msgs,
             Err(e) => {
@@ -1964,9 +2028,9 @@ pub extern "C" fn moltis_switch_session(request_json: *const c_char) -> *mut c_c
             },
         };
 
-        let entry = BRIDGE
+        let entry = bridge
             .runtime
-            .block_on(BRIDGE.session_metadata.get(&request.key))
+            .block_on(bridge.session_metadata.get(&request.key))
             .map(|e| BridgeSessionEntry::from(&e));
 
         match entry {
@@ -1998,6 +2062,7 @@ pub extern "C" fn moltis_create_session(request_json: *const c_char) -> *mut c_c
     trace_call("moltis_create_session");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request: CreateSessionRequest = if request_json.is_null() {
             CreateSessionRequest { label: None }
         } else {
@@ -2013,9 +2078,9 @@ pub extern "C" fn moltis_create_session(request_json: *const c_char) -> *mut c_c
         let key = format!("session:{}", uuid::Uuid::new_v4());
         let label = request.label.unwrap_or_else(|| "New Session".to_owned());
 
-        match BRIDGE
+        match bridge
             .runtime
-            .block_on(BRIDGE.session_metadata.upsert(&key, Some(label)))
+            .block_on(bridge.session_metadata.upsert(&key, Some(label)))
         {
             Ok(entry) => {
                 emit_log(
@@ -2081,13 +2146,20 @@ pub unsafe extern "C" fn moltis_session_chat_stream(
     };
 
     let session_key = request.session_key.clone();
+    let bridge = match bridge_state() {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            send_error(error);
+            return;
+        },
+    };
 
     // Persist user message.
     let user_msg = PersistedMessage::user(&request.message);
     let user_value = user_msg.to_value();
-    if let Err(e) = BRIDGE
+    if let Err(e) = bridge
         .runtime
-        .block_on(BRIDGE.session_store.append(&session_key, &user_value))
+        .block_on(bridge.session_store.append(&session_key, &user_value))
     {
         emit_log(
             "WARN",
@@ -2097,15 +2169,15 @@ pub unsafe extern "C" fn moltis_session_chat_stream(
     }
 
     // Update metadata.
-    BRIDGE.runtime.block_on(async {
-        let _ = BRIDGE.session_metadata.upsert(&session_key, None).await;
-        let msg_count = BRIDGE
+    bridge.runtime.block_on(async {
+        let _ = bridge.session_metadata.upsert(&session_key, None).await;
+        let msg_count = bridge
             .session_store
             .read(&session_key)
             .await
             .map(|m| m.len() as u32)
             .unwrap_or(0);
-        BRIDGE.session_metadata.touch(&session_key, msg_count).await;
+        bridge.session_metadata.touch(&session_key, msg_count).await;
     });
 
     let model_id = provider.id().to_string();
@@ -2128,7 +2200,7 @@ pub unsafe extern "C" fn moltis_session_chat_stream(
         ),
     );
 
-    BRIDGE.runtime.spawn(async move {
+    bridge.runtime.spawn(async move {
         let start = std::time::Instant::now();
         let result = catch_unwind(AssertUnwindSafe(|| provider.stream(messages)));
 
@@ -2175,7 +2247,7 @@ pub unsafe extern "C" fn moltis_session_chat_stream(
             None, // audio
         );
         let assistant_value = assistant_msg.to_value();
-        if let Err(e) = BRIDGE
+        if let Err(e) = bridge
             .session_store
             .append(&session_key, &assistant_value)
             .await
@@ -2188,14 +2260,14 @@ pub unsafe extern "C" fn moltis_session_chat_stream(
         }
 
         // Update metadata in SQLite.
-        let msg_count = BRIDGE
+        let msg_count = bridge
             .session_store
             .read(&session_key)
             .await
             .map(|m| m.len() as u32)
             .unwrap_or(0);
-        BRIDGE.session_metadata.touch(&session_key, msg_count).await;
-        BRIDGE
+        bridge.session_metadata.touch(&session_key, msg_count).await;
+        bridge
             .session_metadata
             .set_model(&session_key, Some(model_id.clone()))
             .await;
@@ -2322,10 +2394,8 @@ pub extern "C" fn moltis_memory_status() -> *mut c_char {
             },
         };
 
-        let pool = match BRIDGE
-            .runtime
-            .block_on(sqlx::SqlitePool::connect_with(options))
-        {
+        let bridge = bridge_or_return_error!();
+        let pool = match bridge.runtime.block_on(sqlx::SqlitePool::connect_with(options)) {
             Ok(pool) => pool,
             Err(error) => {
                 let response = MemoryStatusResponse {
@@ -2342,7 +2412,7 @@ pub extern "C" fn moltis_memory_status() -> *mut c_char {
             },
         };
 
-        let (total_files, total_chunks) = BRIDGE.runtime.block_on(async {
+        let (total_files, total_chunks) = bridge.runtime.block_on(async {
             let has_files_table: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'files'",
             )
@@ -2377,7 +2447,7 @@ pub extern "C" fn moltis_memory_status() -> *mut c_char {
             let chunk_count: usize = chunks.max(0).try_into().unwrap_or(0);
             (files_count, chunk_count)
         });
-        BRIDGE.runtime.block_on(pool.close());
+        bridge.runtime.block_on(pool.close());
 
         let response = MemoryStatusResponse {
             available: true,
@@ -2723,9 +2793,10 @@ pub extern "C" fn moltis_list_env_vars() -> *mut c_char {
     trace_call("moltis_list_env_vars");
 
     with_ffi_boundary(|| {
-        let env_vars = match BRIDGE
+        let bridge = bridge_or_return_error!();
+        let env_vars = match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.list_env_vars())
+            .block_on(bridge.credential_store.list_env_vars())
         {
             Ok(vars) => vars,
             Err(e) => {
@@ -2749,6 +2820,7 @@ pub extern "C" fn moltis_set_env_var(request_json: *const c_char) -> *mut c_char
     trace_call("moltis_set_env_var");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request =
             match parse_ffi_request::<SetEnvVarRequest>("moltis_set_env_var", request_json) {
                 Ok(r) => r,
@@ -2768,9 +2840,9 @@ pub extern "C" fn moltis_set_env_var(request_json: *const c_char) -> *mut c_char
             );
         }
 
-        match BRIDGE
+        match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.set_env_var(key, &request.value))
+            .block_on(bridge.credential_store.set_env_var(key, &request.value))
         {
             Ok(_) => encode_json(&OkResponse { ok: true }),
             Err(e) => {
@@ -2788,15 +2860,16 @@ pub extern "C" fn moltis_delete_env_var(request_json: *const c_char) -> *mut c_c
     trace_call("moltis_delete_env_var");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request =
             match parse_ffi_request::<DeleteEnvVarRequest>("moltis_delete_env_var", request_json) {
                 Ok(r) => r,
                 Err(e) => return e,
             };
 
-        match BRIDGE
+        match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.delete_env_var(request.id))
+            .block_on(bridge.credential_store.delete_env_var(request.id))
         {
             Ok(_) => encode_json(&OkResponse { ok: true }),
             Err(e) => {
@@ -2814,9 +2887,10 @@ pub extern "C" fn moltis_auth_status() -> *mut c_char {
     trace_call("moltis_auth_status");
 
     with_ffi_boundary(|| {
-        let has_password = match BRIDGE
+        let bridge = bridge_or_return_error!();
+        let has_password = match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.has_password())
+            .block_on(bridge.credential_store.has_password())
         {
             Ok(value) => value,
             Err(error) => {
@@ -2825,9 +2899,9 @@ pub extern "C" fn moltis_auth_status() -> *mut c_char {
             },
         };
 
-        let has_passkeys = match BRIDGE
+        let has_passkeys = match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.has_passkeys())
+            .block_on(bridge.credential_store.has_passkeys())
         {
             Ok(value) => value,
             Err(error) => {
@@ -2837,10 +2911,10 @@ pub extern "C" fn moltis_auth_status() -> *mut c_char {
         };
 
         encode_json(&AuthStatusResponse {
-            auth_disabled: BRIDGE.credential_store.is_auth_disabled(),
+            auth_disabled: bridge.credential_store.is_auth_disabled(),
             has_password,
             has_passkeys,
-            setup_complete: BRIDGE.credential_store.is_setup_complete(),
+            setup_complete: bridge.credential_store.is_setup_complete(),
         })
     })
 }
@@ -2856,6 +2930,7 @@ pub extern "C" fn moltis_auth_password_change(request_json: *const c_char) -> *m
     trace_call("moltis_auth_password_change");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request = match parse_ffi_request::<AuthPasswordChangeRequest>(
             "moltis_auth_password_change",
             request_json,
@@ -2872,9 +2947,9 @@ pub extern "C" fn moltis_auth_password_change(request_json: *const c_char) -> *m
             );
         }
 
-        let has_password = match BRIDGE
+        let has_password = match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.has_password())
+            .block_on(bridge.credential_store.has_password())
         {
             Ok(value) => value,
             Err(error) => {
@@ -2893,8 +2968,8 @@ pub extern "C" fn moltis_auth_password_change(request_json: *const c_char) -> *m
                 .as_ref()
                 .map(|s| s.expose_secret().as_str())
                 .unwrap_or("");
-            if let Err(error) = BRIDGE.runtime.block_on(
-                BRIDGE
+            if let Err(error) = bridge.runtime.block_on(
+                bridge
                     .credential_store
                     .change_password(current_password, new_password),
             ) {
@@ -2910,8 +2985,8 @@ pub extern "C" fn moltis_auth_password_change(request_json: *const c_char) -> *m
                 return encode_error("AUTH_PASSWORD_CHANGE_FAILED", &message);
             }
 
-            if let Some(vault) = BRIDGE.credential_store.vault()
-                && let Err(error) = BRIDGE
+            if let Some(vault) = bridge.credential_store.vault()
+                && let Err(error) = bridge
                     .runtime
                     .block_on(vault.change_password(current_password, new_password))
             {
@@ -2921,19 +2996,19 @@ pub extern "C" fn moltis_auth_password_change(request_json: *const c_char) -> *m
                     &format!("Vault password rotation failed: {error}"),
                 );
             }
-        } else if let Err(error) = BRIDGE
+        } else if let Err(error) = bridge
             .runtime
-            .block_on(BRIDGE.credential_store.add_password(new_password))
+            .block_on(bridge.credential_store.add_password(new_password))
         {
             record_error("moltis_auth_password_change", "AUTH_PASSWORD_SET_FAILED");
             return encode_error("AUTH_PASSWORD_SET_FAILED", &error.to_string());
-        } else if let Some(vault) = BRIDGE.credential_store.vault() {
-            match BRIDGE.runtime.block_on(vault.initialize(new_password)) {
+        } else if let Some(vault) = bridge.credential_store.vault() {
+            match bridge.runtime.block_on(vault.initialize(new_password)) {
                 Ok(key) => {
                     recovery_key = Some(key.phrase().to_owned());
                 },
                 Err(moltis_gateway::auth::moltis_vault::VaultError::AlreadyInitialized) => {
-                    if let Err(error) = BRIDGE.runtime.block_on(vault.unseal(new_password)) {
+                    if let Err(error) = bridge.runtime.block_on(vault.unseal(new_password)) {
                         emit_log(
                             "WARN",
                             "bridge.auth",
@@ -2964,15 +3039,16 @@ pub extern "C" fn moltis_auth_reset() -> *mut c_char {
     record_call("moltis_auth_reset");
     trace_call("moltis_auth_reset");
 
-    with_ffi_boundary(
-        || match BRIDGE.runtime.block_on(BRIDGE.credential_store.reset_all()) {
+    with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
+        match bridge.runtime.block_on(bridge.credential_store.reset_all()) {
             Ok(()) => encode_json(&OkResponse { ok: true }),
             Err(error) => {
                 record_error("moltis_auth_reset", "AUTH_RESET_FAILED");
                 encode_error("AUTH_RESET_FAILED", &error.to_string())
             },
-        },
-    )
+        }
+    })
 }
 
 /// Lists all registered passkeys.
@@ -2982,9 +3058,10 @@ pub extern "C" fn moltis_auth_list_passkeys() -> *mut c_char {
     trace_call("moltis_auth_list_passkeys");
 
     with_ffi_boundary(|| {
-        let passkeys = match BRIDGE
+        let bridge = bridge_or_return_error!();
+        let passkeys = match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.list_passkeys())
+            .block_on(bridge.credential_store.list_passkeys())
         {
             Ok(entries) => entries,
             Err(error) => {
@@ -3004,6 +3081,7 @@ pub extern "C" fn moltis_auth_remove_passkey(request_json: *const c_char) -> *mu
     trace_call("moltis_auth_remove_passkey");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request = match parse_ffi_request::<AuthPasskeyIdRequest>(
             "moltis_auth_remove_passkey",
             request_json,
@@ -3012,9 +3090,9 @@ pub extern "C" fn moltis_auth_remove_passkey(request_json: *const c_char) -> *mu
             Err(e) => return e,
         };
 
-        match BRIDGE
+        match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.remove_passkey(request.id))
+            .block_on(bridge.credential_store.remove_passkey(request.id))
         {
             Ok(()) => encode_json(&OkResponse { ok: true }),
             Err(error) => {
@@ -3032,6 +3110,7 @@ pub extern "C" fn moltis_auth_rename_passkey(request_json: *const c_char) -> *mu
     trace_call("moltis_auth_rename_passkey");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request = match parse_ffi_request::<AuthPasskeyRenameRequest>(
             "moltis_auth_rename_passkey",
             request_json,
@@ -3046,9 +3125,9 @@ pub extern "C" fn moltis_auth_rename_passkey(request_json: *const c_char) -> *mu
             return encode_error("AUTH_PASSKEY_NAME_REQUIRED", "name cannot be empty");
         }
 
-        match BRIDGE
+        match bridge
             .runtime
-            .block_on(BRIDGE.credential_store.rename_passkey(request.id, name))
+            .block_on(bridge.credential_store.rename_passkey(request.id, name))
         {
             Ok(()) => encode_json(&OkResponse { ok: true }),
             Err(error) => {
@@ -3078,8 +3157,9 @@ pub extern "C" fn moltis_sandbox_list_images() -> *mut c_char {
     trace_call("moltis_sandbox_list_images");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let builder = moltis_tools::image_cache::DockerImageBuilder::new();
-        let (cached, sandbox) = BRIDGE.runtime.block_on(async {
+        let (cached, sandbox) = bridge.runtime.block_on(async {
             tokio::join!(
                 builder.list_cached(),
                 moltis_tools::sandbox::list_sandbox_images()
@@ -3117,6 +3197,7 @@ pub extern "C" fn moltis_sandbox_delete_image(request_json: *const c_char) -> *m
     trace_call("moltis_sandbox_delete_image");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request = match parse_ffi_request::<SandboxDeleteImageRequest>(
             "moltis_sandbox_delete_image",
             request_json,
@@ -3131,7 +3212,7 @@ pub extern "C" fn moltis_sandbox_delete_image(request_json: *const c_char) -> *m
             return encode_error("IMAGE_TAG_REQUIRED", "tag is required");
         }
 
-        let result = BRIDGE.runtime.block_on(async {
+        let result = bridge.runtime.block_on(async {
             if tag.contains("-sandbox:") {
                 moltis_tools::sandbox::remove_sandbox_image(tag).await
             } else {
@@ -3162,8 +3243,9 @@ pub extern "C" fn moltis_sandbox_prune_images() -> *mut c_char {
     trace_call("moltis_sandbox_prune_images");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let builder = moltis_tools::image_cache::DockerImageBuilder::new();
-        let (tool_result, sandbox_result) = BRIDGE.runtime.block_on(async {
+        let (tool_result, sandbox_result) = bridge.runtime.block_on(async {
             tokio::join!(
                 builder.prune_all(),
                 moltis_tools::sandbox::clean_sandbox_images()
@@ -3195,6 +3277,7 @@ pub extern "C" fn moltis_sandbox_check_packages(request_json: *const c_char) -> 
     trace_call("moltis_sandbox_check_packages");
 
     with_ffi_boundary(|| {
+        let bridge = bridge_or_return_error!();
         let request = match parse_ffi_request::<SandboxCheckPackagesRequest>(
             "moltis_sandbox_check_packages",
             request_json,
@@ -3252,7 +3335,7 @@ pub extern "C" fn moltis_sandbox_check_packages(request_json: *const c_char) -> 
             .collect();
         let script = checks.join("\n");
 
-        let output = BRIDGE.runtime.block_on(async {
+        let output = bridge.runtime.block_on(async {
             tokio::process::Command::new("docker")
                 .args(["run", "--rm", "--entrypoint", "sh", &base, "-c", &script])
                 .stdout(std::process::Stdio::piped())
