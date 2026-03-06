@@ -9,7 +9,7 @@ use {
         error::Error,
         params::{bool_param, str_param, str_param_any, u64_param},
     },
-    moltis_tasks::{HandoffContext, TaskId, TaskStore, TransitionEvent},
+    moltis_tasks::{CompletionEvidence, HandoffContext, TaskId, TaskStore, TransitionEvent},
     time::OffsetDateTime,
 };
 
@@ -751,7 +751,19 @@ impl AgentTool for SpawnAgentTool {
             match &result {
                 Ok(_) => {
                     let _ = store
-                        .apply_transition(lid, &tid.0, None, &TransitionEvent::Complete)
+                        .apply_transition(
+                            lid,
+                            &tid.0,
+                            None,
+                            &TransitionEvent::Complete {
+                                evidence: CompletionEvidence {
+                                    summary: "sub-agent completed successfully".into(),
+                                    source_tool: Some("spawn_agent".into()),
+                                    source_call_id: None,
+                                    verified_at: OffsetDateTime::now_utc(),
+                                },
+                            },
+                        )
                         .await;
                 },
                 Err(err) => {

@@ -36,7 +36,7 @@ pub use {
     store::TaskStore,
     transitions::{TransitionEvent, apply},
     types::{
-        AutonomyTier, FailureClass, HandoffContext, Task, TaskId, TaskPrincipal, TaskRuntime,
-        TaskSpec,
+        AutonomyTier, CompletionEvidence, FailureClass, HandoffContext, Task, TaskId,
+        TaskPrincipal, TaskRuntime, TaskSpec,
     },
 };

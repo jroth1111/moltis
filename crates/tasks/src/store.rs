@@ -909,7 +909,7 @@ fn event_type_name(event: &TransitionEvent) -> &'static str {
         TransitionEvent::Claim { .. } => "Claim",
         TransitionEvent::Block { .. } => "Block",
         TransitionEvent::DependenciesMet => "DependenciesMet",
-        TransitionEvent::Complete => "Complete",
+        TransitionEvent::Complete { .. } => "Complete",
         TransitionEvent::Fail { .. } => "Fail",
         TransitionEvent::Escalate { .. } => "Escalate",
         TransitionEvent::PromoteRetry => "PromoteRetry",
@@ -924,8 +924,17 @@ fn event_type_name(event: &TransitionEvent) -> &'static str {
 mod tests {
     use {
         super::*,
-        crate::types::{FailureClass, HandoffContext},
+        crate::types::{CompletionEvidence, FailureClass, HandoffContext},
     };
+
+    fn completion_evidence() -> CompletionEvidence {
+        CompletionEvidence {
+            summary: "verification passed".into(),
+            source_tool: Some("exec".into()),
+            source_call_id: Some("call-1".into()),
+            verified_at: OffsetDateTime::now_utc(),
+        }
+    }
 
     async fn test_store() -> (TaskStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1561,7 +1570,14 @@ mod tests {
 
         // Complete → Terminal(Completed).
         store
-            .apply_transition("list1", &task.id.0, None, &TransitionEvent::Complete)
+            .apply_transition(
+                "list1",
+                &task.id.0,
+                None,
+                &TransitionEvent::Complete {
+                    evidence: completion_evidence(),
+                },
+            )
             .await
             .expect("complete");
 
@@ -1656,7 +1672,14 @@ mod tests {
             .await
             .expect("claim intent-done");
         store
-            .apply_transition("list1", &t.id.0, None, &TransitionEvent::Complete)
+            .apply_transition(
+                "list1",
+                &t.id.0,
+                None,
+                &TransitionEvent::Complete {
+                    evidence: completion_evidence(),
+                },
+            )
             .await
             .expect("complete intent-done");
 
@@ -1726,7 +1749,14 @@ mod tests {
 
         // Complete the shift.
         store
-            .apply_transition("list1", &shift.id.0, None, &TransitionEvent::Complete)
+            .apply_transition(
+                "list1",
+                &shift.id.0,
+                None,
+                &TransitionEvent::Complete {
+                    evidence: completion_evidence(),
+                },
+            )
             .await
             .expect("complete shift");
 

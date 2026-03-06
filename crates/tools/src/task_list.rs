@@ -28,8 +28,8 @@ use {
     },
     moltis_agents::tool_registry::AgentTool,
     moltis_tasks::{
-        AutonomyTier, FailureClass, HandoffContext, RuntimeState, Task, TaskId, TaskPrincipal,
-        TaskSpec, TaskStore, TerminalState, TransitionEvent,
+        AutonomyTier, CompletionEvidence, FailureClass, HandoffContext, RuntimeState, Task,
+        TaskId, TaskPrincipal, TaskSpec, TaskStore, TerminalState, TransitionEvent,
     },
 };
 
@@ -96,6 +96,14 @@ fn task_view(task: &Task) -> serde_json::Value {
             "observed_error":    handoff.observed_error,
             "dead_ends":         handoff.dead_ends,
             "suggested_next_step": handoff.suggested_next_step,
+        });
+    }
+    if let Some(ref evidence) = task.runtime.completion_evidence {
+        v["completion_evidence"] = json!({
+            "summary": evidence.summary,
+            "source_tool": evidence.source_tool,
+            "source_call_id": evidence.source_call_id,
+            "verified_at": evidence.verified_at.unix_timestamp(),
         });
     }
 
@@ -197,6 +205,64 @@ fn parse_handoff(params: &serde_json::Value) -> HandoffContext {
     }
 }
 
+fn parse_completion_evidence(params: &serde_json::Value) -> crate::Result<CompletionEvidence> {
+    let Some(evidence) = params
+        .get("completion_evidence")
+        .or_else(|| params.get("completionEvidence"))
+    else {
+        return Err(Error::message(
+            "completed tasks require completion_evidence with a non-empty summary",
+        ));
+    };
+    let summary = evidence
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if summary.is_empty() {
+        return Err(Error::message(
+            "completed tasks require completion_evidence.summary",
+        ));
+    }
+
+    Ok(CompletionEvidence {
+        summary,
+        source_tool: evidence
+            .get("source_tool")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        source_call_id: evidence
+            .get("source_call_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        verified_at: time::OffsetDateTime::now_utc(),
+    })
+}
+
+fn caller_identity(params: &serde_json::Value) -> &str {
+    str_param_any(params, &["owner", "_session_key"]).unwrap_or("agent")
+}
+
+fn ensure_owner_allows_mutation(
+    task: &Task,
+    params: &serde_json::Value,
+    action: &str,
+) -> crate::Result<()> {
+    let caller = caller_identity(params);
+    match task.runtime.owner.as_deref() {
+        Some(current_owner) if caller != current_owner => Err(Error::message(format!(
+            "task {} is owned by '{current_owner}'; caller '{caller}' cannot {action}",
+            task.id
+        ))),
+        Some(_) => Ok(()),
+        None => Err(Error::message(format!(
+            "task {} must be claimed before {action}; caller '{caller}' does not own it",
+            task.id
+        ))),
+    }
+}
+
 // ── AgentTool impl ────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -270,6 +336,16 @@ impl AgentTool for TaskListTool {
                         "dead_ends":           { "type": "array", "items": { "type": "string" } },
                         "suggested_next_step": { "type": "string" }
                     }
+                },
+                "completion_evidence": {
+                    "type": "object",
+                    "description": "Required when completing a task.",
+                    "properties": {
+                        "summary": { "type": "string" },
+                        "source_tool": { "type": "string" },
+                        "source_call_id": { "type": "string" }
+                    },
+                    "required": ["summary"]
                 },
                 "question": {
                     "type": "string",
@@ -455,18 +531,12 @@ impl AgentTool for TaskListTool {
                         .map_err(anyhow::Error::from)?
                         .ok_or_else(|| Error::message(format!("task not found: {id}")))?;
 
-                    if (subject.is_some() || description.is_some())
-                        && let Some(current_owner) = task_before.runtime.owner.as_deref()
-                    {
-                        let caller_identity =
-                            str_param_any(&params, &["owner", "_session_key"]).unwrap_or("agent");
-                        if caller_identity != current_owner {
-                            return Err(Error::message(format!(
-                                "task {id} is owned by '{current_owner}'; \
-                                 caller '{caller_identity}' cannot modify subject or description"
-                            ))
-                            .into());
-                        }
+                    if subject.is_some() || description.is_some() || new_blocked_by.is_some() {
+                        ensure_owner_allows_mutation(
+                            &task_before,
+                            &params,
+                            "modify task metadata",
+                        )?;
                     }
 
                     self.store
@@ -490,8 +560,28 @@ impl AgentTool for TaskListTool {
                         .map_err(anyhow::Error::from)?
                         .ok_or_else(|| Error::message(format!("task not found: {id}")))?;
 
+                    match status {
+                        "completed" => {
+                            ensure_owner_allows_mutation(
+                                &task_before,
+                                &params,
+                                "mark the task completed",
+                            )?;
+                        },
+                        "in_progress" if task_before.runtime.owner.is_some() => {
+                            ensure_owner_allows_mutation(
+                                &task_before,
+                                &params,
+                                "reassign the task",
+                            )?;
+                        },
+                        _ => {},
+                    }
+
                     let event = match status {
-                        "completed" => TransitionEvent::Complete,
+                        "completed" => TransitionEvent::Complete {
+                            evidence: parse_completion_evidence(&params)?,
+                        },
                         "in_progress" => TransitionEvent::Claim {
                             owner: owner
                                 .or(task_before.runtime.owner.as_deref())
@@ -586,6 +676,13 @@ impl AgentTool for TaskListTool {
                 let class_str = str_param(&params, "failure_class").unwrap_or("agent_error");
                 let class = parse_failure_class(class_str)?;
                 let handoff = parse_handoff(&params);
+                let task_before = self
+                    .store
+                    .get(list_id, id)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                    .ok_or_else(|| Error::message(format!("task not found: {id}")))?;
+                ensure_owner_allows_mutation(&task_before, &params, "mark the task failed")?;
 
                 let task = self
                     .store
@@ -612,6 +709,13 @@ impl AgentTool for TaskListTool {
                     .unwrap_or("Human input required.")
                     .to_string();
                 let handoff = parse_handoff(&params);
+                let task_before = self
+                    .store
+                    .get(list_id, id)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                    .ok_or_else(|| Error::message(format!("task not found: {id}")))?;
+                ensure_owner_allows_mutation(&task_before, &params, "escalate the task")?;
 
                 let task = self
                     .store
@@ -818,7 +922,17 @@ mod tests {
         t.execute(json!({ "action": "claim", "id": id, "owner": "a" }))
             .await
             .unwrap();
-        t.execute(json!({ "action": "update", "id": id, "status": "completed" }))
+        t.execute(json!({
+            "action": "update",
+            "id": id,
+            "status": "completed",
+            "owner": "a",
+            "completion_evidence": {
+                "summary": "verified",
+                "source_tool": "exec",
+                "source_call_id": "call-1"
+            }
+        }))
             .await
             .unwrap();
 
@@ -852,6 +966,9 @@ mod tests {
             .unwrap();
         let main_id = main["task"]["id"].as_str().unwrap().to_string();
 
+        t.execute(json!({ "action": "claim", "id": main_id, "owner": "agent" }))
+            .await
+            .unwrap();
         t.execute(json!({ "action": "update", "id": main_id, "blocked_by": [dep_id] }))
             .await
             .unwrap();
@@ -1115,6 +1232,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_requires_completion_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
+
+        t.execute(json!({ "action": "claim", "id": id, "owner": "owner-a" }))
+            .await
+            .unwrap();
+
+        let result = t
+            .execute(json!({
+                "action": "update",
+                "id": id,
+                "status": "completed",
+                "owner": "owner-a"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("completion_evidence"),
+        );
+    }
+
+    #[tokio::test]
     async fn update_allows_owner_subject_description_change() {
         let tmp = TempDir::new().unwrap();
         let t = tool(&tmp).await;
@@ -1144,7 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_allows_anyone_subject_description_change_when_unowned() {
+    async fn update_rejects_subject_description_change_when_unowned() {
         let tmp = TempDir::new().unwrap();
         let t = tool(&tmp).await;
         let created = t
@@ -1161,10 +1309,80 @@ mod tests {
                 "description": "updated description",
                 "owner": "owner-b",
             }))
+            .await;
+
+        assert!(updated.is_err());
+        assert!(
+            updated
+                .unwrap_err()
+                .to_string()
+                .contains("must be claimed before modify task metadata"),
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_foreign_owner() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
+
+        t.execute(json!({ "action": "claim", "id": id, "owner": "owner-a" }))
             .await
             .unwrap();
 
-        assert_eq!(updated["task"]["subject"], "updated subject");
-        assert_eq!(updated["task"]["description"], "updated description");
+        let result = t
+            .execute(json!({
+                "action": "update",
+                "id": id,
+                "status": "completed",
+                "owner": "owner-b",
+                "completion_evidence": {
+                    "summary": "verified"
+                }
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot mark the task completed"),
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_unowned_task() {
+        let tmp = TempDir::new().unwrap();
+        let t = tool(&tmp).await;
+        let created = t
+            .execute(json!({ "action": "create", "subject": "work" }))
+            .await
+            .unwrap();
+        let id = created["task"]["id"].as_str().unwrap().to_string();
+
+        let result = t
+            .execute(json!({
+                "action": "update",
+                "id": id,
+                "status": "completed",
+                "owner": "owner-a",
+                "completion_evidence": {
+                    "summary": "verified"
+                }
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must be claimed before mark the task completed"),
+        );
     }
 }

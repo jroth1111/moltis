@@ -9,7 +9,7 @@ use time::OffsetDateTime;
 use crate::{
     errors::TransitionError,
     state::{RuntimeState, TerminalState},
-    types::{FailureClass, HandoffContext, Task, TaskId},
+    types::{CompletionEvidence, FailureClass, HandoffContext, Task, TaskId},
 };
 
 // ── Transition events ─────────────────────────────────────────────────────────
@@ -31,7 +31,7 @@ pub enum TransitionEvent {
     DependenciesMet,
 
     /// Active task completed successfully.
-    Complete,
+    Complete { evidence: CompletionEvidence },
 
     /// Active task failed; provide context for recovery.
     Fail {
@@ -97,11 +97,17 @@ pub fn apply(mut task: Task, event: &TransitionEvent) -> Result<Task, Transition
         TransitionEvent::Claim { owner, .. } => {
             task.runtime.owner = Some(owner.clone());
             task.runtime.attempt = task.runtime.attempt.saturating_add(1);
+            task.runtime.completion_evidence = None;
         },
-        TransitionEvent::Complete
-        | TransitionEvent::Fail { .. }
-        | TransitionEvent::Cancel { .. } => {
+        TransitionEvent::Complete { evidence } => {
             task.runtime.owner = None;
+            task.runtime.completion_evidence = Some(evidence.clone());
+            task.runtime.handoff = None;
+            task.runtime.last_failure = None;
+        },
+        TransitionEvent::Fail { .. } | TransitionEvent::Cancel { .. } => {
+            task.runtime.owner = None;
+            task.runtime.completion_evidence = None;
         },
         _ => {},
     }
@@ -167,7 +173,12 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
         // ── Active ─────────────────────────────────────────────────────────
 
         // Active → Terminal(Completed)
-        (RuntimeState::Active { .. }, TransitionEvent::Complete) => {
+        (RuntimeState::Active { .. }, TransitionEvent::Complete { evidence }) => {
+            if !evidence.is_valid() {
+                return Err(TransitionError::Other(
+                    "completed tasks require non-empty completion evidence".into(),
+                ));
+            }
             Ok(RuntimeState::Terminal(TerminalState::Completed))
         },
 
@@ -275,7 +286,19 @@ fn dispatch(task: &Task, event: &TransitionEvent) -> Result<RuntimeState, Transi
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::types::TaskSpec};
+    use {
+        super::*,
+        crate::types::{CompletionEvidence, TaskSpec},
+    };
+
+    fn completion_evidence() -> CompletionEvidence {
+        CompletionEvidence {
+            summary: "verification passed".into(),
+            source_tool: Some("exec".into()),
+            source_call_id: Some("call-1".into()),
+            verified_at: OffsetDateTime::now_utc(),
+        }
+    }
 
     fn pending_task() -> Task {
         Task::new("default", TaskSpec::new("work", ""))
@@ -366,12 +389,26 @@ mod tests {
     #[test]
     fn active_complete_goes_terminal_completed() {
         let task = active_task("agent");
-        let result = apply(task, &TransitionEvent::Complete).expect("complete");
+        let result = apply(
+            task,
+            &TransitionEvent::Complete {
+                evidence: completion_evidence(),
+            },
+        )
+        .expect("complete");
         assert!(matches!(
             result.runtime.state,
             RuntimeState::Terminal(TerminalState::Completed)
         ));
         assert!(result.runtime.owner.is_none());
+        assert_eq!(
+            result
+                .runtime
+                .completion_evidence
+                .as_ref()
+                .map(|e| e.summary.as_str()),
+            Some("verification passed")
+        );
     }
 
     #[test]
@@ -501,10 +538,22 @@ mod tests {
     #[test]
     fn terminal_rejects_all_transitions() {
         let task = active_task("agent");
-        let done = apply(task, &TransitionEvent::Complete).expect("complete");
+        let done = apply(
+            task,
+            &TransitionEvent::Complete {
+                evidence: completion_evidence(),
+            },
+        )
+        .expect("complete");
         assert!(done.runtime.state.is_terminal());
 
-        let err = apply(done.clone(), &TransitionEvent::Complete).unwrap_err();
+        let err = apply(
+            done.clone(),
+            &TransitionEvent::Complete {
+                evidence: completion_evidence(),
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, TransitionError::InvalidTransition { .. }));
 
         let err2 = apply(
@@ -534,7 +583,13 @@ mod tests {
         .expect("claim");
         assert_eq!(t1.runtime.version, 1);
 
-        let t2 = apply(t1, &TransitionEvent::Complete).expect("complete");
+        let t2 = apply(
+            t1,
+            &TransitionEvent::Complete {
+                evidence: completion_evidence(),
+            },
+        )
+        .expect("complete");
         assert_eq!(t2.runtime.version, 2);
     }
 
@@ -545,9 +600,32 @@ mod tests {
         // Cannot complete a Pending task (must claim first)
         let task = pending_task();
         assert!(matches!(
-            apply(task, &TransitionEvent::Complete),
+            apply(
+                task,
+                &TransitionEvent::Complete {
+                    evidence: completion_evidence(),
+                }
+            ),
             Err(TransitionError::InvalidTransition { .. })
         ));
+    }
+
+    #[test]
+    fn complete_requires_non_empty_evidence_summary() {
+        let task = active_task("agent");
+        let err = apply(
+            task,
+            &TransitionEvent::Complete {
+                evidence: CompletionEvidence {
+                    summary: "   ".into(),
+                    source_tool: Some("exec".into()),
+                    source_call_id: Some("call-1".into()),
+                    verified_at: OffsetDateTime::now_utc(),
+                },
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, TransitionError::Other(_)));
     }
 
     #[test]

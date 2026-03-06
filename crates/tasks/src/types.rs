@@ -177,6 +177,30 @@ impl HandoffContext {
     }
 }
 
+/// Proof attached when a task is marked completed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionEvidence {
+    /// Short human-readable verification summary.
+    pub summary: String,
+    /// Tool that produced the verification evidence, if any.
+    #[serde(default)]
+    pub source_tool: Option<String>,
+    /// Tool call id associated with the verification event, if any.
+    #[serde(default)]
+    pub source_call_id: Option<String>,
+    /// When the verification evidence was recorded.
+    #[serde(with = "time::serde::rfc3339")]
+    pub verified_at: OffsetDateTime,
+}
+
+impl CompletionEvidence {
+    /// Whether the evidence has the minimum required information.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.summary.trim().is_empty()
+    }
+}
+
 // ── Autonomy tier ────────────────────────────────────────────────────────────
 
 /// Autonomy tier for outloop (dispatch-managed) execution.
@@ -340,6 +364,9 @@ pub struct TaskRuntime {
     /// Classification of the most recent failure.
     #[serde(default)]
     pub last_failure: Option<FailureClass>,
+    /// Proof captured when the task reached completion.
+    #[serde(default)]
+    pub completion_evidence: Option<CompletionEvidence>,
 }
 
 impl Default for TaskRuntime {
@@ -352,6 +379,7 @@ impl Default for TaskRuntime {
             last_transition_at: OffsetDateTime::now_utc(),
             handoff: None,
             last_failure: None,
+            completion_evidence: None,
         }
     }
 }
@@ -454,6 +482,25 @@ mod tests {
         assert!(ctx.contains("timeout"));
         assert!(ctx.contains("approach A"));
         assert!(ctx.contains("approach B"));
+    }
+
+    #[test]
+    fn completion_evidence_requires_non_empty_summary() {
+        assert!(!CompletionEvidence {
+            summary: "   ".into(),
+            source_tool: Some("exec".into()),
+            source_call_id: Some("call-1".into()),
+            verified_at: OffsetDateTime::now_utc(),
+        }
+        .is_valid());
+
+        assert!(CompletionEvidence {
+            summary: "tests passed".into(),
+            source_tool: Some("exec".into()),
+            source_call_id: Some("call-1".into()),
+            verified_at: OffsetDateTime::now_utc(),
+        }
+        .is_valid());
     }
 
     #[test]
