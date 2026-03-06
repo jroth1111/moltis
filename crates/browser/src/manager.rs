@@ -452,10 +452,16 @@ impl BrowserManager {
                     session_id = active_sid,
                     "browser connection dead, closing session and retrying"
                 );
+                let interception_snapshot = self.pool.take_interception_snapshot(&active_sid).await;
                 let _ = self.pool.close_session(&active_sid).await;
                 // Retry with a fresh session (use same sandbox mode)
                 let new_sid = self.pool.get_or_create(None, sandbox, browser).await?;
                 let new_page = self.pool.get_page(&new_sid).await?;
+                if let Some(snapshot) = interception_snapshot {
+                    self.pool
+                        .restore_interception_snapshot(&new_sid, snapshot)
+                        .await?;
+                }
                 new_page
                     .goto(url)
                     .await

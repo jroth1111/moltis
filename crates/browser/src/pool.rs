@@ -312,37 +312,70 @@ impl BrowserPool {
         patterns: Vec<String>,
         extra_headers: HashMap<String, String>,
     ) -> Result<(), Error> {
-        use chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused;
+        use chromiumoxide::cdp::browser_protocol::{
+            fetch::EventRequestPaused,
+            network::{
+                EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
+                EventResponseReceived,
+            },
+        };
 
         let page = self.get_page(session_id).await?;
-        crate::network::enable_interception(&page, patterns).await?;
 
-        // Subscribe to CDP EventRequestPaused events before storing state.
-        let event_stream = page
+        // Subscribe before enabling Fetch so we do not miss the first matching event.
+        let paused_stream = page
             .event_listener::<EventRequestPaused>()
             .await
             .map_err(|e| Error::Cdp(format!("intercept event listener: {e}")))?;
+        let response_stream = page
+            .event_listener::<EventResponseReceived>()
+            .await
+            .map_err(|e| Error::Cdp(format!("response event listener: {e}")))?;
+        let request_stream = page
+            .event_listener::<EventRequestWillBeSent>()
+            .await
+            .map_err(|e| Error::Cdp(format!("requestWillBeSent event listener: {e}")))?;
+        let loading_finished_stream = page
+            .event_listener::<EventLoadingFinished>()
+            .await
+            .map_err(|e| Error::Cdp(format!("loadingFinished event listener: {e}")))?;
+        let loading_failed_stream = page
+            .event_listener::<EventLoadingFailed>()
+            .await
+            .map_err(|e| Error::Cdp(format!("loadingFailed event listener: {e}")))?;
+
+        crate::network::enable_interception(&page, patterns.clone()).await?;
 
         let (paused_tx, _rx) = broadcast::channel::<Arc<EventRequestPaused>>(32);
         let paused_tx_clone = paused_tx.clone();
-        let page_clone = page.clone();
+        let paused_page = page.clone();
+        let loading_finished_page = page.clone();
 
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(session_id) {
             let instance_arc = Arc::clone(instance);
             let mut inst = instance.lock().await;
+            for task in inst.interception.tasks.drain(..) {
+                task.abort();
+            }
             inst.interception.enabled = true;
+            inst.interception.url_patterns = patterns;
             inst.interception.extra_headers = extra_headers;
+            inst.interception.paused_tx = Some(paused_tx);
 
-            let task = tokio::spawn(async move {
-                let mut stream = event_stream;
+            let paused_task = tokio::spawn(async move {
+                let mut stream = paused_stream;
                 while let Some(event) = stream.next().await {
                     // Record into HAR if active and capture latest header overrides.
                     // Keep lock scope short and always release before CDP awaits.
                     let extra_headers = {
                         let mut inst = instance_arc.lock().await;
                         if let Some(ref mut rec) = inst.interception.recorder {
-                            rec.record(crate::network::HarEntry::from_event(&event));
+                            if event.response_status_code.is_some() {
+                                rec.apply_fetch_response(&event);
+                            } else {
+                                rec.record_request(&event);
+                            }
                         }
                         if inst.interception.extra_headers.is_empty() {
                             None
@@ -360,7 +393,7 @@ impl BrowserPool {
                     let _ = paused_tx_clone.send(event.clone());
                     // Auto-continue so the request is never left hanging.
                     let _ = crate::network::continue_request(
-                        &page_clone,
+                        &paused_page,
                         event.request_id.clone(),
                         extra_headers,
                     )
@@ -369,8 +402,85 @@ impl BrowserPool {
                 debug!("intercept event stream closed");
             });
 
-            inst.interception.paused_tx = Some(paused_tx);
-            inst.interception._task = Some(task);
+            let response_instance = Arc::clone(instance);
+            let response_task = tokio::spawn(async move {
+                let mut stream = response_stream;
+                while let Some(event) = stream.next().await {
+                    let mut inst = response_instance.lock().await;
+                    if let Some(ref mut rec) = inst.interception.recorder {
+                        rec.apply_response_received(&event);
+                    }
+                }
+                debug!("response event stream closed");
+            });
+
+            let request_instance = Arc::clone(instance);
+            let request_task = tokio::spawn(async move {
+                let mut stream = request_stream;
+                while let Some(event) = stream.next().await {
+                    let mut inst = request_instance.lock().await;
+                    if let Some(ref mut rec) = inst.interception.recorder {
+                        rec.apply_request_will_be_sent(&event);
+                    }
+                }
+                debug!("requestWillBeSent event stream closed");
+            });
+
+            let loading_finished_instance = Arc::clone(instance);
+            let loading_finished_task = tokio::spawn(async move {
+                let mut stream = loading_finished_stream;
+                while let Some(event) = stream.next().await {
+                    let capture_body = {
+                        let inst = loading_finished_instance.lock().await;
+                        if let Some(rec) = inst.interception.recorder.as_ref() {
+                            rec.should_capture_body(&event.request_id).unwrap_or(true)
+                        } else {
+                            false
+                        }
+                    };
+
+                    let body = if capture_body {
+                        crate::network::get_response_body(
+                            &loading_finished_page,
+                            event.request_id.clone(),
+                        )
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    };
+
+                    let mut inst = loading_finished_instance.lock().await;
+                    if let Some(ref mut rec) = inst.interception.recorder {
+                        rec.apply_loading_finished(
+                            &event.request_id,
+                            *event.timestamp.inner(),
+                            body,
+                        );
+                    }
+                }
+                debug!("loadingFinished event stream closed");
+            });
+
+            let loading_failed_instance = Arc::clone(instance);
+            let loading_failed_task = tokio::spawn(async move {
+                let mut stream = loading_failed_stream;
+                while let Some(event) = stream.next().await {
+                    let mut inst = loading_failed_instance.lock().await;
+                    if let Some(ref mut rec) = inst.interception.recorder {
+                        rec.apply_loading_failed(&event);
+                    }
+                }
+                debug!("loadingFailed event stream closed");
+            });
+
+            inst.interception.tasks = vec![
+                paused_task,
+                response_task,
+                request_task,
+                loading_finished_task,
+                loading_failed_task,
+            ];
         }
 
         Ok(())
@@ -384,11 +494,12 @@ impl BrowserPool {
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(session_id) {
             let mut inst = instance.lock().await;
-            if let Some(task) = inst.interception._task.take() {
+            for task in inst.interception.tasks.drain(..) {
                 task.abort();
             }
             inst.interception.paused_tx = None;
             inst.interception.enabled = false;
+            inst.interception.url_patterns.clear();
         }
 
         Ok(())
@@ -411,7 +522,8 @@ impl BrowserPool {
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(session_id) {
             let mut inst = instance.lock().await;
-            if let Some(recorder) = inst.interception.recorder.take() {
+            if let Some(mut recorder) = inst.interception.recorder.take() {
+                recorder.finish();
                 #[cfg(feature = "metrics")]
                 moltis_metrics::counter!(moltis_metrics::browser::HAR_RECORDINGS_TOTAL)
                     .increment(1);
@@ -428,6 +540,59 @@ impl BrowserPool {
             let mut inst = instance.lock().await;
             inst.interception.extra_headers = headers;
         }
+    }
+
+    /// Take interception/HAR state out of a session so it can be restored onto
+    /// a replacement session after a stale-connection retry.
+    pub async fn take_interception_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::network::InterceptionSnapshot> {
+        let instances = self.instances.read().await;
+        let instance = instances.get(session_id)?;
+        let mut inst = instance.lock().await;
+
+        if !inst.interception.enabled && inst.interception.recorder.is_none() {
+            return None;
+        }
+
+        Some(crate::network::InterceptionSnapshot {
+            enabled: inst.interception.enabled,
+            url_patterns: inst.interception.url_patterns.clone(),
+            extra_headers: inst.interception.extra_headers.clone(),
+            recorder: inst.interception.recorder.take(),
+        })
+    }
+
+    /// Restore interception/HAR state onto an already-created session.
+    pub async fn restore_interception_snapshot(
+        &self,
+        session_id: &str,
+        snapshot: crate::network::InterceptionSnapshot,
+    ) -> Result<(), Error> {
+        let crate::network::InterceptionSnapshot {
+            enabled,
+            url_patterns,
+            extra_headers,
+            recorder,
+        } = snapshot;
+
+        if enabled {
+            self.enable_interception(session_id, url_patterns.clone(), extra_headers.clone())
+                .await?;
+        }
+
+        let instances = self.instances.read().await;
+        if let Some(instance) = instances.get(session_id) {
+            let mut inst = instance.lock().await;
+            if !enabled {
+                inst.interception.url_patterns = url_patterns;
+                inst.interception.extra_headers = extra_headers;
+            }
+            inst.interception.recorder = recorder;
+        }
+
+        Ok(())
     }
 
     // ── Screencast ────────────────────────────────────────────────────────────
@@ -585,7 +750,11 @@ impl BrowserPool {
         };
 
         if let Some(instance) = instance {
-            let inst = instance.lock().await;
+            let mut inst = instance.lock().await;
+            for task in inst.interception.tasks.drain(..) {
+                task.abort();
+            }
+            inst.interception.paused_tx = None;
             // Pages are closed when browser is dropped
             drop(inst);
 
