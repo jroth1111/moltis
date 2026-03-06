@@ -95,7 +95,7 @@ async fn run_mcp_scan(installed_dir: &Path) -> anyhow::Result<Value> {
 }
 
 fn is_protected_discovered_skill(name: &str) -> bool {
-    matches!(name, "template-skill" | "template" | "tmux" | "skill-creator")
+    matches!(name, "template-skill" | "template" | "tmux")
 }
 
 fn commit_url_for_source(source: &str, sha: &str) -> Option<String> {
@@ -1969,13 +1969,11 @@ impl GatewayServices {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use {
-        moltis_skills::{
-            formats::PluginFormat,
-            types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
-        },
-        std::{path::Path, process::Command},
+    use moltis_skills::{
+        formats::PluginFormat,
+        types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
     };
+    use std::{path::Path, process::Command};
 
     fn write_skill_file(install_dir: &Path, repo_name: &str, relative_path: &str, body: &str) {
         let skill_dir = install_dir.join(relative_path);
@@ -2474,5 +2472,36 @@ mod tests {
             &expected,
         ));
         Ok(())
+    }
+
+    #[test]
+    fn skill_creator_is_not_treated_as_protected_discovered_skill() {
+        assert!(!is_protected_discovered_skill("skill-creator"));
+    }
+
+    #[test]
+    fn delete_discovered_skill_allows_personal_skill_creator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join("skills/skill-creator");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("SKILL.md"),
+            "---\nname: skill-creator\ndescription: test\n---\nbody\n",
+        )
+        .unwrap();
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+
+        let result = delete_discovered_skill(
+            "personal",
+            &serde_json::json!({
+                "skill": "skill-creator",
+            }),
+        )
+        .expect("skill-creator should be deletable");
+
+        assert_eq!(result["deleted"], true);
+        assert!(!skills_dir.exists());
+
+        moltis_config::clear_data_dir();
     }
 }
