@@ -7,7 +7,11 @@ use {
     async_trait::async_trait,
     serde_json::Value,
     std::time::{Duration, SystemTime, UNIX_EPOCH},
-    tokio::sync::RwLock,
+    tokio::{
+        sync::{Mutex, RwLock},
+        task::JoinHandle,
+        time::sleep,
+    },
     tracing::info,
 };
 
@@ -254,18 +258,70 @@ pub struct LiveMcpService {
     manager: Arc<moltis_mcp::McpManager>,
     /// Shared tool registry for syncing MCP tools into the agent loop.
     /// Set after construction via `set_tool_registry`.
-    tool_registry: RwLock<Option<Arc<RwLock<ToolRegistry>>>>,
+    tool_registry: Arc<RwLock<Option<Arc<RwLock<ToolRegistry>>>>>,
     /// Emergency state for legacy direct MCP bridges.
-    legacy_direct: RwLock<LegacyDirectState>,
+    legacy_direct: Arc<RwLock<LegacyDirectState>>,
+    /// Background task that disables legacy direct mode at TTL expiry.
+    legacy_direct_expiry_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl LiveMcpService {
     pub fn new(manager: Arc<moltis_mcp::McpManager>) -> Self {
         Self {
             manager,
-            tool_registry: RwLock::new(None),
-            legacy_direct: RwLock::new(LegacyDirectState::disabled()),
+            tool_registry: Arc::new(RwLock::new(None)),
+            legacy_direct: Arc::new(RwLock::new(LegacyDirectState::disabled())),
+            legacy_direct_expiry_task: Arc::new(Mutex::new(None)),
         }
+    }
+
+    async fn disable_legacy_direct_if_expired(&self, now: SystemTime) -> bool {
+        let mut state = self.legacy_direct.write().await;
+        if state.enabled_until.is_some() && !state.is_enabled(now) {
+            *state = LegacyDirectState::disabled();
+            return true;
+        }
+        false
+    }
+
+    async fn reschedule_legacy_direct_expiry(&self) {
+        let now = SystemTime::now();
+        let enabled_until = self.legacy_direct.read().await.enabled_until;
+
+        let mut task_slot = self.legacy_direct_expiry_task.lock().await;
+        if let Some(handle) = task_slot.take() {
+            handle.abort();
+        }
+
+        let Some(until) = enabled_until else {
+            return;
+        };
+
+        let Ok(delay) = until.duration_since(now) else {
+            drop(task_slot);
+            if self.disable_legacy_direct_if_expired(now).await {
+                self.sync_tools_if_ready().await;
+            }
+            return;
+        };
+
+        let manager = Arc::clone(&self.manager);
+        let tool_registry = Arc::clone(&self.tool_registry);
+        let legacy_direct = Arc::clone(&self.legacy_direct);
+        *task_slot = Some(tokio::spawn(async move {
+            sleep(delay).await;
+            let now = SystemTime::now();
+            let mut state = legacy_direct.write().await;
+            if state.enabled_until.is_some() && !state.is_enabled(now) {
+                *state = LegacyDirectState::disabled();
+                drop(state);
+
+                if let Some(registry) = tool_registry.read().await.clone() {
+                    let current = legacy_direct.read().await.clone();
+                    sync_mcp_tools(&manager, &registry, &current).await;
+                }
+            }
+        }));
     }
 
     /// Configure startup defaults for emergency legacy direct mode.
@@ -285,6 +341,7 @@ impl LiveMcpService {
             enabled_until,
             allow_servers,
         };
+        self.reschedule_legacy_direct_expiry().await;
     }
 
     /// Store a reference to the shared tool registry so MCP mutations
@@ -295,6 +352,8 @@ impl LiveMcpService {
 
     /// Sync MCP tools into the shared tool registry (if set).
     pub async fn sync_tools_if_ready(&self) {
+        let now = SystemTime::now();
+        let _expired = self.disable_legacy_direct_if_expired(now).await;
         let maybe_reg = self.tool_registry.read().await.clone();
         if let Some(reg) = maybe_reg {
             let legacy_state = self.legacy_direct.read().await.clone();
@@ -309,6 +368,7 @@ impl LiveMcpService {
 
     async fn legacy_direct_status_value(&self) -> Value {
         let now = SystemTime::now();
+        let _expired = self.disable_legacy_direct_if_expired(now).await;
         self.legacy_direct.read().await.status_json(now)
     }
 }
@@ -666,6 +726,7 @@ impl McpService for LiveMcpService {
         }
         drop(state);
 
+        self.reschedule_legacy_direct_expiry().await;
         self.sync_tools_if_ready().await;
         Ok(self.legacy_direct_status_value().await)
     }
@@ -677,7 +738,7 @@ impl McpService for LiveMcpService {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, moltis_mcp::McpRegistry};
+    use {super::*, moltis_mcp::McpRegistry, tokio::time::Duration as TokioDuration};
 
     #[test]
     fn parse_server_config_allows_sse_without_command() {
@@ -846,6 +907,38 @@ mod tests {
 
         let reg = registry.read().await;
         assert!(reg.get("exec").is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_direct_expiry_task_unregisters_tools() {
+        let service = LiveMcpService::new(Arc::new(moltis_mcp::McpManager::new(McpRegistry::new())));
+        let registry = Arc::new(RwLock::new(ToolRegistry::new()));
+        service.set_tool_registry(Arc::clone(&registry)).await;
+
+        {
+            let mut reg = registry.write().await;
+            reg.register_mcp(
+                Box::new(FakeTool("mcp__old__tool".into())),
+                "old".to_string(),
+            );
+        }
+
+        {
+            let mut state = service.legacy_direct.write().await;
+            *state = LegacyDirectState {
+                enabled_until: Some(SystemTime::now() + Duration::from_millis(10)),
+                allow_servers: HashSet::new(),
+            };
+        }
+        service.reschedule_legacy_direct_expiry().await;
+
+        tokio::time::sleep(TokioDuration::from_millis(30)).await;
+
+        let status = service.legacy_direct_status_value().await;
+        assert_eq!(status["enabled"], Value::Bool(false));
+
+        let reg = registry.read().await;
+        assert!(reg.get("mcp__old__tool").is_none());
     }
 
     /// Minimal AgentTool implementation for testing.
