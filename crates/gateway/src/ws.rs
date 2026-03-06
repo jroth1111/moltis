@@ -705,7 +705,7 @@ mod tests {
     struct FailingSerialize;
 
     impl Serialize for FailingSerialize {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer,
         {
