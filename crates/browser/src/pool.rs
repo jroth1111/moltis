@@ -1849,23 +1849,21 @@ mod tests {
         assert!(sandbox_profile_dir(None, "browser-abc123").is_none());
     }
 
-    fn live_test_config() -> BrowserConfig {
-        BrowserConfig {
+    fn live_test_pool() -> (BrowserPool, tempfile::TempDir) {
+        let profile_dir =
+            tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir should work: {error}"));
+        let config = BrowserConfig {
             idle_timeout_secs: 60,
             persist_profile: false,
-            profile_dir: Some(
-                std::env::temp_dir()
-                    .join(format!("moltis-browser-live-{}", Uuid::new_v4()))
-                    .display()
-                    .to_string(),
-            ),
+            profile_dir: Some(profile_dir.path().display().to_string()),
             ..BrowserConfig::default()
-        }
+        };
+        (BrowserPool::new(config), profile_dir)
     }
 
     #[tokio::test]
     async fn cleanup_idle_empty_pool_returns_early() {
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
         // Should not panic — hits the early-return guard.
         pool.cleanup_idle().await;
         assert_eq!(pool.active_count().await, 0);
@@ -1873,20 +1871,20 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_empty_pool_is_noop() {
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
         pool.shutdown().await;
         assert_eq!(pool.active_count().await, 0);
     }
 
     #[tokio::test]
     async fn active_count_starts_at_zero() {
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
         assert_eq!(pool.active_count().await, 0);
     }
 
     #[tokio::test]
     async fn close_session_missing_is_ok() {
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
         // Closing a non-existent session should succeed (no-op).
         let result = pool.close_session("nonexistent").await;
         assert!(result.is_ok());
@@ -1894,7 +1892,7 @@ mod tests {
 
     #[test]
     fn drop_empty_pool_does_not_panic() {
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
         drop(pool);
     }
 
@@ -2614,7 +2612,7 @@ self.addEventListener('fetch', event => {
         let _ = tracing_subscriber::fmt::try_init();
         let _browser_guard = acquire_live_browser_test_guard().await;
         let (addr, state, server) = start_practical_server().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -2719,7 +2717,7 @@ self.addEventListener('fetch', event => {
     -> Result<(), Box<dyn std::error::Error>> {
         let _browser_guard = acquire_live_browser_test_guard().await;
         let (addr, state, server) = start_practical_server().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -2810,7 +2808,7 @@ self.addEventListener('fetch', event => {
     -> Result<(), Box<dyn std::error::Error>> {
         let _browser_guard = acquire_live_browser_test_guard().await;
         let (addr, state, server) = start_practical_server().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -2914,7 +2912,7 @@ self.addEventListener('fetch', event => {
         let _ = tracing_subscriber::fmt::try_init();
         let _browser_guard = acquire_live_browser_test_guard().await;
         let servers = start_live_servers().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -2982,7 +2980,7 @@ self.addEventListener('fetch', event => {
         let _ = tracing_subscriber::fmt::try_init();
         let _browser_guard = acquire_live_browser_test_guard().await;
         let servers = start_live_servers().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -3045,7 +3043,7 @@ self.addEventListener('fetch', event => {
         let _ = tracing_subscriber::fmt::try_init();
         let _browser_guard = acquire_live_browser_test_guard().await;
         let servers = start_live_servers().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -3107,7 +3105,7 @@ self.addEventListener('fetch', event => {
         let _ = tracing_subscriber::fmt::try_init();
         let _browser_guard = acquire_live_browser_test_guard().await;
         let servers = start_live_servers().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -3165,7 +3163,7 @@ self.addEventListener('fetch', event => {
         let _ = tracing_subscriber::fmt::try_init();
         let _browser_guard = acquire_live_browser_test_guard().await;
         let servers = start_live_servers().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -3228,7 +3226,7 @@ self.addEventListener('fetch', event => {
         let _ = tracing_subscriber::fmt::try_init();
         let _browser_guard = acquire_live_browser_test_guard().await;
         let servers = start_live_servers().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool
@@ -3289,7 +3287,7 @@ self.addEventListener('fetch', event => {
         let _ = tracing_subscriber::fmt::try_init();
         let _browser_guard = acquire_live_browser_test_guard().await;
         let servers = start_live_servers().await?;
-        let pool = BrowserPool::new(live_test_config());
+        let (pool, _profile_dir) = live_test_pool();
 
         let outcome = async {
             let sid = pool

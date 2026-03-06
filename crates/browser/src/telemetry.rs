@@ -2040,19 +2040,15 @@ mod tests {
         Ok((origin, state, server))
     }
 
-    fn test_browser_config() -> BrowserConfig {
+    fn test_browser_env() -> (BrowserConfig, tempfile::TempDir) {
+        let profile_dir = tempdir().unwrap_or_else(|error| panic!("tempdir should work: {error}"));
         let mut config = BrowserConfig::default();
         config.persist_profile = false;
-        config.profile_dir = Some(
-            std::env::temp_dir()
-                .join(format!("moltis-browser-telemetry-{}", uuid::Uuid::new_v4()))
-                .display()
-                .to_string(),
-        );
+        config.profile_dir = Some(profile_dir.path().display().to_string());
         config.protection.enabled = true;
         config.protection.timeout_ms = 90_000;
         config.protection.max_retries = 2;
-        config
+        (config, profile_dir)
     }
 
     fn request(session_id: Option<String>, action: BrowserAction, timeout_ms: u64) -> BrowserRequest {
@@ -2818,7 +2814,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
-        let manager = BrowserManager::new(test_browser_config());
+        let (config, _profile_dir) = test_browser_env();
+        let manager = BrowserManager::new(config);
 
         let navigate = manager
             .handle_request(request(
@@ -2985,7 +2982,7 @@ mod tests {
     async fn patchright_probe_captures_identity_and_behavior() -> Result<(), Box<dyn std::error::Error>> {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
-        let config = test_browser_config();
+        let (config, _profile_dir) = test_browser_env();
         let profile = patchright_profile(&config);
         let mut session = PatchrightSession::start(&config.protection, &profile).await?;
 
@@ -3074,7 +3071,8 @@ mod tests {
     {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, _state, server) = start_probe_server().await?;
-        let manager = BrowserManager::new(test_browser_config());
+        let (config, _profile_dir) = test_browser_env();
+        let manager = BrowserManager::new(config);
         let report = manager
             .run_probe_canary(ProbeCanarySpec {
                 origin,
@@ -3112,7 +3110,8 @@ mod tests {
     async fn browser_manager_probe_captures_request_sequence() -> Result<(), Box<dyn std::error::Error>> {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
-        let manager = BrowserManager::new(test_browser_config());
+        let (config, _profile_dir) = test_browser_env();
+        let manager = BrowserManager::new(config);
         let run_id = uuid::Uuid::new_v4().to_string();
 
         let navigate = manager
@@ -3167,7 +3166,7 @@ mod tests {
     async fn patchright_probe_captures_request_sequence() -> Result<(), Box<dyn std::error::Error>> {
         let _guard = acquire_live_browser_test_guard().await;
         let (origin, state, server) = start_probe_server().await?;
-        let config = test_browser_config();
+        let (config, _profile_dir) = test_browser_env();
         let profile = patchright_profile(&config);
         let mut session = PatchrightSession::start(&config.protection, &profile).await?;
         let run_id = uuid::Uuid::new_v4().to_string();
