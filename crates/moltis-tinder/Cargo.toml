@@ -11,7 +11,6 @@ image       = { workspace = true }
 moltis-agents  = { workspace = true }
 moltis-common  = { workspace = true }
 moltis-cron    = { workspace = true }
-once_cell   = { workspace = true }
 regex       = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }

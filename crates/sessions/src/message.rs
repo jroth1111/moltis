@@ -194,10 +194,7 @@ impl PersistedMessage {
     }
 
     /// Create a user message with multimodal content and channel metadata.
-    pub fn user_multimodal_with_channel(
-        blocks: Vec<ContentBlock>,
-        channel: Value,
-    ) -> Self {
+    pub fn user_multimodal_with_channel(blocks: Vec<ContentBlock>, channel: Value) -> Self {
         Self::User {
             content: MessageContent::Multimodal(blocks),
             created_at: Some(now_ms()),
@@ -396,7 +393,7 @@ impl PersistedMessage {
                 insert_optional_u64(&mut object, "durationMs", *duration_ms);
                 insert_optional_u32(&mut object, "requestInputTokens", *request_input_tokens);
                 insert_optional_u32(&mut object, "requestOutputTokens", *request_output_tokens);
-                insert_optional_tool_calls(&mut object, tool_calls.as_ref());
+                insert_optional_tool_calls(&mut object, tool_calls.as_deref());
                 insert_optional_string(&mut object, "reasoning", reasoning.as_ref());
                 insert_optional_value(&mut object, "llmApiResponse", llm_api_response.as_ref());
                 insert_optional_string(&mut object, "audio", audio.as_ref());
@@ -409,7 +406,10 @@ impl PersistedMessage {
                 created_at,
             } => {
                 object.insert("role".to_string(), Value::String("tool".to_string()));
-                object.insert("tool_call_id".to_string(), Value::String(tool_call_id.clone()));
+                object.insert(
+                    "tool_call_id".to_string(),
+                    Value::String(tool_call_id.clone()),
+                );
                 object.insert("content".to_string(), Value::String(content.clone()));
                 insert_optional_u64(&mut object, "created_at", *created_at);
             },
@@ -425,7 +425,10 @@ impl PersistedMessage {
                 run_id,
             } => {
                 object.insert("role".to_string(), Value::String("tool_result".to_string()));
-                object.insert("tool_call_id".to_string(), Value::String(tool_call_id.clone()));
+                object.insert(
+                    "tool_call_id".to_string(),
+                    Value::String(tool_call_id.clone()),
+                );
                 object.insert("tool_name".to_string(), Value::String(tool_name.clone()));
                 insert_optional_value(&mut object, "arguments", arguments.as_ref());
                 object.insert("success".to_string(), Value::Bool(*success));
@@ -543,7 +546,7 @@ fn insert_optional_value(object: &mut Map<String, Value>, key: &str, value: Opti
 
 fn insert_optional_tool_calls(
     object: &mut Map<String, Value>,
-    tool_calls: Option<&Vec<PersistedToolCall>>,
+    tool_calls: Option<&[PersistedToolCall]>,
 ) {
     if let Some(tool_calls) = tool_calls {
         object.insert(

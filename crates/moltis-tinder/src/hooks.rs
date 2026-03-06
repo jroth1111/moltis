@@ -3,8 +3,8 @@ use std::sync::Arc;
 use {
     async_trait::async_trait,
     moltis_common::hooks::{HookAction, HookEvent, HookHandler, HookPayload},
-    once_cell::sync::Lazy,
     regex::Regex,
+    std::sync::LazyLock as Lazy,
     tracing::{info, warn},
 };
 

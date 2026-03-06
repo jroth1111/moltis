@@ -10,7 +10,6 @@ async-trait                 = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { optional = true, workspace = true }
 metrics-tracing-context     = { optional = true, workspace = true }
-once_cell                   = { workspace = true }
 opentelemetry               = { optional = true, workspace = true }
 opentelemetry-otlp          = { features = ["grpc-tonic"], optional = true, workspace = true }
 opentelemetry_sdk           = { optional = true, workspace = true }

@@ -578,7 +578,7 @@ pub mod labels {
 
 /// Standard histogram buckets for different metric types
 pub mod buckets {
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock as Lazy;
 
     /// HTTP request duration buckets (in seconds)
     /// Covers 1ms to 60s

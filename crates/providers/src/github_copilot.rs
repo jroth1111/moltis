@@ -703,9 +703,7 @@ mod tests {
                     let headers: Vec<(String, String)> = req
                         .headers()
                         .iter()
-                        .map(|(k, v)| {
-                            (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
-                        })
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                         .collect();
 
                     let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)

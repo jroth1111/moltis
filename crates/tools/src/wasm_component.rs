@@ -225,7 +225,7 @@ impl HttpHostImpl {
             .iter()
             .map(|(name, value)| {
                 (
-                    name.as_str().to_string(),
+                    name.to_string(),
                     value.to_str().unwrap_or_default().to_string(),
                 )
             })

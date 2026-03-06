@@ -4,12 +4,11 @@
 //! multiple sessions, enabling the agent to improve over time.
 
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 use time::OffsetDateTime;
 
 /// Maximum number of learnings to keep per category.
@@ -86,7 +85,7 @@ impl CrossSessionLearning {
 
     /// Add a new learning.
     pub fn add_learning(&self, learning: Learning) {
-        let mut guard = self.learnings.write();
+        let mut guard = self.learnings.write().unwrap_or_else(|e| e.into_inner());
         let category_learnings = guard.entry(learning.category.clone()).or_default();
 
         if category_learnings
@@ -106,12 +105,12 @@ impl CrossSessionLearning {
         }
 
         category_learnings.push(learning);
-        *self.dirty.write() = true;
+        *self.dirty.write().unwrap_or_else(|e| e.into_inner()) = true;
     }
 
     /// Get learnings for a specific category.
     pub fn get_learnings(&self, category: &str) -> Vec<Learning> {
-        let guard = self.learnings.read();
+        let guard = self.learnings.read().unwrap_or_else(|e| e.into_inner());
         guard
             .get(category)
             .cloned()
@@ -123,25 +122,23 @@ impl CrossSessionLearning {
 
     /// Get all learnings across all categories.
     pub fn get_all_learnings(&self) -> Vec<Learning> {
-        let guard = self.learnings.read();
-        let map: &HashMap<String, Vec<Learning>> = guard.deref();
-        map.values()
-            .flat_map(|v: &Vec<Learning>| v.iter().cloned())
+        let guard = self.learnings.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .values()
+            .flat_map(|v| v.iter().cloned())
             .filter(|l| l.confidence >= CONFIDENCE_THRESHOLD)
             .collect()
     }
 
     /// Record that a learning was applied.
     pub fn record_application(&self, learning_id: &str) {
-        let mut guard = self.learnings.write();
-        let map: &mut HashMap<String, Vec<Learning>> = guard.deref_mut();
-        for (_, category_learnings) in map.iter_mut() {
-            let learnings: &mut Vec<Learning> = category_learnings;
-            for learning in learnings {
+        let mut guard = self.learnings.write().unwrap_or_else(|e| e.into_inner());
+        for category_learnings in guard.values_mut() {
+            for learning in category_learnings.iter_mut() {
                 if learning.id == learning_id {
                     learning.application_count += 1;
                     learning.last_applied = Some(OffsetDateTime::now_utc());
-                    *self.dirty.write() = true;
+                    *self.dirty.write().unwrap_or_else(|e| e.into_inner()) = true;
                     return;
                 }
             }
@@ -150,14 +147,12 @@ impl CrossSessionLearning {
 
     /// Boost confidence of a learning after successful application.
     pub fn boost_confidence(&self, learning_id: &str, boost: f64) {
-        let mut guard = self.learnings.write();
-        let map: &mut HashMap<String, Vec<Learning>> = guard.deref_mut();
-        for (_, category_learnings) in map.iter_mut() {
-            let learnings: &mut Vec<Learning> = category_learnings;
-            for learning in learnings {
+        let mut guard = self.learnings.write().unwrap_or_else(|e| e.into_inner());
+        for category_learnings in guard.values_mut() {
+            for learning in category_learnings.iter_mut() {
                 if learning.id == learning_id {
                     learning.confidence = (learning.confidence + boost).min(1.0);
-                    *self.dirty.write() = true;
+                    *self.dirty.write().unwrap_or_else(|e| e.into_inner()) = true;
                     return;
                 }
             }
@@ -166,14 +161,12 @@ impl CrossSessionLearning {
 
     /// Reduce confidence of a learning after failed application.
     pub fn reduce_confidence(&self, learning_id: &str, reduction: f64) {
-        let mut guard = self.learnings.write();
-        let map: &mut HashMap<String, Vec<Learning>> = guard.deref_mut();
-        for (_, category_learnings) in map.iter_mut() {
-            let learnings: &mut Vec<Learning> = category_learnings;
-            for learning in learnings {
+        let mut guard = self.learnings.write().unwrap_or_else(|e| e.into_inner());
+        for category_learnings in guard.values_mut() {
+            for learning in category_learnings.iter_mut() {
                 if learning.id == learning_id {
                     learning.confidence = (learning.confidence - reduction).max(0.0);
-                    *self.dirty.write() = true;
+                    *self.dirty.write().unwrap_or_else(|e| e.into_inner()) = true;
                     return;
                 }
             }
@@ -182,7 +175,7 @@ impl CrossSessionLearning {
 
     /// Find relevant learnings for a given context.
     pub fn find_relevant(&self, context: &LearningContext) -> Vec<Learning> {
-        let guard = self.learnings.read();
+        let guard = self.learnings.read().unwrap_or_else(|e| e.into_inner());
         let mut relevant: Vec<Learning> = Vec::new();
 
         for category_learnings in guard.values() {
@@ -217,17 +210,17 @@ impl CrossSessionLearning {
 
     /// Persist learnings to disk.
     pub fn save(&self) -> anyhow::Result<()> {
-        if !*self.dirty.read() {
+        if !*self.dirty.read().unwrap_or_else(|e| e.into_inner()) {
             return Ok(());
         }
 
-        let guard = self.learnings.read();
+        let guard = self.learnings.read().unwrap_or_else(|e| e.into_inner());
         let flat_learnings: Vec<&Learning> = guard.values().flatten().collect();
 
         let json = serde_json::to_string_pretty(&flat_learnings)?;
         std::fs::write(&self.store_path, json)?;
 
-        *self.dirty.write() = false;
+        *self.dirty.write().unwrap_or_else(|e| e.into_inner()) = false;
         Ok(())
     }
 
@@ -240,7 +233,7 @@ impl CrossSessionLearning {
         let json = std::fs::read_to_string(&self.store_path)?;
         let flat_learnings: Vec<Learning> = serde_json::from_str(&json)?;
 
-        let mut guard = self.learnings.write();
+        let mut guard = self.learnings.write().unwrap_or_else(|e| e.into_inner());
         for learning in flat_learnings {
             guard
                 .entry(learning.category.clone())
