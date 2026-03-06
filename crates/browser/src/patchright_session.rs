@@ -773,11 +773,11 @@ with sync_playwright() as p:
         try:
             req = json.loads(raw)
             cmd = req.get("cmd")
-            id = req.get("id", 0)
+            request_id = req.get("id", 0)
 
             if cmd == "goto":
                 current_page().goto(req["url"], wait_until="domcontentloaded", timeout=45000)
-                _result(id)
+                _result(request_id)
             elif cmd == "capture_page":
                 page = current_page()
                 title = (page.evaluate("document.title || ''") or "").strip()
@@ -785,7 +785,7 @@ with sync_playwright() as p:
                     const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
                     return text.length;
                 })()""") or 0
-                _result(id, {
+                _result(request_id, {
                     "final_url": page.url,
                     "title": title,
                     "title_len": len(title),
@@ -793,63 +793,63 @@ with sync_playwright() as p:
                     "html": page.content(),
                 })
             elif cmd == "evaluate":
-                _result(id, current_page().evaluate(req["code"]))
+                _result(request_id, current_page().evaluate(req["code"]))
             elif cmd == "screenshot":
                 data = current_page().screenshot(full_page=bool(req.get("full_page")))
-                _result(id, {"data_base64": base64.b64encode(data).decode("ascii")})
+                _result(request_id, {"data_base64": base64.b64encode(data).decode("ascii")})
             elif cmd == "wait_selector":
                 try:
                     current_page().locator(req["selector"]).wait_for(
                         state="attached",
                         timeout=int(req.get("timeout_ms") or 30000),
                     )
-                    _result(id, {"found": True})
+                    _result(request_id, {"found": True})
                 except PlaywrightTimeoutError:
-                    _result(id, {"found": False})
+                    _result(request_id, {"found": False})
             elif cmd == "mouse_move":
                 current_page().mouse.move(float(req["x"]), float(req["y"]))
-                _result(id)
+                _result(request_id)
             elif cmd == "mouse_click":
                 current_page().mouse.click(
                     float(req["x"]),
                     float(req["y"]),
                     click_count=int(req.get("click_count") or 1),
                 )
-                _result(id)
+                _result(request_id)
             elif cmd == "keyboard_type":
                 current_page().keyboard.type(req["text"])
-                _result(id)
+                _result(request_id)
             elif cmd == "keyboard_press":
                 current_page().keyboard.press(req["key"])
-                _result(id)
+                _result(request_id)
             elif cmd == "select_option":
                 current_page().locator(req["selector"]).select_option(req["value"])
-                _result(id)
+                _result(request_id)
             elif cmd == "check":
                 current_page().locator(req["selector"]).check()
-                _result(id)
+                _result(request_id)
             elif cmd == "uncheck":
                 current_page().locator(req["selector"]).uncheck()
-                _result(id)
+                _result(request_id)
             elif cmd == "clear":
                 current_page().locator(req["selector"]).fill("")
-                _result(id)
+                _result(request_id)
             elif cmd == "set_input_files":
                 current_page().locator(req["selector"]).set_input_files(req["path"])
-                _result(id)
+                _result(request_id)
             elif cmd == "get_url":
-                _result(id, {"url": current_page().url})
+                _result(request_id, {"url": current_page().url})
             elif cmd == "get_title":
-                _result(id, {"title": current_page().evaluate("document.title || ''") or ""})
+                _result(request_id, {"title": current_page().evaluate("document.title || ''") or ""})
             elif cmd == "back":
                 current_page().go_back(wait_until="domcontentloaded", timeout=45000)
-                _result(id)
+                _result(request_id)
             elif cmd == "forward":
                 current_page().go_forward(wait_until="domcontentloaded", timeout=45000)
-                _result(id)
+                _result(request_id)
             elif cmd == "refresh":
                 current_page().reload(wait_until="domcontentloaded", timeout=45000)
-                _result(id)
+                _result(request_id)
             elif cmd == "start_api_capture":
                 capture_config = {
                     "allowed_hosts": req.get("allowed_hosts") or [],
@@ -861,12 +861,12 @@ with sync_playwright() as p:
                 capture_completed = []
                 for page in tabs.values():
                     _attach_capture_page(page)
-                _result(id)
+                _result(request_id)
             elif cmd == "stop_api_capture":
                 capture_completed.extend(capture_pending.values())
                 capture_pending = {}
                 capture_config = None
-                _result(id, {"records": capture_completed})
+                _result(request_id, {"records": capture_completed})
             elif cmd == "new_tab":
                 name = req["name"]
                 if name in tabs:
@@ -874,16 +874,16 @@ with sync_playwright() as p:
                 tabs[name] = context.new_page()
                 _attach_capture_page(tabs[name])
                 active_tab = name
-                _result(id)
+                _result(request_id)
             elif cmd == "list_tabs":
-                _result(id, {"tabs": list(tabs.keys()), "active": active_tab})
+                _result(request_id, {"tabs": list(tabs.keys()), "active": active_tab})
             elif cmd == "switch_tab":
                 name = req["name"]
                 if name not in tabs:
                     raise RuntimeError(f"tab '{name}' not found")
                 active_tab = name
                 tabs[name].bring_to_front()
-                _result(id)
+                _result(request_id)
             elif cmd == "close_tab":
                 name = req["name"]
                 if name == "main":
@@ -895,14 +895,14 @@ with sync_playwright() as p:
                 if active_tab == name:
                     active_tab = "main"
                     tabs["main"].bring_to_front()
-                _result(id)
+                _result(request_id)
             elif cmd == "close":
-                _result(id)
+                _result(request_id)
                 break
             else:
                 raise RuntimeError(f"unsupported command: {cmd}")
         except Exception as e:
-            _error(id if 'id' in locals() else 0, e)
+            _error(request_id if 'request_id' in locals() else 0, e)
 
     try:
         context.close()
