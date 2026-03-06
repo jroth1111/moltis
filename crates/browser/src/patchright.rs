@@ -2,8 +2,10 @@
 
 use std::process::Stdio;
 
-use serde::Deserialize;
-use tokio::{process::Command, time::Duration};
+use {
+    serde::{Deserialize, Serialize},
+    tokio::{process::Command, time::Duration},
+};
 
 use crate::{error::Error, types::PatchrightFallbackConfig};
 
@@ -24,6 +26,17 @@ pub struct PatchrightCookie {
 
 fn default_cookie_path() -> String {
     "/".to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct PatchrightLaunchOptions {
+    pub channel: Option<String>,
+    pub executable_path: Option<String>,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub device_scale_factor: f64,
+    pub locale: String,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,13 +81,13 @@ pub async fn run_patchright_probe(
     url: &str,
     config: &PatchrightFallbackConfig,
     headless: bool,
-    display: Option<&str>,
+    launch_options: &PatchrightLaunchOptions,
 ) -> Result<PatchrightProbe, Error> {
     let mut cmd = Command::new(config.python_binary.trim());
     cmd.kill_on_drop(true);
-    if let Some(display) = display {
-        cmd.env("DISPLAY", display);
-    }
+    let launch_options = serde_json::to_string(launch_options).map_err(|e| {
+        Error::NavigationFailed(format!("failed to encode patchright options: {e}"))
+    })?;
     cmd.arg("-c")
         .arg(PATCHRIGHT_PROBE_PY)
         .arg(url)
@@ -83,6 +96,7 @@ pub async fn run_patchright_probe(
         } else {
             "0"
         })
+        .arg(launch_options)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -140,7 +154,7 @@ pub async fn run_patchright_probe_with_retry(
     url: &str,
     config: &PatchrightFallbackConfig,
     headless: bool,
-    display: Option<&str>,
+    launch_options: &PatchrightLaunchOptions,
     max_retries: u32,
 ) -> Result<PatchrightProbe, Error> {
     let mut last_error = None;
@@ -151,7 +165,7 @@ pub async fn run_patchright_probe_with_retry(
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
 
-        match run_patchright_probe(url, config, headless, display).await {
+        match run_patchright_probe(url, config, headless, launch_options).await {
             Ok(probe) => return Ok(probe),
             Err(e) => {
                 last_error = Some(e);
@@ -164,11 +178,47 @@ pub async fn run_patchright_probe_with_retry(
 
 const PATCHRIGHT_PROBE_PY: &str = r#"
 import json
+import platform
 import sys
 import time
 
 url = sys.argv[1]
 headless = sys.argv[2] == "1"
+launch_options = json.loads(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else {}
+channel = launch_options.get("channel")
+browser_path = launch_options.get("executable_path")
+viewport_width = int(launch_options.get("viewport_width") or 2560)
+viewport_height = int(launch_options.get("viewport_height") or 1440)
+device_scale_factor = float(launch_options.get("device_scale_factor") or 1.0)
+locale = launch_options.get("locale") or "en-US"
+user_agent_override = launch_options.get("user_agent")
+
+STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--enable-features=NetworkService,NetworkServiceInProcess",
+    "--disable-infobars",
+    "--disable-extensions",
+    "--disable-default-apps",
+    "--disable-component-extensions-with-background-pages",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--no-first-run",
+    "--disable-translate",
+    "--metrics-recording-only",
+    "--disable-hang-monitor",
+    "--disable-prompt-on-repost",
+    "--disable-client-side-phishing-detection",
+    "--disable-popup-blocking",
+    "--disable-component-update",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-software-rasterizer",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+]
 
 def _is_challenge(html):
     l = (html or "").lower()
@@ -186,6 +236,31 @@ def _is_challenge(html):
     ]
     return any(m in l for m in markers)
 
+def _has_contentful_page(title, body_text):
+    return len(body_text) >= 1000 or (len(title) >= 20 and len(body_text) >= 400)
+
+def _accept_language(locale):
+    normalized = (locale or "en-US").replace("_", "-")
+    base = normalized.split("-")[0]
+    return f"{normalized},{base};q=0.9"
+
+def _default_user_agent(version):
+    major = "120"
+    if version:
+        major = version.split(".", 1)[0] or major
+    chrome_version = f"{major}.0.0.0"
+    system = platform.system().lower()
+    if system == "darwin":
+        platform_token = "Macintosh; Intel Mac OS X 10_15_7"
+    elif system == "windows":
+        platform_token = "Windows NT 10.0; Win64; x64"
+    else:
+        platform_token = "X11; Linux x86_64"
+    return (
+        f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{chrome_version} Safari/537.36"
+    )
+
 def _emit(payload):
     sys.stdout.write(json.dumps(payload))
     sys.stdout.flush()
@@ -198,16 +273,36 @@ except Exception as e:
 
 try:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context()
+        launch_kwargs = {"headless": headless, "args": STEALTH_ARGS}
+        if channel:
+            launch_kwargs["channel"] = channel
+        if browser_path:
+            launch_kwargs["executable_path"] = browser_path
+        browser = p.chromium.launch(**launch_kwargs)
+        user_agent = user_agent_override or _default_user_agent(getattr(browser, "version", ""))
+        context = browser.new_context(
+            user_agent=user_agent,
+            locale=locale,
+            viewport={"width": viewport_width, "height": viewport_height},
+            screen={"width": viewport_width, "height": viewport_height},
+            device_scale_factor=device_scale_factor,
+            extra_http_headers={
+                "Accept-Language": _accept_language(locale),
+            },
+        )
         page = context.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
         stable_reads = 0
         prev_len = None
-        for _ in range(30):
+        for _ in range(45):
             html = page.content()
-            if not _is_challenge(html):
+            body_text = page.evaluate("""(() => {
+                const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+                return text;
+            })()""") or ""
+            title = (page.title() or '').strip()
+            if _has_contentful_page(title, body_text) or not _is_challenge(html):
                 break
             cur_len = len(html)
             if prev_len == cur_len:
@@ -215,14 +310,15 @@ try:
             else:
                 stable_reads = 0
             prev_len = cur_len
-            if stable_reads >= 20:
+            if stable_reads >= 8:
                 break
             time.sleep(1)
 
-        text_len = page.evaluate("""(() => {
+        body_text = page.evaluate("""(() => {
             const text = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
-            return text.length;
-        })()""") or 0
+            return text;
+        })()""") or ""
+        text_len = len(body_text)
         title = (page.title() or '').strip()
         html_content = page.content()
         cookies = []
@@ -245,6 +341,7 @@ try:
             "cookies": cookies,
             "html": html_content,
             "title": title,
+            "body_text": body_text,
         })
 
         context.close()
