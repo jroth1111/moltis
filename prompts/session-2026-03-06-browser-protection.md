@@ -42,3 +42,15 @@
   - `crates/tools/src/session_state.rs`
   - `crates/tools/src/tool_selector.rs`
   - `crates/tools/src/web_fetch.rs`
+
+## Follow-up Improvements
+
+- Added browser-side telemetry models in `crates/browser/src/telemetry.rs` for owned fingerprint and behavior measurement.
+- Added deterministic probe tests covering:
+  - `BrowserManager` identity + behavior capture
+  - `PatchrightSession` identity + behavior capture
+- Added DOM text sanitization in `crates/browser/src/snapshot.rs` to strip invisible Unicode prompt-injection characters before browser text is returned to the agent.
+- Validation for the follow-up work:
+  - `cargo check -p moltis-browser --quiet`
+  - `cargo test -p moltis-browser --lib --quiet`
+  - `cargo test -p moltis-browser --test real_sites_test --no-run --quiet`

@@ -44,6 +44,7 @@ mod protection;
 pub mod screencast;
 pub mod session_state;
 pub mod snapshot;
+pub mod telemetry;
 pub mod types;
 mod virtual_display;
 

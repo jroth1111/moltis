@@ -6,6 +6,8 @@
 //! - Security: no CSS selectors exposed to the model
 //! - Reliability: elements identified by role/content, not fragile paths
 
+use std::borrow::Cow;
+
 use {chromiumoxide::Page, serde_json::Value, tracing::debug};
 
 use crate::{
@@ -182,6 +184,29 @@ pub(crate) const FIND_BY_REF_JS: &str = r#"
 })
 "#;
 
+fn is_filtered_dom_char(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(code, 0x200B..=0x200D | 0x2060 | 0x00AD | 0xFEFF | 0x7F)
+        || (0xE0000..=0xE007F).contains(&code)
+        || (code < 0x20 && !matches!(ch, '\n' | '\r' | '\t'))
+}
+
+pub(crate) fn sanitize_dom_text(input: &str) -> Cow<'_, str> {
+    if !input.chars().any(is_filtered_dom_char) {
+        return Cow::Borrowed(input);
+    }
+
+    let sanitized = input.chars().filter(|ch| !is_filtered_dom_char(*ch)).collect();
+    Cow::Owned(sanitized)
+}
+
+fn sanitize_optional_dom_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(sanitize_dom_text)
+        .map(Cow::into_owned)
+        .filter(|value| !value.is_empty())
+}
+
 /// Extract a DOM snapshot from the page.
 pub async fn extract_snapshot(page: &Page) -> Result<DomSnapshot, Error> {
     let url = page
@@ -267,12 +292,12 @@ fn parse_elements(result: &Value) -> Result<Vec<ElementRef>, Error> {
             Some(ElementRef {
                 ref_: e["ref_"].as_u64()? as u32,
                 tag: e["tag"].as_str()?.to_string(),
-                role: e["role"].as_str().map(String::from),
-                text: e["text"].as_str().map(String::from),
+                role: sanitize_optional_dom_text(e["role"].as_str()),
+                text: sanitize_optional_dom_text(e["text"].as_str()),
                 href: e["href"].as_str().map(String::from),
-                placeholder: e["placeholder"].as_str().map(String::from),
-                value: e["value"].as_str().map(String::from),
-                aria_label: e["aria_label"].as_str().map(String::from),
+                placeholder: sanitize_optional_dom_text(e["placeholder"].as_str()),
+                value: sanitize_optional_dom_text(e["value"].as_str()),
+                aria_label: sanitize_optional_dom_text(e["aria_label"].as_str()),
                 visible: e["visible"].as_bool().unwrap_or(false),
                 interactive: e["interactive"].as_bool().unwrap_or(false),
                 checked: e["checked"].as_bool(),
@@ -290,13 +315,10 @@ pub(crate) fn parse_snapshot_payload(
     result: &Value,
 ) -> Result<DomSnapshot, Error> {
     let elements = parse_elements(result)?;
-    let content = result
-        .get("content")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+    let content = sanitize_optional_dom_text(result.get("content").and_then(|v| v.as_str()));
     let viewport = parse_viewport(result)?;
     let scroll = parse_scroll(result)?;
+    let title = sanitize_dom_text(&title).into_owned();
 
     debug!(
         url = url,
@@ -496,5 +518,50 @@ mod tests {
         );
         let elements = parse_elements(&result).unwrap();
         assert_eq!(elements[0].checked, None);
+    }
+
+    #[test]
+    fn sanitize_dom_text_strips_invisible_unicode() {
+        let dirty = "he\u{200b}ll\u{2060}o\u{00ad}\u{E0001}\u{0007}";
+        assert_eq!(sanitize_dom_text(dirty), "hello");
+    }
+
+    #[test]
+    fn parse_snapshot_payload_sanitizes_content_and_title() {
+        let result = serde_json::json!({
+            "elements": [{
+                "ref_": 1,
+                "tag": "button",
+                "role": "bu\u{200b}tton",
+                "text": "Cl\u{2060}ick",
+                "href": null,
+                "placeholder": "pla\u{00ad}ceholder",
+                "value": null,
+                "aria_label": "la\u{E0002}bel",
+                "visible": true,
+                "interactive": true,
+                "checked": null,
+                "disabled": false,
+                "input_type": null,
+                "bounds": { "x": 1, "y": 2, "width": 3, "height": 4 }
+            }],
+            "content": "vi\u{200b}sible\u{2060} text",
+            "viewport": { "width": 1280, "height": 720 },
+            "scroll": { "x": 0, "y": 0, "width": 1280, "height": 720 }
+        });
+
+        let snapshot = parse_snapshot_payload(
+            "https://example.com".to_string(),
+            "Ti\u{200b}tle".to_string(),
+            &result,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.title, "Title");
+        assert_eq!(snapshot.content.as_deref(), Some("visible text"));
+        assert_eq!(snapshot.elements[0].role.as_deref(), Some("button"));
+        assert_eq!(snapshot.elements[0].text.as_deref(), Some("Click"));
+        assert_eq!(snapshot.elements[0].placeholder.as_deref(), Some("placeholder"));
+        assert_eq!(snapshot.elements[0].aria_label.as_deref(), Some("label"));
     }
 }
