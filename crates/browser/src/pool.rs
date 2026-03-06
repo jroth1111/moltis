@@ -82,6 +82,18 @@ fn sanitize_user_chrome_args(args: &[String], stealth_enabled: bool) -> Vec<Stri
 }
 
 /// A pooled browser instance with one or more pages.
+/// In-flight request buffered by the API recon CDP listener task.
+struct PendingReconRequest {
+    method: String,
+    url: String,
+    tab_id: String,
+    started_at: OffsetDateTime,
+    request_headers: serde_json::Value,
+    request_body_raw: Option<String>,
+    response_status: Option<u16>,
+    response_headers: Option<serde_json::Value>,
+}
+
 struct BrowserInstance {
     browser: Browser,
     pages: HashMap<String, Page>,
@@ -112,6 +124,10 @@ struct BrowserInstance {
     api_recon: crate::api_recon::ApiReconStore,
     /// Pending recon request count (in-flight CDP body fetches).
     pending_recon_count: usize,
+    /// Spawned tasks for API recon CDP subscriptions (one per page).
+    api_recon_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Target IDs that already have a recon CDP subscription attached.
+    api_recon_attached_targets: HashSet<String>,
 }
 
 pub(crate) struct PatchrightInstance {
@@ -434,10 +450,16 @@ impl BrowserPool {
         inst.pages.insert("main".to_string(), page.clone());
         let attach_api_capture =
             inst.api_capture.config.is_some() && inst.api_capture.recorder.is_some();
+        let attach_api_recon =
+            !matches!(inst.api_recon_mode, crate::api_recon_types::ApiReconMode::Off);
         drop(inst);
         drop(instances);
         if attach_api_capture {
-            self.attach_api_capture_to_page(instance_arc, page.clone())
+            self.attach_api_capture_to_page(Arc::clone(&instance_arc), page.clone())
+                .await?;
+        }
+        if attach_api_recon {
+            self.attach_api_recon_to_page(instance_arc, page.clone())
                 .await?;
         }
         Ok(page)
@@ -1401,6 +1423,230 @@ impl BrowserPool {
         Ok(())
     }
 
+    // ── API Reconnaissance CDP subscription ───────────────────────────────────
+
+    async fn attach_api_recon_to_page(
+        &self,
+        instance: Arc<Mutex<BrowserInstance>>,
+        page: Page,
+    ) -> Result<(), Error> {
+        use chromiumoxide::cdp::browser_protocol::network::{
+            EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
+            EventResponseReceived, GetResponseBodyParams,
+        };
+
+        let target_id = page.target_id().as_ref().to_string();
+        {
+            let inst = instance.lock().await;
+            if matches!(inst.api_recon_mode, crate::api_recon_types::ApiReconMode::Off)
+                || inst.api_recon_attached_targets.contains(&target_id)
+            {
+                return Ok(());
+            }
+        }
+
+        let request_stream = page
+            .event_listener::<EventRequestWillBeSent>()
+            .await
+            .map_err(|e| Error::Cdp(format!("recon requestWillBeSent listener: {e}")))?;
+        let response_stream = page
+            .event_listener::<EventResponseReceived>()
+            .await
+            .map_err(|e| Error::Cdp(format!("recon responseReceived listener: {e}")))?;
+        let failed_stream = page
+            .event_listener::<EventLoadingFailed>()
+            .await
+            .map_err(|e| Error::Cdp(format!("recon loadingFailed listener: {e}")))?;
+        let finished_stream = page
+            .event_listener::<EventLoadingFinished>()
+            .await
+            .map_err(|e| Error::Cdp(format!("recon loadingFinished listener: {e}")))?;
+
+        let tab_id = target_id.clone();
+        let instance_for_task = Arc::clone(&instance);
+        let task = tokio::spawn(async move {
+            let instance = instance_for_task;
+            let mut request_stream = request_stream;
+            let mut response_stream = response_stream;
+            let mut failed_stream = failed_stream;
+            let mut finished_stream = finished_stream;
+            let mut pending: HashMap<String, PendingReconRequest> = HashMap::new();
+
+            loop {
+                tokio::select! {
+                    event = request_stream.next() => {
+                        let Some(event) = event else { break; };
+                        let resource_type = event.r#type.as_ref().map(|k| k.as_ref()).unwrap_or("");
+                        if !crate::api_recon::should_capture(resource_type, &event.request.url) {
+                            continue;
+                        }
+                        {
+                            let mut inst = instance.lock().await;
+                            if matches!(inst.api_recon_mode, crate::api_recon_types::ApiReconMode::Off) {
+                                continue;
+                            }
+                            if pending.len() >= crate::api_recon::MAX_PENDING_REQUESTS {
+                                inst.api_recon.note_pending_drop();
+                                continue;
+                            }
+                        }
+
+                        // Collect request body from inline post_data_entries if available.
+                        let body_raw: Option<String> = event
+                            .request
+                            .post_data_entries
+                            .as_deref()
+                            .and_then(|entries| {
+                                entries.first().and_then(|entry| {
+                                    entry.bytes.as_ref().map(|b| {
+                                        let s: &str = b.as_ref();
+                                        s.to_string()
+                                    })
+                                })
+                            })
+                            .filter(|s| !s.is_empty());
+
+                        let req_id = event.request_id.inner().to_string();
+                        pending.insert(req_id, PendingReconRequest {
+                            method: event.request.method.clone(),
+                            url: event.request.url.clone(),
+                            tab_id: tab_id.clone(),
+                            started_at: OffsetDateTime::now_utc(),
+                            request_headers: event.request.headers.inner().clone(),
+                            request_body_raw: body_raw,
+                            response_status: None,
+                            response_headers: None,
+                        });
+                        {
+                            let mut inst = instance.lock().await;
+                            inst.pending_recon_count =
+                                inst.pending_recon_count.saturating_add(1);
+                        }
+                    }
+                    event = response_stream.next() => {
+                        let Some(event) = event else { break; };
+                        let req_id = event.request_id.inner().to_string();
+                        if let Some(req) = pending.get_mut(&req_id) {
+                            req.response_status = Some(event.response.status as u16);
+                            req.response_headers = Some(event.response.headers.inner().clone());
+                        }
+                    }
+                    event = failed_stream.next() => {
+                        let Some(event) = event else { break; };
+                        let req_id = event.request_id.inner().to_string();
+                        if pending.remove(&req_id).is_some() {
+                            let mut inst = instance.lock().await;
+                            inst.pending_recon_count =
+                                inst.pending_recon_count.saturating_sub(1);
+                            inst.api_recon.note_pending_drop();
+                        }
+                    }
+                    event = finished_stream.next() => {
+                        let Some(event) = event else { break; };
+                        let req_id = event.request_id.inner().to_string();
+                        let Some(req) = pending.remove(&req_id) else { continue; };
+
+                        // Fetch response body out-of-band.
+                        let body_text = match page
+                            .execute(GetResponseBodyParams::new(event.request_id.clone()))
+                            .await
+                        {
+                            Ok(resp) => {
+                                if resp.result.base64_encoded {
+                                    // Binary body — skip schema inference.
+                                    None
+                                } else {
+                                    Some(resp.result.body)
+                                }
+                            },
+                            Err(error) => {
+                                debug!(request_id = %req_id, ?error, "recon getResponseBody failed");
+                                None
+                            },
+                        };
+
+                        // Infer schemas.
+                        let req_headers_map = req.request_headers.as_object().cloned().unwrap_or_default();
+                        let req_ct = crate::api_recon::infer_content_type(&req_headers_map);
+                        let req_inference = crate::api_recon_inference::infer_contract_from_body(
+                            req.request_body_raw.as_deref(),
+                            req_ct.as_deref(),
+                        );
+                        let resp_headers_map = req
+                            .response_headers
+                            .as_ref()
+                            .and_then(|v| v.as_object().cloned())
+                            .unwrap_or_default();
+                        let resp_ct = crate::api_recon::infer_content_type(&resp_headers_map);
+                        let resp_inference = crate::api_recon_inference::infer_contract_from_body(
+                            body_text.as_deref(),
+                            resp_ct.as_deref(),
+                        );
+
+                        let finished_at = OffsetDateTime::now_utc();
+                        let query_keys = crate::api_recon::query_keys_from_url(&req.url);
+                        let header_keys =
+                            crate::api_recon::header_keys_from_json(&req.request_headers);
+                        let header_values: std::collections::BTreeMap<String, String> =
+                            req_headers_map
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                                .collect();
+                        let operation_name =
+                            crate::api_recon::operation_name_from_request_body(
+                                req.request_body_raw.as_deref(),
+                            );
+                        let body_value: Option<serde_json::Value> =
+                            req.request_body_raw.as_deref().and_then(|s| {
+                                serde_json::from_str(s).ok()
+                            });
+                        let request_input = crate::api_recon_types::ApiObservedRequestInput {
+                            method: req.method,
+                            url: req.url,
+                            tab_id: req.tab_id,
+                            marker_id: None,
+                            started_at: req.started_at,
+                            query_keys,
+                            header_keys,
+                            header_values,
+                            content_type: req_ct,
+                            operation_name,
+                            body_schema: req_inference.contract,
+                            body_value,
+                        };
+                        let response_input = crate::api_recon_types::ApiObservedResponseInput {
+                            status: req.response_status,
+                            header_keys: crate::api_recon::header_keys_from_json(
+                                req.response_headers.as_ref().unwrap_or(&serde_json::Value::Null),
+                            ),
+                            content_type: resp_ct,
+                            body_schema: resp_inference.contract,
+                            finished_at,
+                        };
+
+                        let mut inst = instance.lock().await;
+                        inst.pending_recon_count =
+                            inst.pending_recon_count.saturating_sub(1);
+                        inst.api_recon.note_network_activity(finished_at);
+                        if !matches!(inst.api_recon_mode, crate::api_recon_types::ApiReconMode::Off) {
+                            inst.api_recon.record(request_input, response_input);
+                        }
+                    }
+                }
+            }
+            debug!("api recon CDP event streams closed for target {tab_id}");
+        });
+
+        let mut inst = instance.lock().await;
+        if inst.api_recon_attached_targets.insert(target_id) {
+            inst.api_recon_tasks.push(task);
+        } else {
+            task.abort();
+        }
+
+        Ok(())
+    }
+
     // ── Screencast ────────────────────────────────────────────────────────────
 
     /// Start a screencast session and store the handle on the instance.
@@ -1499,10 +1745,16 @@ impl BrowserPool {
         })?;
         let attach_api_capture =
             inst.api_capture.config.is_some() && inst.api_capture.recorder.is_some();
+        let attach_api_recon =
+            !matches!(inst.api_recon_mode, crate::api_recon_types::ApiReconMode::Off);
         drop(inst);
         drop(instances);
         if attach_api_capture {
-            self.attach_api_capture_to_page(instance_arc, page).await?;
+            self.attach_api_capture_to_page(Arc::clone(&instance_arc), page.clone())
+                .await?;
+        }
+        if attach_api_recon {
+            self.attach_api_recon_to_page(instance_arc, page).await?;
         }
 
         Ok(())
@@ -1819,6 +2071,8 @@ impl BrowserPool {
             api_recon_mode: crate::api_recon_types::ApiReconMode::default(),
             api_recon: crate::api_recon::ApiReconStore::default(),
             pending_recon_count: 0,
+            api_recon_tasks: Vec::new(),
+            api_recon_attached_targets: HashSet::new(),
         })
     }
 
@@ -1979,6 +2233,8 @@ impl BrowserPool {
             api_recon_mode: crate::api_recon_types::ApiReconMode::default(),
             api_recon: crate::api_recon::ApiReconStore::default(),
             pending_recon_count: 0,
+            api_recon_tasks: Vec::new(),
+            api_recon_attached_targets: HashSet::new(),
         })
     }
 }

@@ -193,7 +193,16 @@ impl AgentTool for BrowserTool {
          - {\"action\": \"start_api_capture\", \"allowed_hosts\": [\"api.example.com\"], \"url_patterns\": [\"*api*\"], \"max_examples_per_endpoint\": 3} / {\"action\": \"stop_api_capture\"} - infer reusable backend request shapes\n\
          - {\"action\": \"save_state\", \"name\": \"mysession\"} - persist cookies+storage\n\
          - {\"action\": \"set_device\", \"width\": 375, \"height\": 812, \"mobile\": true} - emulate device\n\
-         - {\"action\": \"tab_new\", \"tab_name\": \"sidebar\"} - open new tab"
+         - {\"action\": \"tab_new\", \"tab_name\": \"sidebar\"} - open new tab\n\n\
+         API RECON (always-on passive schema inference):\n\
+         - {\"action\": \"api_recon_status\"} - get recon mode and stats\n\
+         - {\"action\": \"api_recon_mark\", \"label\": \"before login\"} - create observation marker\n\
+         - {\"action\": \"api_recon_wait_for_idle\", \"quiet_ms\": 2000} - wait until no in-flight requests\n\
+         - {\"action\": \"api_recon_diff\", \"since\": \"mk_...\"} - get endpoints/exchanges since a marker\n\
+         - {\"action\": \"api_recon_list_data_sources\", \"limit\": 20} - list top-scored data endpoints\n\
+         - {\"action\": \"api_recon_get_endpoint\", \"endpoint_id\": \"...\"} - get typed contract for an endpoint\n\
+         - {\"action\": \"api_recon_call\", \"endpoint_id\": \"...\", \"overrides\": {}, \"extract\": {}} - call endpoint and extract fields\n\
+         - {\"action\": \"api_recon_collect\", \"endpoint_id\": \"...\", \"max_pages\": 5} - paginated data collection"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -217,7 +226,11 @@ impl AgentTool for BrowserTool {
                         "save_state", "load_state", "list_states", "delete_state",
                         "set_device", "set_geolocation", "set_timezone", "set_locale", "clear_device",
                         "start_screencast", "stop_screencast", "get_screencast_frame",
-                        "tab_new", "tab_list", "tab_switch", "tab_close"
+                        "tab_new", "tab_list", "tab_switch", "tab_close",
+                        "api_recon_status", "api_recon_set_mode", "api_recon_mark",
+                        "api_recon_wait_for_idle", "api_recon_diff",
+                        "api_recon_list_data_sources", "api_recon_get_endpoint",
+                        "api_recon_call", "api_recon_collect"
                     ],
                     "description": "REQUIRED. The browser action to perform. Use 'navigate' with 'url' to open a page, 'snapshot' to see elements, 'screenshot' to capture."
                 },
@@ -368,6 +381,55 @@ impl AgentTool for BrowserTool {
                 "tab_name": {
                     "type": "string",
                     "description": "Tab identifier name. For 'tab_new', 'tab_switch', 'tab_close'."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["off", "passive", "focused"],
+                    "description": "API recon observation mode. For 'api_recon_set_mode'."
+                },
+                "reset": {
+                    "type": "boolean",
+                    "description": "Clear accumulated recon data when changing mode. For 'api_recon_set_mode'."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Human-readable label for the observation marker. For 'api_recon_mark'."
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Marker ID from 'api_recon_mark' to diff against. For 'api_recon_diff', 'api_recon_list_data_sources'."
+                },
+                "quiet_ms": {
+                    "type": "integer",
+                    "description": "Milliseconds of network inactivity to consider idle (default 2000). For 'api_recon_wait_for_idle'."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of endpoints to return (default 50). For 'api_recon_list_data_sources'."
+                },
+                "endpoint_id": {
+                    "type": "string",
+                    "description": "Endpoint identifier from 'api_recon_list_data_sources'. For 'api_recon_get_endpoint', 'api_recon_call', 'api_recon_collect'."
+                },
+                "overrides": {
+                    "type": "object",
+                    "description": "HTTP call overrides (headers, query params, body). For 'api_recon_call', 'api_recon_collect'."
+                },
+                "extract": {
+                    "type": "object",
+                    "description": "JSON pointer extraction plan for response fields. For 'api_recon_call', 'api_recon_collect'."
+                },
+                "pagination": {
+                    "type": "object",
+                    "description": "Pagination strategy overrides for collection. For 'api_recon_collect'."
+                },
+                "max_pages": {
+                    "type": "integer",
+                    "description": "Maximum pages to fetch during collection (default 10). For 'api_recon_collect'."
+                },
+                "max_items": {
+                    "type": "integer",
+                    "description": "Maximum items to accumulate during collection (default 5000). For 'api_recon_collect'."
                 }
             }
         })
@@ -635,6 +697,46 @@ mod tests {
             assert!(
                 props.contains_key(expected),
                 "Phase 5-7 property '{expected}' must be in schema"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_includes_api_recon_actions() {
+        let config = moltis_config::schema::BrowserConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let tool = BrowserTool::from_config(&config).unwrap();
+        let schema = tool.parameters_schema();
+        let action_enum = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let actions: Vec<&str> = action_enum.iter().filter_map(|v| v.as_str()).collect();
+
+        for expected in [
+            "api_recon_status",
+            "api_recon_set_mode",
+            "api_recon_mark",
+            "api_recon_wait_for_idle",
+            "api_recon_diff",
+            "api_recon_list_data_sources",
+            "api_recon_get_endpoint",
+            "api_recon_call",
+            "api_recon_collect",
+        ] {
+            assert!(
+                actions.contains(&expected),
+                "api_recon action '{expected}' must be in schema enum"
+            );
+        }
+
+        let props = schema["properties"].as_object().unwrap();
+        for expected in [
+            "mode", "reset", "label", "since", "quiet_ms", "limit",
+            "endpoint_id", "overrides", "extract", "pagination", "max_pages", "max_items",
+        ] {
+            assert!(
+                props.contains_key(expected),
+                "api_recon property '{expected}' must be in schema"
             );
         }
     }
