@@ -75,3 +75,26 @@
       - Woolworths PASS (`patchright`)
       - Coles PASS (`patchright`)
       - Realestate PASS (`patchright`)
+- Added probe baseline drift utilities in `crates/browser/src/telemetry.rs`:
+  - typed probe run profile/evidence models
+  - drift issue classifications for profile, identity, and request-sequence changes
+  - configurable timing thresholds for mean/max request-gap drift
+- Validation for the drift step:
+  - `cargo check -p moltis-browser --quiet`
+    - exit `0`
+  - `cargo test -p moltis-browser --lib telemetry::tests:: -- --nocapture`
+    - exit `0`
+    - `9 passed`
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `128 passed, 0 failed, 8 ignored`
+  - `cargo test -p moltis-browser --test real_sites_test --no-run --quiet`
+    - exit `0`
+  - `CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' MOLTIS_DATA_DIR=$(mktemp -d) cargo test -p moltis-browser --test real_sites_test -- --nocapture --test-threads=1`
+    - exit `0`
+    - `5 passed`
+    - Summary:
+      - Google PASS (`chromiumoxide`)
+      - Woolworths PASS (`patchright`)
+      - Coles PASS (`patchright`)
+      - Realestate PASS (`patchright`)

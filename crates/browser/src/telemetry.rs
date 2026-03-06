@@ -4,6 +4,7 @@
 //! identity and interaction distributions so regressions can be detected
 //! before anti-bot changes reach production targets.
 
+use crate::types::BrowserBackendKind;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,6 +151,304 @@ impl RequestSequenceSummary {
             max_gap_ms: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeBrowserFamily {
+    Chrome,
+    Chromium,
+    Edge,
+    Brave,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeProxyMode {
+    None,
+    Residential,
+    Datacenter,
+    Socks5,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeRunProfile {
+    pub browser_family: ProbeBrowserFamily,
+    pub browser_version: String,
+    pub backend: BrowserBackendKind,
+    pub headless: bool,
+    pub proxy_mode: ProbeProxyMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeRunEvidence {
+    pub profile: ProbeRunProfile,
+    pub fingerprint: FingerprintSnapshot,
+    pub headers: FingerprintHeaders,
+    pub request_sequence: RequestSequenceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeDriftThresholds {
+    pub mean_gap_ratio: f64,
+    pub max_gap_ratio: f64,
+}
+
+impl Default for ProbeDriftThresholds {
+    fn default() -> Self {
+        Self {
+            mean_gap_ratio: 0.35,
+            max_gap_ratio: 0.50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeDriftKind {
+    BrowserFamilyChanged,
+    BrowserVersionChanged,
+    BackendChanged,
+    HeadlessChanged,
+    ProxyModeChanged,
+    UserAgentChanged,
+    AcceptLanguageChanged,
+    WebdriverChanged,
+    PlatformChanged,
+    TimezoneChanged,
+    ScreenChanged,
+    HardwareConcurrencyChanged,
+    DeviceMemoryChanged,
+    RequestCountChanged,
+    PathSequenceChanged,
+    MeanGapDrift,
+    MaxGapDrift,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeDriftIssue {
+    pub kind: ProbeDriftKind,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProbeRunDrift {
+    pub issues: Vec<ProbeDriftIssue>,
+}
+
+impl ProbeRunDrift {
+    #[must_use]
+    pub fn consistent(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+fn relative_delta(baseline: f64, current: f64) -> f64 {
+    let denominator = baseline.abs().max(1.0);
+    (current - baseline).abs() / denominator
+}
+
+fn push_optional_drift_issue(
+    issues: &mut Vec<ProbeDriftIssue>,
+    kind: ProbeDriftKind,
+    detail: impl Into<String>,
+    baseline: Option<f64>,
+    current: Option<f64>,
+    allowed_ratio: f64,
+) {
+    let (Some(baseline), Some(current)) = (baseline, current) else {
+        return;
+    };
+
+    if relative_delta(baseline, current) > allowed_ratio {
+        issues.push(ProbeDriftIssue {
+            kind,
+            detail: detail.into(),
+        });
+    }
+}
+
+#[must_use]
+pub fn compare_probe_run_with_thresholds(
+    baseline: &ProbeRunEvidence,
+    current: &ProbeRunEvidence,
+    thresholds: &ProbeDriftThresholds,
+) -> ProbeRunDrift {
+    let mut issues = Vec::new();
+
+    if baseline.profile.browser_family != current.profile.browser_family {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::BrowserFamilyChanged,
+            detail: format!(
+                "browser family changed from {:?} to {:?}",
+                baseline.profile.browser_family, current.profile.browser_family
+            ),
+        });
+    }
+    if baseline.profile.browser_version != current.profile.browser_version {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::BrowserVersionChanged,
+            detail: format!(
+                "browser version changed from {} to {}",
+                baseline.profile.browser_version, current.profile.browser_version
+            ),
+        });
+    }
+    if baseline.profile.backend != current.profile.backend {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::BackendChanged,
+            detail: format!(
+                "backend changed from {} to {}",
+                baseline.profile.backend, current.profile.backend
+            ),
+        });
+    }
+    if baseline.profile.headless != current.profile.headless {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::HeadlessChanged,
+            detail: format!(
+                "headless changed from {} to {}",
+                baseline.profile.headless, current.profile.headless
+            ),
+        });
+    }
+    if baseline.profile.proxy_mode != current.profile.proxy_mode {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::ProxyModeChanged,
+            detail: format!(
+                "proxy mode changed from {:?} to {:?}",
+                baseline.profile.proxy_mode, current.profile.proxy_mode
+            ),
+        });
+    }
+
+    if baseline.fingerprint.user_agent != current.fingerprint.user_agent {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::UserAgentChanged,
+            detail: format!(
+                "user agent changed from {} to {}",
+                baseline.fingerprint.user_agent, current.fingerprint.user_agent
+            ),
+        });
+    }
+    if baseline.headers.accept_language != current.headers.accept_language {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::AcceptLanguageChanged,
+            detail: format!(
+                "accept-language changed from {:?} to {:?}",
+                baseline.headers.accept_language, current.headers.accept_language
+            ),
+        });
+    }
+    if baseline.fingerprint.webdriver != current.fingerprint.webdriver {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::WebdriverChanged,
+            detail: format!(
+                "webdriver changed from {:?} to {:?}",
+                baseline.fingerprint.webdriver, current.fingerprint.webdriver
+            ),
+        });
+    }
+    if baseline.fingerprint.platform != current.fingerprint.platform {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::PlatformChanged,
+            detail: format!(
+                "platform changed from {:?} to {:?}",
+                baseline.fingerprint.platform, current.fingerprint.platform
+            ),
+        });
+    }
+    if baseline.fingerprint.timezone != current.fingerprint.timezone {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::TimezoneChanged,
+            detail: format!(
+                "timezone changed from {:?} to {:?}",
+                baseline.fingerprint.timezone, current.fingerprint.timezone
+            ),
+        });
+    }
+    if baseline.fingerprint.screen != current.fingerprint.screen {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::ScreenChanged,
+            detail: format!(
+                "screen changed from {:?} to {:?}",
+                baseline.fingerprint.screen, current.fingerprint.screen
+            ),
+        });
+    }
+    if baseline.fingerprint.hardware_concurrency != current.fingerprint.hardware_concurrency {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::HardwareConcurrencyChanged,
+            detail: format!(
+                "hardware concurrency changed from {:?} to {:?}",
+                baseline.fingerprint.hardware_concurrency,
+                current.fingerprint.hardware_concurrency
+            ),
+        });
+    }
+    if baseline.fingerprint.device_memory != current.fingerprint.device_memory {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::DeviceMemoryChanged,
+            detail: format!(
+                "device memory changed from {:?} to {:?}",
+                baseline.fingerprint.device_memory, current.fingerprint.device_memory
+            ),
+        });
+    }
+
+    if baseline.request_sequence.request_count != current.request_sequence.request_count {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::RequestCountChanged,
+            detail: format!(
+                "request count changed from {} to {}",
+                baseline.request_sequence.request_count, current.request_sequence.request_count
+            ),
+        });
+    }
+    if baseline.request_sequence.path_sequence != current.request_sequence.path_sequence {
+        issues.push(ProbeDriftIssue {
+            kind: ProbeDriftKind::PathSequenceChanged,
+            detail: format!(
+                "path sequence changed from {:?} to {:?}",
+                baseline.request_sequence.path_sequence, current.request_sequence.path_sequence
+            ),
+        });
+    }
+
+    push_optional_drift_issue(
+        &mut issues,
+        ProbeDriftKind::MeanGapDrift,
+        format!(
+            "mean gap drifted from {:?} to {:?}",
+            baseline.request_sequence.mean_gap_ms, current.request_sequence.mean_gap_ms
+        ),
+        baseline.request_sequence.mean_gap_ms,
+        current.request_sequence.mean_gap_ms,
+        thresholds.mean_gap_ratio,
+    );
+    push_optional_drift_issue(
+        &mut issues,
+        ProbeDriftKind::MaxGapDrift,
+        format!(
+            "max gap drifted from {:?} to {:?}",
+            baseline.request_sequence.max_gap_ms, current.request_sequence.max_gap_ms
+        ),
+        baseline.request_sequence.max_gap_ms,
+        current.request_sequence.max_gap_ms,
+        thresholds.max_gap_ratio,
+    );
+
+    ProbeRunDrift { issues }
+}
+
+#[must_use]
+pub fn compare_probe_run(
+    baseline: &ProbeRunEvidence,
+    current: &ProbeRunEvidence,
+) -> ProbeRunDrift {
+    compare_probe_run_with_thresholds(baseline, current, &ProbeDriftThresholds::default())
 }
 
 #[must_use]
@@ -844,6 +1143,162 @@ mod tests {
         );
         assert_eq!(summary.mean_gap_ms, Some(100.0));
         assert_eq!(summary.max_gap_ms, Some(140.0));
+    }
+
+    fn sample_probe_run_evidence() -> ProbeRunEvidence {
+        ProbeRunEvidence {
+            profile: ProbeRunProfile {
+                browser_family: ProbeBrowserFamily::Chrome,
+                browser_version: "123.0.0.0".to_string(),
+                backend: BrowserBackendKind::Patchright,
+                headless: true,
+                proxy_mode: ProbeProxyMode::None,
+            },
+            fingerprint: FingerprintSnapshot {
+                session_id: "session-1".to_string(),
+                ts: 12.0,
+                url: "https://probe.example/fp".to_string(),
+                user_agent: "Mozilla/5.0 Chrome/123".to_string(),
+                webdriver: Some(false),
+                platform: Some("MacIntel".to_string()),
+                language: Some("en-AU".to_string()),
+                languages: Some(vec!["en-AU".to_string(), "en".to_string()]),
+                timezone: Some("Australia/Melbourne".to_string()),
+                screen: Some(FingerprintScreen {
+                    width: 2560,
+                    height: 1440,
+                    avail_width: 2560,
+                    avail_height: 1415,
+                    dpr: 2.0,
+                }),
+                hardware_concurrency: Some(8),
+                device_memory: Some(8.0),
+                webgl_vendor: Some("Google Inc.".to_string()),
+                webgl_renderer: Some("ANGLE".to_string()),
+                plugins_count: Some(5),
+            },
+            headers: FingerprintHeaders {
+                user_agent: Some("Mozilla/5.0 Chrome/123".to_string()),
+                accept_language: Some("en-AU,en;q=0.9".to_string()),
+                sec_ch_ua: Some("\"Google Chrome\";v=\"123\"".to_string()),
+                sec_ch_ua_platform: Some("\"macOS\"".to_string()),
+                sec_fetch_site: Some("same-origin".to_string()),
+                x_forwarded_for: None,
+            },
+            request_sequence: RequestSequenceSummary {
+                request_count: 5,
+                first_path: Some("/sequence-probe".to_string()),
+                last_path: Some("/sequence-step".to_string()),
+                distinct_path_count: 3,
+                path_sequence: vec![
+                    "/sequence-probe".to_string(),
+                    "/session".to_string(),
+                    "/sequence-step".to_string(),
+                    "/sequence-step".to_string(),
+                    "/sequence-step".to_string(),
+                ],
+                mean_gap_ms: Some(75.0),
+                max_gap_ms: Some(120.0),
+            },
+        }
+    }
+
+    #[test]
+    fn compare_probe_run_accepts_matching_evidence() {
+        let baseline = sample_probe_run_evidence();
+        let current = baseline.clone();
+
+        let drift = compare_probe_run(&baseline, &current);
+
+        assert!(drift.consistent());
+        assert!(drift.issues.is_empty());
+    }
+
+    #[test]
+    fn compare_probe_run_reports_identity_and_profile_drift() {
+        let baseline = sample_probe_run_evidence();
+        let mut current = baseline.clone();
+        current.profile.browser_version = "124.0.0.0".to_string();
+        current.profile.backend = BrowserBackendKind::Chromiumoxide;
+        current.profile.headless = false;
+        current.profile.proxy_mode = ProbeProxyMode::Residential;
+        current.fingerprint.user_agent = "Mozilla/5.0 Chrome/124".to_string();
+        current.headers.accept_language = Some("en-US,en;q=0.9".to_string());
+        current.fingerprint.platform = Some("Win32".to_string());
+        current.fingerprint.timezone = Some("America/New_York".to_string());
+
+        let drift = compare_probe_run(&baseline, &current);
+
+        assert!(!drift.consistent());
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BrowserVersionChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::BackendChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::HeadlessChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::ProxyModeChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::UserAgentChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::AcceptLanguageChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::PlatformChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::TimezoneChanged));
+    }
+
+    #[test]
+    fn compare_probe_run_reports_request_sequence_drift() {
+        let baseline = sample_probe_run_evidence();
+        let mut current = baseline.clone();
+        current.request_sequence.request_count = 6;
+        current.request_sequence.path_sequence.push("/fp".to_string());
+        current.request_sequence.mean_gap_ms = Some(150.0);
+        current.request_sequence.max_gap_ms = Some(250.0);
+
+        let drift = compare_probe_run_with_thresholds(
+            &baseline,
+            &current,
+            &ProbeDriftThresholds {
+                mean_gap_ratio: 0.25,
+                max_gap_ratio: 0.25,
+            },
+        );
+
+        assert!(!drift.consistent());
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::RequestCountChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::PathSequenceChanged));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::MeanGapDrift));
+        assert!(drift
+            .issues
+            .iter()
+            .any(|issue| issue.kind == ProbeDriftKind::MaxGapDrift));
     }
 
     #[tokio::test(flavor = "multi_thread")]
