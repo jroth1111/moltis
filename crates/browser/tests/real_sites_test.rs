@@ -44,21 +44,32 @@ const TARGET_SITES: &[TargetSite] = &[
     },
 ];
 
+fn base_test_config() -> BrowserConfig {
+    let mut config = BrowserConfig::default();
+    config.persist_profile = false;
+    config
+}
+
 /// Create a browser config with patchright fallback enabled for hard sites.
 fn config_with_patchright_fallback() -> BrowserConfig {
-    let mut config = BrowserConfig::default();
+    let mut config = base_test_config();
     config.patchright_fallback = PatchrightFallbackConfig {
         enabled: true,
         python_binary: "python3".to_string(),
-        timeout_ms: 90_000, // Increased timeout for slow challenge resolution
-        headless: true, // Start headless, will fall back to virtual display if needed
+        timeout_ms: 90_000,
+        headless: true,
         challenge_types: vec!["kasada".to_string(), "imperva".to_string()],
         domains: vec![],
-        max_retries: 3, // More retries for hard sites
+        max_retries: 3,
     };
-    // Enable virtual display for headful fallback
-    config.virtual_display.enabled = true;
     config
+}
+
+fn config_for_site(site: &TargetSite) -> BrowserConfig {
+    match site.name {
+        "coles" | "realestate" => config_with_patchright_fallback(),
+        _ => base_test_config(),
+    }
 }
 
 /// Test result for a single target site.
@@ -92,7 +103,8 @@ impl std::fmt::Display for SiteTestResult {
     }
 }
 
-async fn test_site(manager: &BrowserManager, site: &TargetSite) -> SiteTestResult {
+async fn test_site(site: &TargetSite) -> SiteTestResult {
+    let manager = BrowserManager::new(config_for_site(site));
     let request = BrowserRequest {
         session_id: None,
         action: BrowserAction::Navigate {
@@ -104,6 +116,7 @@ async fn test_site(manager: &BrowserManager, site: &TargetSite) -> SiteTestResul
     };
 
     let response = manager.handle_request(request).await;
+    manager.shutdown().await;
 
     SiteTestResult {
         name: site.name.to_string(),
@@ -121,10 +134,9 @@ async fn test_site(manager: &BrowserManager, site: &TargetSite) -> SiteTestResul
 #[tokio::test(flavor = "multi_thread")]
 async fn test_google_au_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
-    let manager = BrowserManager::new(BrowserConfig::default());
 
     let site = &TARGET_SITES[0]; // google_au
-    let result = timeout(Duration::from_secs(90), test_site(&manager, site))
+    let result = timeout(Duration::from_secs(90), test_site(site))
         .await
         .expect("test timed out");
 
@@ -151,10 +163,9 @@ async fn test_google_au_navigation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_woolworths_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
-    let manager = BrowserManager::new(BrowserConfig::default());
 
     let site = &TARGET_SITES[1]; // woolworths
-    let result = timeout(Duration::from_secs(90), test_site(&manager, site))
+    let result = timeout(Duration::from_secs(90), test_site(site))
         .await
         .expect("test timed out");
 
@@ -178,21 +189,12 @@ async fn test_woolworths_navigation() {
     );
 }
 
-/// Test Coles (Imperva-protected site) navigation.
-///
-/// NOTE: This test is currently ignored because Imperva bot detection
-/// validates browser fingerprint, not just cookies. Cookie transfer from
-/// patchright to chromiumoxide doesn't work because fingerprints don't match.
-/// Requires using patchright directly for navigation (architectural change).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Imperva detection requires patchright direct navigation (cookie transfer insufficient)"]
 async fn test_coles_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
-    // Use patchright fallback for hard sites (Imperva)
-    let manager = BrowserManager::new(config_with_patchright_fallback());
 
     let site = &TARGET_SITES[2]; // coles
-    let result = timeout(Duration::from_secs(120), test_site(&manager, site))
+    let result = timeout(Duration::from_secs(120), test_site(site))
         .await
         .expect("test timed out");
 
@@ -216,22 +218,12 @@ async fn test_coles_navigation() {
     );
 }
 
-/// Test Realestate.com.au (Kasada-protected site) navigation.
-///
-/// NOTE: This test is currently ignored because Kasada bot detection
-/// is not fully bypassed even with patchright fallback. Requires:
-/// - More sophisticated JS evasions
-/// - Virtual display headful mode
-/// - Possibly TLS/JA3 fingerprint work
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Kasada detection requires additional anti-detection work"]
 async fn test_realestate_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
-    // Use patchright fallback for hard sites (Kasada)
-    let manager = BrowserManager::new(config_with_patchright_fallback());
 
     let site = &TARGET_SITES[3]; // realestate
-    let result = timeout(Duration::from_secs(120), test_site(&manager, site))
+    let result = timeout(Duration::from_secs(120), test_site(site))
         .await
         .expect("test timed out");
 
@@ -259,12 +251,14 @@ async fn test_realestate_navigation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_all_target_sites_summary() {
     let _ = tracing_subscriber::fmt::try_init();
-    let manager = BrowserManager::new(BrowserConfig::default());
-
     let mut results = Vec::new();
 
     for site in TARGET_SITES {
-        let result = timeout(Duration::from_secs(90), test_site(&manager, site))
+        let site_timeout = match site.name {
+            "coles" | "realestate" => Duration::from_secs(120),
+            _ => Duration::from_secs(90),
+        };
+        let result = timeout(site_timeout, test_site(site))
             .await
             .expect("test timed out");
         results.push(result);
@@ -289,11 +283,5 @@ async fn test_all_target_sites_summary() {
         pass_count, fail_count
     );
 
-    // Ensure at least google.com.au passes (regression guard)
-    let google_result = &results[0];
-    assert!(
-        google_result.success,
-        "regression: google.com.au failed - {:?}",
-        google_result.error
-    );
+    assert_eq!(fail_count, 0, "all target sites should pass");
 }
