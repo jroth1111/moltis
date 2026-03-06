@@ -150,7 +150,7 @@ impl AgentTool for BrowserTool {
          Core actions: navigate, screenshot, snapshot, click, type, scroll, evaluate, wait\n\
          Extended actions: hover, double_click, focus, drag, check, uncheck, select, press, upload, clear\n\
          Navigation: back, forward, refresh, get_url, get_title, close\n\
-         Network: intercept_requests, stop_intercept, set_extra_headers, start_har, stop_har\n\
+         Network: intercept_requests, stop_intercept, set_extra_headers, start_api_capture, stop_api_capture\n\
          Session: save_state, load_state, list_states, delete_state\n\
          Emulation: set_device, set_geolocation, set_timezone, set_locale, clear_device\n\
          Screencast: start_screencast, stop_screencast, get_screencast_frame\n\
@@ -175,8 +175,8 @@ impl AgentTool for BrowserTool {
          - {\"action\": \"press\", \"key\": \"Enter\"} - press a key (Enter/Escape/Tab/Arrow*)\n\
          - {\"action\": \"upload\", \"ref_\": N, \"path\": \"/abs/path/file.pdf\"} - file upload\n\
          - {\"action\": \"clear\", \"ref_\": N} - clear an input field\n\
-         - {\"action\": \"intercept_requests\", \"url_patterns\": [\"*api*\"]} - intercept network requests\n\
-         - {\"action\": \"start_har\"} / {\"action\": \"stop_har\"} - record network as HAR 1.2\n\
+         - {\"action\": \"intercept_requests\", \"url_patterns\": [\"*api*\"]} - inspect or modify matching requests\n\
+         - {\"action\": \"start_api_capture\", \"url_patterns\": [\"*api*\"], \"max_examples_per_endpoint\": 3} / {\"action\": \"stop_api_capture\"} - infer reusable backend request shapes\n\
          - {\"action\": \"save_state\", \"name\": \"mysession\"} - persist cookies+storage\n\
          - {\"action\": \"set_device\", \"width\": 375, \"height\": 812, \"mobile\": true} - emulate device\n\
          - {\"action\": \"tab_new\", \"tab_name\": \"sidebar\"} - open new tab"
@@ -199,7 +199,7 @@ impl AgentTool for BrowserTool {
                         "press", "upload",
                         "get_url", "get_title", "back", "forward", "refresh", "close",
                         "intercept_requests", "stop_intercept", "set_extra_headers",
-                        "start_har", "stop_har",
+                        "start_api_capture", "stop_api_capture",
                         "save_state", "load_state", "list_states", "delete_state",
                         "set_device", "set_geolocation", "set_timezone", "set_locale", "clear_device",
                         "start_screencast", "stop_screencast", "get_screencast_frame",
@@ -275,11 +275,19 @@ impl AgentTool for BrowserTool {
                 "url_patterns": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "URL glob patterns to intercept (empty = all requests). For 'intercept_requests'."
+                    "description": "URL glob patterns to match (empty = all requests). For 'intercept_requests' and 'start_api_capture'."
                 },
                 "headers": {
                     "type": "object",
                     "description": "HTTP headers map to inject into intercepted requests. For 'set_extra_headers'."
+                },
+                "include_document_requests": {
+                    "type": "boolean",
+                    "description": "Also capture document requests instead of only API-like traffic. For 'start_api_capture'."
+                },
+                "max_examples_per_endpoint": {
+                    "type": "integer",
+                    "description": "Maximum number of redacted example requests to keep per inferred endpoint. For 'start_api_capture'."
                 },
                 "name": {
                     "type": "string",
@@ -530,8 +538,8 @@ mod tests {
             "intercept_requests",
             "stop_intercept",
             "set_extra_headers",
-            "start_har",
-            "stop_har",
+            "start_api_capture",
+            "stop_api_capture",
             "save_state",
             "load_state",
             "list_states",
@@ -587,6 +595,8 @@ mod tests {
         for expected in [
             "url_patterns",
             "headers",
+            "include_document_requests",
+            "max_examples_per_endpoint",
             "name",
             "encrypt",
             "width",

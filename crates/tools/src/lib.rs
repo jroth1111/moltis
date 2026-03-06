@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Tool implementations and policy enforcement.
 //!
 //! Tools: bash/exec, browser, canvas, message, nodes, cron, sessions,
