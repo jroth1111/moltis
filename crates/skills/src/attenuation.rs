@@ -18,19 +18,6 @@ pub struct AllowedToolsResolution<'a> {
     pub unmatched_specs: Vec<String>,
 }
 
-fn strip_tool_wrapper(tool_spec: &str) -> &str {
-    let trimmed = tool_spec.trim();
-    if let Some(open_idx) = trimmed.find('(')
-        && trimmed.ends_with(')')
-    {
-        let wrapper = trimmed[..open_idx].trim();
-        if !wrapper.is_empty() {
-            return wrapper;
-        }
-    }
-    trimmed
-}
-
 fn normalize_tool_token(raw: &str, keep_wildcard: bool) -> String {
     let mut normalized = String::with_capacity(raw.len());
     let mut prev_separator = true;
@@ -67,24 +54,17 @@ fn normalize_tool_token(raw: &str, keep_wildcard: bool) -> String {
 }
 
 fn expand_allowed_tool_patterns(tool_spec: &str) -> Vec<String> {
-    let base = strip_tool_wrapper(tool_spec);
-    let normalized = normalize_tool_token(base, true);
+    let trimmed = tool_spec.trim();
+    if trimmed.contains('(') || trimmed.contains(')') {
+        return Vec::new();
+    }
+
+    let normalized = normalize_tool_token(trimmed, true);
     if normalized.is_empty() {
         return Vec::new();
     }
 
-    match normalized.as_str() {
-        // Accepted Claude/OpenClaw wrapper format.
-        "bash" => vec!["exec".to_string()],
-        // Accepted high-level format for file reads.
-        "read" => vec!["read_file".to_string(), "list_directory".to_string()],
-        "ls" => vec!["list_directory".to_string()],
-        // Normalize camel/pascal case names to runtime snake_case.
-        "webfetch" | "web_fetch" => vec!["web_fetch".to_string()],
-        "websearch" | "web_search" => vec!["web_search".to_string()],
-        "memorysearch" | "memory_search" => vec!["memory_search".to_string()],
-        _ => vec![normalized],
-    }
+    vec![normalized]
 }
 
 fn wildcard_match(pattern: &str, candidate: &str) -> bool {
@@ -328,11 +308,10 @@ mod tests {
     }
 
     #[test]
-    fn trusted_skill_allowed_tools_support_aliases_and_wrappers() {
+    fn trusted_skill_allowed_tools_rejects_wrapped_specs() {
         let skill = mock_skill(vec![
             "Bash(git:*)".to_string(),
-            "Read".to_string(),
-            "WebFetch".to_string(),
+            "web_fetch".to_string(),
         ]);
         let all = &[
             "exec",
@@ -344,10 +323,10 @@ mod tests {
 
         let result = attenuate_tools(&[(&skill, SkillTrust::Trusted)], all);
 
-        assert!(result.contains(&"exec"));
-        assert!(result.contains(&"read_file"));
-        assert!(result.contains(&"list_directory"));
         assert!(result.contains(&"web_fetch"));
+        assert!(!result.contains(&"exec"));
+        assert!(!result.contains(&"read_file"));
+        assert!(!result.contains(&"list_directory"));
         assert!(!result.contains(&"web_search"));
     }
 
@@ -364,12 +343,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_allowed_tools_matches_aliases_and_wrappers() {
-        let specs = vec![
-            "Bash(git:*)".to_string(),
-            "Read".to_string(),
-            "WebFetch".to_string(),
-        ];
+    fn resolve_allowed_tools_rejects_wrapped_specs() {
+        let specs = vec!["Bash(git:*)".to_string(), "web_fetch".to_string()];
         let all = &[
             "exec",
             "read_file",
@@ -380,11 +355,8 @@ mod tests {
 
         let resolved = resolve_allowed_tools(&specs, all);
 
-        assert_eq!(
-            resolved.matched_tools,
-            vec!["exec", "read_file", "list_directory", "web_fetch"]
-        );
-        assert!(resolved.unmatched_specs.is_empty());
+        assert_eq!(resolved.matched_tools, vec!["web_fetch"]);
+        assert_eq!(resolved.unmatched_specs, vec!["Bash(git:*)".to_string()]);
     }
 
     #[test]
@@ -394,8 +366,11 @@ mod tests {
 
         let resolved = resolve_allowed_tools(&specs, all);
 
-        assert_eq!(resolved.matched_tools, vec!["exec"]);
-        assert_eq!(resolved.unmatched_specs, vec!["web_search".to_string()]);
+        assert!(resolved.matched_tools.is_empty());
+        assert_eq!(
+            resolved.unmatched_specs,
+            vec!["web_search".to_string(), "Bash(git:*)".to_string()]
+        );
     }
 
     #[test]

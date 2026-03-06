@@ -414,7 +414,20 @@ fn detect_upgrade_regressions(
         .iter()
         .map(|decision| (decision.run.skill_name.as_str(), decision))
         .collect();
+    let after_by_name: HashMap<&str, &SkillGateDecision> = after
+        .iter()
+        .map(|decision| (decision.run.skill_name.as_str(), decision))
+        .collect();
     let mut regressions = Vec::new();
+
+    for before_decision in before {
+        if !after_by_name.contains_key(before_decision.run.skill_name.as_str()) {
+            regressions.push(format!(
+                "{} missing after upgrade",
+                before_decision.run.skill_name
+            ));
+        }
+    }
 
     for after_decision in after {
         let Some(before_decision) = before_by_name.get(after_decision.run.skill_name.as_str()) else {
@@ -940,6 +953,42 @@ Support {description}.
         let after = mock_summary(0.82, 0.30, 0.84, 0.83);
         let reasons = compare_run_summaries(&before, &after);
         assert!(reasons.is_empty());
+    }
+
+    fn gate_decision(skill_name: &str, passed: bool) -> SkillGateDecision {
+        SkillGateDecision {
+            passed,
+            reasons: Vec::new(),
+            run: crate::evals::SkillEvalRun {
+                id: format!("{skill_name}-run"),
+                skill_name: skill_name.to_string(),
+                source: "owner/repo".to_string(),
+                created_at_ms: 1,
+                status: if passed {
+                    "passed".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                benchmark: crate::evals::SkillEvalBenchmark {
+                    metadata: crate::evals::SkillEvalMetadata {
+                        timestamp_ms: 1,
+                        rounds: 1,
+                        skill_name: skill_name.to_string(),
+                        source: "owner/repo".to_string(),
+                    },
+                    configurations: Vec::new(),
+                    assertions: Vec::new(),
+                    run_summary: mock_summary(1.0, 0.5, 1.0, 1.0),
+                    notes: Vec::new(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn detect_upgrade_regressions_flags_missing_skills() {
+        let regressions = detect_upgrade_regressions(&[gate_decision("demo", true)], &[]);
+        assert_eq!(regressions, vec!["demo missing after upgrade".to_string()]);
     }
 
     #[tokio::test]
