@@ -319,6 +319,11 @@ fn parse_selected_tools(params: &Value) -> Result<HashSet<String>> {
     Ok(selectors)
 }
 
+fn prepare_tool_arguments(arguments: &Value, values: &HashMap<String, Value>) -> Result<Value> {
+    let resolved = resolve_refs(arguments, values)?;
+    Ok(moltis_mcp::tool_bridge::sanitize_tool_arguments(resolved))
+}
+
 fn parse_detail_level(raw: Option<&str>) -> Result<ToolDetailLevel> {
     match raw
         .unwrap_or("summary")
@@ -1182,6 +1187,7 @@ pub struct McpCodeExecTool {
     redact_pii: bool,
     max_steps: usize,
     max_tool_calls: usize,
+    max_stdout_bytes: usize,
     max_result_bytes: usize,
     default_retry_attempts: u32,
     default_retry_backoff_ms: u64,
@@ -1234,6 +1240,7 @@ impl McpCodeExecTool {
             redact_pii: cfg.redact_pii,
             max_steps: cfg.max_steps.max(1),
             max_tool_calls: cfg.max_tool_calls.max(1),
+            max_stdout_bytes: cfg.max_stdout_bytes.max(1_024),
             max_result_bytes: cfg.max_result_bytes.max(1_024),
             default_retry_attempts: cfg.default_retry_attempts.max(1),
             default_retry_backoff_ms: cfg.default_retry_backoff_ms.max(50),
@@ -1396,6 +1403,8 @@ impl McpCodeExecTool {
             return Ok((cached, 0, true));
         }
 
+        let sanitized_arguments = moltis_mcp::tool_bridge::sanitize_tool_arguments(arguments);
+
         let mut attempt = 0u32;
         let mut backoff = retry.backoff_ms;
         let mut last_error: Option<anyhow::Error> = None;
@@ -1403,11 +1412,18 @@ impl McpCodeExecTool {
             attempt += 1;
             let called = self
                 .manager
-                .call_server_tool(server, tool, arguments.clone())
+                .call_server_tool(server, tool, sanitized_arguments.clone())
                 .await;
             match called {
                 Ok(called) => match flatten_tool_result(called) {
                     Ok(flattened) => {
+                        if let Err(error) =
+                            ensure_serialized_value_limit(&flattened, self.max_stdout_bytes, "tool output")
+                        {
+                            self.manager.record_tool_outcome(server, tool, false).await;
+                            last_error = Some(error);
+                            continue;
+                        }
                         self.manager.record_tool_outcome(server, tool, true).await;
                         return Ok((flattened, attempt, false));
                     },
@@ -1498,7 +1514,7 @@ impl McpCodeExecTool {
                             selector
                         ));
                     }
-                    let resolved_args = resolve_refs(arguments, &state.outputs)?;
+                    let resolved_args = prepare_tool_arguments(arguments, &state.outputs)?;
                     let resolved_idempotency =
                         resolve_idempotency_key(idempotency_key, &state.outputs)?;
                     let (value, attempts, reused) = self
@@ -1970,6 +1986,18 @@ impl McpCodeExecTool {
     }
 }
 
+fn ensure_serialized_value_limit(value: &Value, max_bytes: usize, label: &str) -> Result<()> {
+    let serialized = serde_json::to_vec(value)?;
+    if serialized.len() > max_bytes {
+        return Err(anyhow!(
+            "{label} exceeds configured size: {} > {} bytes",
+            serialized.len(),
+            max_bytes
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl AgentTool for McpCodeExecTool {
     fn name(&self) -> &str {
@@ -2361,4 +2389,50 @@ mod tests {
         };
         assert!(evaluate_condition(&exists, &outputs).expect("exists should evaluate"));
     }
+
+    #[test]
+    fn ensure_serialized_value_limit_rejects_large_values() {
+        let err = ensure_serialized_value_limit(
+            &serde_json::json!({ "text": "abcdef" }),
+            8,
+            "tool output",
+        )
+        .expect_err("oversized value should be rejected");
+        assert!(err.to_string().contains("tool output exceeds configured size"));
+    }
+
+    #[test]
+    fn ensure_serialized_value_limit_accepts_small_values() {
+        ensure_serialized_value_limit(&serde_json::json!({ "ok": true }), 64, "tool output")
+            .expect("small value should pass");
+    }
+
+    #[test]
+    fn prepare_tool_arguments_resolves_refs_and_sanitizes() {
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "step1".to_string(),
+            serde_json::json!({
+                "_meta": "ignore",
+                "nested": { "keep": 1, "drop": null }
+            }),
+        );
+
+        let prepared = prepare_tool_arguments(
+            &serde_json::json!({
+                "payload": "$step1",
+                "_runner": "ignore"
+            }),
+            &outputs,
+        )
+        .expect("tool arguments should prepare");
+
+        assert_eq!(
+            prepared,
+            serde_json::json!({
+                "payload": { "nested": { "keep": 1 } }
+            })
+        );
+    }
+
 }
