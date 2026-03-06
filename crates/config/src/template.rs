@@ -444,14 +444,14 @@ sandbox = false                   # Run browser in Docker/Apple Container for is
 # display_max = 120               # Scan range end for :DISPLAY allocation
 # startup_timeout_ms = 3000       # Wait for X socket readiness
 
-# Optional: Patchright fallback for challenge pages (Kasada/Imperva, etc.).
-# [tools.browser.patchright_fallback]
-# enabled = false                 # Enable Patchright probe+cookie fallback
+# Optional: protected-site backend switching (Kasada/Imperva/empty shells).
+# [tools.browser.protection]
+# enabled = false                 # Enable Patchright-backed protected sessions
 # python_binary = "python3"       # Python executable with patchright installed
-# timeout_ms = 45000              # Probe timeout
-# headless = true                 # Run Patchright probe headless
-# challenge_types = ["kasada", "imperva"] # Challenge classes that trigger fallback
-# domains = []                    # Optional domain allowlist for fallback (empty = all)
+# timeout_ms = 45000              # Worker RPC timeout
+# triggers = ["kasada", "imperva", "empty_shell"] # Trigger classes that switch backend
+# domains = []                    # Optional domain allowlist (empty = all)
+# max_retries = 2                 # Retry backend handoff this many times before giving up
 
 # Domain restrictions for security.
 # When set, browser will refuse to navigate to domains not in this list.
