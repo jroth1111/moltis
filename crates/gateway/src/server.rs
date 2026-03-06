@@ -1468,20 +1468,12 @@ pub async fn prepare_gateway(
 
     // Initialize data directory and SQLite database.
     let data_dir = data_dir.unwrap_or_else(moltis_config::data_dir);
-    std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
-        panic!(
-            "failed to create data directory {}: {e}",
-            data_dir.display()
-        )
-    });
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("failed to create data directory {}", data_dir.display()))?;
 
     let config_dir = moltis_config::config_dir().unwrap_or_else(|| PathBuf::from(".moltis"));
-    std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
-        panic!(
-            "failed to create config directory {}: {e}",
-            config_dir.display()
-        )
-    });
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("failed to create config directory {}", config_dir.display()))?;
     log_startup_config_storage_diagnostics();
 
     let openclaw_startup_status = log_startup_openclaw_detection();
@@ -5483,7 +5475,9 @@ pub async fn start_gateway(
 
         // Run HTTPS server with automatic HTTP-to-HTTPS redirect on the same port.
         // Plain HTTP requests to this port get a 301 redirect instead of a TLS error.
-        let tls_cfg = rustls_config.expect("rustls config must be set when TLS is active");
+        let Some(tls_cfg) = rustls_config else {
+            anyhow::bail!("tls is active but rustls config was not initialized");
+        };
         let tcp_listener = tokio::net::TcpListener::bind(addr).await?;
         crate::tls::serve_tls_with_http_redirect(tcp_listener, Arc::new(tls_cfg), app, port, bind)
             .await?;
