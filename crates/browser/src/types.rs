@@ -95,34 +95,105 @@ impl Default for VirtualDisplayConfig {
     }
 }
 
-/// Patchright subprocess fallback configuration.
+/// Protection trigger class that can move a session to the Patchright backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectionTrigger {
+    Imperva,
+    Kasada,
+    Cloudflare,
+    Recaptcha,
+    Hcaptcha,
+    GenericBrowserCheck,
+    GenericChallenge,
+    EmptyShell,
+}
+
+impl ProtectionTrigger {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Imperva => "imperva",
+            Self::Kasada => "kasada",
+            Self::Cloudflare => "cloudflare",
+            Self::Recaptcha => "recaptcha",
+            Self::Hcaptcha => "hcaptcha",
+            Self::GenericBrowserCheck => "generic_browser_check",
+            Self::GenericChallenge => "generic_challenge",
+            Self::EmptyShell => "empty_shell",
+        }
+    }
+}
+
+impl fmt::Display for ProtectionTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<crate::challenge::ChallengeType> for ProtectionTrigger {
+    fn from(value: crate::challenge::ChallengeType) -> Self {
+        match value {
+            crate::challenge::ChallengeType::Imperva => Self::Imperva,
+            crate::challenge::ChallengeType::Kasada => Self::Kasada,
+            crate::challenge::ChallengeType::Cloudflare => Self::Cloudflare,
+            crate::challenge::ChallengeType::Recaptcha => Self::Recaptcha,
+            crate::challenge::ChallengeType::Hcaptcha => Self::Hcaptcha,
+            crate::challenge::ChallengeType::GenericBrowserCheck => Self::GenericBrowserCheck,
+            crate::challenge::ChallengeType::GenericChallenge => Self::GenericChallenge,
+        }
+    }
+}
+
+impl From<moltis_config::schema::ProtectionTrigger> for ProtectionTrigger {
+    fn from(value: moltis_config::schema::ProtectionTrigger) -> Self {
+        match value {
+            moltis_config::schema::ProtectionTrigger::Imperva => Self::Imperva,
+            moltis_config::schema::ProtectionTrigger::Kasada => Self::Kasada,
+            moltis_config::schema::ProtectionTrigger::Cloudflare => Self::Cloudflare,
+            moltis_config::schema::ProtectionTrigger::Recaptcha => Self::Recaptcha,
+            moltis_config::schema::ProtectionTrigger::Hcaptcha => Self::Hcaptcha,
+            moltis_config::schema::ProtectionTrigger::GenericBrowserCheck => {
+                Self::GenericBrowserCheck
+            },
+            moltis_config::schema::ProtectionTrigger::GenericChallenge => Self::GenericChallenge,
+            moltis_config::schema::ProtectionTrigger::EmptyShell => Self::EmptyShell,
+        }
+    }
+}
+
+/// Protection backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct PatchrightFallbackConfig {
-    /// Master switch for fallback behavior.
+pub struct ProtectionConfig {
+    /// Master switch for protection handling.
     pub enabled: bool,
     /// Python executable with Patchright installed.
     pub python_binary: String,
-    /// Subprocess timeout in milliseconds.
+    /// Worker RPC timeout in milliseconds.
     pub timeout_ms: u64,
-    /// Whether Patchright probe should run headless.
-    pub headless: bool,
-    /// Challenge type allowlist (`kasada`, `imperva`, etc.).
-    pub challenge_types: Vec<String>,
-    /// Optional domain allowlist for fallback (empty = all).
+    /// Trigger allowlist (empty = all supported triggers).
+    pub triggers: Vec<ProtectionTrigger>,
+    /// Optional domain allowlist for backend switching (empty = all).
     pub domains: Vec<String>,
-    /// Number of retries for patchright probe (default: 2).
+    /// Number of retries for protected navigation handoff.
     pub max_retries: u32,
 }
 
-impl Default for PatchrightFallbackConfig {
+impl Default for ProtectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             python_binary: "python3".to_string(),
             timeout_ms: 45_000,
-            headless: true,
-            challenge_types: vec!["kasada".to_string(), "imperva".to_string()],
+            triggers: vec![
+                ProtectionTrigger::Kasada,
+                ProtectionTrigger::Imperva,
+                ProtectionTrigger::Cloudflare,
+                ProtectionTrigger::GenericBrowserCheck,
+                ProtectionTrigger::GenericChallenge,
+                ProtectionTrigger::EmptyShell,
+            ],
             domains: Vec::new(),
             max_retries: 2,
         }
@@ -448,6 +519,30 @@ impl fmt::Display for BrowserPreference {
     }
 }
 
+/// Runtime browser backend handling a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserBackendKind {
+    Chromiumoxide,
+    Patchright,
+}
+
+impl Default for BrowserBackendKind {
+    fn default() -> Self {
+        Self::Chromiumoxide
+    }
+}
+
+impl fmt::Display for BrowserBackendKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Chromiumoxide => "chromiumoxide",
+            Self::Patchright => "patchright",
+        };
+        f.write_str(value)
+    }
+}
+
 impl fmt::Display for BrowserAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -656,6 +751,46 @@ pub struct ScrollDimensions {
     pub height: u32,
 }
 
+/// Evidence collected for a classified challenge/interstitial page.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChallengeEvidence {
+    pub challenge_type: crate::challenge::ChallengeType,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub markers: Vec<String>,
+}
+
+/// Why the final navigation path moved into protected-site handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationTrigger {
+    Direct,
+    Challenge,
+    EmptyShell,
+}
+
+/// Final classified outcome of a navigation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationVerdict {
+    Content,
+    Challenge,
+    EmptyShell,
+}
+
+/// Structured navigation/protection outcome.
+#[derive(Debug, Clone, Serialize)]
+pub struct NavigationOutcome {
+    pub final_url: String,
+    pub title_len: u64,
+    pub body_text_len: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<ChallengeEvidence>,
+    pub trigger: NavigationTrigger,
+    pub verdict: NavigationVerdict,
+    pub fallback_attempted: bool,
+    pub authoritative_backend: BrowserBackendKind,
+}
+
 /// Response from a browser action.
 #[derive(Debug, Clone, Serialize)]
 pub struct BrowserResponse {
@@ -667,6 +802,9 @@ pub struct BrowserResponse {
 
     /// Whether the browser is running in a sandboxed container.
     pub sandboxed: bool,
+
+    /// Runtime backend that served this response.
+    pub backend: BrowserBackendKind,
 
     /// Error message if action failed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -692,29 +830,13 @@ pub struct BrowserResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 
-    /// Final URL after navigation resolution/redirects.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub final_url: Option<String>,
-
     /// Page title (for get_title, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 
-    /// Title length captured during navigation diagnostics.
+    /// Typed navigation/protection outcome for navigation actions.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub title_len: Option<u64>,
-
-    /// Body text length captured during navigation diagnostics.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body_text_len: Option<u64>,
-
-    /// Classified challenge type for challenge/interstitial pages.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub challenge_type: Option<String>,
-
-    /// Matched challenge markers found in page HTML.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub challenge_markers: Option<Vec<String>>,
+    pub navigation: Option<NavigationOutcome>,
 
     /// Duration of the action in milliseconds.
     pub duration_ms: u64,
@@ -726,18 +848,15 @@ impl BrowserResponse {
             success: true,
             session_id,
             sandboxed,
+            backend: BrowserBackendKind::Chromiumoxide,
             error: None,
             screenshot: None,
             screenshot_scale: None,
             snapshot: None,
             result: None,
             url: None,
-            final_url: None,
             title: None,
-            title_len: None,
-            body_text_len: None,
-            challenge_type: None,
-            challenge_markers: None,
+            navigation: None,
             duration_ms,
         }
     }
@@ -747,20 +866,22 @@ impl BrowserResponse {
             success: false,
             session_id,
             sandboxed: false,
+            backend: BrowserBackendKind::Chromiumoxide,
             error: Some(error.into()),
             screenshot: None,
             screenshot_scale: None,
             snapshot: None,
             result: None,
             url: None,
-            final_url: None,
             title: None,
-            title_len: None,
-            body_text_len: None,
-            challenge_type: None,
-            challenge_markers: None,
+            navigation: None,
             duration_ms,
         }
+    }
+
+    pub fn with_backend(mut self, backend: BrowserBackendKind) -> Self {
+        self.backend = backend;
+        self
     }
 
     pub fn with_screenshot(mut self, screenshot: String, scale: f64) -> Self {
@@ -789,23 +910,8 @@ impl BrowserResponse {
         self
     }
 
-    pub fn with_navigation_diagnostics(
-        mut self,
-        final_url: String,
-        title_len: usize,
-        body_text_len: usize,
-        challenge_type: Option<String>,
-        challenge_markers: Vec<String>,
-    ) -> Self {
-        self.final_url = Some(final_url);
-        self.title_len = Some(title_len as u64);
-        self.body_text_len = Some(body_text_len as u64);
-        self.challenge_type = challenge_type;
-        self.challenge_markers = if challenge_markers.is_empty() {
-            None
-        } else {
-            Some(challenge_markers)
-        };
+    pub fn with_navigation(mut self, navigation: NavigationOutcome) -> Self {
+        self.navigation = Some(navigation);
         self
     }
 }
@@ -859,8 +965,8 @@ pub struct BrowserConfig {
     pub profile_dir: Option<String>,
     /// Virtual display settings (Linux/Xvfb).
     pub virtual_display: VirtualDisplayConfig,
-    /// Patchright fallback settings.
-    pub patchright_fallback: PatchrightFallbackConfig,
+    /// Protected-site backend switching settings.
+    pub protection: ProtectionConfig,
     /// Stealth / anti-bot-detection configuration.
     pub stealth: StealthConfig,
 }
@@ -895,7 +1001,7 @@ impl Default for BrowserConfig {
             persist_profile: true,
             profile_dir: None,
             virtual_display: VirtualDisplayConfig::default(),
-            patchright_fallback: PatchrightFallbackConfig::default(),
+            protection: ProtectionConfig::default(),
             stealth: StealthConfig::default(),
         }
     }
@@ -950,14 +1056,19 @@ impl From<&moltis_config::schema::BrowserConfig> for BrowserConfig {
                 display_max: cfg.virtual_display.display_max,
                 startup_timeout_ms: cfg.virtual_display.startup_timeout_ms,
             },
-            patchright_fallback: PatchrightFallbackConfig {
-                enabled: cfg.patchright_fallback.enabled,
-                python_binary: cfg.patchright_fallback.python_binary.clone(),
-                timeout_ms: cfg.patchright_fallback.timeout_ms,
-                headless: cfg.patchright_fallback.headless,
-                challenge_types: cfg.patchright_fallback.challenge_types.clone(),
-                domains: cfg.patchright_fallback.domains.clone(),
-                max_retries: cfg.patchright_fallback.max_retries,
+            protection: ProtectionConfig {
+                enabled: cfg.protection.enabled,
+                python_binary: cfg.protection.python_binary.clone(),
+                timeout_ms: cfg.protection.timeout_ms,
+                triggers: cfg
+                    .protection
+                    .triggers
+                    .iter()
+                    .copied()
+                    .map(ProtectionTrigger::from)
+                    .collect(),
+                domains: cfg.protection.domains.clone(),
+                max_retries: cfg.protection.max_retries,
             },
             stealth: StealthConfig {
                 enabled: cfg.stealth.enabled,

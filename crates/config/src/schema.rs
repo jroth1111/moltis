@@ -2054,8 +2054,8 @@ pub struct BrowserConfig {
     pub profile_dir: Option<String>,
     /// Headful browser on a virtual display (Linux/Xvfb).
     pub virtual_display: VirtualDisplayConfig,
-    /// External Patchright fallback for challenge pages.
-    pub patchright_fallback: PatchrightFallbackConfig,
+    /// Protected-site backend switching.
+    pub protection: ProtectionConfig,
     /// Stealth / anti-bot-detection configuration.
     pub stealth: StealthConfig,
 }
@@ -2101,34 +2101,52 @@ impl Default for VirtualDisplayConfig {
     }
 }
 
-/// Patchright subprocess fallback for challenge/captcha navigation.
+/// Trigger that can move a session onto the protected-site backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectionTrigger {
+    Imperva,
+    Kasada,
+    Cloudflare,
+    Recaptcha,
+    Hcaptcha,
+    GenericBrowserCheck,
+    GenericChallenge,
+    EmptyShell,
+}
+
+/// Protected-site backend switching configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct PatchrightFallbackConfig {
-    /// Master switch for Patchright fallback.
+pub struct ProtectionConfig {
+    /// Master switch for protected-site backend switching.
     pub enabled: bool,
     /// Python executable used to run Patchright.
     pub python_binary: String,
-    /// Patchright probe timeout.
+    /// Worker RPC timeout.
     pub timeout_ms: u64,
-    /// Headless mode for Patchright subprocess.
-    pub headless: bool,
-    /// Challenge type allowlist (lowercase identifiers, e.g. `kasada`, `imperva`).
-    pub challenge_types: Vec<String>,
-    /// Optional domain allowlist for fallback execution.
+    /// Trigger allowlist.
+    pub triggers: Vec<ProtectionTrigger>,
+    /// Optional domain allowlist for protected-site backend switching.
     pub domains: Vec<String>,
-    /// Number of retries for patchright probe (default: 2).
+    /// Number of retries for backend switching (default: 2).
     pub max_retries: u32,
 }
 
-impl Default for PatchrightFallbackConfig {
+impl Default for ProtectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             python_binary: "python3".to_string(),
             timeout_ms: 45_000,
-            headless: true,
-            challenge_types: vec!["kasada".to_string(), "imperva".to_string()],
+            triggers: vec![
+                ProtectionTrigger::Kasada,
+                ProtectionTrigger::Imperva,
+                ProtectionTrigger::Cloudflare,
+                ProtectionTrigger::GenericBrowserCheck,
+                ProtectionTrigger::GenericChallenge,
+                ProtectionTrigger::EmptyShell,
+            ],
             domains: Vec::new(),
             max_retries: 2,
         }
@@ -2212,7 +2230,7 @@ impl Default for BrowserConfig {
             persist_profile: default_persist_profile(),
             profile_dir: None,
             virtual_display: VirtualDisplayConfig::default(),
-            patchright_fallback: PatchrightFallbackConfig::default(),
+            protection: ProtectionConfig::default(),
             stealth: StealthConfig::default(),
         }
     }

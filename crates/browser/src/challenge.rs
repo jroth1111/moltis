@@ -1,7 +1,10 @@
 //! Challenge-page detection helpers for anti-bot/WAF interstitials.
 
+use serde::{Deserialize, Serialize};
+
 /// Classified challenge page type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChallengeType {
     Imperva,
     Kasada,

@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// JavaScript to extract interactive elements from the DOM.
-const EXTRACT_ELEMENTS_JS: &str = r#"
+pub(crate) const EXTRACT_ELEMENTS_JS: &str = r#"
 (() => {
     const interactive = [
         'a', 'button', 'input', 'select', 'textarea',
@@ -168,7 +168,7 @@ const EXTRACT_ELEMENTS_JS: &str = r#"
 "#;
 
 /// JavaScript to find an element by its ref number.
-const FIND_BY_REF_JS: &str = r#"
+pub(crate) const FIND_BY_REF_JS: &str = r#"
 ((ref) => {
     const el = document.querySelector(`[data-moltis-ref="${ref}"]`);
     if (!el) return null;
@@ -203,30 +203,7 @@ pub async fn extract_snapshot(page: &Page) -> Result<DomSnapshot, Error> {
         .into_value()
         .map_err(|e| Error::JsEvalFailed(format!("failed to get result: {e:?}")))?;
 
-    let elements = parse_elements(&result)?;
-    let content = result
-        .get("content")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    let viewport = parse_viewport(&result)?;
-    let scroll = parse_scroll(&result)?;
-
-    debug!(
-        url = url,
-        elements = elements.len(),
-        content_len = content.as_ref().map(|c| c.len()).unwrap_or(0),
-        "extracted DOM snapshot"
-    );
-
-    Ok(DomSnapshot {
-        url,
-        title,
-        content,
-        elements,
-        viewport,
-        scroll,
-    })
+    parse_snapshot_payload(url, title, &result)
 }
 
 /// Find an element's center coordinates by its ref number.
@@ -240,30 +217,12 @@ pub async fn find_element_by_ref(page: &Page, ref_: u32) -> Result<(f64, f64), E
         .into_value()
         .map_err(|e| Error::JsEvalFailed(format!("failed to get result: {e:?}")))?;
 
-    if result.is_null() {
-        return Err(Error::ElementNotFound(ref_));
-    }
-
-    let center_x = result["centerX"]
-        .as_f64()
-        .ok_or(Error::ElementNotFound(ref_))?;
-    let center_y = result["centerY"]
-        .as_f64()
-        .ok_or(Error::ElementNotFound(ref_))?;
-
-    Ok((center_x, center_y))
+    parse_find_element_result(&result, ref_)
 }
 
 /// Focus an input element by its ref number.
 pub async fn focus_element_by_ref(page: &Page, ref_: u32) -> Result<(), Error> {
-    let js = format!(
-        r#"(() => {{
-            const el = document.querySelector(`[data-moltis-ref="{ref_}"]`);
-            if (!el) return false;
-            el.focus();
-            return true;
-        }})()"#
-    );
+    let js = build_focus_element_js(ref_);
 
     let result: Value = page
         .evaluate(js.as_str())
@@ -281,14 +240,7 @@ pub async fn focus_element_by_ref(page: &Page, ref_: u32) -> Result<(), Error> {
 
 /// Scroll an element into view by its ref number.
 pub async fn scroll_element_into_view(page: &Page, ref_: u32) -> Result<(), Error> {
-    let js = format!(
-        r#"(() => {{
-            const el = document.querySelector(`[data-moltis-ref="{ref_}"]`);
-            if (!el) return false;
-            el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
-            return true;
-        }})()"#
-    );
+    let js = build_scroll_into_view_js(ref_);
 
     let result: Value = page
         .evaluate(js.as_str())
@@ -330,6 +282,78 @@ fn parse_elements(result: &Value) -> Result<Vec<ElementRef>, Error> {
             })
         })
         .collect())
+}
+
+pub(crate) fn parse_snapshot_payload(
+    url: String,
+    title: String,
+    result: &Value,
+) -> Result<DomSnapshot, Error> {
+    let elements = parse_elements(result)?;
+    let content = result
+        .get("content")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let viewport = parse_viewport(result)?;
+    let scroll = parse_scroll(result)?;
+
+    debug!(
+        url = url,
+        elements = elements.len(),
+        content_len = content.as_ref().map(|c| c.len()).unwrap_or(0),
+        "extracted DOM snapshot"
+    );
+
+    Ok(DomSnapshot {
+        url,
+        title,
+        content,
+        elements,
+        viewport,
+        scroll,
+    })
+}
+
+pub(crate) fn parse_find_element_result(result: &Value, ref_: u32) -> Result<(f64, f64), Error> {
+    if result.is_null() {
+        return Err(Error::ElementNotFound(ref_));
+    }
+
+    let center_x = result["centerX"]
+        .as_f64()
+        .ok_or(Error::ElementNotFound(ref_))?;
+    let center_y = result["centerY"]
+        .as_f64()
+        .ok_or(Error::ElementNotFound(ref_))?;
+
+    Ok((center_x, center_y))
+}
+
+pub(crate) fn build_find_element_js(ref_: u32) -> String {
+    format!("({FIND_BY_REF_JS})({ref_})")
+}
+
+pub(crate) fn build_focus_element_js(ref_: u32) -> String {
+    format!(
+        r#"(() => {{
+            const el = document.querySelector(`[data-moltis-ref="{ref_}"]`);
+            if (!el) return false;
+            el.focus();
+            return true;
+        }})()"#
+    )
+}
+
+pub(crate) fn build_scroll_into_view_js(ref_: u32) -> String {
+    format!(
+        r#"(() => {{
+            const el = document.querySelector(`[data-moltis-ref="{ref_}"]`);
+            if (!el) return false;
+            el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+            return true;
+        }})()"#
+    )
 }
 
 fn parse_bounds(v: &Value) -> Option<ElementBounds> {

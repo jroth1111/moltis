@@ -38,7 +38,7 @@ pub mod emulation;
 pub mod error;
 pub mod manager;
 pub mod network;
-mod patchright;
+mod patchright_session;
 pub mod pool;
 mod protection;
 pub mod screencast;
@@ -54,7 +54,8 @@ pub use {
     error::Error,
     manager::BrowserManager,
     types::{
-        BrowserAction, BrowserConfig, BrowserKind, BrowserPreference, BrowserRequest,
-        BrowserResponse, StealthConfig,
+        BrowserAction, BrowserBackendKind, BrowserConfig, BrowserKind, BrowserPreference,
+        BrowserRequest, BrowserResponse, ChallengeEvidence, NavigationOutcome, NavigationTrigger,
+        NavigationVerdict, ProtectionConfig, ProtectionTrigger, StealthConfig,
     },
 };

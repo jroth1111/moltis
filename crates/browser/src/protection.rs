@@ -2,8 +2,8 @@ use serde::Serialize;
 
 use crate::{
     challenge::ChallengeType,
-    patchright::PatchrightProbe,
-    types::{BrowserConfig, BrowserKind, BrowserPreference, PatchrightFallbackConfig},
+    detect::{DetectedBrowser, DetectionSource},
+    types::{BrowserConfig, BrowserKind, ProtectionConfig, ProtectionTrigger},
 };
 
 const CONTENTFUL_CHALLENGE_BODY_THRESHOLD: usize = 1_000;
@@ -22,11 +22,28 @@ pub(crate) struct ProtectionAssessment {
 
 impl ProtectionAssessment {
     pub(crate) fn is_content(&self) -> bool {
-        self.challenge_type.is_none()
+        self.challenge_type.is_none() && !self.is_empty_shell()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_better_than(&self, other: &Self) -> bool {
         self.body_text_len > other.body_text_len || self.title_len > other.title_len
+    }
+
+    pub(crate) fn is_empty_shell(&self) -> bool {
+        self.challenge_type.is_none()
+            && self.title_len == 0
+            && self.body_text_len == 0
+            && self.html_len > 0
+    }
+
+    pub(crate) fn fallback_trigger(&self) -> Option<ProtectionTrigger> {
+        self.challenge_type
+            .map(ProtectionTrigger::from)
+            .or_else(|| {
+                self.is_empty_shell()
+                    .then_some(ProtectionTrigger::EmptyShell)
+            })
     }
 }
 
@@ -71,65 +88,34 @@ pub(crate) fn assess_html(
     }
 }
 
-pub(crate) fn assess_patchright_probe(probe: &PatchrightProbe) -> ProtectionAssessment {
-    let title_len = if probe.title_len > 0 {
-        probe.title_len
-    } else {
-        probe
-            .title
-            .as_deref()
-            .map(str::trim)
-            .map(str::len)
-            .unwrap_or(0)
-    };
-    let body_text_len = if probe.body_text_len > 0 {
-        probe.body_text_len
-    } else {
-        probe
-            .body_text
-            .as_deref()
-            .map(str::trim)
-            .map(str::len)
-            .unwrap_or(0)
-    };
-
-    assess_html(
-        probe.final_url.clone(),
-        title_len,
-        body_text_len,
-        probe.html.as_deref().unwrap_or_default(),
-    )
-}
-
 pub(crate) fn should_wait_for_challenge_resolution(diagnostics: &ProtectionAssessment) -> bool {
-    diagnostics.challenge_type.is_some()
-        || (diagnostics.title_len == 0
-            && diagnostics.body_text_len == 0
-            && diagnostics.html_len > 0)
+    diagnostics.challenge_type.is_some() || diagnostics.is_empty_shell()
 }
 
-pub(crate) fn should_attempt_patchright_fallback(
-    challenge_type: Option<ChallengeType>,
+pub(crate) fn protection_trigger_for_fallback(
+    diagnostics: &ProtectionAssessment,
     sandbox: bool,
     url: &str,
-    config: &PatchrightFallbackConfig,
-) -> bool {
+    config: &ProtectionConfig,
+) -> Option<ProtectionTrigger> {
     if !config.enabled || sandbox {
-        return false;
+        return None;
     }
     if !crate::types::is_domain_allowed(url, &config.domains) {
-        return false;
+        return None;
     }
 
-    match challenge_type {
-        Some(kind) => is_patchright_challenge_allowed(kind, &config.challenge_types),
-        None => false,
+    let trigger = diagnostics.fallback_trigger()?;
+    if is_allowed_trigger(trigger, &config.triggers) {
+        Some(trigger)
+    } else {
+        None
     }
 }
 
-pub(crate) fn build_patchright_launch_profile(
+pub(crate) fn build_patchright_launch_profile_for_browser(
     config: &BrowserConfig,
-    browser: Option<BrowserPreference>,
+    selected: Option<&DetectedBrowser>,
 ) -> PatchrightLaunchProfile {
     let locale = config
         .stealth
@@ -141,14 +127,10 @@ pub(crate) fn build_patchright_launch_profile(
         .user_agent
         .clone()
         .or_else(|| config.stealth.user_agent.clone());
-    let detection = crate::detect::detect_browser(config.chrome_path.as_deref());
-    let selected = crate::detect::pick_browser(&detection.browsers, browser);
 
     let (channel, executable_path) = if let Some(selected) = selected {
-        let use_channel = !matches!(
-            selected.source,
-            crate::detect::DetectionSource::CustomPath | crate::detect::DetectionSource::EnvVar
-        );
+        let use_channel =
+            !matches!(selected.source, DetectionSource::CustomPath | DetectionSource::EnvVar);
         let channel = if use_channel {
             patchright_channel_for_browser(selected.kind).map(ToString::to_string)
         } else {
@@ -181,7 +163,6 @@ fn should_suppress_challenge(
     body_text_len: usize,
 ) -> bool {
     match challenge_type {
-        Some(ChallengeType::GenericChallenge) => title_len > 0 || body_text_len > 80,
         Some(ChallengeType::Imperva)
         | Some(ChallengeType::Kasada)
         | Some(ChallengeType::Cloudflare)
@@ -194,18 +175,12 @@ fn should_suppress_challenge(
     }
 }
 
-fn is_patchright_challenge_allowed(
-    challenge_type: ChallengeType,
-    challenge_allowlist: &[String],
-) -> bool {
-    if challenge_allowlist.is_empty() {
+fn is_allowed_trigger(trigger: ProtectionTrigger, allowlist: &[ProtectionTrigger]) -> bool {
+    if allowlist.is_empty() {
         return true;
     }
 
-    let challenge = challenge_type.as_str();
-    challenge_allowlist
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(challenge))
+    allowlist.contains(&trigger)
 }
 
 fn patchright_channel_for_browser(kind: BrowserKind) -> Option<&'static str> {
@@ -223,15 +198,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn suppresses_contentful_challenge_pages() {
-        let generic = assess_html(
-            "https://example.com".to_string(),
-            12,
-            0,
-            "verify you are human",
-        );
-        assert!(generic.is_content());
-
+    fn suppresses_contentful_vendor_challenge_pages() {
         let imperva = assess_html(
             "https://coles.com.au".to_string(),
             41,
@@ -269,61 +236,74 @@ mod tests {
     }
 
     #[test]
-    fn patchright_challenge_allowlist_matches_case_insensitively() {
-        let allow = vec!["KASADA".to_string(), "imperva".to_string()];
-        assert!(is_patchright_challenge_allowed(
-            ChallengeType::Kasada,
-            &allow
-        ));
-        assert!(is_patchright_challenge_allowed(
-            ChallengeType::Imperva,
-            &allow
-        ));
-        assert!(!is_patchright_challenge_allowed(
-            ChallengeType::Cloudflare,
-            &allow
-        ));
+    fn generic_challenge_pages_remain_flagged() {
+        let generic = assess_html(
+            "https://example.com".to_string(),
+            12,
+            150,
+            "verify you are human",
+        );
+        assert_eq!(
+            generic.challenge_type,
+            Some(ChallengeType::GenericChallenge)
+        );
+        assert!(!generic.is_content());
     }
 
     #[test]
     fn patchright_fallback_gate_respects_enabled_sandbox_domain_and_challenge() {
-        let mut cfg = PatchrightFallbackConfig {
+        let mut cfg = ProtectionConfig {
             enabled: true,
-            ..PatchrightFallbackConfig::default()
+            ..ProtectionConfig::default()
         };
         cfg.domains = vec!["*.example.com".to_string()];
-        cfg.challenge_types = vec!["kasada".to_string()];
+        cfg.triggers = vec![ProtectionTrigger::Kasada];
 
-        assert!(should_attempt_patchright_fallback(
-            Some(ChallengeType::Kasada),
-            false,
-            "https://shop.example.com/",
-            &cfg
-        ));
-        assert!(!should_attempt_patchright_fallback(
-            Some(ChallengeType::Kasada),
-            true,
-            "https://shop.example.com/",
-            &cfg
-        ));
-        assert!(!should_attempt_patchright_fallback(
-            Some(ChallengeType::Kasada),
-            false,
-            "https://www.other.com/",
-            &cfg
-        ));
-        assert!(!should_attempt_patchright_fallback(
-            Some(ChallengeType::Imperva),
-            false,
-            "https://shop.example.com/",
-            &cfg
-        ));
-        assert!(!should_attempt_patchright_fallback(
-            None,
-            false,
-            "https://shop.example.com/",
-            &cfg
-        ));
+        let kasada = ProtectionAssessment {
+            final_url: "https://shop.example.com/".to_string(),
+            title_len: 0,
+            body_text_len: 0,
+            html_len: 128,
+            challenge_type: Some(ChallengeType::Kasada),
+            challenge_markers: vec!["kpsdk".to_string()],
+        };
+
+        assert_eq!(
+            protection_trigger_for_fallback(&kasada, false, "https://shop.example.com/", &cfg),
+            Some(ProtectionTrigger::Kasada)
+        );
+        assert_eq!(
+            protection_trigger_for_fallback(&kasada, true, "https://shop.example.com/", &cfg),
+            None
+        );
+        assert_eq!(
+            protection_trigger_for_fallback(&kasada, false, "https://www.other.com/", &cfg),
+            None
+        );
+
+        let imperva = ProtectionAssessment {
+            challenge_type: Some(ChallengeType::Imperva),
+            challenge_markers: vec!["incapsula".to_string()],
+            ..kasada.clone()
+        };
+        assert_eq!(
+            protection_trigger_for_fallback(&imperva, false, "https://shop.example.com/", &cfg),
+            None
+        );
+
+        let empty_shell = ProtectionAssessment {
+            final_url: "https://shop.example.com/".to_string(),
+            title_len: 0,
+            body_text_len: 0,
+            html_len: 120,
+            challenge_type: None,
+            challenge_markers: Vec::new(),
+        };
+        cfg.triggers = vec![ProtectionTrigger::EmptyShell];
+        assert_eq!(
+            protection_trigger_for_fallback(&empty_shell, false, "https://shop.example.com/", &cfg),
+            Some(ProtectionTrigger::EmptyShell)
+        );
     }
 
     #[test]
@@ -337,6 +317,7 @@ mod tests {
             challenge_markers: Vec::new(),
         };
         assert!(should_wait_for_challenge_resolution(&diagnostics));
+        assert!(diagnostics.is_empty_shell());
     }
 
     #[test]

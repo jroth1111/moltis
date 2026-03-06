@@ -21,6 +21,8 @@ use {
 use crate::{
     container::BrowserContainer,
     error::Error,
+    patchright_session::PatchrightSession,
+    protection::{PatchrightLaunchProfile, build_patchright_launch_profile_for_browser},
     types::{BrowserConfig, BrowserPreference},
     virtual_display::VirtualDisplay,
 };
@@ -82,6 +84,7 @@ struct BrowserInstance {
     browser: Browser,
     pages: HashMap<String, Page>,
     last_used: Instant,
+    patchright_launch_profile: PatchrightLaunchProfile,
     /// Whether this instance is running in sandbox mode.
     #[allow(dead_code)]
     sandboxed: bool,
@@ -103,10 +106,18 @@ struct BrowserInstance {
     virtual_display: Option<VirtualDisplay>,
 }
 
+pub(crate) struct PatchrightInstance {
+    pub(crate) session: PatchrightSession,
+    last_used: Instant,
+    #[allow(dead_code)]
+    patchright_launch_profile: PatchrightLaunchProfile,
+}
+
 /// Pool of browser instances for reuse.
 pub struct BrowserPool {
     config: BrowserConfig,
     instances: RwLock<HashMap<String, Arc<Mutex<BrowserInstance>>>>,
+    patchright_instances: RwLock<HashMap<String, Arc<Mutex<PatchrightInstance>>>>,
     #[cfg(feature = "metrics")]
     active_count: std::sync::atomic::AtomicUsize,
 }
@@ -117,6 +128,7 @@ impl BrowserPool {
         Self {
             config,
             instances: RwLock::new(HashMap::new()),
+            patchright_instances: RwLock::new(HashMap::new()),
             #[cfg(feature = "metrics")]
             active_count: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -144,6 +156,13 @@ impl BrowserPool {
                 debug!(session_id = sid, "reusing existing browser instance");
                 return Ok(sid.to_string());
             }
+            drop(instances);
+
+            let patchright_instances = self.patchright_instances.read().await;
+            if patchright_instances.contains_key(sid) {
+                debug!(session_id = sid, "reusing existing patchright session");
+                return Ok(sid.to_string());
+            }
         }
 
         // Check pool capacity using memory-based limits
@@ -151,12 +170,15 @@ impl BrowserPool {
             // If max_instances is set (> 0), enforce it as a hard limit
             if self.config.max_instances > 0 {
                 let instances = self.instances.read().await;
-                if instances.len() >= self.config.max_instances {
+                let patchright_instances = self.patchright_instances.read().await;
+                if instances.len() + patchright_instances.len() >= self.config.max_instances {
                     drop(instances);
+                    drop(patchright_instances);
                     self.cleanup_idle().await;
 
                     let instances = self.instances.read().await;
-                    if instances.len() >= self.config.max_instances {
+                    let patchright_instances = self.patchright_instances.read().await;
+                    if instances.len() + patchright_instances.len() >= self.config.max_instances {
                         return Err(Error::PoolExhausted);
                     }
                 }
@@ -286,6 +308,67 @@ impl BrowserPool {
                 .await?;
         }
         Ok(page)
+    }
+
+    pub async fn session_uses_patchright(&self, session_id: &str) -> bool {
+        let patchright_instances = self.patchright_instances.read().await;
+        patchright_instances.contains_key(session_id)
+    }
+
+    pub(crate) async fn get_patchright_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<Mutex<PatchrightInstance>>, Error> {
+        let patchright_instances = self.patchright_instances.read().await;
+        let instance = patchright_instances
+            .get(session_id)
+            .ok_or_else(|| Error::ElementNotFound(0))?;
+        let instance = Arc::clone(instance);
+        drop(patchright_instances);
+        if let Ok(mut inst) = instance.try_lock() {
+            inst.last_used = Instant::now();
+        }
+        Ok(instance)
+    }
+
+    pub(crate) async fn replace_with_patchright(
+        &self,
+        session_id: &str,
+    ) -> Result<(), Error> {
+        let launch_profile = {
+            let instances = self.instances.read().await;
+            let instance = instances
+                .get(session_id)
+                .ok_or_else(|| Error::ElementNotFound(0))?;
+            let inst = instance.lock().await;
+            inst.patchright_launch_profile.clone()
+        };
+        let instance = PatchrightInstance {
+            session: PatchrightSession::start(&self.config.protection, &launch_profile).await?,
+            last_used: Instant::now(),
+            patchright_launch_profile: launch_profile,
+        };
+        let instance = Arc::new(Mutex::new(instance));
+
+        let old = {
+            let mut instances = self.instances.write().await;
+            instances.remove(session_id)
+        };
+        if let Some(old) = old {
+            let mut inst = old.lock().await;
+            for task in inst.interception.tasks.drain(..) {
+                task.abort();
+            }
+            inst.interception.paused_tx = None;
+            for task in inst.api_capture.tasks.drain(..) {
+                task.abort();
+            }
+            inst.api_capture.attached_targets.clear();
+        }
+
+        let mut patchright_instances = self.patchright_instances.write().await;
+        patchright_instances.insert(session_id.to_string(), instance);
+        Ok(())
     }
 
     // ── Mouse position tracking ──────────────────────────────────────────────
@@ -901,6 +984,29 @@ impl BrowserPool {
             }
 
             info!(session_id, "closed browser session");
+            return Ok(());
+        }
+
+        let instance = {
+            let mut patchright_instances = self.patchright_instances.write().await;
+            patchright_instances.remove(session_id)
+        };
+
+        if let Some(instance) = instance {
+            let mut inst = instance.lock().await;
+            let _ = inst.session.close().await;
+
+            #[cfg(feature = "metrics")]
+            {
+                self.active_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                moltis_metrics::gauge!(moltis_metrics::browser::INSTANCES_ACTIVE)
+                    .set(self.active_count.load(std::sync::atomic::Ordering::Relaxed) as f64);
+                moltis_metrics::counter!(moltis_metrics::browser::INSTANCES_DESTROYED_TOTAL)
+                    .increment(1);
+            }
+
+            info!(session_id, "closed patchright browser session");
         }
 
         Ok(())
@@ -916,6 +1022,17 @@ impl BrowserPool {
         {
             let instances = self.instances.read().await;
             for (sid, instance) in instances.iter() {
+                if let Ok(inst) = instance.try_lock()
+                    && now.duration_since(inst.last_used) > idle_timeout
+                {
+                    to_remove.push(sid.clone());
+                }
+            }
+        }
+
+        {
+            let patchright_instances = self.patchright_instances.read().await;
+            for (sid, instance) in patchright_instances.iter() {
                 if let Ok(inst) = instance.try_lock()
                     && now.duration_since(inst.last_used) > idle_timeout
                 {
@@ -943,10 +1060,15 @@ impl BrowserPool {
 
     /// Shut down all browser instances.
     pub async fn shutdown(&self) {
-        let sessions: Vec<String> = {
+        let mut sessions: Vec<String> = {
             let instances = self.instances.read().await;
             instances.keys().cloned().collect()
         };
+        let patchright_sessions: Vec<String> = {
+            let instances = self.patchright_instances.read().await;
+            instances.keys().cloned().collect()
+        };
+        sessions.extend(patchright_sessions);
 
         for sid in sessions {
             let _ = self.close_session(&sid).await;
@@ -957,7 +1079,7 @@ impl BrowserPool {
 
     /// Get the number of active instances.
     pub async fn active_count(&self) -> usize {
-        self.instances.read().await.len()
+        self.instances.read().await.len() + self.patchright_instances.read().await.len()
     }
 
     /// Launch a new browser instance.
@@ -1076,6 +1198,10 @@ impl BrowserPool {
             browser,
             pages: HashMap::new(),
             last_used: Instant::now(),
+            patchright_launch_profile: build_patchright_launch_profile_for_browser(
+                &self.config,
+                None,
+            ),
             sandboxed: true,
             container: Some(container),
             active_tab: "main".to_string(),
@@ -1278,6 +1404,10 @@ impl BrowserPool {
             browser,
             pages: HashMap::new(),
             last_used: Instant::now(),
+            patchright_launch_profile: build_patchright_launch_profile_for_browser(
+                &self.config,
+                Some(&selected),
+            ),
             sandboxed: false,
             container: None,
             active_tab: "main".to_string(),
@@ -1343,14 +1473,25 @@ mod tests {
         axum::{
             Json, Router,
             extract::State,
-            http::{HeaderMap, Uri},
-            response::Html,
-            routing::{get, post},
+            http::{
+                HeaderMap, StatusCode, Uri,
+                header::{
+                    ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
+                    ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+                    ACCESS_CONTROL_MAX_AGE, CACHE_CONTROL, CONTENT_TYPE, LOCATION, SET_COOKIE,
+                },
+            },
+            response::{Html, IntoResponse},
+            routing::{get, options, post},
         },
-        serde_json::json,
-        std::sync::{Arc, Mutex as StdMutex},
+        serde_json::{Value, json},
+        std::{
+            net::SocketAddr,
+            sync::{Arc, Mutex as StdMutex, OnceLock},
+        },
         tokio::{
             net::TcpListener,
+            sync::{Mutex, OwnedMutexGuard},
             task::JoinHandle,
             time::{Duration, sleep, timeout},
         },
@@ -1385,16 +1526,18 @@ mod tests {
         assert!(sandbox_profile_dir(None, "browser-abc123").is_none());
     }
 
-    fn test_config() -> BrowserConfig {
+    fn live_test_config() -> BrowserConfig {
         BrowserConfig {
             idle_timeout_secs: 60,
+            persist_profile: false,
+            profile_dir: None,
             ..BrowserConfig::default()
         }
     }
 
     #[tokio::test]
     async fn cleanup_idle_empty_pool_returns_early() {
-        let pool = BrowserPool::new(test_config());
+        let pool = BrowserPool::new(live_test_config());
         // Should not panic — hits the early-return guard.
         pool.cleanup_idle().await;
         assert_eq!(pool.active_count().await, 0);
@@ -1402,20 +1545,20 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_empty_pool_is_noop() {
-        let pool = BrowserPool::new(test_config());
+        let pool = BrowserPool::new(live_test_config());
         pool.shutdown().await;
         assert_eq!(pool.active_count().await, 0);
     }
 
     #[tokio::test]
     async fn active_count_starts_at_zero() {
-        let pool = BrowserPool::new(test_config());
+        let pool = BrowserPool::new(live_test_config());
         assert_eq!(pool.active_count().await, 0);
     }
 
     #[tokio::test]
     async fn close_session_missing_is_ok() {
-        let pool = BrowserPool::new(test_config());
+        let pool = BrowserPool::new(live_test_config());
         // Closing a non-existent session should succeed (no-op).
         let result = pool.close_session("nonexistent").await;
         assert!(result.is_ok());
@@ -1423,7 +1566,7 @@ mod tests {
 
     #[test]
     fn drop_empty_pool_does_not_panic() {
-        let pool = BrowserPool::new(test_config());
+        let pool = BrowserPool::new(live_test_config());
         drop(pool);
     }
 
@@ -1489,12 +1632,108 @@ mod tests {
         path: String,
         query: String,
         auth: Option<String>,
+        cookie: Option<String>,
+        content_type: Option<String>,
         method: String,
+        body: String,
     }
 
     #[derive(Clone, Default)]
-    struct PracticalServerState {
+    struct LiveServerState {
         seen: Arc<StdMutex<Vec<SeenRequest>>>,
+    }
+
+    #[derive(Clone)]
+    struct AppServerState {
+        api_origin: String,
+        shared: LiveServerState,
+    }
+
+    #[derive(Clone)]
+    struct ApiServerState {
+        app_origin: String,
+        shared: LiveServerState,
+    }
+
+    struct LiveServers {
+        app_addr: SocketAddr,
+        api_addr: SocketAddr,
+        shared: LiveServerState,
+        app_server: JoinHandle<()>,
+        api_server: JoinHandle<()>,
+    }
+
+    impl LiveServers {
+        fn app_origin(&self) -> String {
+            format!("http://{}", self.app_addr)
+        }
+
+        fn api_origin(&self) -> String {
+            format!("http://{}", self.api_addr)
+        }
+
+        fn abort(self) {
+            self.app_server.abort();
+            self.api_server.abort();
+        }
+    }
+
+    fn record_seen_request(
+        state: &LiveServerState,
+        method: &str,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: impl Into<String>,
+    ) {
+        state.seen.lock().unwrap().push(SeenRequest {
+            path: uri.path().to_string(),
+            query: uri.query().unwrap_or_default().to_string(),
+            auth: headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            cookie: headers
+                .get("cookie")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            content_type: headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            method: method.to_string(),
+            body: body.into(),
+        });
+    }
+
+    fn scripted_page(script: &str) -> Html<String> {
+        let mut html = String::from(
+            r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <link rel="icon" href="data:,">
+  </head>
+  <body>
+    <script>
+"#,
+        );
+        html.push_str(script);
+        html.push_str(
+            r#"
+    </script>
+  </body>
+</html>"#,
+        );
+        Html(html)
+    }
+
+    fn live_browser_test_lock() -> Arc<Mutex<()>> {
+        static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+        Arc::clone(LOCK.get_or_init(|| Arc::new(Mutex::new(()))))
+    }
+
+    async fn acquire_live_browser_test_guard() -> OwnedMutexGuard<()> {
+        live_browser_test_lock().lock_owned().await
     }
 
     async fn page_one() -> Html<&'static str> {
@@ -1549,46 +1788,27 @@ mod tests {
     }
 
     async fn record_get(
-        State(state): State<PracticalServerState>,
+        State(state): State<LiveServerState>,
         uri: Uri,
         headers: HeaderMap,
-    ) -> Json<serde_json::Value> {
-        state.seen.lock().unwrap().push(SeenRequest {
-            path: uri.path().to_string(),
-            query: uri.query().unwrap_or_default().to_string(),
-            auth: headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string),
-            method: "GET".to_string(),
-        });
+    ) -> Json<Value> {
+        record_seen_request(&state, "GET", &uri, &headers, "");
         Json(json!({ "ok": true }))
     }
 
     async fn record_graphql(
-        State(state): State<PracticalServerState>,
+        State(state): State<LiveServerState>,
         uri: Uri,
         headers: HeaderMap,
         body: String,
-    ) -> Json<serde_json::Value> {
-        let _ = body;
-        state.seen.lock().unwrap().push(SeenRequest {
-            path: uri.path().to_string(),
-            query: uri.query().unwrap_or_default().to_string(),
-            auth: headers
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string),
-            method: "POST".to_string(),
-        });
+    ) -> Json<Value> {
+        record_seen_request(&state, "POST", &uri, &headers, body);
         Json(json!({ "data": { "search": [{ "id": 1 }] } }))
     }
 
-    async fn start_practical_server() -> Result<
-        (std::net::SocketAddr, PracticalServerState, JoinHandle<()>),
-        Box<dyn std::error::Error>,
-    > {
-        let state = PracticalServerState::default();
+    async fn start_practical_server()
+    -> Result<(SocketAddr, LiveServerState, JoinHandle<()>), Box<dyn std::error::Error>> {
+        let state = LiveServerState::default();
         let app = Router::new()
             .route("/page1", get(page_one))
             .route("/page2", get(page_two))
@@ -1608,14 +1828,387 @@ mod tests {
         Ok((addr, state, server))
     }
 
+    async fn remote_httpbin_page() -> Html<String> {
+        scripted_page(
+            r#"
+      (async () => {
+        try {
+          const getResponse = await fetch('https://httpbin.org/anything?term=milk&filter=fresh&filter=organic');
+          const getJson = await getResponse.json();
+          const postResponse = await fetch('https://httpbin.org/post', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: 'hello', count: 2 })
+          });
+          const postJson = await postResponse.json();
+          window.__captureResults = {
+            get: { args: getJson.args, url: getJson.url },
+            post: { json: postJson.json, url: postJson.url }
+          };
+        } catch (error) {
+          window.__captureError = String(error && error.message ? error.message : error);
+        } finally {
+          document.body.dataset.done = 'true';
+        }
+      })();
+"#,
+        )
+    }
+
+    async fn remote_graphql_page() -> Html<String> {
+        scripted_page(
+            r#"
+      (async () => {
+        try {
+          const payload = {
+            operationName: 'CountryByCode',
+            query: 'query CountryByCode($code: ID!) { country(code: $code) { code name } }',
+            variables: { code: 'US' }
+          };
+          const response = await fetch('https://countries.trevorblades.com/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          window.__captureResults = await response.json();
+        } catch (error) {
+          window.__captureError = String(error && error.message ? error.message : error);
+        } finally {
+          document.body.dataset.done = 'true';
+        }
+      })();
+"#,
+        )
+    }
+
+    async fn cors_preflight_page(State(state): State<AppServerState>) -> Html<String> {
+        scripted_page(&format!(
+            r#"
+      (async () => {{
+        try {{
+          const response = await fetch('{api_origin}/cors/preflight', {{
+            method: 'POST',
+            headers: {{
+              'Content-Type': 'application/json',
+              'X-Test-Mode': 'cors-live'
+            }},
+            body: JSON.stringify({{ term: 'milk', page: 2 }})
+          }});
+          window.__captureResults = await response.json();
+        }} catch (error) {{
+          window.__captureError = String(error && error.message ? error.message : error);
+        }} finally {{
+          document.body.dataset.done = 'true';
+        }}
+      }})();
+"#,
+            api_origin = state.api_origin,
+        ))
+    }
+
+    async fn multipart_upload_page(State(state): State<AppServerState>) -> Html<String> {
+        scripted_page(&format!(
+            r#"
+      (async () => {{
+        try {{
+          const formData = new FormData();
+          formData.append('metadata', 'alpha');
+          formData.append(
+            'file',
+            new Blob(['hello upload'], {{ type: 'text/plain' }}),
+            'note.txt'
+          );
+          const response = await fetch('{api_origin}/upload', {{
+            method: 'POST',
+            body: formData
+          }});
+          window.__captureResults = await response.json();
+        }} catch (error) {{
+          window.__captureError = String(error && error.message ? error.message : error);
+        }} finally {{
+          document.body.dataset.done = 'true';
+        }}
+      }})();
+"#,
+            api_origin = state.api_origin,
+        ))
+    }
+
+    async fn eventsource_page() -> Html<String> {
+        scripted_page(
+            r#"
+      (() => {
+        try {
+          const source = new EventSource('/sse?stream=prices');
+          source.onmessage = event => {
+            window.__captureResults = JSON.parse(event.data);
+            document.body.dataset.done = 'true';
+            source.close();
+          };
+          source.onerror = () => {
+            window.__captureError = 'eventsource failed';
+            document.body.dataset.done = 'true';
+            source.close();
+          };
+        } catch (error) {
+          window.__captureError = String(error && error.message ? error.message : error);
+          document.body.dataset.done = 'true';
+        }
+      })();
+"#,
+        )
+    }
+
+    async fn service_worker_page() -> Html<String> {
+        scripted_page(
+            r#"
+      (async () => {
+        try {
+          await navigator.serviceWorker.register('/sw.js');
+          await navigator.serviceWorker.ready;
+          if (!navigator.serviceWorker.controller) {
+            const reloads = Number(sessionStorage.getItem('sw-reloads') || '0');
+            if (reloads < 1) {
+              sessionStorage.setItem('sw-reloads', String(reloads + 1));
+              location.reload();
+              return;
+            }
+          }
+          const response = await fetch('/sw-proxy?term=milk');
+          window.__captureResults = await response.json();
+        } catch (error) {
+          window.__captureError = String(error && error.message ? error.message : error);
+        } finally {
+          if (navigator.serviceWorker.controller || sessionStorage.getItem('sw-reloads') === '1') {
+            document.body.dataset.done = 'true';
+          }
+        }
+      })();
+"#,
+        )
+    }
+
+    async fn service_worker_script() -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE, "application/javascript")],
+            r#"
+self.addEventListener('install', event => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+  if (url.pathname === '/sw-proxy') {
+    const term = url.searchParams.get('term') || '';
+    event.respondWith(fetch(`/api/sw-data?term=${encodeURIComponent(term)}&via=service-worker`));
+  }
+});
+"#,
+        )
+    }
+
+    async fn sse_stream(
+        State(state): State<AppServerState>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        record_seen_request(&state.shared, "GET", &uri, &headers, "");
+        (
+            [
+                (CONTENT_TYPE, "text/event-stream"),
+                (CACHE_CONTROL, "no-cache"),
+            ],
+            r#"data: {"stream":"prices","price":42}
+
+"#,
+        )
+    }
+
+    async fn record_sw_data(
+        State(state): State<AppServerState>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Json<Value> {
+        record_seen_request(&state.shared, "GET", &uri, &headers, "");
+        Json(json!({ "via": "service-worker", "term": "milk" }))
+    }
+
+    async fn cors_preflight_options(
+        State(state): State<ApiServerState>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        record_seen_request(&state.shared, "OPTIONS", &uri, &headers, "");
+        (StatusCode::NO_CONTENT, [
+            (ACCESS_CONTROL_ALLOW_ORIGIN, state.app_origin),
+            (
+                ACCESS_CONTROL_ALLOW_METHODS,
+                "GET, POST, PUT, DELETE, PATCH, OPTIONS".to_string(),
+            ),
+            (
+                ACCESS_CONTROL_ALLOW_HEADERS,
+                "content-type,x-test-mode".to_string(),
+            ),
+            (ACCESS_CONTROL_ALLOW_CREDENTIALS, "true".to_string()),
+            (ACCESS_CONTROL_MAX_AGE, "3600".to_string()),
+        ])
+    }
+
+    async fn cors_preflight_post(
+        State(state): State<ApiServerState>,
+        uri: Uri,
+        headers: HeaderMap,
+        body: String,
+    ) -> impl IntoResponse {
+        let payload: Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("cors payload should parse: {error}"));
+        record_seen_request(&state.shared, "POST", &uri, &headers, body);
+        (
+            StatusCode::OK,
+            [(ACCESS_CONTROL_ALLOW_ORIGIN, state.app_origin)],
+            Json(json!({
+                "ok": true,
+                "term": payload["term"],
+                "page": payload["page"],
+                "mode": headers.get("x-test-mode").and_then(|value| value.to_str().ok())
+            })),
+        )
+    }
+
+    async fn upload_handler(
+        State(state): State<ApiServerState>,
+        uri: Uri,
+        headers: HeaderMap,
+        body: String,
+    ) -> impl IntoResponse {
+        let body_snapshot = body.clone();
+        record_seen_request(&state.shared, "POST", &uri, &headers, body);
+        (
+            StatusCode::OK,
+            [(ACCESS_CONTROL_ALLOW_ORIGIN, state.app_origin)],
+            Json(json!({
+                "uploaded": true,
+                "metadata_seen": body_snapshot.contains("name=\"metadata\""),
+                "file_seen": body_snapshot.contains("filename=\"note.txt\"")
+            })),
+        )
+    }
+
+    async fn login_start() -> impl IntoResponse {
+        (
+            StatusCode::FOUND,
+            [(LOCATION, "/login-complete")],
+            String::new(),
+        )
+    }
+
+    async fn login_complete() -> impl IntoResponse {
+        (
+            [(SET_COOKIE, "session=browser-live; Path=/; HttpOnly")],
+            scripted_page("document.body.dataset.done = 'true';").0,
+        )
+    }
+
+    async fn profile_client_page() -> Html<String> {
+        scripted_page(
+            r#"
+      (async () => {
+        try {
+          const response = await fetch('/api/profile');
+          window.__captureResults = await response.json();
+        } catch (error) {
+          window.__captureError = String(error && error.message ? error.message : error);
+        } finally {
+          document.body.dataset.done = 'true';
+        }
+      })();
+"#,
+        )
+    }
+
+    async fn profile_api(
+        State(state): State<ApiServerState>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Json<Value> {
+        record_seen_request(&state.shared, "GET", &uri, &headers, "");
+        Json(json!({
+            "authenticated": headers
+                .get("cookie")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|cookie| cookie.contains("session=browser-live"))
+        }))
+    }
+
+    async fn start_live_servers() -> Result<LiveServers, Box<dyn std::error::Error>> {
+        let app_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let api_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let app_addr = app_listener.local_addr()?;
+        let api_addr = api_listener.local_addr()?;
+        let shared = LiveServerState::default();
+
+        let app = Router::new()
+            .route("/remote-httpbin", get(remote_httpbin_page))
+            .route("/remote-graphql", get(remote_graphql_page))
+            .route("/cors-page", get(cors_preflight_page))
+            .route("/upload-page", get(multipart_upload_page))
+            .route("/eventsource-page", get(eventsource_page))
+            .route("/service-worker-page", get(service_worker_page))
+            .route("/sw.js", get(service_worker_script))
+            .route("/sse", get(sse_stream))
+            .route("/api/sw-data", get(record_sw_data))
+            .with_state(AppServerState {
+                api_origin: format!("http://{api_addr}"),
+                shared: shared.clone(),
+            });
+
+        let api = Router::new()
+            .route(
+                "/cors/preflight",
+                options(cors_preflight_options).post(cors_preflight_post),
+            )
+            .route("/upload", post(upload_handler))
+            .route("/login-start", get(login_start))
+            .route("/login-complete", get(login_complete))
+            .route("/profile-client", get(profile_client_page))
+            .route("/api/profile", get(profile_api))
+            .with_state(ApiServerState {
+                app_origin: format!("http://{app_addr}"),
+                shared: shared.clone(),
+            });
+
+        let app_server = tokio::spawn(async move {
+            axum::serve(app_listener, app)
+                .await
+                .unwrap_or_else(|error| panic!("live app server should run: {error}"));
+        });
+        let api_server = tokio::spawn(async move {
+            axum::serve(api_listener, api)
+                .await
+                .unwrap_or_else(|error| panic!("live api server should run: {error}"));
+        });
+
+        Ok(LiveServers {
+            app_addr,
+            api_addr,
+            shared,
+            app_server,
+            api_server,
+        })
+    }
+
     async fn wait_for_page_done(page: &Page) -> Result<(), Box<dyn std::error::Error>> {
         timeout(Duration::from_secs(10), async {
             loop {
-                let result: serde_json::Value = page
+                let result: Value = page
                     .evaluate("document.body.dataset.done || ''")
                     .await?
                     .into_value()?;
-                if result == serde_json::Value::String("true".to_string()) {
+                if result == Value::String("true".to_string()) {
                     return Ok(()) as Result<(), Box<dyn std::error::Error>>;
                 }
                 sleep(Duration::from_millis(100)).await;
@@ -1624,6 +2217,34 @@ mod tests {
         .await??;
 
         Ok(())
+    }
+
+    async fn page_capture_results(page: &Page) -> Result<Value, Box<dyn std::error::Error>> {
+        let error_payload: Value = page
+            .evaluate("JSON.stringify(window.__captureError ?? null)")
+            .await?
+            .into_value()?;
+        let error: Value = serde_json::from_str(
+            error_payload
+                .as_str()
+                .ok_or("capture error payload should be a string")?,
+        )?;
+        if let Some(error) = error.as_str() {
+            return Err(format!("page capture failed: {error}").into());
+        }
+        let results_payload: Value = page
+            .evaluate("JSON.stringify(window.__captureResults ?? null)")
+            .await?
+            .into_value()?;
+        let results: Value = serde_json::from_str(
+            results_payload
+                .as_str()
+                .ok_or("capture results payload should be a string")?,
+        )?;
+        if results.is_null() {
+            return Err("page produced no capture results".into());
+        }
+        Ok(results)
     }
 
     fn find_endpoint<'a>(
@@ -1637,13 +2258,26 @@ mod tests {
             .unwrap_or_else(|| panic!("endpoint '{path_template}' should be captured"))
     }
 
+    fn find_endpoint_by_method<'a>(
+        catalog: &'a crate::api_capture::ApiCatalog,
+        method: &str,
+        path_template: &str,
+    ) -> &'a crate::api_capture::ApiEndpoint {
+        catalog
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.method == method && endpoint.path_template == path_template)
+            .unwrap_or_else(|| panic!("endpoint '{method} {path_template}' should be captured"))
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires local chromium"]
     async fn api_capture_tracks_real_browser_session_usage()
     -> Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt::try_init();
+        let _browser_guard = acquire_live_browser_test_guard().await;
         let (addr, state, server) = start_practical_server().await?;
-        let pool = BrowserPool::new(test_config());
+        let pool = BrowserPool::new(live_test_config());
 
         let outcome = async {
             let sid = pool
@@ -1738,6 +2372,428 @@ mod tests {
                 && request.method == "GET"
                 && request.auth.is_none()
                 && request.query.contains("api_key=top-secret")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a live browser and internet access"]
+    async fn api_capture_matches_remote_httpbin_echo() -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let servers = start_live_servers().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig {
+                url_patterns: vec!["*httpbin.org/*".to_string()],
+                ..crate::api_capture::ApiCaptureConfig::default()
+            })
+            .await?;
+
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("{}/remote-httpbin", servers.app_origin()))
+                .await?;
+            wait_for_page_done(&page).await?;
+            let results = page_capture_results(&page).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("httpbin capture should produce a catalog"));
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((results, catalog))
+        }
+        .await;
+
+        servers.abort();
+        let (results, catalog) = outcome?;
+        let get_endpoint = find_endpoint_by_method(&catalog, "GET", "/anything");
+        let post_endpoint = find_endpoint_by_method(&catalog, "POST", "/post");
+        let preflight_endpoint = find_endpoint_by_method(&catalog, "OPTIONS", "/post");
+
+        assert_eq!(results["get"]["args"]["term"], "milk");
+        assert_eq!(results["get"]["args"]["filter"][0], "fresh");
+        assert_eq!(results["post"]["json"]["message"], "hello");
+        assert_eq!(results["post"]["json"]["count"], 2);
+
+        assert_eq!(get_endpoint.origin, "https://httpbin.org");
+        assert!(
+            get_endpoint
+                .query_params
+                .iter()
+                .any(|field| field.name == "filter" && field.repeated)
+        );
+        assert_eq!(post_endpoint.origin, "https://httpbin.org");
+        assert_eq!(post_endpoint.body_kind, "json");
+        assert!(
+            post_endpoint
+                .body
+                .as_ref()
+                .is_some_and(|body| body.fields.iter().any(|field| field.name == "message"))
+        );
+        assert_eq!(preflight_endpoint.origin, "https://httpbin.org");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a live browser and internet access"]
+    async fn api_capture_matches_live_graphql_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let servers = start_live_servers().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig {
+                url_patterns: vec!["*countries.trevorblades.com*".to_string()],
+                ..crate::api_capture::ApiCaptureConfig::default()
+            })
+            .await?;
+
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("{}/remote-graphql", servers.app_origin()))
+                .await?;
+            wait_for_page_done(&page).await?;
+            let results = page_capture_results(&page).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("graphql capture should produce a catalog"));
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((results, catalog))
+        }
+        .await;
+
+        servers.abort();
+        let (results, catalog) = outcome?;
+        let graphql_endpoint = find_endpoint_by_method(&catalog, "POST", "/");
+
+        assert_eq!(results["data"]["country"]["code"], "US");
+        assert_eq!(results["data"]["country"]["name"], "United States");
+        assert_eq!(
+            graphql_endpoint.origin,
+            "https://countries.trevorblades.com"
+        );
+        assert_eq!(graphql_endpoint.body_kind, "graphql");
+        assert_eq!(
+            graphql_endpoint.operation_name.as_deref(),
+            Some("CountryByCode")
+        );
+        assert!(
+            graphql_endpoint
+                .body
+                .as_ref()
+                .is_some_and(|body| body.fields.iter().any(|field| field.name == "code"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a live browser"]
+    async fn api_capture_records_actual_cors_preflight_behavior()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let servers = start_live_servers().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig::default())
+                .await?;
+
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("{}/cors-page", servers.app_origin()))
+                .await?;
+            wait_for_page_done(&page).await?;
+            let results = page_capture_results(&page).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("cors capture should produce a catalog"));
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((results, catalog))
+        }
+        .await;
+
+        let seen = servers.shared.seen.lock().unwrap().clone();
+        servers.abort();
+        let (results, catalog) = outcome?;
+        let options_endpoint = find_endpoint_by_method(&catalog, "OPTIONS", "/cors/preflight");
+        let post_endpoint = find_endpoint_by_method(&catalog, "POST", "/cors/preflight");
+
+        assert_eq!(results["ok"], true);
+        assert_eq!(results["mode"], "cors-live");
+        assert_eq!(options_endpoint.body_kind, "none");
+        assert_eq!(post_endpoint.body_kind, "json");
+        assert!(
+            post_endpoint
+                .body
+                .as_ref()
+                .is_some_and(|body| body.fields.iter().any(|field| field.name == "term"))
+        );
+        assert!(seen.iter().any(|request| {
+            request.path == "/cors/preflight"
+                && request.method == "OPTIONS"
+                && request.content_type.as_deref().is_none_or(str::is_empty)
+        }));
+        assert!(seen.iter().any(|request| {
+            request.path == "/cors/preflight"
+                && request.method == "POST"
+                && request.body.contains("\"term\":\"milk\"")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a live browser"]
+    async fn api_capture_tracks_cross_tab_redirected_cookie_auth_flow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let servers = start_live_servers().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig::default())
+                .await?;
+
+            let login_page = pool.get_page(&sid).await?;
+            login_page
+                .goto(&format!("{}/login-start", servers.api_origin()))
+                .await?;
+            wait_for_page_done(&login_page).await?;
+
+            pool.new_tab(&sid, "profile").await?;
+            let profile_page = pool.get_active_page(&sid).await?;
+            profile_page
+                .goto(&format!("{}/profile-client", servers.api_origin()))
+                .await?;
+            wait_for_page_done(&profile_page).await?;
+            let results = page_capture_results(&profile_page).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("cookie flow capture should produce a catalog"));
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((results, catalog))
+        }
+        .await;
+
+        let seen = servers.shared.seen.lock().unwrap().clone();
+        servers.abort();
+        let (results, catalog) = outcome?;
+        let profile_endpoint = find_endpoint_by_method(&catalog, "GET", "/api/profile");
+
+        assert_eq!(results["authenticated"], true);
+        assert_eq!(profile_endpoint.response.statuses, vec![200]);
+        assert!(seen.iter().any(|request| {
+            request.path == "/api/profile"
+                && request.method == "GET"
+                && request
+                    .cookie
+                    .as_deref()
+                    .is_some_and(|cookie| cookie.contains("session=browser-live"))
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a live browser"]
+    async fn api_capture_infers_live_multipart_uploads() -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let servers = start_live_servers().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig::default())
+                .await?;
+
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("{}/upload-page", servers.app_origin()))
+                .await?;
+            wait_for_page_done(&page).await?;
+            let results = page_capture_results(&page).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("multipart capture should produce a catalog"));
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((results, catalog))
+        }
+        .await;
+
+        let seen = servers.shared.seen.lock().unwrap().clone();
+        servers.abort();
+        let (results, catalog) = outcome?;
+        let upload_endpoint = find_endpoint_by_method(&catalog, "POST", "/upload");
+
+        assert_eq!(results["uploaded"], true);
+        assert_eq!(results["metadata_seen"], true);
+        assert_eq!(results["file_seen"], true);
+        assert_eq!(upload_endpoint.body_kind, "multipart");
+        assert!(
+            upload_endpoint
+                .body
+                .as_ref()
+                .is_some_and(|body| body.fields.iter().any(|field| field.name == "metadata"))
+        );
+        assert!(
+            upload_endpoint
+                .body
+                .as_ref()
+                .is_some_and(|body| body.fields.iter().any(|field| field.name == "file"))
+        );
+        assert!(seen.iter().any(|request| {
+            request.path == "/upload"
+                && request.method == "POST"
+                && request.body.contains("filename=\"note.txt\"")
+                && request.body.contains("name=\"metadata\"")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a live browser"]
+    async fn api_capture_records_live_eventsource_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let servers = start_live_servers().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig::default())
+                .await?;
+
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("{}/eventsource-page", servers.app_origin()))
+                .await?;
+            wait_for_page_done(&page).await?;
+            let results = page_capture_results(&page).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("eventsource capture should produce a catalog"));
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((results, catalog))
+        }
+        .await;
+
+        let seen = servers.shared.seen.lock().unwrap().clone();
+        servers.abort();
+        let (results, catalog) = outcome?;
+        let sse_endpoint = find_endpoint_by_method(&catalog, "GET", "/sse");
+
+        assert_eq!(results["stream"], "prices");
+        assert_eq!(results["price"], 42);
+        assert!(
+            sse_endpoint
+                .query_params
+                .iter()
+                .any(|field| field.name == "stream" && field.required)
+        );
+        assert!(
+            sse_endpoint
+                .response
+                .content_types
+                .iter()
+                .any(|content_type| content_type == "text/event-stream")
+        );
+        assert!(seen.iter().any(|request| {
+            request.path == "/sse"
+                && request.method == "GET"
+                && request.query.contains("stream=prices")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a live browser"]
+    async fn api_capture_records_service_worker_network_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let servers = start_live_servers().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig::default())
+                .await?;
+
+            let page = pool.get_page(&sid).await?;
+            page.goto(&format!("{}/service-worker-page", servers.app_origin()))
+                .await?;
+            wait_for_page_done(&page).await?;
+            let results = page_capture_results(&page).await?;
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("service worker capture should produce a catalog"));
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>((results, catalog))
+        }
+        .await;
+
+        let seen = servers.shared.seen.lock().unwrap().clone();
+        servers.abort();
+        let (results, catalog) = outcome?;
+        let sw_endpoint = find_endpoint_by_method(&catalog, "GET", "/api/sw-data");
+
+        assert_eq!(results["via"], "service-worker");
+        assert_eq!(results["term"], "milk");
+        assert!(
+            sw_endpoint
+                .query_params
+                .iter()
+                .any(|field| field.name == "term" && field.required)
+        );
+        assert!(seen.iter().any(|request| {
+            request.path == "/api/sw-data"
+                && request.method == "GET"
+                && request.query.contains("via=service-worker")
         }));
 
         Ok(())

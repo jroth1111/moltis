@@ -259,13 +259,12 @@ fn build_schema_map() -> KnownKeys {
                 ])),
             ),
             (
-                "patchright_fallback",
+                "protection",
                 Struct(HashMap::from([
                     ("enabled", Leaf),
                     ("python_binary", Leaf),
                     ("timeout_ms", Leaf),
-                    ("headless", Leaf),
-                    ("challenge_types", Leaf),
+                    ("triggers", Leaf),
                     ("domains", Leaf),
                     ("max_retries", Leaf),
                 ])),
@@ -1466,12 +1465,12 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         });
     }
 
-    // Patchright fallback: python binary path should not be empty when enabled.
-    if config.tools.browser.patchright_fallback.enabled
+    // Protected backend: python binary path should not be empty when enabled.
+    if config.tools.browser.protection.enabled
         && config
             .tools
             .browser
-            .patchright_fallback
+            .protection
             .python_binary
             .trim()
             .is_empty()
@@ -1479,8 +1478,8 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
             category: "invalid-value",
-            path: "tools.browser.patchright_fallback.python_binary".into(),
-            message: "python_binary is empty; patchright fallback cannot start".into(),
+            path: "tools.browser.protection.python_binary".into(),
+            message: "python_binary is empty; protected-site backend cannot start".into(),
         });
     }
 

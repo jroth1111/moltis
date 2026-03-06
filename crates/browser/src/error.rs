@@ -49,6 +49,9 @@ pub enum Error {
     #[error("invalid action: {0}")]
     InvalidAction(String),
 
+    #[error("action '{action}' is not supported on backend '{backend}'")]
+    UnsupportedBackendAction { backend: String, action: String },
+
     #[error("browser error: {source}")]
     Other {
         #[source]

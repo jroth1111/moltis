@@ -11,7 +11,6 @@ use {
                 DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams,
                 DispatchMouseEventType, MouseButton,
             },
-            network::{CookieParam, SetCookiesParams, TimeSinceEpoch},
             page::CaptureScreenshotFormat,
         },
     },
@@ -22,17 +21,21 @@ use {
 use crate::{
     challenge::ChallengeType,
     error::Error,
-    patchright::{PatchrightProbe, run_patchright_probe_with_retry},
     pool::BrowserPool,
     protection::{
-        ProtectionAssessment, assess_html, assess_patchright_probe,
-        build_patchright_launch_profile, should_attempt_patchright_fallback,
+        ProtectionAssessment, assess_html, protection_trigger_for_fallback,
         should_wait_for_challenge_resolution,
     },
     snapshot::{
-        extract_snapshot, find_element_by_ref, focus_element_by_ref, scroll_element_into_view,
+        EXTRACT_ELEMENTS_JS, build_find_element_js, build_focus_element_js,
+        build_scroll_into_view_js, extract_snapshot, find_element_by_ref, focus_element_by_ref,
+        parse_find_element_result, parse_snapshot_payload, scroll_element_into_view,
     },
-    types::{BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest, BrowserResponse},
+    types::{
+        BrowserAction, BrowserBackendKind, BrowserConfig, BrowserPreference, BrowserRequest,
+        BrowserResponse, ChallengeEvidence, NavigationOutcome, NavigationTrigger,
+        NavigationVerdict,
+    },
 };
 
 const NAV_DIAGNOSTICS_JS: &str = r#"
@@ -99,6 +102,15 @@ impl BrowserManager {
         self.config.enabled
     }
 
+    async fn session_backend(&self, session_id: Option<&str>) -> BrowserBackendKind {
+        if let Some(session_id) = session_id.filter(|sid| !sid.is_empty())
+            && self.pool.session_uses_patchright(session_id).await
+        {
+            return BrowserBackendKind::Patchright;
+        }
+        BrowserBackendKind::Chromiumoxide
+    }
+
     /// Handle a browser request.
     pub async fn handle_request(&self, request: BrowserRequest) -> BrowserResponse {
         if !self.config.enabled {
@@ -143,6 +155,7 @@ impl BrowserManager {
         {
             Ok(result) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
+                let session_backend = self.session_backend(request.session_id.as_deref()).await;
                 match result {
                     Ok((session_id, response)) => {
                         let mut resp = response;
@@ -163,10 +176,12 @@ impl BrowserManager {
                             e.to_string(),
                             duration_ms,
                         )
+                        .with_backend(session_backend)
                     },
                 }
             },
             Err(_) => {
+                let session_backend = self.session_backend(request.session_id.as_deref()).await;
                 #[cfg(feature = "metrics")]
                 moltis_metrics::counter!(
                     moltis_metrics::browser::ERRORS_TOTAL,
@@ -179,6 +194,7 @@ impl BrowserManager {
                     format!("operation timed out after {}ms", request.timeout_ms),
                     request.timeout_ms,
                 )
+                .with_backend(session_backend)
             },
         }
     }
@@ -197,6 +213,10 @@ impl BrowserManager {
         ))
     }
 
+    fn patchright_success(&self, sid: String, sandbox: bool) -> BrowserResponse {
+        BrowserResponse::success(sid, 0, sandbox).with_backend(BrowserBackendKind::Patchright)
+    }
+
     /// Execute a browser action.
     async fn execute_action(
         &self,
@@ -205,6 +225,12 @@ impl BrowserManager {
         sandbox: bool,
         browser: Option<BrowserPreference>,
     ) -> Result<(String, BrowserResponse), Error> {
+        if let Some(sid) = session_id.filter(|sid| !sid.is_empty())
+            && self.pool.session_uses_patchright(sid).await
+        {
+            return self.execute_patchright_action(sid, action, sandbox).await;
+        }
+
         // Navigate has its own retry-with-fresh-session logic, so handle it
         // separately to avoid double-cleanup.
         if let BrowserAction::Navigate { ref url } = action {
@@ -377,6 +403,821 @@ impl BrowserManager {
         }
     }
 
+    fn unsupported_patchright_action(&self, action: &str) -> Error {
+        Error::UnsupportedBackendAction {
+            backend: BrowserBackendKind::Patchright.to_string(),
+            action: action.to_string(),
+        }
+    }
+
+    async fn patchright_evaluate(
+        &self,
+        session_id: &str,
+        code: &str,
+    ) -> Result<serde_json::Value, Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.evaluate(code).await
+    }
+
+    async fn patchright_evaluate_bool(&self, session_id: &str, code: &str) -> Result<bool, Error> {
+        let value = self.patchright_evaluate(session_id, code).await?;
+        Ok(value.as_bool().unwrap_or(false))
+    }
+
+    async fn patchright_scroll_element_into_view(
+        &self,
+        session_id: &str,
+        ref_: u32,
+    ) -> Result<(), Error> {
+        if self
+            .patchright_evaluate_bool(session_id, &build_scroll_into_view_js(ref_))
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(Error::ElementNotFound(ref_))
+        }
+    }
+
+    async fn patchright_focus_ref(&self, session_id: &str, ref_: u32) -> Result<(), Error> {
+        if self
+            .patchright_evaluate_bool(session_id, &build_focus_element_js(ref_))
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(Error::ElementNotFound(ref_))
+        }
+    }
+
+    async fn patchright_find_element(
+        &self,
+        session_id: &str,
+        ref_: u32,
+    ) -> Result<(f64, f64), Error> {
+        let value = self
+            .patchright_evaluate(session_id, &build_find_element_js(ref_))
+            .await?;
+        parse_find_element_result(&value, ref_)
+    }
+
+    async fn collect_patchright_navigation_diagnostics(
+        &self,
+        session_id: &str,
+    ) -> Result<ProtectionAssessment, Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        let capture = inst.session.capture_page().await?;
+        Ok(assess_html(
+            capture.final_url,
+            capture.title_len,
+            capture.body_text_len,
+            &capture.html,
+        ))
+    }
+
+    async fn wait_for_patchright_challenge_resolution_if_needed(
+        &self,
+        session_id: &str,
+    ) -> Result<ProtectionAssessment, Error> {
+        let mut diagnostics = self
+            .collect_patchright_navigation_diagnostics(session_id)
+            .await?;
+        if !should_wait_for_challenge_resolution(&diagnostics) {
+            return Ok(diagnostics);
+        }
+
+        let mut previous_challenge_len: Option<usize> = None;
+        let mut stable_challenge_reads = 0usize;
+
+        for _ in 0..CHALLENGE_WAIT_MAX_SECONDS {
+            sleep(Duration::from_secs(1)).await;
+            let next = self
+                .collect_patchright_navigation_diagnostics(session_id)
+                .await?;
+            let still_waiting = should_wait_for_challenge_resolution(&next);
+            let is_protected = next.challenge_type.is_some() || next.is_empty_shell();
+
+            if is_protected {
+                if previous_challenge_len == Some(next.html_len) {
+                    stable_challenge_reads += 1;
+                } else {
+                    stable_challenge_reads = 0;
+                }
+                previous_challenge_len = Some(next.html_len);
+            } else {
+                stable_challenge_reads = 0;
+                previous_challenge_len = None;
+            }
+
+            diagnostics = next;
+            if !still_waiting || stable_challenge_reads >= CHALLENGE_STABLE_READ_THRESHOLD {
+                break;
+            }
+        }
+
+        Ok(diagnostics)
+    }
+
+    fn build_navigation_outcome(
+        &self,
+        diagnostics: &ProtectionAssessment,
+        backend: BrowserBackendKind,
+        fallback_attempted: bool,
+    ) -> NavigationOutcome {
+        let challenge = diagnostics
+            .challenge_type
+            .map(|challenge_type| ChallengeEvidence {
+                challenge_type,
+                markers: diagnostics.challenge_markers.clone(),
+            });
+        let verdict = if diagnostics.is_empty_shell() {
+            NavigationVerdict::EmptyShell
+        } else if challenge.is_some() {
+            NavigationVerdict::Challenge
+        } else {
+            NavigationVerdict::Content
+        };
+        let trigger = if diagnostics.is_empty_shell() {
+            NavigationTrigger::EmptyShell
+        } else if challenge.is_some() {
+            NavigationTrigger::Challenge
+        } else {
+            NavigationTrigger::Direct
+        };
+
+        NavigationOutcome {
+            final_url: diagnostics.final_url.clone(),
+            title_len: diagnostics.title_len as u64,
+            body_text_len: diagnostics.body_text_len as u64,
+            challenge,
+            trigger,
+            verdict,
+            fallback_attempted,
+            authoritative_backend: backend,
+        }
+    }
+
+    fn apply_navigation_result(
+        &self,
+        session_id: String,
+        sandbox: bool,
+        backend: BrowserBackendKind,
+        navigation: NavigationOutcome,
+    ) -> BrowserResponse {
+        let mut response = BrowserResponse::success(session_id, 0, sandbox)
+            .with_backend(backend)
+            .with_url(navigation.final_url.clone())
+            .with_navigation(navigation.clone());
+        if navigation.verdict != NavigationVerdict::Content {
+            response.success = false;
+            response.error = Some(match &navigation.challenge {
+                Some(challenge) => format!(
+                    "navigated to {} challenge page",
+                    challenge.challenge_type.as_str()
+                ),
+                None => "navigated to unresolved empty-shell page".to_string(),
+            });
+        }
+        response
+    }
+
+    async fn navigate_patchright_session(
+        &self,
+        session_id: &str,
+        url: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let diagnostics = self.navigate_patchright_and_assess(session_id, url).await?;
+        let navigation =
+            self.build_navigation_outcome(&diagnostics, BrowserBackendKind::Patchright, true);
+        let response = self.apply_navigation_result(
+            session_id.to_string(),
+            sandbox,
+            BrowserBackendKind::Patchright,
+            navigation,
+        );
+        Ok((session_id.to_string(), response))
+    }
+
+    async fn navigate_patchright_and_assess(
+        &self,
+        session_id: &str,
+        url: &str,
+    ) -> Result<ProtectionAssessment, Error> {
+        let mut last_diagnostics = None;
+
+        for attempt in 0..=self.config.protection.max_retries {
+            let instance = self.pool.get_patchright_session(session_id).await?;
+            {
+                let mut inst = instance.lock().await;
+                inst.session.goto(url).await?;
+            }
+            let diagnostics = self
+                .wait_for_patchright_challenge_resolution_if_needed(session_id)
+                .await?;
+            if diagnostics.is_content() {
+                return Ok(diagnostics);
+            }
+            last_diagnostics = Some(diagnostics);
+            if attempt < self.config.protection.max_retries {
+                let backoff_ms = 500 * (2_u64.pow(attempt + 1));
+                sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+
+        last_diagnostics.ok_or_else(|| {
+            Error::NavigationFailed("patchright navigation completed without diagnostics".into())
+        })
+    }
+
+    async fn execute_patchright_action(
+        &self,
+        session_id: &str,
+        action: BrowserAction,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let sid = session_id.to_string();
+        match action {
+            BrowserAction::Navigate { url } => {
+                self.navigate_patchright_session(&sid, &url, sandbox).await
+            },
+            BrowserAction::Screenshot {
+                full_page,
+                highlight_ref,
+            } => {
+                self.patchright_screenshot(&sid, full_page, highlight_ref, sandbox)
+                    .await
+            },
+            BrowserAction::Snapshot => self.patchright_snapshot(&sid, sandbox).await,
+            BrowserAction::Click { ref_ } => self.patchright_click(&sid, ref_, sandbox).await,
+            BrowserAction::Type { ref_, text } => {
+                self.patchright_type_text(&sid, ref_, &text, sandbox).await
+            },
+            BrowserAction::Scroll { ref_, x, y } => {
+                self.patchright_scroll(&sid, ref_, x, y, sandbox).await
+            },
+            BrowserAction::Evaluate { code } => {
+                self.patchright_eval_action(&sid, &code, sandbox).await
+            },
+            BrowserAction::Wait {
+                selector,
+                ref_,
+                timeout_ms,
+            } => {
+                self.patchright_wait(&sid, selector, ref_, timeout_ms, sandbox)
+                    .await
+            },
+            BrowserAction::GetUrl => self.patchright_get_url(&sid, sandbox).await,
+            BrowserAction::GetTitle => self.patchright_get_title(&sid, sandbox).await,
+            BrowserAction::Back => self.patchright_back(&sid, sandbox).await,
+            BrowserAction::Forward => self.patchright_forward(&sid, sandbox).await,
+            BrowserAction::Refresh => self.patchright_refresh(&sid, sandbox).await,
+            BrowserAction::Hover { ref_ } => self.patchright_hover(&sid, ref_, sandbox).await,
+            BrowserAction::DoubleClick { ref_ } => {
+                self.patchright_double_click(&sid, ref_, sandbox).await
+            },
+            BrowserAction::Focus { ref_ } => self.patchright_focus(&sid, ref_, sandbox).await,
+            BrowserAction::Check { ref_ } => self.patchright_check(&sid, ref_, sandbox).await,
+            BrowserAction::Uncheck { ref_ } => self.patchright_uncheck(&sid, ref_, sandbox).await,
+            BrowserAction::Select { ref_, value } => {
+                self.patchright_select(&sid, ref_, &value, sandbox).await
+            },
+            BrowserAction::Press { key } => self.patchright_press(&sid, &key, sandbox).await,
+            BrowserAction::Upload { ref_, path } => {
+                self.patchright_upload(&sid, ref_, &path, sandbox).await
+            },
+            BrowserAction::Clear { ref_ } => self.patchright_clear(&sid, ref_, sandbox).await,
+            BrowserAction::TabNew { name } => self.patchright_tab_new(&sid, &name, sandbox).await,
+            BrowserAction::TabList => self.patchright_tab_list(&sid, sandbox).await,
+            BrowserAction::TabSwitch { name } => {
+                self.patchright_tab_switch(&sid, &name, sandbox).await
+            },
+            BrowserAction::TabClose { name } => {
+                self.patchright_tab_close(&sid, &name, sandbox).await
+            },
+            BrowserAction::Close => self.close(Some(&sid), sandbox).await,
+            BrowserAction::Drag { .. }
+            | BrowserAction::InterceptRequests { .. }
+            | BrowserAction::StopIntercept
+            | BrowserAction::SetExtraHeaders { .. }
+            | BrowserAction::StartApiCapture { .. }
+            | BrowserAction::StopApiCapture
+            | BrowserAction::SaveState { .. }
+            | BrowserAction::LoadState { .. }
+            | BrowserAction::ListStates
+            | BrowserAction::DeleteState { .. }
+            | BrowserAction::SetDevice { .. }
+            | BrowserAction::SetGeolocation { .. }
+            | BrowserAction::SetTimezone { .. }
+            | BrowserAction::SetLocale { .. }
+            | BrowserAction::ClearDevice
+            | BrowserAction::StartScreencast { .. }
+            | BrowserAction::StopScreencast
+            | BrowserAction::GetScreencastFrame => {
+                Err(self.unsupported_patchright_action(&action.to_string()))
+            },
+        }
+    }
+
+    fn patchright_selector(ref_: u32) -> String {
+        format!(r#"[data-moltis-ref="{ref_}"]"#)
+    }
+
+    async fn patchright_screenshot(
+        &self,
+        session_id: &str,
+        full_page: bool,
+        highlight_ref: Option<u32>,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        if let Some(ref_) = highlight_ref {
+            let highlight_script = format!(
+                r#"(() => {{
+                            const el = document.querySelector(`[data-moltis-ref="{ref_}"]`);
+                            if (el) {{
+                                el.style.outline = '3px solid #ff0000';
+                                el.style.outlineOffset = '2px';
+                            }}
+                        }})()"#
+            );
+            let _ = self
+                .patchright_evaluate(session_id, &highlight_script)
+                .await;
+        }
+
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let screenshot = {
+            let mut inst = instance.lock().await;
+            inst.session.screenshot(full_page).await?
+        };
+
+        if highlight_ref.is_some() {
+            let _ = self
+                .patchright_evaluate(
+                    session_id,
+                    r#"
+                        document.querySelectorAll('[data-moltis-ref]').forEach(el => {
+                            el.style.outline = '';
+                            el.style.outlineOffset = '';
+                        });
+                    "#,
+                )
+                .await;
+        }
+
+        let data_uri = format!("data:image/png;base64,{screenshot}");
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_screenshot(data_uri, self.config.device_scale_factor),
+        ))
+    }
+
+    async fn patchright_snapshot(
+        &self,
+        session_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let (url, title, result) = {
+            let mut inst = instance.lock().await;
+            let url = inst.session.get_url().await?;
+            let title = inst.session.get_title().await?;
+            let result = inst.session.evaluate(EXTRACT_ELEMENTS_JS).await?;
+            (url, title, result)
+        };
+        let snapshot = parse_snapshot_payload(url, title, &result)?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_snapshot(snapshot),
+        ))
+    }
+
+    async fn patchright_click(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        self.patchright_scroll_element_into_view(session_id, ref_)
+            .await?;
+        sleep(Duration::from_millis(100)).await;
+        let (x, y) = self.patchright_find_element(session_id, ref_).await?;
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.mouse_click(x, y, 1).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_type_text(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        text: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        self.patchright_focus_ref(session_id, ref_).await?;
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.keyboard_type(text).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_scroll(
+        &self,
+        session_id: &str,
+        ref_: Option<u32>,
+        x: i32,
+        y: i32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let js = if let Some(ref_) = ref_ {
+            format!(
+                r#"(() => {{
+                    const el = document.querySelector(`[data-moltis-ref="{ref_}"]`);
+                    if (!el) return false;
+                    el.scrollBy({x}, {y});
+                    return true;
+                }})()"#
+            )
+        } else {
+            format!("window.scrollBy({x}, {y}); true")
+        };
+        let ok = self.patchright_evaluate_bool(session_id, &js).await?;
+        if !ok {
+            return Err(Error::ElementNotFound(ref_.unwrap_or_default()));
+        }
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_eval_action(
+        &self,
+        session_id: &str,
+        code: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        let result = inst.session.evaluate(code).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_result(result),
+        ))
+    }
+
+    async fn patchright_wait(
+        &self,
+        session_id: &str,
+        selector: Option<String>,
+        ref_: Option<u32>,
+        timeout_ms: u64,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let found = if let Some(selector) = selector {
+            let instance = self.pool.get_patchright_session(session_id).await?;
+            let mut inst = instance.lock().await;
+            inst.session.wait_selector(&selector, timeout_ms).await?
+        } else if let Some(ref_) = ref_ {
+            let selector = Self::patchright_selector(ref_);
+            let exists_script = format!(
+                "document.querySelector({}) !== null",
+                serde_json::to_string(&selector).map_err(|e| Error::JsEvalFailed(e.to_string()))?
+            );
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                let exists = self
+                    .patchright_evaluate_bool(session_id, &exists_script)
+                    .await?;
+                if exists {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        } else {
+            return Err(Error::InvalidAction(
+                "wait requires selector or ref".to_string(),
+            ));
+        };
+
+        if !found {
+            return Err(Error::Timeout(format!(
+                "element not found after {timeout_ms}ms"
+            )));
+        }
+
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_get_url(
+        &self,
+        session_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        let url = inst.session.get_url().await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_url(url),
+        ))
+    }
+
+    async fn patchright_get_title(
+        &self,
+        session_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        let title = inst.session.get_title().await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_title(title),
+        ))
+    }
+
+    async fn patchright_back(
+        &self,
+        session_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.back().await?;
+        let url = inst.session.get_url().await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_url(url),
+        ))
+    }
+
+    async fn patchright_forward(
+        &self,
+        session_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.forward().await?;
+        let url = inst.session.get_url().await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_url(url),
+        ))
+    }
+
+    async fn patchright_refresh(
+        &self,
+        session_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.refresh().await?;
+        let url = inst.session.get_url().await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_url(url),
+        ))
+    }
+
+    async fn patchright_hover(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        self.patchright_scroll_element_into_view(session_id, ref_)
+            .await?;
+        let (x, y) = self.patchright_find_element(session_id, ref_).await?;
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.mouse_move(x, y).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_double_click(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        self.patchright_scroll_element_into_view(session_id, ref_)
+            .await?;
+        let (x, y) = self.patchright_find_element(session_id, ref_).await?;
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.mouse_click(x, y, 2).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_focus(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        self.patchright_focus_ref(session_id, ref_).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_check(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        self.patchright_scroll_element_into_view(session_id, ref_)
+            .await?;
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.check(&Self::patchright_selector(ref_)).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_uncheck(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        self.patchright_scroll_element_into_view(session_id, ref_)
+            .await?;
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session
+            .uncheck(&Self::patchright_selector(ref_))
+            .await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_select(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        value: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session
+            .select_option(&Self::patchright_selector(ref_), value)
+            .await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_press(
+        &self,
+        session_id: &str,
+        key: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.keyboard_press(key).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_upload(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        path: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session
+            .set_input_files(&Self::patchright_selector(ref_), path)
+            .await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_clear(
+        &self,
+        session_id: &str,
+        ref_: u32,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        self.patchright_scroll_element_into_view(session_id, ref_)
+            .await?;
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.clear(&Self::patchright_selector(ref_)).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_tab_new(
+        &self,
+        session_id: &str,
+        name: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.new_tab(name).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_tab_list(
+        &self,
+        session_id: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        let tabs = inst.session.list_tabs().await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox)
+                .with_result(serde_json::json!(tabs)),
+        ))
+    }
+
+    async fn patchright_tab_switch(
+        &self,
+        session_id: &str,
+        name: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.switch_tab(name).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
+    async fn patchright_tab_close(
+        &self,
+        session_id: &str,
+        name: &str,
+        sandbox: bool,
+    ) -> Result<(String, BrowserResponse), Error> {
+        let instance = self.pool.get_patchright_session(session_id).await?;
+        let mut inst = instance.lock().await;
+        inst.session.close_tab(name).await?;
+        Ok((
+            session_id.to_string(),
+            self.patchright_success(session_id.to_string(), sandbox),
+        ))
+    }
+
     /// Navigate to a URL.
     async fn navigate(
         &self,
@@ -448,9 +1289,18 @@ impl BrowserManager {
         let mut diagnostics = self
             .wait_for_challenge_resolution_if_needed(&active_page)
             .await;
-        diagnostics = self
-            .retry_with_patchright_if_needed(&active_page, diagnostics, url, sandbox, browser)
-            .await;
+        let mut backend = BrowserBackendKind::Chromiumoxide;
+        let mut fallback_attempted = false;
+        if protection_trigger_for_fallback(&diagnostics, sandbox, url, &self.config.protection)
+            .is_some()
+        {
+            fallback_attempted = true;
+            self.pool.replace_with_patchright(&active_sid).await?;
+            diagnostics = self
+                .navigate_patchright_and_assess(&active_sid, url)
+                .await?;
+            backend = BrowserBackendKind::Patchright;
+        }
 
         #[cfg(feature = "metrics")]
         {
@@ -459,11 +1309,8 @@ impl BrowserManager {
         }
 
         let current_url = diagnostics.final_url.clone();
-        let challenge_type = diagnostics
-            .challenge_type
-            .map(|kind| kind.as_str().to_string());
-
-        if let Some(ref kind) = challenge_type {
+        let challenge_type = diagnostics.challenge_type.map(ChallengeType::as_str);
+        if let Some(kind) = challenge_type {
             warn!(
                 session_id = active_sid,
                 url = current_url,
@@ -472,6 +1319,14 @@ impl BrowserManager {
                 title_len = diagnostics.title_len,
                 body_text_len = diagnostics.body_text_len,
                 "navigated to challenge/interstitial page"
+            );
+        } else if diagnostics.is_empty_shell() {
+            warn!(
+                session_id = active_sid,
+                url = current_url,
+                title_len = diagnostics.title_len,
+                body_text_len = diagnostics.body_text_len,
+                "navigated to unresolved empty-shell page"
             );
         } else {
             info!(
@@ -483,19 +1338,9 @@ impl BrowserManager {
             );
         }
 
-        let mut response = BrowserResponse::success(active_sid.clone(), 0, sandbox)
-            .with_url(current_url.clone())
-            .with_navigation_diagnostics(
-                current_url,
-                diagnostics.title_len,
-                diagnostics.body_text_len,
-                challenge_type,
-                diagnostics.challenge_markers,
-            );
-        if let Some(ref kind) = response.challenge_type {
-            response.success = false;
-            response.error = Some(format!("navigated to {kind} challenge page"));
-        }
+        let navigation = self.build_navigation_outcome(&diagnostics, backend, fallback_attempted);
+        let response =
+            self.apply_navigation_result(active_sid.clone(), sandbox, backend, navigation);
         Ok((active_sid, response))
     }
 
@@ -567,185 +1412,6 @@ impl BrowserManager {
         }
 
         diagnostics
-    }
-
-    async fn mirror_patchright_probe(
-        &self,
-        page: &Page,
-        probe: &PatchrightProbe,
-        url: &str,
-        attempt: &str,
-    ) {
-        debug!(
-            url = url,
-            attempt = attempt,
-            patchright_final_url = probe.final_url,
-            patchright_title_len = probe.title_len,
-            patchright_body_text_len = probe.body_text_len,
-            patchright_cookie_count = probe.cookies.len(),
-            "patchright probe completed"
-        );
-
-        let cookie_params: Vec<CookieParam> = probe
-            .cookies
-            .iter()
-            .filter(|cookie| !cookie.name.is_empty())
-            .map(|cookie| CookieParam {
-                name: cookie.name.clone(),
-                value: cookie.value.clone(),
-                url: None,
-                domain: if cookie.domain.is_empty() {
-                    None
-                } else {
-                    Some(cookie.domain.clone())
-                },
-                path: if cookie.path.is_empty() {
-                    None
-                } else {
-                    Some(cookie.path.clone())
-                },
-                secure: Some(cookie.secure),
-                http_only: Some(cookie.http_only),
-                same_site: None,
-                expires: cookie
-                    .expires
-                    .filter(|ts| ts.is_finite() && *ts > 0.0)
-                    .map(TimeSinceEpoch::new),
-                priority: None,
-                same_party: None,
-                source_scheme: None,
-                source_port: None,
-                partition_key: None,
-            })
-            .collect();
-
-        if cookie_params.is_empty() {
-            debug!(
-                url = url,
-                attempt = attempt,
-                "patchright probe returned no transferable cookies to mirror"
-            );
-        } else if let Err(e) = page.execute(SetCookiesParams::new(cookie_params)).await {
-            warn!(
-                url = url,
-                attempt = attempt,
-                error = %e,
-                "failed to mirror patchright cookies into active session"
-            );
-        }
-
-        if let Some(html) = &probe.html {
-            debug!(
-                original_url = url,
-                attempt = attempt,
-                html_len = html.len(),
-                "mirroring patchright HTML into chromium session"
-            );
-
-            let inject_js = format!(
-                r#"(function() {{
-                    const targetUrl = {};
-                    const newHtml = {};
-                    const title = {};
-                    try {{
-                        history.replaceState(null, "", targetUrl);
-                    }} catch (_) {{}}
-                    try {{
-                        document.open();
-                        document.write(newHtml);
-                        document.close();
-                    }} catch (_) {{}}
-                    if (title) {{
-                        try {{
-                            document.title = title;
-                        }} catch (_) {{}}
-                    }}
-                }})()"#,
-                serde_json::to_string(&probe.final_url).unwrap_or_else(|_| "\"\"".to_string()),
-                serde_json::to_string(html).unwrap_or_else(|_| "null".to_string()),
-                serde_json::to_string(probe.title.as_deref().unwrap_or(""))
-                    .unwrap_or_else(|_| "\"\"".to_string())
-            );
-
-            if let Err(e) = page.evaluate(inject_js.as_str()).await {
-                warn!(
-                    original_url = url,
-                    attempt = attempt,
-                    error = %e,
-                    "failed to mirror patchright HTML"
-                );
-            } else {
-                sleep(Duration::from_millis(300)).await;
-            }
-        }
-    }
-
-    async fn retry_with_patchright_if_needed(
-        &self,
-        page: &Page,
-        diagnostics: ProtectionAssessment,
-        url: &str,
-        sandbox: bool,
-        browser: Option<BrowserPreference>,
-    ) -> ProtectionAssessment {
-        if !should_attempt_patchright_fallback(
-            diagnostics.challenge_type,
-            sandbox,
-            url,
-            &self.config.patchright_fallback,
-        ) {
-            return diagnostics;
-        }
-
-        let challenge_name = diagnostics.challenge_type.map(ChallengeType::as_str);
-        info!(
-            url = url,
-            challenge_type = ?challenge_name,
-            "attempting patchright fallback for challenge page"
-        );
-
-        let mut best = diagnostics;
-        let fallback = &self.config.patchright_fallback;
-        let launch_profile = build_patchright_launch_profile(&self.config, browser);
-
-        match run_patchright_probe_with_retry(
-            url,
-            fallback,
-            fallback.headless,
-            &launch_profile,
-            fallback.max_retries,
-        )
-        .await
-        {
-            Ok(probe) => {
-                let direct = assess_patchright_probe(&probe);
-                if direct.is_content() {
-                    self.mirror_patchright_probe(page, &probe, url, "primary")
-                        .await;
-                    info!(
-                        original_url = url,
-                        attempt = "primary",
-                        patchright_final_url = probe.final_url,
-                        title_len = direct.title_len,
-                        body_text_len = direct.body_text_len,
-                        "patchright direct navigation resolved challenge"
-                    );
-                    best = direct;
-                } else if direct.is_better_than(&best) {
-                    best = direct;
-                }
-            },
-            Err(e) => {
-                warn!(
-                    url = url,
-                    challenge_type = ?challenge_name,
-                    error = %e,
-                    "patchright fallback failed"
-                );
-            },
-        }
-
-        best
     }
 
     /// Take a screenshot of the page.
@@ -1176,12 +1842,16 @@ impl BrowserManager {
         sandbox: bool,
     ) -> Result<(String, BrowserResponse), Error> {
         let sid = require_session(session_id, "close")?;
+        let backend = self.session_backend(Some(&sid)).await;
 
         self.pool.close_session(&sid).await?;
 
         info!(session_id = sid, "closed browser session");
 
-        Ok((sid.clone(), BrowserResponse::success(sid, 0, sandbox)))
+        Ok((
+            sid.clone(),
+            BrowserResponse::success(sid, 0, sandbox).with_backend(backend),
+        ))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1575,17 +2245,14 @@ impl BrowserManager {
             .await?;
         let start = Instant::now();
         self.pool
-            .start_api_capture(
-                &sid,
-                crate::api_capture::ApiCaptureConfig {
-                    url_patterns,
-                    include_document_requests,
-                    max_examples_per_endpoint: usize::try_from(max_examples_per_endpoint)
-                        .ok()
-                        .filter(|value| *value > 0)
-                        .unwrap_or(3),
-                },
-            )
+            .start_api_capture(&sid, crate::api_capture::ApiCaptureConfig {
+                url_patterns,
+                include_document_requests,
+                max_examples_per_endpoint: usize::try_from(max_examples_per_endpoint)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .unwrap_or(3),
+            })
             .await?;
         let resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
