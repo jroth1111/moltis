@@ -2897,7 +2897,7 @@ impl BrowserManager {
         let start = Instant::now();
         let page = self.pool.get_page(&sid).await?;
         let state = crate::session_state::capture_state(&page).await?;
-        let path = crate::session_state::save_to_disk(&state, name, encrypt)?;
+        let path = crate::session_state::save_to_disk(&state, name, encrypt).await?;
         let mut resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
         resp = resp.with_url(path.to_string_lossy().into_owned());
@@ -2913,7 +2913,7 @@ impl BrowserManager {
     ) -> Result<(String, BrowserResponse), Error> {
         let sid = require_session(session_id, "load_state")?;
         let start = Instant::now();
-        let state = crate::session_state::load_from_disk(name)?;
+        let state = crate::session_state::load_from_disk(name).await?;
         let page = self.pool.get_page(&sid).await?;
         crate::session_state::restore_state(&page, &state).await?;
         let resp =
@@ -2931,7 +2931,7 @@ impl BrowserManager {
             .map(String::from)
             .unwrap_or_else(|| "no-session".to_string());
         let start = Instant::now();
-        let names = crate::session_state::list_saved()?;
+        let names = crate::session_state::list_saved().await?;
         let json = serde_json::json!({"states": names});
         let mut resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
@@ -2950,7 +2950,7 @@ impl BrowserManager {
             .map(String::from)
             .unwrap_or_else(|| "no-session".to_string());
         let start = Instant::now();
-        crate::session_state::delete_saved(name)?;
+        crate::session_state::delete_saved(name).await?;
         let resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
         Ok((sid, resp))

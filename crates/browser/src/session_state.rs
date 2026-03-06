@@ -324,12 +324,39 @@ pub fn sessions_dir() -> PathBuf {
     moltis_config::data_dir().join("browser").join("sessions")
 }
 
+async fn run_session_fs_task<T, F>(action: &'static str, task: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| Error::InvalidAction(format!("{action} task failed: {error}")))?
+}
+
 /// Persist `state` to disk as `<name>.json` in the sessions directory.
 ///
 /// When `encrypt` is `true` and the `session-encrypt` Cargo feature is enabled,
 /// the JSON is XChaCha20-Poly1305 encrypted before writing.
 /// When the feature is not enabled and `encrypt=true`, returns an error.
-pub fn save_to_disk(state: &SessionState, name: &str, encrypt: bool) -> Result<PathBuf, Error> {
+pub async fn save_to_disk(
+    state: &SessionState,
+    name: &str,
+    encrypt: bool,
+) -> Result<PathBuf, Error> {
+    let state = state.clone();
+    let name = name.to_string();
+    run_session_fs_task("save session state", move || {
+        save_to_disk_blocking(&state, &name, encrypt)
+    })
+    .await
+}
+
+fn save_to_disk_blocking(
+    state: &SessionState,
+    name: &str,
+    encrypt: bool,
+) -> Result<PathBuf, Error> {
     let dir = sessions_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::InvalidAction(format!("cannot create sessions dir: {e}")))?;
@@ -357,7 +384,12 @@ pub fn save_to_disk(state: &SessionState, name: &str, encrypt: bool) -> Result<P
 ///
 /// Automatically detects whether the file is encrypted (starts with `"ENC:"`)
 /// and decrypts it if needed.
-pub fn load_from_disk(name: &str) -> Result<SessionState, Error> {
+pub async fn load_from_disk(name: &str) -> Result<SessionState, Error> {
+    let name = name.to_string();
+    run_session_fs_task("load session state", move || load_from_disk_blocking(&name)).await
+}
+
+fn load_from_disk_blocking(name: &str) -> Result<SessionState, Error> {
     let path = sessions_dir().join(format!("{}.json", sanitise_name(name)));
 
     let content = std::fs::read_to_string(&path).map_err(|e| {
@@ -380,7 +412,11 @@ pub fn load_from_disk(name: &str) -> Result<SessionState, Error> {
 }
 
 /// List saved session names.
-pub fn list_saved() -> Result<Vec<String>, Error> {
+pub async fn list_saved() -> Result<Vec<String>, Error> {
+    run_session_fs_task("list saved session states", list_saved_blocking).await
+}
+
+fn list_saved_blocking() -> Result<Vec<String>, Error> {
     let dir = sessions_dir();
     if !dir.exists() {
         return Ok(vec![]);
@@ -404,7 +440,15 @@ pub fn list_saved() -> Result<Vec<String>, Error> {
 }
 
 /// Delete a saved session by name.
-pub fn delete_saved(name: &str) -> Result<(), Error> {
+pub async fn delete_saved(name: &str) -> Result<(), Error> {
+    let name = name.to_string();
+    run_session_fs_task("delete saved session state", move || {
+        delete_saved_blocking(&name)
+    })
+    .await
+}
+
+fn delete_saved_blocking(name: &str) -> Result<(), Error> {
     let path = sessions_dir().join(format!("{}.json", sanitise_name(name)));
     std::fs::remove_file(&path)
         .map_err(|e| Error::InvalidAction(format!("delete session '{}': {e}", name)))?;
@@ -548,8 +592,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_save_load_disk_unencrypted() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_save_load_disk_unencrypted() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         // Since sessions_dir() is hardcoded, we test the serde round-trip
         // by writing/reading directly to a temp path.
@@ -572,16 +616,16 @@ mod tests {
     }
 
     #[cfg(feature = "session-encrypt")]
-    #[test]
+    #[tokio::test]
     #[allow(clippy::unwrap_used)]
-    fn session_state_encrypt_decrypt_round_trip() {
+    async fn session_state_encrypt_decrypt_round_trip() {
         let state = make_state("https://encrypt-roundtrip.test");
 
         // Use a unique name to avoid collisions with other tests.
         let name = "test-encrypt-rt";
 
         // Save encrypted.
-        let path = save_to_disk(&state, name, true).unwrap();
+        let path = save_to_disk(&state, name, true).await.unwrap();
 
         // The file on disk should start with "ENC:".
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -591,7 +635,7 @@ mod tests {
         );
 
         // Load and verify round-trip fidelity.
-        let loaded = load_from_disk(name).unwrap();
+        let loaded = load_from_disk(name).await.unwrap();
         assert_eq!(loaded.version, state.version);
         assert_eq!(loaded.url, state.url);
         assert_eq!(loaded.captured_at, state.captured_at);
