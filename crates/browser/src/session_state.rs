@@ -10,7 +10,8 @@ use {
     chromiumoxide::{
         Page,
         cdp::browser_protocol::network::{
-            Cookie, CookieParam, GetCookiesParams, SetCookiesParams, TimeSinceEpoch,
+            Cookie, CookieParam, CookieSameSite as CdpCookieSameSite, GetCookiesParams,
+            SetCookiesParams, TimeSinceEpoch,
         },
     },
     serde::{Deserialize, Serialize},
@@ -28,8 +29,39 @@ pub struct CookieEntry {
     pub path: String,
     pub secure: bool,
     pub http_only: bool,
-    pub same_site: Option<String>,
+    pub same_site: Option<CookieSameSiteValue>,
     pub expires: f64,
+}
+
+/// SameSite value persisted with captured cookies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CookieSameSiteValue {
+    #[serde(rename = "Strict")]
+    Strict,
+    #[serde(rename = "Lax")]
+    Lax,
+    #[serde(rename = "None")]
+    None,
+}
+
+impl From<&CdpCookieSameSite> for CookieSameSiteValue {
+    fn from(value: &CdpCookieSameSite) -> Self {
+        match value {
+            CdpCookieSameSite::Strict => Self::Strict,
+            CdpCookieSameSite::Lax => Self::Lax,
+            CdpCookieSameSite::None => Self::None,
+        }
+    }
+}
+
+impl From<&CookieSameSiteValue> for CdpCookieSameSite {
+    fn from(value: &CookieSameSiteValue) -> Self {
+        match value {
+            CookieSameSiteValue::Strict => Self::Strict,
+            CookieSameSiteValue::Lax => Self::Lax,
+            CookieSameSiteValue::None => Self::None,
+        }
+    }
 }
 
 impl From<&Cookie> for CookieEntry {
@@ -41,7 +73,7 @@ impl From<&Cookie> for CookieEntry {
             path: c.path.clone(),
             secure: c.secure,
             http_only: c.http_only,
-            same_site: c.same_site.as_ref().map(|s| s.as_ref().to_string()),
+            same_site: c.same_site.as_ref().map(CookieSameSiteValue::from),
             expires: c.expires,
         }
     }
@@ -57,7 +89,7 @@ impl From<&CookieEntry> for CookieParam {
             path: Some(e.path.clone()),
             secure: Some(e.secure),
             http_only: Some(e.http_only),
-            same_site: None,
+            same_site: e.same_site.as_ref().map(CdpCookieSameSite::from),
             expires: if e.expires > 0.0 {
                 Some(TimeSinceEpoch::new(e.expires))
             } else {
@@ -487,7 +519,7 @@ mod tests {
                 path: "/".to_string(),
                 secure: true,
                 http_only: true,
-                same_site: Some("Strict".to_string()),
+                same_site: Some(CookieSameSiteValue::Strict),
                 expires: -1.0,
             }],
             storage: vec![StorageEntry {
@@ -588,6 +620,23 @@ mod tests {
         assert_eq!(param.name, "tok");
         assert_eq!(param.value, "xyz");
         assert_eq!(param.expires, None); // -1 expires → None
+    }
+
+    #[test]
+    fn test_cookie_entry_round_trip_preserves_same_site() {
+        let entry = CookieEntry {
+            name: "tok".to_string(),
+            value: "xyz".to_string(),
+            domain: ".example.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: true,
+            same_site: Some(CookieSameSiteValue::Strict),
+            expires: 42.0,
+        };
+
+        let param = CookieParam::from(&entry);
+        assert_eq!(param.same_site, Some(CdpCookieSameSite::Strict));
     }
 
     #[tokio::test]
