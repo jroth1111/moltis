@@ -223,3 +223,32 @@
       - missing `allowed_hosts` field in `ApiCaptureConfig` initializer in `crates/browser/src/manager.rs`
       - missing `handle` field in `ApiCaptureSnapshot` initializer in `crates/browser/src/pool.rs`
       - multiple type and helper mismatches in `crates/browser/src/api_capture.rs`
+- Anti-bot cleanup follow-up with breaking changes:
+  - renamed `empty_shell` trigger/verdict terminology to `unresolved_interstitial`
+  - removed vendor challenge suppression and now classify blocking pages from raw challenge signals plus page shape
+  - added `interactive_element_count` to navigation diagnostics for both `chromiumoxide` and Patchright
+  - tightened unresolved-page detection for title-only and low-content/no-interactive interstitials
+  - preserved interception and extra-header semantics across Chromium -> Patchright handoff
+  - added Patchright-side interception commands and kept API capture working after backend switch
+  - extracted the Patchright Python worker into `crates/browser/src/patchright_worker.py`
+  - added worker startup handshake validation before `PatchrightSession::start()` returns
+  - added direct worker-level tests for core commands and interception/API capture
+  - isolated live-browser tests onto unique profile roots to avoid Chromium singleton-lock collisions under full `--lib` runs
+- Validation for the anti-bot cleanup follow-up:
+  - `cargo test -p moltis-browser --lib patchright_session_ -- --nocapture`
+    - exit `0`
+    - `2 passed`
+  - `cargo test -p moltis-browser --lib replace_with_patchright_preserves_interception_and_api_capture -- --nocapture`
+    - exit `0`
+    - `1 passed`
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `155 passed, 0 failed, 8 ignored`
+  - `CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' MOLTIS_DATA_DIR=$(mktemp -d) CARGO_TARGET_DIR=$(mktemp -d) cargo test -q -p moltis-browser --test real_sites_test -- --nocapture --test-threads=1`
+    - exit `0`
+    - `5 passed`
+    - Summary:
+      - Google PASS (`chromiumoxide`)
+      - Woolworths PASS (`patchright`)
+      - Coles PASS (`patchright`)
+      - Realestate PASS (`patchright`)
