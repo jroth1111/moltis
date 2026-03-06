@@ -715,8 +715,10 @@ mod tests {
 
     #[tokio::test]
     async fn validate_restore_targets_rejects_private_storage_origin() {
+        // Use a non-loopback private IP; literal loopback IPs are allowed in
+        // test builds so integration tests can navigate to local servers.
         let mut state = make_state("https://example.com");
-        state.storage[0].origin = "http://127.0.0.1:8080".to_string();
+        state.storage[0].origin = "http://10.0.0.5:8080".to_string();
 
         let error = validate_restore_targets(&state)
             .await
@@ -725,7 +727,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("session storage origin host '127.0.0.1' is not allowed")
+                .contains("session storage origin host '10.0.0.5' is not allowed")
         );
     }
 

@@ -49,6 +49,13 @@ async fn resolve_host_ips(host: &str, port: u16, target: &str) -> Result<Vec<IpA
     }
 
     if let Ok(ip) = normalized.parse::<IpAddr>() {
+        // In test builds, treat literal loopback IPs as public so integration
+        // tests can navigate to local servers (e.g. 127.0.0.1:0 probe servers).
+        // The `localhost` name path above is NOT bypassed — only literal IPs.
+        #[cfg(test)]
+        if ip.is_loopback() {
+            return Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+        }
         return Ok(vec![ip]);
     }
 

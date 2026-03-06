@@ -2098,13 +2098,15 @@ mod tests {
 
     #[tokio::test]
     async fn non_public_targets_are_excluded_from_capture() {
+        // Use a non-loopback private IP; literal loopback IPs are allowed in
+        // test builds so integration tests can navigate to local servers.
         let mut recorder = ApiCaptureRecorder::new(ApiCaptureConfig {
-            allowed_hosts: vec!["127.0.0.1".to_string()],
+            allowed_hosts: vec!["10.0.0.5".to_string()],
             ..ApiCaptureConfig::default()
         });
         recorder
             .record_request(
-                &request_event("http://127.0.0.1/admin", "GET", "Fetch", None),
+                &request_event("http://10.0.0.5/admin", "GET", "Fetch", None),
                 None,
             )
             .await;

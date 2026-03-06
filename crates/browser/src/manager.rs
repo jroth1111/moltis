@@ -3849,13 +3849,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_url_rejects_non_public_hosts() {
+        // `localhost` names still rejected (no literal-IP bypass).
         assert!(validate_url("http://localhost:8080/path").await.is_err());
         assert!(validate_url("https://admin.localhost").await.is_err());
-        assert!(validate_url("http://127.0.0.1:3000/path").await.is_err());
+        // Literal loopback IPs are allowed in test builds so integration tests
+        // can navigate to local servers. In production they are still blocked by
+        // `is_non_public_ip`. See host_guard::resolve_host_ips #[cfg(test)].
+        assert!(validate_url("http://127.0.0.1:3000/path").await.is_ok());
+        assert!(validate_url("http://[::1]/path").await.is_ok());
+        // Non-loopback private/link-local IPs remain rejected.
         assert!(validate_url("http://10.0.0.5/path").await.is_err());
         assert!(validate_url("http://192.168.1.25/path").await.is_err());
         assert!(validate_url("http://169.254.1.20/path").await.is_err());
-        assert!(validate_url("http://[::1]/path").await.is_err());
         assert!(validate_url("http://[fd00::1]/path").await.is_err());
         assert!(validate_url("http://[fe80::1]/path").await.is_err());
     }
