@@ -14,6 +14,7 @@ use {
             page::CaptureScreenshotFormat,
         },
     },
+    serde::Deserialize,
     tokio::{
         fs,
         sync::RwLock,
@@ -91,6 +92,33 @@ fn sanitize_evaluate_result(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::String(sanitize_string_response(text))
         },
         other => other,
+    }
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+struct NavigationDiagnostics {
+    #[serde(default)]
+    title_len: usize,
+    #[serde(default)]
+    body_text_len: usize,
+    #[serde(default)]
+    interactive_element_count: usize,
+}
+
+fn decode_navigation_diagnostics(
+    value: serde_json::Value,
+    final_url: &str,
+) -> NavigationDiagnostics {
+    match serde_json::from_value::<NavigationDiagnostics>(value) {
+        Ok(metrics) => metrics,
+        Err(error) => {
+            warn!(
+                url = final_url,
+                error = %error,
+                "failed to decode navigation diagnostics"
+            );
+            NavigationDiagnostics::default()
+        },
     }
 }
 
@@ -1859,33 +1887,33 @@ impl BrowserManager {
 
     async fn collect_navigation_diagnostics(&self, page: &Page) -> ProtectionAssessment {
         let final_url = page.url().await.ok().flatten().unwrap_or_default();
-        let metrics: serde_json::Value = page
-            .evaluate(NAV_DIAGNOSTICS_JS)
-            .await
-            .ok()
-            .and_then(|v| v.into_value().ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-        let title_len = metrics
-            .get("title_len")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(0);
-        let body_text_len = metrics
-            .get("body_text_len")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(0);
-        let interactive_element_count = metrics
-            .get("interactive_element_count")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(0);
+        let metrics = match page.evaluate(NAV_DIAGNOSTICS_JS).await {
+            Ok(value) => match value.into_value() {
+                Ok(value) => decode_navigation_diagnostics(value, &final_url),
+                Err(error) => {
+                    warn!(
+                        url = final_url,
+                        error = %error,
+                        "failed to read navigation diagnostics value"
+                    );
+                    NavigationDiagnostics::default()
+                },
+            },
+            Err(error) => {
+                warn!(
+                    url = final_url,
+                    error = %error,
+                    "failed to evaluate navigation diagnostics"
+                );
+                NavigationDiagnostics::default()
+            },
+        };
         let html = page.content().await.unwrap_or_default();
         assess_html(
             final_url,
-            title_len,
-            body_text_len,
-            interactive_element_count,
+            metrics.title_len,
+            metrics.body_text_len,
+            metrics.interactive_element_count,
             &html,
         )
     }
@@ -3384,6 +3412,39 @@ mod tests {
     fn test_browser_manager_enabled_by_default() {
         let manager = BrowserManager::default();
         assert!(manager.is_enabled());
+    }
+
+    #[test]
+    fn decode_navigation_diagnostics_defaults_missing_fields() {
+        let metrics = decode_navigation_diagnostics(
+            serde_json::json!({
+                "title_len": 12,
+            }),
+            "https://example.com",
+        );
+
+        assert_eq!(
+            metrics,
+            NavigationDiagnostics {
+                title_len: 12,
+                body_text_len: 0,
+                interactive_element_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_navigation_diagnostics_rejects_invalid_shapes() {
+        let metrics = decode_navigation_diagnostics(
+            serde_json::json!({
+                "title_len": "twelve",
+                "body_text_len": 5,
+                "interactive_element_count": 1,
+            }),
+            "https://example.com",
+        );
+
+        assert_eq!(metrics, NavigationDiagnostics::default());
     }
 
     #[tokio::test]
