@@ -168,3 +168,58 @@
       - Woolworths PASS (`patchright`)
       - Coles PASS (`patchright`)
       - Realestate PASS (`patchright`)
+- Added an explicit owned-site canary API:
+  - `BrowserManager::run_probe_canary(&self, spec: ProbeCanarySpec)`
+  - canary backend reports for explicit `chromiumoxide` and `patchright` runs
+  - reusable probe client/report types for fingerprint, behavior, and request-sequence collection
+  - richer probe profile identity with browser kind, browser binary basename, and launch-profile hash
+- Validation for the explicit canary API step:
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `140 passed, 0 failed, 8 ignored`
+  - `CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' MOLTIS_DATA_DIR=$(mktemp -d) CARGO_TARGET_DIR=$(mktemp -d) cargo test -q -p moltis-browser --test real_sites_test -- --nocapture --test-threads=1`
+    - exit `0`
+    - `5 passed`
+    - Summary:
+      - Google PASS (`chromiumoxide`)
+      - Woolworths PASS (`patchright`)
+      - Coles PASS (`patchright`)
+      - Realestate PASS (`patchright`)
+- Hardened canary drift detection and TLS capture:
+  - drift checks now include browser kind, browser binary basename, launch-profile hash, and behavior-summary drift
+  - TLS/JA4 sidecar capture now validates early exit, missing output, and empty output
+  - canary runner can attach optional TLS/JA4 summaries to stored evidence
+- Validation for the drift/TLS hardening step:
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `144 passed, 0 failed, 8 ignored`
+  - `CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' MOLTIS_DATA_DIR=$(mktemp -d) CARGO_TARGET_DIR=$(mktemp -d) cargo test -q -p moltis-browser --test real_sites_test -- --nocapture --test-threads=1`
+    - first rerun hit a Realestate empty-shell flake
+    - second clean rerun exit `0`
+    - `5 passed`
+    - Summary:
+      - Google PASS (`chromiumoxide`)
+      - Woolworths PASS (`patchright`)
+      - Coles PASS (`patchright`)
+      - Realestate PASS (`patchright`)
+- Sanitized more agent-facing output surfaces:
+  - `get_title` now strips invisible Unicode in both `chromiumoxide` and `patchright` paths
+  - top-level string `evaluate` results now strip invisible Unicode in both backends
+  - probe report strings are sanitized before baseline persistence and drift comparison
+- Validation for the sanitization step:
+  - `cargo test -p moltis-browser --lib sanitize_string_response_strips_invisible_unicode -- --nocapture`
+    - exit `0`
+    - `1 passed`
+  - `cargo test -p moltis-browser --lib probe_reports_sanitize_string_fields -- --nocapture`
+    - exit `0`
+    - `1 passed`
+  - `cargo test -p moltis-browser --lib --quiet`
+    - exit `0`
+    - `147 passed, 0 failed, 8 ignored`
+  - `cargo test -q -p moltis-browser --test real_sites_test --no-run`
+    - exit `101`
+    - blocked by unrelated in-progress `api_capture` worktree changes
+    - key errors:
+      - missing `allowed_hosts` field in `ApiCaptureConfig` initializer in `crates/browser/src/manager.rs`
+      - missing `handle` field in `ApiCaptureSnapshot` initializer in `crates/browser/src/pool.rs`
+      - multiple type and helper mismatches in `crates/browser/src/api_capture.rs`
