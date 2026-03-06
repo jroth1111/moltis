@@ -1745,7 +1745,12 @@ mod tests {
         BrowserConfig {
             idle_timeout_secs: 60,
             persist_profile: false,
-            profile_dir: None,
+            profile_dir: Some(
+                std::env::temp_dir()
+                    .join(format!("moltis-browser-live-{}", Uuid::new_v4()))
+                    .display()
+                    .to_string(),
+            ),
             ..BrowserConfig::default()
         }
     }

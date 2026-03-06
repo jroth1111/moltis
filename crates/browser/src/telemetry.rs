@@ -2043,6 +2043,12 @@ mod tests {
     fn test_browser_config() -> BrowserConfig {
         let mut config = BrowserConfig::default();
         config.persist_profile = false;
+        config.profile_dir = Some(
+            std::env::temp_dir()
+                .join(format!("moltis-browser-telemetry-{}", uuid::Uuid::new_v4()))
+                .display()
+                .to_string(),
+        );
         config.protection.enabled = true;
         config.protection.timeout_ms = 90_000;
         config.protection.max_retries = 2;
@@ -2096,7 +2102,7 @@ mod tests {
         state: &ProbeState,
         kind: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        for _ in 0..50 {
+        for _ in 0..100 {
             let session_id = match kind {
                 "fingerprint" => state.first_fingerprint_session(),
                 "behavior" => state.first_behavior_session(),
@@ -3006,6 +3012,14 @@ mod tests {
                 .mouse_move(
                     point["x"].as_f64().unwrap(),
                     point["y"].as_f64().unwrap(),
+                )
+                .await?;
+        }
+        for offset in [(-18.0, -12.0), (-8.0, -5.0), (6.0, 4.0), (12.0, 8.0)] {
+            session
+                .mouse_move(
+                    centers[2]["x"].as_f64().unwrap() + offset.0,
+                    centers[2]["y"].as_f64().unwrap() + offset.1,
                 )
                 .await?;
         }
