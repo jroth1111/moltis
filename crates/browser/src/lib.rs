@@ -36,6 +36,7 @@ pub mod container;
 pub mod detect;
 pub mod emulation;
 pub mod error;
+mod host_guard;
 pub mod manager;
 pub mod network;
 mod patchright_session;
@@ -56,8 +57,8 @@ pub use {
     manager::BrowserManager,
     telemetry::{
         ProbeBackendReport, ProbeBaselineUpdate, ProbeCanaryReport, ProbeCanarySpec,
-        ProbeCanaryVerdict, ProbeRunDrift, ProbeRunEvidence, ProbeRunProfile,
-        ProbeTelemetryPolicy, TlsJa4CollectionMode, TlsJa4SidecarConfig,
+        ProbeCanaryVerdict, ProbeRunDrift, ProbeRunEvidence, ProbeRunProfile, ProbeTelemetryPolicy,
+        TlsJa4CollectionMode, TlsJa4SidecarConfig,
     },
     types::{
         BrowserAction, BrowserBackendKind, BrowserConfig, BrowserKind, BrowserPreference,

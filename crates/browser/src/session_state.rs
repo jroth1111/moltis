@@ -98,6 +98,29 @@ pub struct SessionState {
     pub storage: Vec<StorageEntry>,
 }
 
+pub(crate) async fn validate_restore_targets(state: &SessionState) -> Result<(), Error> {
+    let needs_state_url = state
+        .cookies
+        .iter()
+        .any(|cookie| cookie.domain.trim().is_empty());
+    if needs_state_url && !state.url.is_empty() {
+        crate::host_guard::validate_public_url_str(&state.url, "session state URL").await?;
+    }
+
+    for cookie in &state.cookies {
+        let domain = cookie.domain.trim().trim_start_matches('.');
+        if !domain.is_empty() {
+            crate::host_guard::validate_public_host(domain, 443, "session cookie domain").await?;
+        }
+    }
+
+    for entry in &state.storage {
+        crate::host_guard::validate_public_url_str(&entry.origin, "session storage origin").await?;
+    }
+
+    Ok(())
+}
+
 // ── Capture & restore ────────────────────────────────────────────────────────
 
 /// Capture the current session state from `page`.
@@ -197,6 +220,13 @@ pub async fn capture_state(page: &Page) -> Result<SessionState, Error> {
 ///
 /// Sets cookies and restores localStorage/sessionStorage entries.
 pub async fn restore_state(page: &Page, state: &SessionState) -> Result<(), Error> {
+    validate_restore_targets(state).await?;
+    restore_cookies(page, state).await?;
+    restore_storage(page, state).await
+}
+
+/// Restore only cookies from a previously captured session state.
+pub(crate) async fn restore_cookies(page: &Page, state: &SessionState) -> Result<(), Error> {
     // Restore cookies.
     if !state.cookies.is_empty() {
         let cookie_params: Vec<CookieParam> = state.cookies.iter().map(CookieParam::from).collect();
@@ -207,6 +237,11 @@ pub async fn restore_state(page: &Page, state: &SessionState) -> Result<(), Erro
         debug!(count = state.cookies.len(), "restored cookies");
     }
 
+    Ok(())
+}
+
+/// Restore localStorage/sessionStorage from a previously captured session state.
+pub(crate) async fn restore_storage(page: &Page, state: &SessionState) -> Result<(), Error> {
     // Restore storage entries.
     for entry in &state.storage {
         // Restore localStorage.
@@ -553,5 +588,37 @@ mod tests {
         assert_eq!(param.name, "tok");
         assert_eq!(param.value, "xyz");
         assert_eq!(param.expires, None); // -1 expires → None
+    }
+
+    #[tokio::test]
+    async fn validate_restore_targets_rejects_private_storage_origin() {
+        let mut state = make_state("https://example.com");
+        state.storage[0].origin = "http://127.0.0.1:8080".to_string();
+
+        let error = validate_restore_targets(&state)
+            .await
+            .expect_err("private storage origin should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("session storage origin host '127.0.0.1' is not allowed")
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_restore_targets_rejects_private_cookie_domain() {
+        let mut state = make_state("https://example.com");
+        state.cookies[0].domain = ".localhost".to_string();
+
+        let error = validate_restore_targets(&state)
+            .await
+            .expect_err("private cookie domain should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("session cookie domain host 'localhost' is not allowed")
+        );
     }
 }

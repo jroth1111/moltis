@@ -1,12 +1,6 @@
 //! Browser manager providing high-level browser automation actions.
 
-use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    path::PathBuf,
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use {
     base64::{Engine, engine::general_purpose::STANDARD as BASE64},
@@ -22,7 +16,6 @@ use {
     },
     tokio::{
         fs,
-        net::lookup_host,
         sync::RwLock,
         time::{Duration, sleep, timeout},
     },
@@ -32,6 +25,7 @@ use {
 use crate::{
     challenge::ChallengeType,
     error::Error,
+    host_guard::validate_public_url_target,
     pool::BrowserPool,
     protection::{
         ProtectionAssessment, assess_html, protection_trigger_for_fallback,
@@ -984,8 +978,7 @@ impl BrowserManager {
                 .collect_patchright_navigation_diagnostics(session_id)
                 .await?;
             let still_waiting = should_wait_for_challenge_resolution(&next);
-            let is_protected =
-                next.challenge_type.is_some() || next.is_unresolved_interstitial();
+            let is_protected = next.challenge_type.is_some() || next.is_unresolved_interstitial();
 
             if is_protected {
                 if previous_challenge_len == Some(next.html_len) {
@@ -1226,7 +1219,8 @@ impl BrowserManager {
             },
             BrowserAction::StopIntercept => self.stop_intercept(Some(&sid), sandbox, None).await,
             BrowserAction::SetExtraHeaders { headers } => {
-                self.set_extra_headers(Some(&sid), headers, sandbox, None).await
+                self.set_extra_headers(Some(&sid), headers, sandbox, None)
+                    .await
             },
         }
     }
@@ -1766,18 +1760,32 @@ impl BrowserManager {
                     session_id = active_sid,
                     "browser connection dead, closing session and retrying"
                 );
-                let transfer_state = self.pool.take_transfer_state_from_chromium(&active_sid).await;
+                let transfer_state = self
+                    .pool
+                    .take_transfer_state_from_chromium(&active_sid)
+                    .await;
                 let _ = self.pool.close_session(&active_sid).await;
                 // Retry with a fresh session (use same sandbox mode)
                 let new_sid = self.pool.get_or_create(None, sandbox, browser).await?;
                 let new_page = self.pool.get_page(&new_sid).await?;
-                self.pool
-                    .restore_transfer_state_to_chromium(&new_sid, transfer_state)
+                let post_navigation_state = self
+                    .pool
+                    .prepare_transfer_state_for_chromium_retry(&new_sid, transfer_state)
                     .await?;
                 new_page
                     .goto(url)
                     .await
                     .map_err(|e| Error::NavigationFailed(e.to_string()))?;
+                if let Some(state) = post_navigation_state.as_ref()
+                    && !state.storage.is_empty()
+                {
+                    crate::session_state::restore_storage(&new_page, state).await?;
+                    new_page
+                        .reload()
+                        .await
+                        .map_err(|e| Error::NavigationFailed(e.to_string()))?;
+                    let _ = new_page.wait_for_navigation().await;
+                }
                 active_sid = new_sid;
                 active_page = new_page;
             }
@@ -1904,8 +1912,7 @@ impl BrowserManager {
             sleep(Duration::from_secs(1)).await;
             let next = self.collect_navigation_diagnostics(page).await;
             let still_waiting = should_wait_for_challenge_resolution(&next);
-            let is_challenge =
-                next.challenge_type.is_some() || next.is_unresolved_interstitial();
+            let is_challenge = next.challenge_type.is_some() || next.is_unresolved_interstitial();
 
             if is_challenge {
                 if previous_challenge_len == Some(next.html_len) {
@@ -3174,11 +3181,7 @@ async fn validate_url(url: &str) -> Result<(), Error> {
         },
     }
 
-    if let Some(host) = parsed.host_str() {
-        let resolved_ips =
-            resolve_browser_host_ips(host, parsed.port_or_known_default().unwrap_or(443)).await?;
-        validate_resolved_browser_host(host, &resolved_ips)?;
-    }
+    validate_public_url_target(&parsed, "URL").await?;
 
     // Check for obviously malformed URLs (LLM garbage)
     // Check the original URL string (before normalization) to catch garbage
@@ -3207,95 +3210,6 @@ async fn validate_url(url: &str) -> Result<(), Error> {
     Ok(())
 }
 
-async fn resolve_browser_host_ips(host: &str, port: u16) -> Result<Vec<IpAddr>, Error> {
-    let normalized = host.trim_matches(['[', ']']);
-
-    if normalized.eq_ignore_ascii_case("localhost") || normalized.ends_with(".localhost") {
-        return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
-    }
-
-    if let Ok(ip) = normalized.parse::<IpAddr>() {
-        return Ok(vec![ip]);
-    }
-
-    let resolved: Vec<IpAddr> = lookup_host((normalized, port))
-        .await
-        .map_err(|error| {
-            Error::InvalidAction(format!(
-                "URL host '{}' could not be resolved: {}",
-                normalized, error
-            ))
-        })?
-        .map(|socket_addr| socket_addr.ip())
-        .collect();
-
-    if resolved.is_empty() {
-        return Err(Error::InvalidAction(format!(
-            "URL host '{}' could not be resolved",
-            normalized
-        )));
-    }
-
-    Ok(resolved)
-}
-
-fn validate_resolved_browser_host(host: &str, resolved_ips: &[IpAddr]) -> Result<(), Error> {
-    if resolved_ips.iter().copied().any(is_non_public_ip) {
-        return Err(Error::InvalidAction(format!(
-            "URL host '{}' is not allowed",
-            host
-        )));
-    }
-
-    Ok(())
-}
-
-fn is_non_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => is_non_public_ipv4(ip),
-        IpAddr::V6(ip) => is_non_public_ipv6(ip),
-    }
-}
-
-fn is_non_public_ipv4(ip: Ipv4Addr) -> bool {
-    if ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_unspecified()
-    {
-        return true;
-    }
-
-    let [a, b, c, _] = ip.octets();
-    matches!(
-        (a, b, c),
-        (100, 64..=127, _)
-            | (192, 0, 0)
-            | (192, 0, 2)
-            | (198, 18..=19, _)
-            | (198, 51, 100)
-            | (203, 0, 113)
-            | (224..=255, _, _)
-    )
-}
-
-fn is_non_public_ipv6(ip: Ipv6Addr) -> bool {
-    if ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() {
-        return true;
-    }
-
-    let segments = ip.segments();
-    let first = segments[0];
-    let second = segments[1];
-
-    matches!(
-        (first, second),
-        (0xfc00..=0xfdff, _) | (0xfe80..=0xfebf, _) | (0x2001, 0x0db8)
-    )
-}
-
 /// Truncate a URL for error messages (to avoid huge garbage URLs in logs).
 fn truncate_url(url: &str) -> String {
     if url.len() > 100 {
@@ -3308,7 +3222,10 @@ fn truncate_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        sync::OnceLock,
+    };
 
     use axum::{Router, response::Html, routing::get};
     use tokio::{
@@ -3445,7 +3362,9 @@ mod tests {
                 let _ = page.wait_for_navigation().await;
                 manager.wait_for_challenge_resolution_if_needed(&page).await
             },
-            BrowserBackendKind::Patchright => manager.navigate_patchright_and_assess(&sid, url).await?,
+            BrowserBackendKind::Patchright => {
+                manager.navigate_patchright_and_assess(&sid, url).await?
+            },
         };
         let outcome = manager.build_navigation_outcome(&diagnostics, backend, false);
         manager.pool.close_session(&sid).await?;
@@ -3470,9 +3389,11 @@ mod tests {
     #[tokio::test]
     async fn test_validate_url_valid() {
         assert!(validate_url("https://93.184.216.34").await.is_ok());
-        assert!(validate_url("https://[2607:f8b0:4004:800::200e]/")
-            .await
-            .is_ok());
+        assert!(
+            validate_url("https://[2607:f8b0:4004:800::200e]/")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -3503,7 +3424,10 @@ mod tests {
     #[test]
     fn test_validate_resolved_browser_host_rejects_private_dns_results() {
         let resolved = [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))];
-        assert!(validate_resolved_browser_host("internal.example", &resolved).is_err());
+        assert!(
+            crate::host_guard::validate_resolved_public_host("internal.example", &resolved, "URL")
+                .is_err()
+        );
     }
 
     #[test]
@@ -3514,7 +3438,10 @@ mod tests {
                 0x2607, 0xf8b0, 0x4004, 0x0800, 0, 0, 0, 0x200e,
             )),
         ];
-        assert!(validate_resolved_browser_host("example.com", &resolved).is_ok());
+        assert!(
+            crate::host_guard::validate_resolved_public_host("example.com", &resolved, "URL")
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -3524,15 +3451,19 @@ mod tests {
         assert!(validate_url(garbage).await.is_err());
 
         // LLM function leakage
-        assert!(validate_url("https://example.com/path/functions.browser")
-            .await
-            .is_err());
+        assert!(
+            validate_url("https://example.com/path/functions.browser")
+                .await
+                .is_err()
+        );
 
         // Test with the closing brace pattern from JSON garbage
         // Note: `}}<` would match the `}<` pattern
-        assert!(validate_url("https://example.com/path}}<tag")
-            .await
-            .is_err());
+        assert!(
+            validate_url("https://example.com/path}}<tag")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3681,8 +3612,14 @@ mod tests {
         assert_eq!(chromium.verdict, patchright.verdict);
         assert_eq!(chromium.trigger, patchright.trigger);
         assert_eq!(
-            chromium.challenge.as_ref().map(|value| value.challenge_type),
-            patchright.challenge.as_ref().map(|value| value.challenge_type)
+            chromium
+                .challenge
+                .as_ref()
+                .map(|value| value.challenge_type),
+            patchright
+                .challenge
+                .as_ref()
+                .map(|value| value.challenge_type)
         );
         assert_eq!(chromium.final_url, patchright.final_url);
         Ok(())
@@ -3712,8 +3649,14 @@ mod tests {
         assert_eq!(chromium.verdict, patchright.verdict);
         assert_eq!(chromium.trigger, patchright.trigger);
         assert_eq!(
-            chromium.challenge.as_ref().map(|value| value.challenge_type),
-            patchright.challenge.as_ref().map(|value| value.challenge_type)
+            chromium
+                .challenge
+                .as_ref()
+                .map(|value| value.challenge_type),
+            patchright
+                .challenge
+                .as_ref()
+                .map(|value| value.challenge_type)
         );
         assert_eq!(chromium.final_url, patchright.final_url);
         Ok(())
@@ -3743,8 +3686,14 @@ mod tests {
         assert_eq!(chromium.verdict, patchright.verdict);
         assert_eq!(chromium.trigger, patchright.trigger);
         assert_eq!(
-            chromium.challenge.as_ref().map(|value| value.challenge_type),
-            patchright.challenge.as_ref().map(|value| value.challenge_type)
+            chromium
+                .challenge
+                .as_ref()
+                .map(|value| value.challenge_type),
+            patchright
+                .challenge
+                .as_ref()
+                .map(|value| value.challenge_type)
         );
         assert_eq!(chromium.final_url, patchright.final_url);
         Ok(())
