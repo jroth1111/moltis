@@ -11,13 +11,15 @@ use {
 use crate::funnel::{self, FunnelState};
 
 /// Regex that matches phone numbers, social handles, and contact-sharing patterns.
-#[allow(clippy::expect_used)]
-static CONTACT_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
+static CONTACT_PATTERN: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| {
+    compile_contact_pattern(
         r"(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|@\w+|whatsapp|snapchat|instagram",
     )
-    .expect("CONTACT_PATTERN regex must compile")
 });
+
+fn compile_contact_pattern(pattern: &str) -> Result<Regex, regex::Error> {
+    Regex::new(pattern)
+}
 
 pub struct FunnelGuardHook {
     pool: Arc<sqlx::SqlitePool>,
@@ -146,8 +148,18 @@ impl FunnelGuardHook {
             None => return Ok(HookAction::Continue),
         };
 
+        let contact_pattern = match CONTACT_PATTERN.as_ref() {
+            Ok(pattern) => pattern,
+            Err(error) => {
+                warn!(error = %error, "funnel guard regex unavailable — blocking action");
+                return Ok(HookAction::Block(
+                    "guard unavailable, action blocked".to_string(),
+                ));
+            },
+        };
+
         // Check if the typed text contains contact patterns.
-        if !CONTACT_PATTERN.is_match(text) {
+        if !contact_pattern.is_match(text) {
             return Ok(HookAction::Continue);
         }
 
@@ -191,5 +203,17 @@ impl FunnelGuardHook {
         Ok(HookAction::Block(
             "contact pattern detected in browser type without match_id".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_contact_pattern;
+
+    #[test]
+    fn compile_contact_pattern_rejects_invalid_regex() {
+        let result = compile_contact_pattern("(");
+
+        assert!(result.is_err());
     }
 }

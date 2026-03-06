@@ -35,104 +35,94 @@ pub struct LeakMatch {
 }
 
 type PatternEntry = (Regex, &'static str, LeakAction);
+type RawPatternEntry = (&'static str, &'static str, LeakAction);
+const DETECTOR_UNAVAILABLE_PATTERN: &str = "leak_detector_unavailable";
 
 /// Compiled credential patterns, initialised once.
-fn patterns() -> &'static Vec<PatternEntry> {
-    static PATTERNS: OnceLock<Vec<PatternEntry>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        // Each entry: (regex, pattern_name, action)
-        // Using `Regex::new(...).expect(...)` here is acceptable because these are
-        // compile-time-constant patterns that cannot fail at runtime.  The OnceLock
-        // ensures this runs exactly once.
-        let raw: Vec<(&str, &'static str, LeakAction)> = vec![
-            // OpenAI API key
-            (r"sk-[A-Za-z0-9]{20,}", "openai_api_key", LeakAction::Redact),
-            // Anthropic API key
-            (
-                r"sk-ant-api[0-9]{2}-[A-Za-z0-9\-_]{93,}",
-                "anthropic_api_key",
-                LeakAction::Block,
-            ),
-            // AWS access key
-            (r"AKIA[0-9A-Z]{16}", "aws_access_key", LeakAction::Block),
-            // GitHub PAT
-            (
-                r"gh[pousr]_[A-Za-z0-9]{36,}",
-                "github_pat",
-                LeakAction::Block,
-            ),
-            // Stripe live key
-            (
-                r"sk_live_[A-Za-z0-9]{24,}",
-                "stripe_live_key",
-                LeakAction::Redact,
-            ),
-            // PEM block header
-            (
-                r"-----BEGIN [A-Z ]+-----",
-                "pem_block",
-                LeakAction::Warn,
-            ),
-            // JWT
-            (
-                r"eyJ[A-Za-z0-9\-_=]+\.eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]+",
-                "jwt",
-                LeakAction::Redact,
-            ),
-            // Bearer token in header
-            (
-                r"[Bb]earer\s+[A-Za-z0-9\-_.~+/=]{20,}",
-                "bearer_token",
-                LeakAction::Warn,
-            ),
-            // Generic secret assignment
-            (
-                r#"(?i)(api[_\-]?key|secret|token|password|passwd|pwd)\s*[=:]\s*['"]?([A-Za-z0-9\-_.~+/=]{16,})['"]?"#,
-                "generic_secret",
-                LeakAction::Redact,
-            ),
-            // Slack token
-            (
-                r"xox[baprs]-[0-9A-Za-z\-]{10,}",
-                "slack_token",
-                LeakAction::Redact,
-            ),
-            // GCP service account indicator
-            (
-                r#""type"\s*:\s*"service_account""#,
-                "gcp_service_account",
-                LeakAction::Warn,
-            ),
-            // RSA/EC/DSA/OPENSSH private key
-            (
-                r"-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY",
-                "private_key",
-                LeakAction::Block,
-            ),
-            // Database URL with credentials
-            (
-                r"(?i)(postgres|mysql|mongodb)://[^:]+:[^@]+@",
-                "database_url_with_creds",
-                LeakAction::Redact,
-            ),
-            // npm token
-            (
-                r"npm_[A-Za-z0-9]{36}",
-                "npm_token",
-                LeakAction::Redact,
-            ),
-        ];
+fn patterns() -> Result<&'static [PatternEntry], &'static regex::Error> {
+    static PATTERNS: OnceLock<Result<Vec<PatternEntry>, regex::Error>> = OnceLock::new();
+    match PATTERNS.get_or_init(|| compile_patterns(raw_patterns())) {
+        Ok(patterns) => Ok(patterns.as_slice()),
+        Err(error) => Err(error),
+    }
+}
 
-        raw.into_iter()
-            .map(|(pat, name, action)| {
-                // SAFETY: these are static regex patterns validated at development time.
-                #[allow(clippy::expect_used)]
-                let re = Regex::new(pat)
-                    .expect("built-in leak-detection regex must compile");
-                (re, name, action)
-            })
-            .collect()
-    })
+fn compile_patterns(raw: &[RawPatternEntry]) -> Result<Vec<PatternEntry>, regex::Error> {
+    raw.iter()
+        .map(|(pattern, name, action)| Regex::new(pattern).map(|regex| (regex, *name, *action)))
+        .collect()
+}
+
+fn raw_patterns() -> &'static [RawPatternEntry] {
+    &[
+        (r"sk-[A-Za-z0-9]{20,}", "openai_api_key", LeakAction::Redact),
+        (
+            r"sk-ant-api[0-9]{2}-[A-Za-z0-9\-_]{93,}",
+            "anthropic_api_key",
+            LeakAction::Block,
+        ),
+        (r"AKIA[0-9A-Z]{16}", "aws_access_key", LeakAction::Block),
+        (
+            r"gh[pousr]_[A-Za-z0-9]{36,}",
+            "github_pat",
+            LeakAction::Block,
+        ),
+        (
+            r"sk_live_[A-Za-z0-9]{24,}",
+            "stripe_live_key",
+            LeakAction::Redact,
+        ),
+        (
+            r"-----BEGIN [A-Z ]+-----",
+            "pem_block",
+            LeakAction::Warn,
+        ),
+        (
+            r"eyJ[A-Za-z0-9\-_=]+\.eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]+",
+            "jwt",
+            LeakAction::Redact,
+        ),
+        (
+            r"[Bb]earer\s+[A-Za-z0-9\-_.~+/=]{20,}",
+            "bearer_token",
+            LeakAction::Warn,
+        ),
+        (
+            r#"(?i)(api[_\-]?key|secret|token|password|passwd|pwd)\s*[=:]\s*['"]?([A-Za-z0-9\-_.~+/=]{16,})['"]?"#,
+            "generic_secret",
+            LeakAction::Redact,
+        ),
+        (
+            r"xox[baprs]-[0-9A-Za-z\-]{10,}",
+            "slack_token",
+            LeakAction::Redact,
+        ),
+        (
+            r#""type"\s*:\s*"service_account""#,
+            "gcp_service_account",
+            LeakAction::Warn,
+        ),
+        (
+            r"-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY",
+            "private_key",
+            LeakAction::Block,
+        ),
+        (
+            r"(?i)(postgres|mysql|mongodb)://[^:]+:[^@]+@",
+            "database_url_with_creds",
+            LeakAction::Redact,
+        ),
+        (r"npm_[A-Za-z0-9]{36}", "npm_token", LeakAction::Redact),
+    ]
+}
+
+fn detector_unavailable_match(content: &str) -> LeakMatch {
+    LeakMatch {
+        pattern_name: DETECTOR_UNAVAILABLE_PATTERN,
+        action: LeakAction::Block,
+        start: 0,
+        end: content.len(),
+    }
 }
 
 /// Compute Shannon entropy (bits per character) of a string.
@@ -183,7 +173,11 @@ impl LeakDetector {
         let mut matches = Vec::new();
 
         // Regex-based pattern matching.
-        for (re, name, action) in patterns() {
+        let compiled_patterns = match patterns() {
+            Ok(patterns) => patterns,
+            Err(_) => return vec![detector_unavailable_match(content)],
+        };
+        for (re, name, action) in compiled_patterns {
             for m in re.find_iter(content) {
                 matches.push(LeakMatch {
                     pattern_name: name,
@@ -543,6 +537,23 @@ mod tests {
         let input = "Hello, world!";
         let result = detector.apply(input).unwrap();
         assert_eq!(result, "Hello, world!");
+    }
+
+    #[test]
+    fn compile_patterns_returns_error_for_invalid_regex() {
+        let result = compile_patterns(&[("(", "broken", LeakAction::Block)]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn detector_unavailable_match_blocks_entire_content() {
+        let matched = detector_unavailable_match("secret");
+
+        assert_eq!(matched.pattern_name, DETECTOR_UNAVAILABLE_PATTERN);
+        assert_eq!(matched.action, LeakAction::Block);
+        assert_eq!(matched.start, 0);
+        assert_eq!(matched.end, 6);
     }
 
     #[test]

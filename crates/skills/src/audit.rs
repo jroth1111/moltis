@@ -91,68 +91,12 @@ pub fn audit_skill_file(skill_dir: &Path, skill_file: &Path, content: &str) -> a
 }
 
 fn detect_high_risk_snippets(content: &str, source: &Path) -> anyhow::Result<()> {
-    static MALICIOUS_SIGNATURES: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
-    let signatures = MALICIOUS_SIGNATURES.get_or_init(|| {
-        vec![
-            (
-                Regex::new(
-                    r"(?im)\b(?:ignore|disregard|override|bypass)\b[^\n]{0,180}\b(?:previous|earlier|system|developer|safety|security)\s+instructions?\b",
-                )
-                .expect("valid malicious signature regex"),
-                "prompt-injection-override",
-            ),
-            (
-                Regex::new(
-                    r"(?im)\b(?:reveal|show|exfiltrate|leak|print)\b[^\n]{0,180}\b(?:system prompt|developer instructions|hidden prompt|secret instructions)\b",
-                )
-                .expect("valid malicious signature regex"),
-                "prompt-injection-exfiltration",
-            ),
-            (
-                Regex::new(
-                    r"(?im)\b(?:ask|request|collect|harvest|obtain)\b[^\n]{0,180}\b(?:password|api[_ -]?key|token|private[_ -]?key|seed phrase|recovery phrase|otp|2fa)\b",
-                )
-                .expect("valid malicious signature regex"),
-                "credential-harvest",
-            ),
-            (
-                Regex::new(
-                    r"(?im)\b(?:curl|wget|invoke-webrequest)\b[^\n]{0,300}\|[^\n]{0,120}\b(?:sudo\s+)?(?:sh|bash|zsh|dash|ash|fish|ksh|csh|tcsh|pwsh|powershell)\b",
-                )
-                .expect("valid malicious signature regex"),
-                "download-and-execute",
-            ),
-            (
-                Regex::new(r"(?im)\b(?:invoke-expression|iex)\b")
-                    .expect("valid malicious signature regex"),
-                "powershell-iex",
-            ),
-            (
-                Regex::new(r"(?im)\brm\s+-rf\s+/(?:\s|$|\*)")
-                    .expect("valid malicious signature regex"),
-                "destructive-rm-rf-root",
-            ),
-            (
-                Regex::new(r"(?im)\bdd\s+if=").expect("valid malicious signature regex"),
-                "disk-overwrite-dd",
-            ),
-            (
-                Regex::new(r"(?im)\bmkfs(?:\.[a-z0-9]+)?\b")
-                    .expect("valid malicious signature regex"),
-                "filesystem-format",
-            ),
-            (
-                Regex::new(r"(?im):\(\)\s*\{\s*:\|:\&\s*\};:")
-                    .expect("valid malicious signature regex"),
-                "fork-bomb",
-            ),
-            (
-                Regex::new(r"(?im)\b(?:shutdown\s+-h\s+now|poweroff|reboot)\b")
-                    .expect("valid malicious signature regex"),
-                "forced-reboot",
-            ),
-        ]
-    });
+    static MALICIOUS_SIGNATURES: OnceLock<Result<Vec<(Regex, &'static str)>, regex::Error>> =
+        OnceLock::new();
+    let signatures = MALICIOUS_SIGNATURES
+        .get_or_init(|| compile_malicious_signatures(raw_malicious_signatures()))
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("skill audit unavailable: {error}"))?;
 
     for (signature, label) in signatures {
         if signature.is_match(content) {
@@ -165,6 +109,44 @@ fn detect_high_risk_snippets(content: &str, source: &Path) -> anyhow::Result<()>
     }
 
     Ok(())
+}
+
+fn compile_malicious_signatures(
+    raw: &[(&'static str, &'static str)],
+) -> Result<Vec<(Regex, &'static str)>, regex::Error> {
+    raw.iter()
+        .map(|(pattern, label)| Regex::new(pattern).map(|regex| (regex, *label)))
+        .collect()
+}
+
+fn raw_malicious_signatures() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            r"(?im)\b(?:ignore|disregard|override|bypass)\b[^\n]{0,180}\b(?:previous|earlier|system|developer|safety|security)\s+instructions?\b",
+            "prompt-injection-override",
+        ),
+        (
+            r"(?im)\b(?:reveal|show|exfiltrate|leak|print)\b[^\n]{0,180}\b(?:system prompt|developer instructions|hidden prompt|secret instructions)\b",
+            "prompt-injection-exfiltration",
+        ),
+        (
+            r"(?im)\b(?:ask|request|collect|harvest|obtain)\b[^\n]{0,180}\b(?:password|api[_ -]?key|token|private[_ -]?key|seed phrase|recovery phrase|otp|2fa)\b",
+            "credential-harvest",
+        ),
+        (
+            r"(?im)\b(?:curl|wget|invoke-webrequest)\b[^\n]{0,300}\|[^\n]{0,120}\b(?:sudo\s+)?(?:sh|bash|zsh|dash|ash|fish|ksh|csh|tcsh|pwsh|powershell)\b",
+            "download-and-execute",
+        ),
+        (r"(?im)\b(?:invoke-expression|iex)\b", "powershell-iex"),
+        (r"(?im)\brm\s+-rf\s+/(?:\s|$|\*)", "destructive-rm-rf-root"),
+        (r"(?im)\bdd\s+if=", "disk-overwrite-dd"),
+        (r"(?im)\bmkfs(?:\.[a-z0-9]+)?\b", "filesystem-format"),
+        (r"(?im):\(\)\s*\{\s*:\|:\&\s*\};:", "fork-bomb"),
+        (
+            r"(?im)\b(?:shutdown\s+-h\s+now|poweroff|reboot)\b",
+            "forced-reboot",
+        ),
+    ]
 }
 
 fn audit_markdown_links(skill_dir: &Path, content: &str, source: &Path) -> anyhow::Result<()> {
@@ -491,6 +473,13 @@ mod tests {
         let content = "[guide][ref]\n\n[ref]: docs/guide.md";
         let result = audit_skill_markdown(Path::new("/tmp/skill"), content, source);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn compile_malicious_signatures_returns_error_for_invalid_regex() {
+        let result = compile_malicious_signatures(&[("(", "broken")]);
+
+        assert!(result.is_err());
     }
 
     #[cfg(unix)]
