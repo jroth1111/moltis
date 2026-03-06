@@ -112,6 +112,7 @@ pub(crate) struct PatchrightInstance {
     last_used: Instant,
     #[allow(dead_code)]
     patchright_launch_profile: PatchrightLaunchProfile,
+    interception: crate::network::InterceptionState,
     api_capture: Option<PatchrightApiCaptureState>,
 }
 
@@ -240,6 +241,7 @@ impl BrowserPool {
             session: PatchrightSession::start(&self.config.protection, &launch_profile).await?,
             last_used: Instant::now(),
             patchright_launch_profile: launch_profile,
+            interception: crate::network::InterceptionState::default(),
             api_capture: None,
         };
         let instance = Arc::new(Mutex::new(instance));
@@ -457,49 +459,29 @@ impl BrowserPool {
             let inst = instance.lock().await;
             inst.patchright_launch_profile.clone()
         };
+        let interception_snapshot = self.take_interception_snapshot(session_id).await;
+        let api_capture_snapshot = self.take_api_capture_snapshot(session_id).await;
         let instance = PatchrightInstance {
             session: PatchrightSession::start(&self.config.protection, &launch_profile).await?,
             last_used: Instant::now(),
             patchright_launch_profile: launch_profile,
+            interception: crate::network::InterceptionState::default(),
             api_capture: None,
         };
         let instance = Arc::new(Mutex::new(instance));
 
-        let old = {
+        {
             let mut instances = self.instances.write().await;
-            instances.remove(session_id)
-        };
-        let api_capture_snapshot = if let Some(old) = old {
-            let mut inst = old.lock().await;
-            for task in inst.interception.tasks.drain(..) {
-                task.abort();
-            }
-            inst.interception.paused_tx = None;
-            for task in inst.api_capture.tasks.drain(..) {
-                task.abort();
-            }
-            inst.api_capture.attached_targets.clear();
-            match (
-                inst.api_capture.handle.take(),
-                inst.api_capture.config.take(),
-                inst.api_capture.recorder.take(),
-            ) {
-                (Some(handle), Some(config), Some(recorder)) => {
-                    Some(crate::api_capture::ApiCaptureSnapshot {
-                        handle,
-                        config,
-                        recorder,
-                    })
-                },
-                _ => None,
-            }
-        } else {
-            None
-        };
+            instances.remove(session_id);
+        }
 
         let mut patchright_instances = self.patchright_instances.write().await;
         patchright_instances.insert(session_id.to_string(), instance);
         drop(patchright_instances);
+        if let Some(snapshot) = interception_snapshot {
+            self.restore_interception_snapshot(session_id, snapshot)
+                .await?;
+        }
         if let Some(snapshot) = api_capture_snapshot {
             self.restore_api_capture_snapshot(session_id, snapshot)
                 .await?;
@@ -540,6 +522,25 @@ impl BrowserPool {
         patterns: Vec<String>,
         extra_headers: HashMap<String, String>,
     ) -> Result<(), Error> {
+        if let Some(instance) = self
+            .patchright_instances
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            let mut inst = instance.lock().await;
+            inst.session
+                .enable_interception(patterns.clone(), extra_headers.clone())
+                .await?;
+            inst.interception.enabled = true;
+            inst.interception.url_patterns = patterns;
+            inst.interception.extra_headers = extra_headers;
+            inst.interception.paused_tx = None;
+            inst.interception.tasks.clear();
+            return Ok(());
+        }
+
         use chromiumoxide::cdp::browser_protocol::fetch::EventRequestPaused;
 
         let page = self.get_page(session_id).await?;
@@ -611,6 +612,23 @@ impl BrowserPool {
 
     /// Disable network interception for a session.
     pub async fn disable_interception(&self, session_id: &str) -> Result<(), Error> {
+        if let Some(instance) = self
+            .patchright_instances
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            let mut inst = instance.lock().await;
+            inst.session.disable_interception().await?;
+            inst.interception.paused_tx = None;
+            inst.interception.enabled = false;
+            inst.interception.url_patterns.clear();
+            inst.interception.extra_headers.clear();
+            inst.interception.tasks.clear();
+            return Ok(());
+        }
+
         let page = self.get_page(session_id).await?;
         crate::network::disable_interception(&page).await?;
 
@@ -708,12 +726,30 @@ impl BrowserPool {
     }
 
     /// Update extra headers for a session's interception state.
-    pub async fn set_extra_headers(&self, session_id: &str, headers: HashMap<String, String>) {
+    pub async fn set_extra_headers(
+        &self,
+        session_id: &str,
+        headers: HashMap<String, String>,
+    ) -> Result<(), Error> {
+        if let Some(instance) = self
+            .patchright_instances
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+        {
+            let mut inst = instance.lock().await;
+            inst.session.set_extra_headers(headers.clone()).await?;
+            inst.interception.extra_headers = headers;
+            return Ok(());
+        }
+
         let instances = self.instances.read().await;
         if let Some(instance) = instances.get(session_id) {
             let mut inst = instance.lock().await;
             inst.interception.extra_headers = headers;
         }
+        Ok(())
     }
 
     /// Take interception state out of a session so it can be restored onto
@@ -2483,7 +2519,7 @@ self.addEventListener('fetch', event => {
                     "Bearer secret-token".to_string(),
                 )]),
             )
-            .await;
+            .await?;
 
             let page = pool.get_page(&sid).await?;
             page.goto(&format!("http://{addr}/page1")).await?;
@@ -2560,6 +2596,97 @@ self.addEventListener('fetch', event => {
                 && request.method == "GET"
                 && request.auth.is_none()
                 && request.query.contains("api_key=top-secret")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replace_with_patchright_preserves_interception_and_api_capture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _browser_guard = acquire_live_browser_test_guard().await;
+        let (addr, state, server) = start_practical_server().await?;
+        let pool = BrowserPool::new(live_test_config());
+
+        let outcome = async {
+            let sid = pool
+                .get_or_create(None, false, Some(BrowserPreference::Auto))
+                .await?;
+
+            pool.start_api_capture(&sid, crate::api_capture::ApiCaptureConfig::default())
+                .await?;
+            pool.enable_interception(
+                &sid,
+                vec!["*api/search*".to_string(), "*api/suggest*".to_string()],
+                HashMap::new(),
+            )
+            .await?;
+            pool.set_extra_headers(
+                &sid,
+                HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer initial-token".to_string(),
+                )]),
+            )
+            .await?;
+
+            pool.replace_with_patchright(&sid).await?;
+            assert!(pool.session_uses_patchright(&sid).await);
+
+            pool.set_extra_headers(
+                &sid,
+                HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer patchright-token".to_string(),
+                )]),
+            )
+            .await?;
+
+            {
+                let instance = pool.get_patchright_session(&sid).await?;
+                let mut inst = instance.lock().await;
+                inst.session.goto(&format!("http://{addr}/page1")).await?;
+                assert!(inst
+                    .session
+                    .wait_selector("body[data-done='true']", 10_000)
+                    .await?);
+                inst.session.goto(&format!("http://{addr}/page2")).await?;
+                assert!(inst
+                    .session
+                    .wait_selector("body[data-done='true']", 10_000)
+                    .await?);
+            }
+
+            let catalog = pool
+                .stop_api_capture(&sid)
+                .await
+                .unwrap_or_else(|| panic!("api capture should produce a catalog"));
+            pool.disable_interception(&sid).await?;
+            pool.close_session(&sid).await?;
+
+            Ok::<_, Box<dyn std::error::Error>>(catalog)
+        }
+        .await;
+
+        server.abort();
+
+        let catalog = outcome?;
+        let search = find_endpoint(&catalog, "/api/search");
+        let suggest = find_endpoint(&catalog, "/api/suggest");
+
+        assert!(search.auth.iter().any(|auth| auth.scheme == "bearer"));
+        assert!(suggest.auth.iter().any(|auth| auth.scheme == "bearer"));
+
+        let seen = state.seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|request| {
+            request.path == "/api/search"
+                && request.method == "GET"
+                && request.auth.as_deref() == Some("Bearer patchright-token")
+        }));
+        assert!(seen.iter().any(|request| {
+            request.path == "/api/suggest"
+                && request.method == "GET"
+                && request.auth.as_deref() == Some("Bearer patchright-token")
         }));
 
         Ok(())

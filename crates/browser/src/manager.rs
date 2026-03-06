@@ -1199,9 +1199,6 @@ impl BrowserManager {
             },
             BrowserAction::Close => self.close(Some(&sid), sandbox).await,
             BrowserAction::Drag { .. }
-            | BrowserAction::InterceptRequests { .. }
-            | BrowserAction::StopIntercept
-            | BrowserAction::SetExtraHeaders { .. }
             | BrowserAction::SaveState { .. }
             | BrowserAction::LoadState { .. }
             | BrowserAction::ListStates
@@ -1215,6 +1212,14 @@ impl BrowserManager {
             | BrowserAction::StopScreencast
             | BrowserAction::GetScreencastFrame => {
                 Err(self.unsupported_patchright_action(&action.to_string()))
+            },
+            BrowserAction::InterceptRequests { url_patterns } => {
+                self.intercept_requests(Some(&sid), url_patterns, sandbox, None)
+                    .await
+            },
+            BrowserAction::StopIntercept => self.stop_intercept(Some(&sid), sandbox, None).await,
+            BrowserAction::SetExtraHeaders { headers } => {
+                self.set_extra_headers(Some(&sid), headers, sandbox, None).await
             },
         }
     }
@@ -2740,7 +2745,7 @@ impl BrowserManager {
             .get_or_create(session_id, sandbox, browser)
             .await?;
         let start = Instant::now();
-        self.pool.set_extra_headers(&sid, headers).await;
+        self.pool.set_extra_headers(&sid, headers).await?;
         let resp =
             BrowserResponse::success(sid.clone(), start.elapsed().as_millis() as u64, sandbox);
         Ok((sid, resp))

@@ -1,4 +1,4 @@
-use std::process::Stdio;
+use std::{collections::HashMap, process::Stdio};
 
 use {
     serde::{Deserialize, Serialize},
@@ -108,6 +108,18 @@ enum PatchrightRequest {
     },
     Refresh {
         id: u64,
+    },
+    EnableInterception {
+        id: u64,
+        patterns: Vec<String>,
+        extra_headers: HashMap<String, String>,
+    },
+    DisableInterception {
+        id: u64,
+    },
+    SetExtraHeaders {
+        id: u64,
+        headers: HashMap<String, String>,
     },
     StartApiCapture {
         id: u64,
@@ -223,6 +235,9 @@ impl PatchrightSession {
             | PatchrightRequest::Back { id }
             | PatchrightRequest::Forward { id }
             | PatchrightRequest::Refresh { id }
+            | PatchrightRequest::EnableInterception { id, .. }
+            | PatchrightRequest::DisableInterception { id }
+            | PatchrightRequest::SetExtraHeaders { id, .. }
             | PatchrightRequest::StartApiCapture { id, .. }
             | PatchrightRequest::StopApiCapture { id }
             | PatchrightRequest::NewTab { id, .. }
@@ -489,6 +504,38 @@ impl PatchrightSession {
             .map(|_| ())
     }
 
+    pub async fn enable_interception(
+        &mut self,
+        patterns: Vec<String>,
+        extra_headers: HashMap<String, String>,
+    ) -> Result<(), Error> {
+        let id = self.next_id();
+        self.send(PatchrightRequest::EnableInterception {
+            id,
+            patterns,
+            extra_headers,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn disable_interception(&mut self) -> Result<(), Error> {
+        let id = self.next_id();
+        self.send(PatchrightRequest::DisableInterception { id })
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn set_extra_headers(
+        &mut self,
+        headers: HashMap<String, String>,
+    ) -> Result<(), Error> {
+        let id = self.next_id();
+        self.send(PatchrightRequest::SetExtraHeaders { id, headers })
+            .await
+            .map(|_| ())
+    }
+
     pub async fn start_api_capture(
         &mut self,
         config: &crate::api_capture::ApiCaptureConfig,
@@ -659,6 +706,9 @@ with sync_playwright() as p:
     capture_pending = {}
     capture_completed = []
     capture_attached_pages = set()
+    interception_enabled = False
+    interception_patterns = []
+    interception_extra_headers = {}
 
     def current_page():
         return tabs[active_tab]
@@ -706,9 +756,11 @@ with sync_playwright() as p:
 
     def _request_headers(request):
         try:
-            headers = request.headers or {}
+            headers = dict(request.headers or {})
         except Exception:
             headers = {}
+        if interception_enabled and _matches_patterns(str(request.url), interception_patterns):
+            headers.update(interception_extra_headers)
         return [[str(name), str(value)] for name, value in headers.items()]
 
     def _request_content_type(headers):
@@ -772,6 +824,16 @@ with sync_playwright() as p:
 
     context.on("page", _attach_capture_page)
     _attach_capture_page(tabs["main"])
+
+    def _intercept_route(route, request):
+        if not interception_enabled or not _matches_patterns(str(request.url), interception_patterns):
+            route.continue_()
+            return
+        headers = dict(request.headers or {})
+        headers.update(interception_extra_headers)
+        route.continue_(headers=headers)
+
+    context.route("**/*", _intercept_route)
 
     for raw in sys.stdin:
         raw = raw.strip()
@@ -870,6 +932,25 @@ with sync_playwright() as p:
                 _result(request_id)
             elif cmd == "refresh":
                 current_page().reload(wait_until="domcontentloaded", timeout=45000)
+                _result(request_id)
+            elif cmd == "enable_interception":
+                interception_enabled = True
+                interception_patterns = [str(pattern) for pattern in (req.get("patterns") or [])]
+                interception_extra_headers = {
+                    str(name): str(value)
+                    for name, value in (req.get("extra_headers") or {}).items()
+                }
+                _result(request_id)
+            elif cmd == "disable_interception":
+                interception_enabled = False
+                interception_patterns = []
+                interception_extra_headers = {}
+                _result(request_id)
+            elif cmd == "set_extra_headers":
+                interception_extra_headers = {
+                    str(name): str(value)
+                    for name, value in (req.get("headers") or {}).items()
+                }
                 _result(request_id)
             elif cmd == "start_api_capture":
                 capture_config = {
