@@ -29,7 +29,8 @@ use crate::{
     snapshot::{
         EXTRACT_ELEMENTS_JS, build_find_element_js, build_focus_element_js,
         build_scroll_into_view_js, extract_snapshot, find_element_by_ref, focus_element_by_ref,
-        parse_find_element_result, parse_snapshot_payload, scroll_element_into_view,
+        parse_find_element_result, parse_snapshot_payload, sanitize_dom_text,
+        scroll_element_into_view,
     },
     telemetry::{
         ProbeBackendReport, ProbeBaselineStore, ProbeCanaryReport, ProbeCanarySpec,
@@ -62,6 +63,19 @@ fn require_session(session_id: Option<&str>, action: &str) -> Result<String, Err
     session_id
         .map(String::from)
         .ok_or_else(|| Error::InvalidAction(format!("{action} requires a session_id")))
+}
+
+fn sanitize_string_response(value: String) -> String {
+    sanitize_dom_text(&value).into_owned()
+}
+
+fn sanitize_evaluate_result(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(sanitize_string_response(text))
+        },
+        other => other,
+    }
 }
 
 /// Manage Chrome/Chromium instances with CDP.
@@ -1314,7 +1328,7 @@ impl BrowserManager {
     ) -> Result<(String, BrowserResponse), Error> {
         let instance = self.pool.get_patchright_session(session_id).await?;
         let mut inst = instance.lock().await;
-        let result = inst.session.evaluate(code).await?;
+        let result = sanitize_evaluate_result(inst.session.evaluate(code).await?);
         Ok((
             session_id.to_string(),
             self.patchright_success(session_id.to_string(), sandbox)
@@ -1393,7 +1407,7 @@ impl BrowserManager {
     ) -> Result<(String, BrowserResponse), Error> {
         let instance = self.pool.get_patchright_session(session_id).await?;
         let mut inst = instance.lock().await;
-        let title = inst.session.get_title().await?;
+        let title = sanitize_string_response(inst.session.get_title().await?);
         Ok((
             session_id.to_string(),
             self.patchright_success(session_id.to_string(), sandbox)
@@ -2108,12 +2122,13 @@ impl BrowserManager {
 
         let page = self.pool.get_page(&sid).await?;
 
-        let result: serde_json::Value = page
-            .evaluate(code)
-            .await
-            .map_err(|e| Error::JsEvalFailed(e.to_string()))?
-            .into_value()
-            .map_err(|e| Error::JsEvalFailed(format!("{e:?}")))?;
+        let result = sanitize_evaluate_result(
+            page.evaluate(code)
+                .await
+                .map_err(|e| Error::JsEvalFailed(e.to_string()))?
+                .into_value()
+                .map_err(|e| Error::JsEvalFailed(format!("{e:?}")))?,
+        );
 
         debug!(session_id = sid, "evaluated JavaScript");
 
@@ -2198,7 +2213,7 @@ impl BrowserManager {
         let sid = require_session(session_id, "get_title")?;
 
         let page = self.pool.get_page(&sid).await?;
-        let title = page.get_title().await.ok().flatten().unwrap_or_default();
+        let title = sanitize_string_response(page.get_title().await.ok().flatten().unwrap_or_default());
 
         Ok((
             sid.clone(),
@@ -3184,6 +3199,25 @@ mod tests {
         assert!(
             msg.contains("screenshot"),
             "error should mention the action"
+        );
+    }
+
+    #[test]
+    fn sanitize_string_response_strips_invisible_unicode() {
+        assert_eq!(sanitize_string_response("Ti\u{200b}tle\u{2060}".to_string()), "Title");
+    }
+
+    #[test]
+    fn sanitize_evaluate_result_only_updates_top_level_strings() {
+        assert_eq!(
+            sanitize_evaluate_result(serde_json::Value::String(
+                "va\u{200b}lue\u{2060}".to_string()
+            )),
+            serde_json::Value::String("value".to_string())
+        );
+        assert_eq!(
+            sanitize_evaluate_result(serde_json::json!({"text": "ke\u{200b}ep"})),
+            serde_json::json!({"text": "ke\u{200b}ep"})
         );
     }
 }

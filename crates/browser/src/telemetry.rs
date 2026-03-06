@@ -5,7 +5,10 @@
 //! before anti-bot changes reach production targets.
 
 use {
-    crate::types::{BrowserBackendKind, BrowserKind, BrowserPreference},
+    crate::{
+        snapshot::sanitize_dom_text,
+        types::{BrowserBackendKind, BrowserKind, BrowserPreference},
+    },
     reqwest::Url,
     serde::{Deserialize, Serialize},
     std::{
@@ -97,6 +100,20 @@ pub struct FingerprintSnapshot {
     pub plugins_count: Option<u32>,
 }
 
+impl FingerprintSnapshot {
+    fn sanitize(&mut self) {
+        sanitize_string_field(&mut self.session_id);
+        sanitize_string_field(&mut self.url);
+        sanitize_string_field(&mut self.user_agent);
+        sanitize_optional_string_field(&mut self.platform);
+        sanitize_optional_string_field(&mut self.language);
+        sanitize_optional_vec_string_field(&mut self.languages);
+        sanitize_optional_string_field(&mut self.timezone);
+        sanitize_optional_string_field(&mut self.webgl_vendor);
+        sanitize_optional_string_field(&mut self.webgl_renderer);
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FingerprintHeaders {
     #[serde(default)]
@@ -111,6 +128,17 @@ pub struct FingerprintHeaders {
     pub sec_fetch_site: Option<String>,
     #[serde(default)]
     pub x_forwarded_for: Option<String>,
+}
+
+impl FingerprintHeaders {
+    fn sanitize(&mut self) {
+        sanitize_optional_string_field(&mut self.user_agent);
+        sanitize_optional_string_field(&mut self.accept_language);
+        sanitize_optional_string_field(&mut self.sec_ch_ua);
+        sanitize_optional_string_field(&mut self.sec_ch_ua_platform);
+        sanitize_optional_string_field(&mut self.sec_fetch_site);
+        sanitize_optional_string_field(&mut self.x_forwarded_for);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,6 +230,32 @@ impl RequestSequenceSummary {
             max_gap_ms: None,
         }
     }
+
+    fn sanitize(&mut self) {
+        sanitize_optional_string_field(&mut self.first_path);
+        sanitize_optional_string_field(&mut self.last_path);
+        sanitize_vec_string_field(&mut self.path_sequence);
+    }
+}
+
+fn sanitize_string_field(value: &mut String) {
+    *value = sanitize_dom_text(value).into_owned();
+}
+
+fn sanitize_optional_string_field(value: &mut Option<String>) {
+    if let Some(inner) = value {
+        sanitize_string_field(inner);
+    }
+}
+
+fn sanitize_vec_string_field(values: &mut Vec<String>) {
+    values.iter_mut().for_each(sanitize_string_field);
+}
+
+fn sanitize_optional_vec_string_field(values: &mut Option<Vec<String>>) {
+    if let Some(inner) = values {
+        sanitize_vec_string_field(inner);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -212,6 +266,14 @@ pub struct ProbeFingerprintReport {
     pub headers: FingerprintHeaders,
 }
 
+impl ProbeFingerprintReport {
+    fn sanitize(&mut self) {
+        sanitize_string_field(&mut self.session_id);
+        self.body.sanitize();
+        self.headers.sanitize();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeBehaviorReport {
     pub session_id: String,
@@ -220,10 +282,23 @@ pub struct ProbeBehaviorReport {
     pub summary: BehaviorBatchSummary,
 }
 
+impl ProbeBehaviorReport {
+    fn sanitize(&mut self) {
+        sanitize_string_field(&mut self.session_id);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeSequenceReport {
     pub run_id: String,
     pub summary: RequestSequenceSummary,
+}
+
+impl ProbeSequenceReport {
+    fn sanitize(&mut self) {
+        sanitize_string_field(&mut self.run_id);
+        self.summary.sanitize();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -930,7 +1005,9 @@ pub async fn fetch_probe_fingerprint_report(
 ) -> Result<ProbeFingerprintReport, TelemetryError> {
     let session_id = url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect::<String>();
     let url = probe_report_url(origin, &format!("/report/{session_id}"))?;
-    fetch_probe_json(client, url).await
+    let mut report: ProbeFingerprintReport = fetch_probe_json(client, url).await?;
+    report.sanitize();
+    Ok(report)
 }
 
 pub async fn fetch_probe_behavior_report(
@@ -940,7 +1017,9 @@ pub async fn fetch_probe_behavior_report(
 ) -> Result<ProbeBehaviorReport, TelemetryError> {
     let session_id = url::form_urlencoded::byte_serialize(session_id.as_bytes()).collect::<String>();
     let url = probe_report_url(origin, &format!("/behavior-report/{session_id}"))?;
-    fetch_probe_json(client, url).await
+    let mut report: ProbeBehaviorReport = fetch_probe_json(client, url).await?;
+    report.sanitize();
+    Ok(report)
 }
 
 pub async fn fetch_probe_sequence_report(
@@ -950,7 +1029,9 @@ pub async fn fetch_probe_sequence_report(
 ) -> Result<ProbeSequenceReport, TelemetryError> {
     let run_id = url::form_urlencoded::byte_serialize(run_id.as_bytes()).collect::<String>();
     let url = probe_report_url(origin, &format!("/sequence-report/{run_id}"))?;
-    fetch_probe_json(client, url).await
+    let mut report: ProbeSequenceReport = fetch_probe_json(client, url).await?;
+    report.sanitize();
+    Ok(report)
 }
 
 pub fn load_tls_ja4_observations(path: &Path) -> Result<Vec<TlsJa4Observation>, TelemetryError> {
@@ -2619,6 +2700,63 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.kind == ProbeDriftKind::BehaviorEventRateDrift));
+    }
+
+    #[test]
+    fn probe_reports_sanitize_string_fields() {
+        let mut fingerprint = ProbeFingerprintReport {
+            session_id: "sess\u{200b}ion".to_string(),
+            body: FingerprintSnapshot {
+                session_id: "sess\u{2060}ion".to_string(),
+                ts: 1.0,
+                url: "https://exa\u{200b}mple.com".to_string(),
+                user_agent: "Mozi\u{2060}lla".to_string(),
+                webdriver: Some(false),
+                platform: Some("Mac\u{200b}Intel".to_string()),
+                language: Some("en\u{2060}-AU".to_string()),
+                languages: Some(vec!["en\u{200b}-AU".to_string()]),
+                timezone: Some("Austral\u{2060}ia/Melbourne".to_string()),
+                screen: None,
+                hardware_concurrency: None,
+                device_memory: None,
+                webgl_vendor: Some("Ven\u{200b}dor".to_string()),
+                webgl_renderer: Some("Rend\u{2060}erer".to_string()),
+                plugins_count: None,
+            },
+            headers: FingerprintHeaders {
+                user_agent: Some("Mozi\u{200b}lla".to_string()),
+                accept_language: Some("en\u{2060}-AU".to_string()),
+                sec_ch_ua: Some("\"Chrom\u{200b}e\"".to_string()),
+                sec_ch_ua_platform: Some("\"mac\u{2060}OS\"".to_string()),
+                sec_fetch_site: Some("sam\u{200b}e-origin".to_string()),
+                x_forwarded_for: Some("127.0.0.\u{2060}1".to_string()),
+            },
+        };
+        fingerprint.sanitize();
+        assert_eq!(fingerprint.session_id, "session");
+        assert_eq!(fingerprint.body.url, "https://example.com");
+        assert_eq!(fingerprint.body.user_agent, "Mozilla");
+        assert_eq!(fingerprint.body.platform.as_deref(), Some("MacIntel"));
+        assert_eq!(fingerprint.body.languages.as_deref(), Some(&["en-AU".to_string()][..]));
+        assert_eq!(fingerprint.headers.accept_language.as_deref(), Some("en-AU"));
+
+        let mut sequence = ProbeSequenceReport {
+            run_id: "run\u{200b}id".to_string(),
+            summary: RequestSequenceSummary {
+                request_count: 2,
+                first_path: Some("/fi\u{2060}rst".to_string()),
+                last_path: Some("/la\u{200b}st".to_string()),
+                distinct_path_count: 2,
+                path_sequence: vec!["/fi\u{200b}rst".to_string(), "/la\u{2060}st".to_string()],
+                mean_gap_ms: Some(10.0),
+                max_gap_ms: Some(12.0),
+            },
+        };
+        sequence.sanitize();
+        assert_eq!(sequence.run_id, "runid");
+        assert_eq!(sequence.summary.first_path.as_deref(), Some("/first"));
+        assert_eq!(sequence.summary.last_path.as_deref(), Some("/last"));
+        assert_eq!(sequence.summary.path_sequence, vec!["/first", "/last"]);
     }
 
     #[test]
