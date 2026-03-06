@@ -1,4 +1,4 @@
-use std::{fmt::Write, sync::Arc};
+use std::{collections::BTreeSet, fmt::Write, sync::Arc};
 
 use {
     anyhow::{Result, bail},
@@ -12,10 +12,11 @@ use moltis_common::hooks::{HookAction, HookPayload, HookRegistry};
 
 use crate::{
     classify::{ProviderErrorKind, classify_error_message, extract_retry_after_ms},
+    cross_session::{CrossSessionLearning, Learning, LearningContext, LearningOutcome},
     intent_tracker::IntentTracker,
     model::{
-        ChatMessage, CompletionResponse, ContentPart, LlmProvider, StreamEvent, ToolCall, Usage,
-        UserContent, values_to_chat_messages,
+        ChatMessage, CompletionResponse, ConfidenceMetrics, ContentPart, LlmProvider, StreamEvent,
+        ToolCall, Usage, UserContent, values_to_chat_messages,
     },
     response_sanitizer::{
         clean_response, recover_tool_calls_from_content, sanitize_with_leak_detection,
@@ -23,13 +24,16 @@ use crate::{
     tool_parsing::{
         looks_like_failed_tool_call, new_synthetic_tool_call_id, parse_tool_calls_from_text,
     },
-    tool_registry::ToolRegistry,
+    tool_registry::{ToolEffectClass, ToolRegistry},
 };
 
 use futures::StreamExt;
 
 /// Fallback loop limit when config is missing or invalid.
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 25;
+const MAX_INJECTED_LEARNINGS: usize = 3;
+const MAX_LEARNING_HINT_CHARS: usize = 240;
+const MAX_SUMMARY_ACTIONS: usize = 3;
 
 fn resolve_agent_max_iterations(configured: usize) -> usize {
     if configured == 0 {
@@ -290,6 +294,266 @@ fn explicit_shell_command_from_user_content(user_content: &UserContent) -> Optio
     }
 
     Some(command.to_string())
+}
+
+fn original_intent_from_user_content(user_content: &UserContent) -> String {
+    match user_content {
+        UserContent::Text(text) => text.trim().to_string(),
+        UserContent::Multimodal(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string(),
+    }
+}
+
+fn trim_inline_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn learning_entities(text: &str) -> Vec<String> {
+    let mut entities = BTreeSet::new();
+    for token in text
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|token| token.len() > 2)
+    {
+        entities.insert(token.to_ascii_lowercase());
+    }
+    entities.into_iter().take(12).collect()
+}
+
+fn learning_context_for_request(
+    user_content: &UserContent,
+    explicit_shell_command: Option<&str>,
+) -> LearningContext {
+    let original_intent = original_intent_from_user_content(user_content);
+    let lowered_intent = original_intent.to_ascii_lowercase();
+    let task_type = if explicit_shell_command.is_some() {
+        "shell"
+    } else if lowered_intent.contains("browser")
+        || lowered_intent.contains("navigate")
+        || lowered_intent.contains("click")
+    {
+        "browser"
+    } else if lowered_intent.contains("code")
+        || lowered_intent.contains("file")
+        || lowered_intent.contains("rust")
+        || lowered_intent.contains("build")
+        || lowered_intent.contains("test")
+        || lowered_intent.contains("fix")
+    {
+        "coding"
+    } else {
+        "general"
+    };
+
+    LearningContext {
+        task_type: task_type.to_string(),
+        entities: learning_entities(&original_intent),
+        outcome: LearningOutcome::PatternObserved,
+    }
+}
+
+fn build_learning_system_message(learnings: &[Learning]) -> Option<String> {
+    if learnings.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(learnings.len() + 2);
+    lines.push(String::from(
+        "Relevant prior learnings from successful runs. Use them only when the current evidence matches.",
+    ));
+    for learning in learnings.iter().take(MAX_INJECTED_LEARNINGS) {
+        lines.push(format!(
+            "- {}",
+            trim_inline_text(&learning.content, MAX_LEARNING_HINT_CHARS)
+        ));
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn record_learning_success(store: &CrossSessionLearning, learning_ids: &[String]) {
+    for learning_id in learning_ids {
+        store.record_application(learning_id);
+        store.boost_confidence(learning_id, 0.1);
+        #[cfg(feature = "metrics")]
+        counter!("moltis_agent_learning_boost_total").increment(1);
+    }
+}
+
+fn record_learning_failure(store: &CrossSessionLearning, learning_ids: &[String]) {
+    for learning_id in learning_ids {
+        store.reduce_confidence(learning_id, 0.1);
+        #[cfg(feature = "metrics")]
+        counter!("moltis_agent_learning_reduce_total").increment(1);
+    }
+}
+
+fn build_agent_run_result(
+    text: String,
+    iterations: usize,
+    tool_calls_made: usize,
+    input_tokens: u32,
+    output_tokens: u32,
+    request_usage: Usage,
+    raw_llm_responses: Vec<serde_json::Value>,
+) -> AgentRunResult {
+    AgentRunResult {
+        text,
+        iterations,
+        tool_calls_made,
+        usage: Usage {
+            input_tokens,
+            output_tokens,
+            ..Default::default()
+        },
+        request_usage,
+        raw_llm_responses,
+    }
+}
+
+fn browser_action_name(arguments: &serde_json::Value) -> Option<&str> {
+    arguments.get("action").and_then(serde_json::Value::as_str)
+}
+
+fn browser_action_is_high_risk(action: &str) -> bool {
+    !matches!(
+        action,
+        "navigate"
+            | "snapshot"
+            | "screenshot"
+            | "get_url"
+            | "get_title"
+            | "wait"
+            | "back"
+            | "forward"
+            | "refresh"
+            | "start_api_capture"
+            | "stop_api_capture"
+            | "tab_new"
+            | "tab_list"
+            | "tab_switch"
+            | "get_screencast_frame"
+    )
+}
+
+fn tool_call_is_high_risk(tool_call: &ToolCall, tools: &ToolRegistry) -> bool {
+    if tool_call.name == "browser" {
+        return browser_action_name(&tool_call.arguments).map_or(true, browser_action_is_high_risk);
+    }
+
+    match tools.side_effect_class(&tool_call.name) {
+        Some(ToolEffectClass::ReadOnly) => false,
+        Some(ToolEffectClass::LocalMutation | ToolEffectClass::ExternalEffect) | None => true,
+    }
+}
+
+fn summarize_tool_calls(tool_calls: &[ToolCall]) -> String {
+    let mut parts = Vec::new();
+    for tool_call in tool_calls.iter().take(MAX_SUMMARY_ACTIONS) {
+        if tool_call.name == "browser"
+            && let Some(action) = browser_action_name(&tool_call.arguments)
+        {
+            parts.push(format!("browser.{action}"));
+        } else {
+            parts.push(tool_call.name.clone());
+        }
+    }
+
+    if tool_calls.len() > MAX_SUMMARY_ACTIONS {
+        parts.push(format!("and {} more action(s)", tool_calls.len() - MAX_SUMMARY_ACTIONS));
+    }
+
+    parts.join(", ")
+}
+
+fn build_low_confidence_question(original_intent: &str, confidence: &ConfidenceMetrics) -> String {
+    let reason = confidence
+        .uncertainty_reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    format!(
+        "I’m not confident enough to act on \"{}\"{} yet. What exact outcome should I focus on next?",
+        trim_inline_text(original_intent, 160),
+        reason
+    )
+}
+
+fn build_high_risk_confirmation_question(original_intent: &str, tool_calls: &[ToolCall]) -> String {
+    format!(
+        "I can keep exploring, but I need confirmation before I run {} for \"{}\". Should I proceed?",
+        summarize_tool_calls(tool_calls),
+        trim_inline_text(original_intent, 160)
+    )
+}
+
+fn confidence_gate_question(
+    response: &CompletionResponse,
+    verified_tool_evidence: bool,
+    tools: &ToolRegistry,
+    original_intent: &str,
+) -> Option<String> {
+    let confidence = response.confidence.as_ref()?;
+    if confidence.should_retry() {
+        if !verified_tool_evidence || !response.tool_calls.is_empty() {
+            #[cfg(feature = "metrics")]
+            counter!("moltis_agent_low_confidence_clarifications_total").increment(1);
+            return Some(build_low_confidence_question(original_intent, confidence));
+        }
+        return None;
+    }
+
+    if confidence.should_escalate()
+        && response
+            .tool_calls
+            .iter()
+            .any(|tool_call| tool_call_is_high_risk(tool_call, tools))
+    {
+        #[cfg(feature = "metrics")]
+        counter!("moltis_agent_medium_confidence_blocks_total").increment(1);
+        return Some(build_high_risk_confirmation_question(
+            original_intent,
+            &response.tool_calls,
+        ));
+    }
+
+    None
+}
+
+fn build_intent_correction_message(original_intent: &str) -> String {
+    format!(
+        "You are drifting from the original goal. Stay focused on: {}. Do not open a new branch of work unless the user explicitly asks for it.",
+        trim_inline_text(original_intent, 200)
+    )
+}
+
+fn build_intent_redirect_question(
+    original_intent: &str,
+    current_intent: &str,
+    tool_calls: &[ToolCall],
+) -> String {
+    let requested_actions = summarize_tool_calls(tool_calls);
+    let current_summary = trim_inline_text(current_intent, 160);
+    format!(
+        "Your current plan is drifting from \"{}\" toward \"{}\" via {}. Do you want me to switch directions?",
+        trim_inline_text(original_intent, 160),
+        current_summary,
+        requested_actions
+    )
 }
 
 // ── Tool result sanitization ────────────────────────────────────────────
@@ -614,18 +878,26 @@ pub async fn run_agent_loop_with_context(
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
 
     // Intent drift detection: track how far agent responses wander from the original goal.
-    let original_intent = match user_content {
-        UserContent::Text(t) => t.clone(),
-        UserContent::Multimodal(parts) => parts
-            .iter()
-            .filter_map(|p| match p {
-                ContentPart::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-    };
+    let original_intent = original_intent_from_user_content(user_content);
     let mut intent_tracker = IntentTracker::new(&original_intent);
+    let learning_store = CrossSessionLearning::new(moltis_config::data_dir());
+    let relevant_learnings = learning_store
+        .find_relevant(&learning_context_for_request(
+            user_content,
+            explicit_shell_command.as_deref(),
+        ))
+        .into_iter()
+        .take(MAX_INJECTED_LEARNINGS)
+        .collect::<Vec<_>>();
+    let applied_learning_ids = relevant_learnings
+        .iter()
+        .map(|learning| learning.id.clone())
+        .collect::<Vec<_>>();
+    if let Some(learning_message) = build_learning_system_message(&relevant_learnings) {
+        messages.insert(1, ChatMessage::system(learning_message));
+        #[cfg(feature = "metrics")]
+        counter!("moltis_agent_learning_hits_total").increment(1);
+    }
 
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
@@ -651,11 +923,14 @@ pub async fn run_agent_loop_with_context(
     let mut rate_limit_backoff_ms: Option<u64> = None;
     let mut last_answer_text = String::new();
     let mut malformed_retry_count: u8 = 0;
+    let mut verified_tool_evidence = false;
+    let mut drift_corrections_applied: u8 = 0;
 
     loop {
         iterations += 1;
         if iterations > max_iterations {
             warn!("agent loop exceeded max iterations ({})", max_iterations);
+            record_learning_failure(&learning_store, &applied_learning_ids);
             return Err(AgentRunError::Other(anyhow::anyhow!(
                 "agent loop exceeded max iterations"
             )));
@@ -663,6 +938,7 @@ pub async fn run_agent_loop_with_context(
         if agent_timeout_secs > 0
             && remaining_agent_budget(run_started, agent_timeout_secs).is_none()
         {
+            record_learning_failure(&learning_store, &applied_learning_ids);
             return Err(AgentRunError::Other(anyhow::anyhow!(
                 "agent run timed out after {agent_timeout_secs}s"
             )));
@@ -695,6 +971,7 @@ pub async fn run_agent_loop_with_context(
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
                     warn!(reason = %reason, "LLM call blocked by BeforeLLMCall hook");
+                    record_learning_failure(&learning_store, &applied_learning_ids);
                     return Err(AgentRunError::Other(anyhow::anyhow!(
                         "blocked by BeforeLLMCall hook: {reason}"
                     )));
@@ -754,6 +1031,7 @@ pub async fn run_agent_loop_with_context(
             Err(e) => {
                 let msg = e.to_string();
                 if msg.starts_with("agent run timed out after ") {
+                    record_learning_failure(&learning_store, &applied_learning_ids);
                     return Err(AgentRunError::Other(anyhow::anyhow!(msg)));
                 }
                 if let Some(ref hooks) = hook_registry {
@@ -775,6 +1053,7 @@ pub async fn run_agent_loop_with_context(
                     }
                 }
                 if classify_error_message(&msg) == ProviderErrorKind::ContextWindow {
+                    record_learning_failure(&learning_store, &applied_learning_ids);
                     return Err(AgentRunError::ContextWindowExceeded(msg));
                 }
                 if let Some(delay_ms) = next_retry_delay_ms(
@@ -800,6 +1079,7 @@ pub async fn run_agent_loop_with_context(
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
+                record_learning_failure(&learning_store, &applied_learning_ids);
                 return Err(AgentRunError::Other(e));
             },
         };
@@ -937,6 +1217,7 @@ pub async fn run_agent_loop_with_context(
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
                     warn!(reason = %reason, "LLM response blocked by AfterLLMCall hook");
+                    record_learning_failure(&learning_store, &applied_learning_ids);
                     return Err(AgentRunError::Other(anyhow::anyhow!(
                         "blocked by AfterLLMCall hook: {reason}"
                     )));
@@ -951,6 +1232,20 @@ pub async fn run_agent_loop_with_context(
             }
         }
 
+        if let Some(question) =
+            confidence_gate_question(&response, verified_tool_evidence, tools, &original_intent)
+        {
+            return Ok(build_agent_run_result(
+                question,
+                iterations,
+                total_tool_calls,
+                total_input_tokens,
+                total_output_tokens,
+                response.usage.clone(),
+                Vec::new(),
+            ));
+        }
+
         // If no tool calls, return the text response.
         if response.tool_calls.is_empty() {
             let text = clean_response(
@@ -959,37 +1254,68 @@ pub async fn run_agent_loop_with_context(
                     .filter(|t| !t.is_empty())
                     .unwrap_or(std::mem::take(&mut last_answer_text)),
             );
+            if verified_tool_evidence {
+                record_learning_success(&learning_store, &applied_learning_ids);
+            }
 
             info!(
                 iterations,
                 tool_calls = total_tool_calls,
                 "agent loop complete — returning text"
             );
-            return Ok(AgentRunResult {
+            return Ok(build_agent_run_result(
                 text,
                 iterations,
-                tool_calls_made: total_tool_calls,
-                usage: Usage {
-                    input_tokens: total_input_tokens,
-                    output_tokens: total_output_tokens,
-                    ..Default::default()
-                },
-                request_usage: response.usage.clone(),
-                raw_llm_responses: Vec::new(),
-            });
+                total_tool_calls,
+                total_input_tokens,
+                total_output_tokens,
+                response.usage.clone(),
+                Vec::new(),
+            ));
         }
 
         // Check intent drift when the agent is iterating with tool calls.
-        {
-            let current_intent = response.text.as_deref().unwrap_or("");
-            let (drift_score, is_drifted) =
-                intent_tracker.check_drift(current_intent, trace_id.as_deref());
-            if is_drifted && let Some(cb) = on_event {
+        let current_intent = format!(
+            "{} {}",
+            response.text.as_deref().unwrap_or(""),
+            summarize_tool_calls(&response.tool_calls)
+        );
+        let (drift_score, is_drifted) =
+            intent_tracker.check_drift(&current_intent, trace_id.as_deref());
+        if is_drifted {
+            if let Some(cb) = on_event {
                 cb(RunnerEvent::IntentDrift {
                     drift_score,
                     iteration: iterations,
                 });
             }
+
+            if drift_corrections_applied == 0 {
+                drift_corrections_applied += 1;
+                #[cfg(feature = "metrics")]
+                counter!("moltis_agent_intent_drift_corrections_total").increment(1);
+                if let Some(text) = response.text.filter(|text| !text.is_empty()) {
+                    messages.push(ChatMessage::assistant(text));
+                }
+                messages.push(ChatMessage::system(build_intent_correction_message(
+                    &original_intent,
+                )));
+                continue;
+            }
+
+            return Ok(build_agent_run_result(
+                build_intent_redirect_question(
+                    &original_intent,
+                    &current_intent,
+                    &response.tool_calls,
+                ),
+                iterations,
+                total_tool_calls,
+                total_input_tokens,
+                total_output_tokens,
+                response.usage.clone(),
+                Vec::new(),
+            ));
         }
 
         // Append assistant message with tool calls.
@@ -1141,6 +1467,7 @@ pub async fn run_agent_loop_with_context(
         // Process results in original order: emit events, append messages.
         for (tc, (success, result, error)) in response.tool_calls.iter().zip(results) {
             if success {
+                verified_tool_evidence = true;
                 info!(tool = %tc.name, id = %tc.id, "tool execution succeeded");
                 trace!(tool = %tc.name, result = %result, "tool result");
             } else {
@@ -1240,18 +1567,26 @@ pub async fn run_agent_loop_streaming(
     let explicit_shell_command = explicit_shell_command_from_user_content(user_content);
 
     // Extract original intent for drift detection.
-    let original_intent = match user_content {
-        UserContent::Text(t) => t.clone(),
-        UserContent::Multimodal(parts) => parts
-            .iter()
-            .filter_map(|p| match p {
-                ContentPart::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-    };
+    let original_intent = original_intent_from_user_content(user_content);
     let mut intent_tracker = IntentTracker::new(&original_intent);
+    let learning_store = CrossSessionLearning::new(moltis_config::data_dir());
+    let relevant_learnings = learning_store
+        .find_relevant(&learning_context_for_request(
+            user_content,
+            explicit_shell_command.as_deref(),
+        ))
+        .into_iter()
+        .take(MAX_INJECTED_LEARNINGS)
+        .collect::<Vec<_>>();
+    let applied_learning_ids = relevant_learnings
+        .iter()
+        .map(|learning| learning.id.clone())
+        .collect::<Vec<_>>();
+    if let Some(learning_message) = build_learning_system_message(&relevant_learnings) {
+        messages.insert(1, ChatMessage::system(learning_message));
+        #[cfg(feature = "metrics")]
+        counter!("moltis_agent_learning_hits_total").increment(1);
+    }
 
     // Only send tool schemas to providers that support them natively.
     let schemas_for_api = if native_tools {
@@ -1288,6 +1623,8 @@ pub async fn run_agent_loop_streaming(
     // this is used as the final response text instead of returning silent.
     let mut last_answer_text = String::new();
     let mut malformed_retry_count: u8 = 0;
+    let mut verified_tool_evidence = false;
+    let mut drift_corrections_applied: u8 = 0;
 
     loop {
         iterations += 1;
@@ -1296,6 +1633,7 @@ pub async fn run_agent_loop_streaming(
                 "streaming agent loop exceeded max iterations ({})",
                 max_iterations
             );
+            record_learning_failure(&learning_store, &applied_learning_ids);
             return Err(AgentRunError::Other(anyhow::anyhow!(
                 "agent loop exceeded max iterations"
             )));
@@ -1303,6 +1641,7 @@ pub async fn run_agent_loop_streaming(
         if agent_timeout_secs > 0
             && remaining_agent_budget(run_started, agent_timeout_secs).is_none()
         {
+            record_learning_failure(&learning_store, &applied_learning_ids);
             return Err(AgentRunError::Other(anyhow::anyhow!(
                 "agent run timed out after {agent_timeout_secs}s"
             )));
@@ -1335,6 +1674,7 @@ pub async fn run_agent_loop_streaming(
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
                     warn!(reason = %reason, "LLM call blocked by BeforeLLMCall hook");
+                    record_learning_failure(&learning_store, &applied_learning_ids);
                     return Err(AgentRunError::Other(anyhow::anyhow!(
                         "blocked by BeforeLLMCall hook: {reason}"
                     )));
@@ -1562,6 +1902,7 @@ pub async fn run_agent_loop_streaming(
         // Handle stream errors — retry on transient failures/rate limits.
         if let Some(err) = stream_error {
             if err.starts_with("agent run timed out after ") {
+                record_learning_failure(&learning_store, &applied_learning_ids);
                 return Err(AgentRunError::Other(anyhow::anyhow!(err)));
             }
             if let Some(ref hooks) = hook_registry {
@@ -1583,6 +1924,7 @@ pub async fn run_agent_loop_streaming(
                 }
             }
             if classify_error_message(&err) == ProviderErrorKind::ContextWindow {
+                record_learning_failure(&learning_store, &applied_learning_ids);
                 return Err(AgentRunError::ContextWindowExceeded(err));
             }
             if let Some(delay_ms) = next_retry_delay_ms(
@@ -1609,6 +1951,7 @@ pub async fn run_agent_loop_streaming(
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 continue;
             }
+            record_learning_failure(&learning_store, &applied_learning_ids);
             return Err(AgentRunError::Other(anyhow::anyhow!(err)));
         }
 
@@ -1733,6 +2076,7 @@ pub async fn run_agent_loop_streaming(
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
                     warn!(reason = %reason, "LLM response blocked by AfterLLMCall hook");
+                    record_learning_failure(&learning_store, &applied_learning_ids);
                     return Err(AgentRunError::Other(anyhow::anyhow!(
                         "blocked by AfterLLMCall hook: {reason}"
                     )));
@@ -1747,6 +2091,44 @@ pub async fn run_agent_loop_streaming(
             }
         }
 
+        let confidence_response = CompletionResponse {
+            text: if accumulated_text.is_empty() {
+                None
+            } else {
+                Some(accumulated_text.clone())
+            },
+            tool_calls: tool_calls.clone(),
+            usage: Usage {
+                input_tokens,
+                output_tokens,
+                ..Default::default()
+            },
+            confidence: None,
+        };
+        if let Some(question) = confidence_gate_question(
+            &confidence_response,
+            verified_tool_evidence,
+            tools,
+            &original_intent,
+        ) {
+            return Ok(AgentRunResult {
+                text: question,
+                iterations,
+                tool_calls_made: total_tool_calls,
+                usage: Usage {
+                    input_tokens: total_input_tokens,
+                    output_tokens: total_output_tokens,
+                    ..Default::default()
+                },
+                request_usage: Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..Default::default()
+                },
+                raw_llm_responses,
+            });
+        }
+
         // If no tool calls, return the text response.
         if tool_calls.is_empty() {
             // When the final iteration produced no text but a previous iteration
@@ -1756,6 +2138,9 @@ pub async fn run_agent_loop_streaming(
             } else {
                 accumulated_text
             };
+            if verified_tool_evidence {
+                record_learning_success(&learning_store, &applied_learning_ids);
+            }
             info!(
                 iterations,
                 tool_calls = total_tool_calls,
@@ -1792,10 +2177,46 @@ pub async fn run_agent_loop_streaming(
         // check_drift logs warnings internally when drift is detected.
         let (drift_score, is_drifted) =
             intent_tracker.check_drift(&current_intent, trace_id.as_deref());
-        if is_drifted && let Some(cb) = on_event {
-            cb(RunnerEvent::IntentDrift {
-                drift_score,
-                iteration: iterations,
+        if is_drifted {
+            if let Some(cb) = on_event {
+                cb(RunnerEvent::IntentDrift {
+                    drift_score,
+                    iteration: iterations,
+                });
+            }
+
+            if drift_corrections_applied == 0 {
+                drift_corrections_applied += 1;
+                #[cfg(feature = "metrics")]
+                counter!("moltis_agent_intent_drift_corrections_total").increment(1);
+                if !accumulated_text.is_empty() {
+                    messages.push(ChatMessage::assistant(accumulated_text));
+                }
+                messages.push(ChatMessage::system(build_intent_correction_message(
+                    &original_intent,
+                )));
+                continue;
+            }
+
+            return Ok(AgentRunResult {
+                text: build_intent_redirect_question(
+                    &original_intent,
+                    &current_intent,
+                    &tool_calls,
+                ),
+                iterations,
+                tool_calls_made: total_tool_calls,
+                usage: Usage {
+                    input_tokens: total_input_tokens,
+                    output_tokens: total_output_tokens,
+                    ..Default::default()
+                },
+                request_usage: Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..Default::default()
+                },
+                raw_llm_responses,
             });
         }
 
@@ -1955,6 +2376,7 @@ pub async fn run_agent_loop_streaming(
         // Process results in original order: emit events, append messages.
         for (tc, (success, result, error)) in tool_calls.iter().zip(results) {
             if success {
+                verified_tool_evidence = true;
                 info!(tool = %tc.name, id = %tc.id, "tool execution succeeded");
                 trace!(tool = %tc.name, result = %result, "tool result");
             } else {
@@ -2381,6 +2803,343 @@ mod tests {
         }
     }
 
+    struct BrowserLikeTool;
+
+    #[async_trait]
+    impl crate::tool_registry::AgentTool for BrowserLikeTool {
+        fn name(&self) -> &str {
+            "browser"
+        }
+
+        fn description(&self) -> &str {
+            "Browser-like tool for confidence gating tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" }
+                },
+                "required": ["action"]
+            })
+        }
+
+        fn side_effect_class(&self) -> ToolEffectClass {
+            ToolEffectClass::ExternalEffect
+        }
+
+        async fn execute(&self, params: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({ "ok": true, "params": params }))
+        }
+    }
+
+    struct LowConfidenceToolProvider;
+
+    #[async_trait]
+    impl LlmProvider for LowConfidenceToolProvider {
+        fn name(&self) -> &str {
+            "mock-low-confidence"
+        }
+
+        fn id(&self) -> &str {
+            "mock-low-confidence"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: Some("I think I should run a tool".into()),
+                tool_calls: vec![ToolCall {
+                    id: "call_low_conf".into(),
+                    name: "echo_tool".into(),
+                    arguments: serde_json::json!({ "text": "hi" }),
+                }],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                confidence: Some(ConfidenceMetrics {
+                    score: Some(0.2),
+                    logprobs: None,
+                    uncertainty_reason: Some("ambiguous request".into()),
+                }),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    struct MediumConfidenceBrowserProvider;
+
+    #[async_trait]
+    impl LlmProvider for MediumConfidenceBrowserProvider {
+        fn name(&self) -> &str {
+            "mock-medium-confidence"
+        }
+
+        fn id(&self) -> &str {
+            "mock-medium-confidence"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: Some("I should click through this flow".into()),
+                tool_calls: vec![ToolCall {
+                    id: "call_medium_conf".into(),
+                    name: "browser".into(),
+                    arguments: serde_json::json!({ "action": "click", "ref_": 1 }),
+                }],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                confidence: Some(ConfidenceMetrics {
+                    score: Some(0.5),
+                    logprobs: None,
+                    uncertainty_reason: Some("needs confirmation".into()),
+                }),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    struct ToolThenLowConfidenceAnswerProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolThenLowConfidenceAnswerProvider {
+        fn name(&self) -> &str {
+            "mock-tool-then-low-confidence"
+        }
+
+        fn id(&self) -> &str {
+            "mock-tool-then-low-confidence"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let call_count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_count == 0 {
+                Ok(CompletionResponse {
+                    text: Some("Verify and finish".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_verify".into(),
+                        name: "echo_tool".into(),
+                        arguments: serde_json::json!({ "text": "verified" }),
+                    }],
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    },
+                    confidence: None,
+                })
+            } else {
+                Ok(CompletionResponse {
+                    text: Some("Verified result".into()),
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                        ..Default::default()
+                    },
+                    confidence: Some(ConfidenceMetrics {
+                        score: Some(0.2),
+                        logprobs: None,
+                        uncertainty_reason: Some("model uncertain, tool evidence present".into()),
+                    }),
+                })
+            }
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    struct DriftThenRecoverProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+        saw_correction: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for DriftThenRecoverProvider {
+        fn name(&self) -> &str {
+            "mock-drift-recover"
+        }
+
+        fn id(&self) -> &str {
+            "mock-drift-recover"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let call_count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_count == 0 {
+                return Ok(CompletionResponse {
+                    text: Some("Delete unrelated files".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_drift".into(),
+                        name: "echo_tool".into(),
+                        arguments: serde_json::json!({ "text": "drifted" }),
+                    }],
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    },
+                    confidence: None,
+                });
+            }
+
+            let saw_correction = messages.iter().any(|message| {
+                matches!(
+                    message,
+                    ChatMessage::System { content }
+                        if content.contains("You are drifting from the original goal")
+                )
+            });
+            self.saw_correction
+                .store(saw_correction, std::sync::atomic::Ordering::SeqCst);
+
+            if call_count == 1 {
+                Ok(CompletionResponse {
+                    text: Some("Write Rust function parse JSON".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_recover".into(),
+                        name: "echo_tool".into(),
+                        arguments: serde_json::json!({ "text": "aligned" }),
+                    }],
+                    usage: Usage {
+                        input_tokens: 15,
+                        output_tokens: 7,
+                        ..Default::default()
+                    },
+                    confidence: None,
+                })
+            } else {
+                Ok(CompletionResponse {
+                    text: Some("Done!".into()),
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                        ..Default::default()
+                    },
+                    confidence: None,
+                })
+            }
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    struct DriftTwiceProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for DriftTwiceProvider {
+        fn name(&self) -> &str {
+            "mock-drift-twice"
+        }
+
+        fn id(&self) -> &str {
+            "mock-drift-twice"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let call_count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(CompletionResponse {
+                text: Some(format!("Drift attempt {}", call_count + 1)),
+                tool_calls: vec![ToolCall {
+                    id: format!("call_drift_{}", call_count + 1),
+                    name: "echo_tool".into(),
+                    arguments: serde_json::json!({ "text": "drifted" }),
+                }],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
+                confidence: None,
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
     // ── Tests ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2414,6 +3173,164 @@ mod tests {
         assert_eq!(result.text, "Done!");
         assert_eq!(result.iterations, 2);
         assert_eq!(result.tool_calls_made, 1);
+    }
+
+    #[tokio::test]
+    async fn test_low_confidence_requests_clarification_before_tool_execution() {
+        let provider = Arc::new(LowConfidenceToolProvider);
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Do the thing"),
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.text.contains("not confident enough"));
+        assert_eq!(result.tool_calls_made, 0);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::ToolCallStart { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_medium_confidence_blocks_high_risk_browser_actions() {
+        let provider = Arc::new(MediumConfidenceBrowserProvider);
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(BrowserLikeTool));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Continue the flow"),
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.text.contains("need confirmation"));
+        assert_eq!(result.tool_calls_made, 0);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::ToolCallStart { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verified_tool_evidence_overrides_low_confidence_answer() {
+        let provider = Arc::new(ToolThenLowConfidenceAnswerProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Verify and finish"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Verified result");
+        assert_eq!(result.tool_calls_made, 1);
+        assert_eq!(result.iterations, 2);
+    }
+
+    #[tokio::test]
+    async fn test_first_intent_drift_injects_correction_before_tool_execution() {
+        let saw_correction = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = Arc::new(DriftThenRecoverProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            saw_correction: Arc::clone(&saw_correction),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Write a Rust function to parse JSON"),
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Done!");
+        assert_eq!(result.tool_calls_made, 1);
+        assert!(saw_correction.load(std::sync::atomic::Ordering::SeqCst));
+
+        let drift_events = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, RunnerEvent::IntentDrift { .. }))
+            .count();
+        assert_eq!(drift_events, 1);
+    }
+
+    #[tokio::test]
+    async fn test_second_intent_drift_requests_redirect_confirmation() {
+        let provider = Arc::new(DriftTwiceProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Write a Rust function to parse JSON"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.text.contains("switch directions"));
+        assert_eq!(result.tool_calls_made, 0);
     }
 
     /// Mock provider that calls the "exec" tool (native) and verifies result fed back.

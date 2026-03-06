@@ -14,6 +14,7 @@ async-trait     = { workspace = true }
 dashmap         = { workspace = true }
 futures         = { workspace = true }
 moltis-common   = { workspace = true }
+parking_lot     = { workspace = true }
 rand            = { workspace = true }
 regex           = { workspace = true }
 moltis-config   = { workspace = true }
@@ -25,6 +26,7 @@ secrecy         = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 thiserror       = { workspace = true }
+time            = { workspace = true }
 tokio           = { workspace = true }
 tokio-stream    = { workspace = true }
 tracing         = { workspace = true }

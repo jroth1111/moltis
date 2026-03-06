@@ -2,6 +2,7 @@
 
 pub mod auth_profiles;
 pub mod classify;
+pub mod cross_session;
 pub mod intent_tracker;
 pub mod json_repair;
 pub mod memory_writer;
