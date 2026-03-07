@@ -302,17 +302,11 @@ fn discover_registry(install_dir: &Path, skills: &mut Vec<SkillMetadata>) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
-
     use {
         super::*,
+        crate::test_support::data_dir_lock,
         crate::types::{RepoEntry, SkillState, SkillStatus, SkillsManifest},
     };
-
-    fn data_dir_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn write_local_skill(base: &Path, name: &str, content: &str) {
         let skill_dir = base.join(name);
@@ -322,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_skills_in_temp_dir() {
-        let _guard = data_dir_lock().lock().unwrap();
+        let _guard = data_dir_lock().lock().await;
         let tmp = tempfile::tempdir().unwrap();
         moltis_config::set_data_dir(tmp.path().to_path_buf());
         struct Reset;
@@ -370,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_skips_missing_dirs() {
-        let _guard = data_dir_lock().lock().unwrap();
+        let _guard = data_dir_lock().lock().await;
         let tmp = tempfile::tempdir().unwrap();
         moltis_config::set_data_dir(tmp.path().to_path_buf());
         struct Reset;
@@ -389,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_skips_dirs_without_skill_md() {
-        let _guard = data_dir_lock().lock().unwrap();
+        let _guard = data_dir_lock().lock().await;
         let tmp = tempfile::tempdir().unwrap();
         moltis_config::set_data_dir(tmp.path().to_path_buf());
         struct Reset;
@@ -411,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_skips_invalid_frontmatter() {
-        let _guard = data_dir_lock().lock().unwrap();
+        let _guard = data_dir_lock().lock().await;
         let tmp = tempfile::tempdir().unwrap();
         moltis_config::set_data_dir(tmp.path().to_path_buf());
         struct Reset;
@@ -433,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_skips_audit_blocked_skill() {
-        let _guard = data_dir_lock().lock().unwrap();
+        let _guard = data_dir_lock().lock().await;
         let tmp = tempfile::tempdir().unwrap();
         moltis_config::set_data_dir(tmp.path().to_path_buf());
         struct Reset;
@@ -636,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_local_skips_pending_skill() {
-        let _guard = data_dir_lock().lock().unwrap();
+        let _guard = data_dir_lock().lock().await;
         let tmp = tempfile::tempdir().unwrap();
         moltis_config::set_data_dir(tmp.path().to_path_buf());
         struct Reset;

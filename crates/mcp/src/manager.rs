@@ -1135,7 +1135,7 @@ mod tests {
         assert!(matches!(err, Error::Message { .. }));
 
         let inner = mgr.inner.read().await;
-        assert!(inner.tool_outcomes.get("failing::tool").is_none());
+        assert!(!inner.tool_outcomes.contains_key("failing::tool"));
     }
 
     #[tokio::test]

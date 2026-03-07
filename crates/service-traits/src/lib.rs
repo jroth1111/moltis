@@ -1397,143 +1397,122 @@ mod tests {
 
     #[tokio::test]
     async fn noop_services_return_unavailable_errors_for_missing_wiring() {
+        fn assert_service_error(
+            result: Result<Value, ServiceError>,
+            expected: &str,
+            context: &str,
+        ) {
+            match result {
+                Ok(value) => panic!("{context} unexpectedly succeeded with {value:?}"),
+                Err(error) => assert_eq!(error.to_string(), expected),
+            }
+        }
+
         let session = NoopSessionService;
-        assert_eq!(
-            session
-                .list()
-                .await
-                .expect_err("session list should fail")
-                .to_string(),
-            "session service not configured"
+        assert_service_error(
+            session.list().await,
+            "session service not configured",
+            "session list",
         );
-        assert_eq!(
-            session
-                .clear_all()
-                .await
-                .expect_err("session clear_all should fail")
-                .to_string(),
-            "session service not configured"
+        assert_service_error(
+            session.clear_all().await,
+            "session service not configured",
+            "session clear_all",
         );
 
         let config = NoopConfigService;
-        assert_eq!(
-            config
-                .schema()
-                .await
-                .expect_err("config schema should fail")
-                .to_string(),
-            "config service not configured"
+        assert_service_error(
+            config.schema().await,
+            "config service not configured",
+            "config schema",
         );
 
         let chat = NoopChatService;
-        assert_eq!(
-            chat.abort(serde_json::json!({}))
-                .await
-                .expect_err("chat abort should fail")
-                .to_string(),
-            "chat service not configured"
+        assert_service_error(
+            chat.abort(serde_json::json!({})).await,
+            "chat service not configured",
+            "chat abort",
         );
-        assert_eq!(
-            chat.context(serde_json::json!({}))
-                .await
-                .expect_err("chat context should fail")
-                .to_string(),
-            "chat service not configured"
+        assert_service_error(
+            chat.context(serde_json::json!({})).await,
+            "chat service not configured",
+            "chat context",
         );
 
         let approvals = NoopExecApprovalService;
-        assert_eq!(
-            approvals
-                .get()
-                .await
-                .expect_err("approval get should fail")
-                .to_string(),
-            "exec approval service not configured"
+        assert_service_error(
+            approvals.get().await,
+            "exec approval service not configured",
+            "approval get",
         );
 
         let onboarding = NoopOnboardingService;
-        assert_eq!(
-            onboarding
-                .wizard_start(serde_json::json!({}))
-                .await
-                .expect_err("wizard_start should fail")
-                .to_string(),
-            "onboarding service not configured"
+        assert_service_error(
+            onboarding.wizard_start(serde_json::json!({})).await,
+            "onboarding service not configured",
+            "wizard_start",
         );
-        assert_eq!(
-            onboarding
-                .identity_update_soul(None)
-                .await
-                .expect_err("identity_update_soul should fail")
-                .to_string(),
-            "onboarding service not configured"
+        assert_service_error(
+            onboarding.identity_update_soul(None).await,
+            "onboarding service not configured",
+            "identity_update_soul",
         );
 
         let voicewake = NoopVoicewakeService;
-        assert_eq!(
-            voicewake
-                .talk_mode(serde_json::json!({}))
-                .await
-                .expect_err("talk_mode should fail")
-                .to_string(),
-            "voicewake service not configured"
+        assert_service_error(
+            voicewake.talk_mode(serde_json::json!({})).await,
+            "voicewake service not configured",
+            "talk_mode",
         );
 
         let logs = NoopLogsService;
-        assert_eq!(
-            logs.tail(serde_json::json!({}))
-                .await
-                .expect_err("logs tail should fail")
-                .to_string(),
-            "logs service not configured"
+        assert_service_error(
+            logs.tail(serde_json::json!({})).await,
+            "logs service not configured",
+            "logs tail",
         );
-        assert_eq!(
-            logs.ack()
-                .await
-                .expect_err("logs ack should fail")
-                .to_string(),
-            "logs service not configured"
-        );
+        assert_service_error(logs.ack().await, "logs service not configured", "logs ack");
     }
 
     #[tokio::test]
     async fn noop_probe_methods_remain_honest_about_disabled_state() {
+        fn assert_probe_value(result: Result<Value, ServiceError>, expected: Value, context: &str) {
+            match result {
+                Ok(value) => assert_eq!(value, expected),
+                Err(error) => panic!("{context} unexpectedly failed with {error}"),
+            }
+        }
+
         let chat = NoopChatService;
-        assert_eq!(
-            chat.active(serde_json::json!({}))
-                .await
-                .expect("chat active probe should succeed"),
-            serde_json::json!({ "active": false })
+        assert_probe_value(
+            chat.active(serde_json::json!({})).await,
+            serde_json::json!({ "active": false }),
+            "chat active probe",
         );
 
         let onboarding = NoopOnboardingService;
-        assert_eq!(
-            onboarding
-                .wizard_status()
-                .await
-                .expect("wizard status probe should succeed"),
-            serde_json::json!({ "active": false })
+        assert_probe_value(
+            onboarding.wizard_status().await,
+            serde_json::json!({ "active": false }),
+            "wizard status probe",
         );
 
         let voicewake = NoopVoicewakeService;
-        assert_eq!(
-            voicewake
-                .get()
-                .await
-                .expect("voicewake get probe should succeed"),
-            serde_json::json!({ "enabled": false })
+        assert_probe_value(
+            voicewake.get().await,
+            serde_json::json!({ "enabled": false }),
+            "voicewake get probe",
         );
 
         let logs = NoopLogsService;
-        assert_eq!(
-            logs.status()
-                .await
-                .expect("logs status probe should succeed"),
+        assert_probe_value(
+            logs.status().await,
             serde_json::json!({
                 "unseen_warns": 0,
                 "unseen_errors": 0,
                 "enabled_levels": { "debug": false, "trace": false }
-            })
+            }),
+            "logs status probe",
         );
     }
 }

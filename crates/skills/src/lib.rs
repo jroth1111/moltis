@@ -22,3 +22,15 @@ pub mod selector;
 pub mod types;
 #[cfg(feature = "file-watcher")]
 pub mod watcher;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::OnceLock;
+
+    use tokio::sync::Mutex;
+
+    pub(crate) fn data_dir_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+}

@@ -259,14 +259,7 @@ fn refreshed_local_skill_state(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
-
-    use super::*;
-
-    fn data_dir_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use {super::*, crate::test_support::data_dir_lock};
 
     fn write_local_skill(base: &Path, name: &str, body: &str) {
         let skill_dir = base.join(name);
@@ -282,7 +275,7 @@ mod tests {
 
     #[test]
     fn sync_local_manifest_adds_pending_disabled_skills() {
-        let _guard = data_dir_lock().lock().expect("data dir lock poisoned");
+        let _guard = data_dir_lock().blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         moltis_config::set_data_dir(tmp.path().to_path_buf());
         struct Reset;
@@ -315,7 +308,7 @@ mod tests {
 
     #[test]
     fn sync_local_manifest_resets_changed_trusted_skill_to_pending() {
-        let _guard = data_dir_lock().lock().expect("data dir lock poisoned");
+        let _guard = data_dir_lock().blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         moltis_config::set_data_dir(tmp.path().to_path_buf());
         struct Reset;

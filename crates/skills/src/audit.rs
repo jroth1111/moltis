@@ -191,19 +191,23 @@ fn markdown_link_targets(markdown: &str) -> Vec<&str> {
             let ref_id = &after[..end];
             if ref_definitions.contains(&ref_id.to_ascii_lowercase()) {
                 // Find the URL from the definition - we need to re-scan for the actual target
-                for line in markdown.lines() {
-                    let trimmed = line.trim();
-                    if let Some((def_id, url_part)) = trimmed.strip_prefix('[').and_then(|rest| {
-                        rest.find("]:").map(|bracket_end| {
-                            (&rest[..bracket_end], rest[bracket_end + 2..].trim())
+                if let Some(url) = markdown.lines().find_map(|line| {
+                    line.trim()
+                        .strip_prefix('[')
+                        .and_then(|rest| {
+                            rest.find("]:").map(|bracket_end| {
+                                (&rest[..bracket_end], rest[bracket_end + 2..].trim())
+                            })
                         })
-                    }) {
-                        if def_id.eq_ignore_ascii_case(ref_id) {
-                            if let Some(url) = url_part.split_whitespace().next() {
-                                targets.push(url);
+                        .and_then(|(def_id, url_part)| {
+                            if def_id.eq_ignore_ascii_case(ref_id) {
+                                url_part.split_whitespace().next()
+                            } else {
+                                None
                             }
-                        }
-                    }
+                        })
+                }) {
+                    targets.push(url);
                 }
             }
             remaining = &after[end + 1..];
