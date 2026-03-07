@@ -173,6 +173,24 @@ impl BrowserPool {
         }
     }
 
+    async fn wait_for_host_profile_release(&self) {
+        let Some(profile_dir) = self.config.resolved_profile_dir() else {
+            return;
+        };
+
+        let singleton_paths = [
+            profile_dir.join("SingletonLock"),
+            profile_dir.join("SingletonCookie"),
+            profile_dir.join("SingletonSocket"),
+        ];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        while singleton_paths.iter().any(|path| path.exists()) && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Get or create a browser instance for the given session ID.
     /// Returns the session ID for the browser instance.
     ///
@@ -1829,6 +1847,7 @@ impl BrowserPool {
 
         if let Some(instance) = instance {
             let mut inst = instance.lock().await;
+            let should_wait_for_profile_release = !inst.sandboxed;
             for task in inst.interception.tasks.drain(..) {
                 task.abort();
             }
@@ -1837,8 +1856,12 @@ impl BrowserPool {
                 task.abort();
             }
             inst.api_capture.attached_targets.clear();
-            // Pages are closed when browser is dropped
+            let _ = inst.browser.close().await;
             drop(inst);
+            drop(instance);
+            if should_wait_for_profile_release {
+                self.wait_for_host_profile_release().await;
+            }
 
             #[cfg(feature = "metrics")]
             {
