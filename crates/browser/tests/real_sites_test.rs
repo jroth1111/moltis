@@ -5,12 +5,16 @@
 
 #![allow(clippy::expect_used, clippy::field_reassign_with_default)]
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use moltis_browser::{
     BrowserBackendKind, BrowserManager, NavigationVerdict, ProtectionConfig,
     types::{BrowserAction, BrowserConfig, BrowserPreference, BrowserRequest},
 };
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::timeout;
 
 struct TargetSite {
@@ -53,6 +57,15 @@ fn base_test_config() -> BrowserConfig {
         ..ProtectionConfig::default()
     };
     config
+}
+
+fn live_browser_test_lock() -> Arc<Mutex<()>> {
+    static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(Mutex::new(()))))
+}
+
+async fn acquire_live_browser_test_guard() -> OwnedMutexGuard<()> {
+    live_browser_test_lock().lock_owned().await
 }
 
 #[derive(Debug)]
@@ -102,7 +115,12 @@ fn request(session_id: Option<String>, action: BrowserAction, timeout_ms: u64) -
 }
 
 async fn test_site(site: &TargetSite) -> SiteTestResult {
-    let manager = BrowserManager::new(base_test_config());
+    let _browser_guard = acquire_live_browser_test_guard().await;
+    let profile_dir =
+        tempfile::tempdir().expect("real site tests should be able to create a temp profile dir");
+    let mut config = base_test_config();
+    config.profile_dir = Some(profile_dir.path().display().to_string());
+    let manager = BrowserManager::new(config);
 
     let navigate = manager
         .handle_request(request(
@@ -213,30 +231,35 @@ async fn assert_site(site: &TargetSite, timeout_secs: u64) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live external sites and internet access"]
 async fn test_google_au_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
     assert_site(&TARGET_SITES[0], 90).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live external sites and internet access"]
 async fn test_woolworths_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
     assert_site(&TARGET_SITES[1], 90).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live external sites and internet access"]
 async fn test_coles_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
     assert_site(&TARGET_SITES[2], 120).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live external sites and internet access"]
 async fn test_realestate_navigation() {
     let _ = tracing_subscriber::fmt::try_init();
     assert_site(&TARGET_SITES[3], 120).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires live external sites and internet access"]
 async fn test_all_target_sites_summary() {
     let _ = tracing_subscriber::fmt::try_init();
     let mut results = Vec::new();
