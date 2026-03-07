@@ -64,6 +64,73 @@ async fn root_redirects_to_onboarding_when_not_onboarded() {
     assert!(body.contains("id=\"onboardingRoot\""));
 }
 
+#[cfg(feature = "web-ui")]
+#[tokio::test]
+async fn api_gon_returns_bootstrap_payload() {
+    let addr = start_test_server().await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/gon"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["identity"]["name"].is_string());
+    assert_eq!(body["routes"]["onboarding"], "/onboarding");
+}
+
+#[cfg(feature = "web-ui")]
+#[tokio::test]
+async fn share_route_is_bound_even_without_share_store() {
+    let addr = start_test_server().await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/share/00000000-0000-0000-0000-000000000000"
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.text().await.unwrap(), "share not found");
+}
+
+#[cfg(feature = "web-ui")]
+#[tokio::test]
+async fn logs_download_reports_missing_file_without_router_miss() {
+    let addr = start_test_server().await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/logs/download"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.text().await.unwrap(), "log file not available");
+}
+
+#[cfg(feature = "web-ui")]
+#[tokio::test]
+async fn terminal_windows_endpoint_returns_structured_response() {
+    let addr = start_test_server().await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/terminal/windows"))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    match status {
+        reqwest::StatusCode::OK => {
+            assert_eq!(body["ok"], true);
+            assert!(body["available"].is_boolean());
+        },
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR => {
+            assert!(body["code"].is_string());
+            assert!(body["error"].is_string());
+        },
+        other => panic!("unexpected terminal status {other}: {body}"),
+    }
+}
+
 #[tokio::test]
 async fn health_endpoint_returns_json() {
     let addr = start_test_server().await;
