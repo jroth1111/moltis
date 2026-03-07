@@ -58,7 +58,6 @@ moltis-tasks           = { workspace = true }
 moltis-skills          = { workspace = true }
 moltis-tailscale       = { optional = true, workspace = true }
 moltis-telegram        = { workspace = true }
-moltis-tinder          = { path = "../moltis-tinder" }
 moltis-tls             = { optional = true, workspace = true }
 moltis-tools           = { workspace = true }
 moltis-vault           = { optional = true, workspace = true }

@@ -1538,10 +1538,6 @@ pub async fn prepare_gateway(
     crate::run_migrations(&db_pool)
         .await
         .context("failed to run gateway migrations")?;
-    moltis_tinder::run_migrations(&db_pool)
-        .await
-        .context("failed to run tinder migrations")?;
-
     // Vault migrations (vault_metadata table).
     #[cfg(feature = "vault")]
     moltis_vault::run_migrations(&db_pool)
@@ -3935,14 +3931,6 @@ pub async fn prepare_gateway(
             tool_registry.register(Box::new(spawn_tool));
         }
 
-        crate::tinder_subsystem::register_tinder_subsystem(
-            &cron_service,
-            &mut tool_registry,
-            Arc::new(db_pool.clone()),
-            &data_dir,
-        )
-        .await?;
-
         let shared_tool_registry = Arc::new(tokio::sync::RwLock::new(tool_registry));
         let mut chat_service = LiveChatService::new(
             Arc::clone(&registry),
@@ -5946,12 +5934,6 @@ fn builtin_hook_metadata() -> Vec<(
             vec![HookEvent::BeforeLLMCall],
             "crates/plugins/src/bundled/screenshot_resolver.rs",
         ),
-        (
-            "funnel_guard",
-            "Enforces Tinder funnel state transitions and blocks premature contact sharing.",
-            vec![HookEvent::BeforeToolCall],
-            "crates/moltis-tinder/src/hooks.rs",
-        ),
     ]
 }
 
@@ -6472,7 +6454,6 @@ pub(crate) async fn discover_and_build_hooks(
             hook_eligibility::check_hook_eligibility,
             shell_hook::ShellHookHandler,
         },
-        moltis_tinder::FunnelGuardHook,
     };
 
     let db_pool = db_pool.or_else(|| HOOK_DB_POOL.get().cloned());
@@ -6586,7 +6567,6 @@ pub(crate) async fn discover_and_build_hooks(
                 .filter(|v| *v > 0.0)
                 .unwrap_or(f64::MAX);
             registry.register(Arc::new(CostGuardHook::new(Arc::clone(pool), limit_usd)));
-            registry.register(Arc::new(FunnelGuardHook::new(Arc::clone(pool))));
         }
     }
 
@@ -6755,6 +6735,29 @@ mod tests {
             info.iter()
                 .any(|h| h.name == "session-memory" && h.source == "builtin" && !h.enabled)
         );
+    }
+
+    #[tokio::test]
+    async fn discover_hooks_does_not_register_tinder_builtin_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session_store = Arc::new(SessionStore::new(sessions_dir));
+        let pool = Arc::new(sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap());
+
+        let (registry, info) = discover_and_build_hooks(
+            &HashSet::new(),
+            Some(&session_store),
+            Some(pool),
+            None,
+            true,
+        )
+        .await;
+        let registry = registry.expect("expected hook registry to be created");
+        let handler_names = registry.handler_names();
+
+        assert!(!handler_names.iter().any(|n| n == "funnel_guard"));
+        assert!(!info.iter().any(|h| h.name == "funnel_guard"));
     }
 
     #[test]

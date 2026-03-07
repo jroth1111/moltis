@@ -6175,7 +6175,6 @@ dependencies = [
  "moltis-tailscale",
  "moltis-tasks",
  "moltis-telegram",
- "moltis-tinder",
  "moltis-tls",
  "moltis-tools",
  "moltis-vault",

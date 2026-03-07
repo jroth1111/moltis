@@ -65,7 +65,6 @@ pub mod state;
 pub mod tailscale;
 #[cfg(feature = "tailscale")]
 pub mod tailscale_routes;
-pub mod tinder_subsystem;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod tools_routes;
@@ -87,4 +86,23 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
         .run(pool)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn gateway_migrations_do_not_create_tinder_tables() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+
+        super::run_migrations(&pool).await.unwrap();
+
+        let tinder_table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tinder_matches'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(tinder_table_count, 0);
+    }
 }
