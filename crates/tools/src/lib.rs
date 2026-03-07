@@ -1,4 +1,13 @@
 #![recursion_limit = "256"]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::await_holding_lock,
+        clippy::expect_used,
+        clippy::field_reassign_with_default,
+        clippy::unwrap_used
+    )
+)]
 
 //! Tool implementations and policy enforcement.
 //!

@@ -274,6 +274,7 @@ pub fn parse_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
+#[allow(clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

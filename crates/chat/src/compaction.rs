@@ -664,7 +664,7 @@ fn looks_like_acknowledgement(lower: &str) -> bool {
         "yep",
         "yes",
     ];
-    ACKS.iter().any(|ack| normalized == *ack)
+    ACKS.contains(&normalized)
 }
 
 fn estimate_message_tokens(message: &Value) -> u64 {

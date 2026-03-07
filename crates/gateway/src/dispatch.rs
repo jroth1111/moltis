@@ -813,6 +813,7 @@ fn extract_tokens(result: &Value) -> u64 {
     i.saturating_add(o)
 }
 
+#[allow(clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

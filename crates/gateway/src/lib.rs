@@ -10,6 +10,16 @@
 //! All domain logic (agents, channels, etc.) lives in other crates and is
 //! invoked through method handlers registered in `methods.rs`.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::await_holding_lock,
+        clippy::expect_used,
+        clippy::field_reassign_with_default,
+        clippy::unwrap_used
+    )
+)]
+
 pub mod agent_persona;
 pub mod approval;
 pub mod auth;
@@ -88,6 +98,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     #[tokio::test]

@@ -21,6 +21,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("moltis-tinder migrations failed: {e}"))
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::run_migrations;

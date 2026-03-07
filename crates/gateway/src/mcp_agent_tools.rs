@@ -607,7 +607,7 @@ fn enforce_max_bytes(mut value: Value, max_bytes: usize) -> Value {
                 }
             },
             Value::Object(mut obj) => {
-                if let Some(last) = obj.keys().last().cloned() {
+                if let Some(last) = obj.keys().next_back().cloned() {
                     obj.remove(&last);
                 }
                 Value::Object(obj)
@@ -1710,14 +1710,12 @@ impl McpCodeExecTool {
                 } => {
                     let mut cloned = (**wrapped).clone();
                     cloned.id = step.id.clone();
-                    match &mut cloned.op {
-                        ProgramOp::Tool {
-                            retry: existing_retry,
-                            ..
-                        } => {
-                            *existing_retry = Some(retry.clone());
-                        },
-                        _ => {},
+                    if let ProgramOp::Tool {
+                        retry: existing_retry,
+                        ..
+                    } = &mut cloned.op
+                    {
+                        *existing_retry = Some(retry.clone());
                     }
                     self.execute_step(
                         run_id,

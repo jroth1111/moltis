@@ -1,3 +1,8 @@
+#![cfg_attr(
+    test,
+    allow(clippy::await_holding_lock, clippy::expect_used, clippy::unwrap_used)
+)]
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
@@ -4527,57 +4532,55 @@ impl ChatService for LiveChatService {
                         session = %session_key,
                         "emergency compaction skipped: not enough history to reduce"
                     );
+                } else if let Err(error) = self
+                    .session_store
+                    .replace_history(&session_key, reduction.messages.clone())
+                    .await
+                {
+                    warn!(
+                        session = %session_key,
+                        %error,
+                        "emergency compaction failed, continuing with full history"
+                    );
                 } else {
-                    if let Err(error) = self
-                        .session_store
-                        .replace_history(&session_key, reduction.messages.clone())
-                        .await
-                    {
-                        warn!(
-                            session = %session_key,
-                            %error,
-                            "emergency compaction failed, continuing with full history"
-                        );
-                    } else {
-                        history = reduction.messages;
-                        self.session_metadata
-                            .touch(&session_key, history.len() as u32)
-                            .await;
-                        warn!(
-                            session = %session_key,
-                            estimated_next_input,
-                            context_window,
-                            removed_messages = reduction.removed_messages,
-                            retained_anchors = reduction.retained_anchor_messages,
-                            "emergency layered compaction applied"
-                        );
-                        broadcast(
-                            &self.state,
-                            "chat",
-                            serde_json::json!({
-                                "sessionKey": session_key,
-                                "state": "auto_compact",
-                                "phase": "emergency",
-                                "reason": "threshold_emergency",
-                                "estimatedNextInputTokens": estimated_next_input,
-                                "contextWindow": context_window,
-                                "layerStats": {
-                                    "criticalAnchors": layer_stats.critical_anchor_messages,
-                                    "working": layer_stats.working_messages,
-                                    "background": layer_stats.background_messages,
-                                },
-                                "anchorCount": reduction.retained_anchor_messages,
-                                "summaryChars": 0,
-                                "removedMessages": reduction.removed_messages,
-                                "messagesRemoved": reduction.removed_messages,
-                                "keptMessages": history.len(),
-                                "messagesKept": history.len(),
-                                "retainedAnchors": reduction.retained_anchor_messages
-                            }),
-                            BroadcastOpts::default(),
-                        )
+                    history = reduction.messages;
+                    self.session_metadata
+                        .touch(&session_key, history.len() as u32)
                         .await;
-                    }
+                    warn!(
+                        session = %session_key,
+                        estimated_next_input,
+                        context_window,
+                        removed_messages = reduction.removed_messages,
+                        retained_anchors = reduction.retained_anchor_messages,
+                        "emergency layered compaction applied"
+                    );
+                    broadcast(
+                        &self.state,
+                        "chat",
+                        serde_json::json!({
+                            "sessionKey": session_key,
+                            "state": "auto_compact",
+                            "phase": "emergency",
+                            "reason": "threshold_emergency",
+                            "estimatedNextInputTokens": estimated_next_input,
+                            "contextWindow": context_window,
+                            "layerStats": {
+                                "criticalAnchors": layer_stats.critical_anchor_messages,
+                                "working": layer_stats.working_messages,
+                                "background": layer_stats.background_messages,
+                            },
+                            "anchorCount": reduction.retained_anchor_messages,
+                            "summaryChars": 0,
+                            "removedMessages": reduction.removed_messages,
+                            "messagesRemoved": reduction.removed_messages,
+                            "keptMessages": history.len(),
+                            "messagesKept": history.len(),
+                            "retainedAnchors": reduction.retained_anchor_messages
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
                 }
             },
             ContextCompactionAction::HardCompact => {
@@ -7656,6 +7659,7 @@ fn research_text_from_user_content(user_content: &UserContent) -> &str {
     }
 }
 
+#[cfg(test)]
 fn format_compaction_facts_document(
     session_key: &str,
     ts: u64,
@@ -8084,8 +8088,8 @@ async fn run_auto_memory_extraction_task(
     use moltis_agents::memory_writer::MemoryWriter;
     let _result = writer.write_memory(&target_file, &entry, true).await?;
 
-    if settings.reconcile_enabled {
-        if let Err(error) = reconcile_auto_extracted_facts(
+    if settings.reconcile_enabled
+        && let Err(error) = reconcile_auto_extracted_facts(
             extraction_provider.as_ref(),
             &manager,
             &writer,
@@ -8098,9 +8102,8 @@ async fn run_auto_memory_extraction_task(
             timestamp,
         )
         .await
-        {
-            warn!(%error, "auto-memory reconcile failed; continuing with staged facts");
-        }
+    {
+        warn!(%error, "auto-memory reconcile failed; continuing with staged facts");
     }
 
     Ok(AutoExtractOutcome::Written)

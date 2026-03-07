@@ -123,7 +123,7 @@ impl BridgeState {
             .await
             {
                 Ok(store) => Ok(Arc::new(store)),
-                Err(error) => return Err(format!("failed to init credential store: {error}")),
+                Err(error) => Err(format!("failed to init credential store: {error}")),
             }
         })?;
 

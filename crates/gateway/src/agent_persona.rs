@@ -555,6 +555,7 @@ fn synthesize_main_agent(is_default: bool) -> AgentPersona {
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::await_holding_lock)]
 #[cfg(test)]
 mod tests {
     use {
