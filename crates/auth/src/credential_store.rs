@@ -939,6 +939,7 @@ pub fn resolve_auth(token: Option<String>, password: Option<String>) -> Resolved
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moltis_service_traits::EnvVarProvider;
 
     #[test]
     fn test_is_loopback() {
@@ -1223,6 +1224,25 @@ mod tests {
         let vars = store.list_env_vars().await.unwrap();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].key, "OTHER");
+    }
+
+    #[tokio::test]
+    async fn test_env_var_provider_surfaces_store_failures() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = CredentialStore::new(pool.clone()).await.unwrap();
+
+        pool.close().await;
+
+        let error = store
+            .get_env_vars()
+            .await
+            .expect_err("closed pool should surface an env-provider error");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to load stored env variables"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
