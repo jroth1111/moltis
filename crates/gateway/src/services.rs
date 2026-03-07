@@ -2696,8 +2696,14 @@ mod tests {
     fn toggle_skill_rejects_local_content_drift_until_revalidated() {
         with_temp_data_dir(|data_dir| {
             let trusted_markdown = strong_local_skill_markdown("demo");
-            let drifted_markdown =
-                trusted_markdown.replace("structured evaluation workflow", "rewritten workflow");
+            let drifted_markdown = trusted_markdown.replace(
+                "concise skill-authoring workflow",
+                "rewritten skill-authoring workflow",
+            );
+            assert_ne!(
+                drifted_markdown, trusted_markdown,
+                "test fixture must actually drift local content"
+            );
             let trusted_hash = moltis_skills::integrity::hash_skill_markdown(&trusted_markdown);
 
             write_local_skill("personal", "demo", &drifted_markdown);
@@ -2736,9 +2742,17 @@ mod tests {
             .expect_err("drifted local skill should require revalidation");
 
             assert!(
-                error.to_string().contains("changed since last validation"),
+                error.to_string().contains("not validated"),
                 "unexpected error: {error}"
             );
+
+            let store =
+                moltis_skills::manifest::ManifestStore::new(data_dir.join("skills-manifest.json"));
+            let manifest = store.load().expect("manifest should load after drift sync");
+            let skill = &manifest.find_repo("personal").unwrap().skills[0];
+            assert_eq!(skill.status, SkillStatus::Pending);
+            assert!(!skill.enabled);
+            assert!(skill.trusted_hash.is_none());
         });
     }
 
