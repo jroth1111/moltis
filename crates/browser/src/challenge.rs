@@ -200,7 +200,7 @@ mod tests {
         let result = detect_challenge(html);
         assert_eq!(result.candidate_type, Some(ChallengeType::Imperva));
         assert!(
-            result.markers.iter().any(|m| *m == "_incapsula_resource"),
+            result.markers.contains(&"_incapsula_resource"),
             "expected incapsula marker in {:?}",
             result.markers
         );

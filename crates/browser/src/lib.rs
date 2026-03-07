@@ -29,6 +29,16 @@
 //! let response = manager.handle_request(request).await;
 //! ```
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::field_reassign_with_default,
+        clippy::manual_contains,
+        clippy::unwrap_used
+    )
+)]
+
 pub mod actions;
 mod api_capture;
 pub mod api_recon;

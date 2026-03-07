@@ -248,7 +248,7 @@ fn sanitize_optional_string_field(value: &mut Option<String>) {
     }
 }
 
-fn sanitize_vec_string_field(values: &mut Vec<String>) {
+fn sanitize_vec_string_field(values: &mut [String]) {
     values.iter_mut().for_each(sanitize_string_field);
 }
 
@@ -1544,7 +1544,6 @@ pub fn summarize_request_sequence(events: &[RequestSequenceEvent]) -> RequestSeq
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use {

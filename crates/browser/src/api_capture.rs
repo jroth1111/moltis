@@ -351,11 +351,11 @@ impl ApiCaptureRecorder {
         ApiCatalog {
             summary: ApiCatalogSummary {
                 captured_requests: self.observations.len(),
-                endpoint_count: self
-                    .observations
-                    .is_empty()
-                    .then_some(0)
-                    .unwrap_or_else(|| grouped_endpoint_count(&endpoints)),
+                endpoint_count: if self.observations.is_empty() {
+                    0
+                } else {
+                    grouped_endpoint_count(&endpoints)
+                },
                 hosts: hosts.into_iter().collect(),
             },
             endpoints,

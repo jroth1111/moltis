@@ -1021,15 +1021,18 @@ impl BrowserPool {
             session_state,
         } = transfer_state;
         if let Some(snapshot) = session_state.clone() {
-            if let Err(error) = instance.session.restore_state(&snapshot).await {
-                return Err((
-                    error,
-                    SessionTransferState {
-                        interception,
-                        api_capture,
-                        session_state: Some(snapshot),
-                    },
-                ));
+            match instance.session.restore_state(&snapshot).await {
+                Ok(()) => {},
+                Err(error) => {
+                    return Err((
+                        error,
+                        SessionTransferState {
+                            interception,
+                            api_capture,
+                            session_state: Some(snapshot),
+                        },
+                    ));
+                },
             }
         }
 

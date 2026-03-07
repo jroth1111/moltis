@@ -3,6 +3,8 @@
 //! Tests navigation to target sites with challenge detection and verifies that
 //! the returned session is still usable for follow-up actions.
 
+#![allow(clippy::expect_used, clippy::field_reassign_with_default)]
+
 use std::time::Duration;
 
 use moltis_browser::{

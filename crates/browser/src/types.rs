@@ -241,18 +241,18 @@ pub enum BrowserApiAction {
     Call {
         endpoint_id: String,
         #[serde(default)]
-        overrides: Option<ApiCallOverrides>,
+        overrides: Option<Box<ApiCallOverrides>>,
         #[serde(default)]
-        extract: Option<ApiExtractPlan>,
+        extract: Option<Box<ApiExtractPlan>>,
     },
     Collect {
         endpoint_id: String,
         #[serde(default)]
-        overrides: Option<ApiCallOverrides>,
+        overrides: Option<Box<ApiCallOverrides>>,
         #[serde(default)]
-        pagination: Option<ApiPaginationPlan>,
+        pagination: Option<Box<ApiPaginationPlan>>,
         #[serde(default)]
-        extract: Option<ApiExtractPlan>,
+        extract: Option<Box<ApiExtractPlan>>,
         #[serde(default = "default_max_pages")]
         max_pages: u32,
         #[serde(default = "default_max_items")]
@@ -538,7 +538,7 @@ pub enum BrowserAction {
     /// API reconnaissance actions.
     ApiRecon {
         #[serde(flatten)]
-        sub: BrowserApiAction,
+        sub: Box<BrowserApiAction>,
     },
 }
 
@@ -645,17 +645,12 @@ impl fmt::Display for BrowserPreference {
 }
 
 /// Runtime browser backend handling a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserBackendKind {
+    #[default]
     Chromiumoxide,
     Patchright,
-}
-
-impl Default for BrowserBackendKind {
-    fn default() -> Self {
-        Self::Chromiumoxide
-    }
 }
 
 impl fmt::Display for BrowserBackendKind {

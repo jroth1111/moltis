@@ -47,23 +47,12 @@ struct ApiEndpointAggregate {
     examples: VecDeque<ApiExampleRef>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ApiResponseAggregate {
     sample_count: u64,
     headers: KeyPresenceAggregate,
     content_types: BTreeMap<String, u64>,
     body: Option<AggregateNode>,
-}
-
-impl Default for ApiResponseAggregate {
-    fn default() -> Self {
-        Self {
-            sample_count: 0,
-            headers: KeyPresenceAggregate::default(),
-            content_types: BTreeMap::new(),
-            body: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -214,10 +203,7 @@ impl ApiReconStore {
         aggregate.last_request_body = request.body_value.clone();
 
         if let Some(status) = response.status {
-            let entry = aggregate
-                .responses
-                .entry(status)
-                .or_insert_with(ApiResponseAggregate::default);
+            let entry = aggregate.responses.entry(status).or_default();
             entry.sample_count = entry.sample_count.saturating_add(1);
             entry.headers.observe(response.header_keys.iter().cloned());
             if let Some(content_type) = response.content_type.as_deref() {

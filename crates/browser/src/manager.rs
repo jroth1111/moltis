@@ -901,7 +901,7 @@ impl BrowserManager {
             BrowserAction::Close => self.close(session_id, sandbox).await,
             // API reconnaissance
             BrowserAction::ApiRecon { sub } => {
-                self.handle_api_recon(session_id, sub, sandbox, browser)
+                self.handle_api_recon(session_id, *sub, sandbox, browser)
                     .await
             },
         };
@@ -1256,7 +1256,7 @@ impl BrowserManager {
                     .await
             },
             BrowserAction::ApiRecon { sub } => {
-                self.handle_api_recon(Some(&sid), sub, sandbox, None).await
+                self.handle_api_recon(Some(&sid), *sub, sandbox, None).await
             },
         }
     }
@@ -2992,8 +2992,15 @@ impl BrowserManager {
                 overrides,
                 extract,
             } => {
-                self.handle_api_recon_call(&sid, &endpoint_id, overrides, extract, sandbox, start)
-                    .await
+                self.handle_api_recon_call(
+                    &sid,
+                    &endpoint_id,
+                    overrides.map(|overrides| *overrides),
+                    extract.map(|extract| *extract),
+                    sandbox,
+                    start,
+                )
+                .await
             },
             BrowserApiAction::Collect {
                 endpoint_id,
@@ -3006,9 +3013,9 @@ impl BrowserManager {
                 self.handle_api_recon_collect(
                     &sid,
                     &endpoint_id,
-                    overrides,
-                    pagination,
-                    extract,
+                    overrides.map(|overrides| *overrides),
+                    pagination.map(|pagination| *pagination),
+                    extract.map(|extract| *extract),
                     max_pages,
                     max_items,
                     sandbox,
