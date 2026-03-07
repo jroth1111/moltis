@@ -555,8 +555,9 @@ mod tests {
             .await
             .unwrap();
         let snapshot = hook.snapshot().await;
-        let state = snapshot.iter().find(|s| s.provider == "p").unwrap();
-        assert_eq!(state.state, "closed");
-        assert_eq!(state.failure_count, 0);
+        assert!(
+            snapshot.iter().all(|state| state.provider != "p"),
+            "successful zero-token text responses should not create circuit state"
+        );
     }
 }
