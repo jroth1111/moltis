@@ -185,7 +185,8 @@ impl BrowserPool {
         ];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
-        while singleton_paths.iter().any(|path| path.exists()) && tokio::time::Instant::now() < deadline
+        while singleton_paths.iter().any(|path| path.exists())
+            && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
