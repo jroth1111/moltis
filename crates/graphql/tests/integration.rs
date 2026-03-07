@@ -519,6 +519,22 @@ impl moltis_service_traits::McpService for MockMcp {
     async fn oauth_complete(&self, p: Value) -> ServiceResult {
         self.0.call("mcp.oauth.complete", p)
     }
+
+    async fn search_tools(&self, p: Value) -> ServiceResult {
+        self.0.call("mcp.search_tools", p)
+    }
+
+    async fn describe_tool(&self, p: Value) -> ServiceResult {
+        self.0.call("mcp.describe_tool", p)
+    }
+
+    async fn legacy_direct_set(&self, p: Value) -> ServiceResult {
+        self.0.call("mcp.legacy_direct.set", p)
+    }
+
+    async fn legacy_direct_status(&self) -> ServiceResult {
+        self.0.call("mcp.legacy_direct.status", json!({}))
+    }
 }
 
 #[async_trait::async_trait]
@@ -876,6 +892,15 @@ fn build_test_schema(
     let (tx, _) = broadcast::channel(16);
     let services = build_mock_services(&mock);
     let schema = moltis_graphql::build_schema(services, tx.clone());
+    (schema, tx)
+}
+
+fn build_noop_schema() -> (
+    moltis_graphql::MoltisSchema,
+    broadcast::Sender<(String, Value)>,
+) {
+    let (tx, _) = broadcast::channel(16);
+    let schema = moltis_graphql::build_schema(Arc::new(Services::default()), tx.clone());
     (schema, tx)
 }
 
@@ -1373,6 +1398,44 @@ async fn service_error_becomes_graphql_error() {
         "error: {}",
         res.errors[0].message
     );
+    let error = serde_json::to_value(&res.errors[0]).expect("serialize graphql error");
+    assert_eq!(error["extensions"]["code"], "UNAVAILABLE");
+}
+
+#[tokio::test]
+async fn noop_session_query_surfaces_unavailable_code() {
+    let (schema, _) = build_noop_schema();
+
+    let res = schema
+        .execute(Request::new("{ sessions { list { key label } } }"))
+        .await;
+
+    assert_eq!(res.errors.len(), 1, "errors: {:?}", res.errors);
+    assert!(
+        res.errors[0].message.contains("session service not configured"),
+        "error: {}",
+        res.errors[0].message
+    );
+    let error = serde_json::to_value(&res.errors[0]).expect("serialize graphql error");
+    assert_eq!(error["extensions"]["code"], "UNAVAILABLE");
+}
+
+#[tokio::test]
+async fn noop_logs_ack_mutation_surfaces_unavailable_code() {
+    let (schema, _) = build_noop_schema();
+
+    let res = schema
+        .execute(Request::new("mutation { logs { ack { ok } } }"))
+        .await;
+
+    assert_eq!(res.errors.len(), 1, "errors: {:?}", res.errors);
+    assert!(
+        res.errors[0].message.contains("logs service not configured"),
+        "error: {}",
+        res.errors[0].message
+    );
+    let error = serde_json::to_value(&res.errors[0]).expect("serialize graphql error");
+    assert_eq!(error["extensions"]["code"], "UNAVAILABLE");
 }
 
 // ── Namespace nesting ───────────────────────────────────────────────────────

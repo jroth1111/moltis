@@ -1,12 +1,15 @@
 //! Error mapping from service errors to GraphQL errors.
 
+use async_graphql::ErrorExtensions as _;
 use moltis_service_traits::ServiceResult;
 
 use crate::scalars::Json;
 
 /// Convert a service error into an `async_graphql::Error`.
 pub fn gql_err(error: moltis_service_traits::ServiceError) -> async_graphql::Error {
-    async_graphql::Error::new(error.to_string())
+    async_graphql::Error::new(error.to_string()).extend_with(|_, extensions| {
+        extensions.set("code", "UNAVAILABLE");
+    })
 }
 
 /// Convert a serde_json parse error into an `async_graphql::Error`.
