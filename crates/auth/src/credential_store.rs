@@ -758,14 +758,23 @@ impl CredentialStore {
 // ── EnvVarProvider impl ─────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
-impl moltis_tools::exec::EnvVarProvider for CredentialStore {
-    async fn get_env_vars(&self) -> Vec<(String, secrecy::Secret<String>)> {
+impl moltis_service_traits::EnvVarProvider for CredentialStore {
+    async fn get_env_vars(
+        &self,
+    ) -> moltis_service_traits::ServiceResult<Vec<(String, secrecy::Secret<String>)>> {
         self.get_all_env_values()
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, secrecy::Secret::new(v)))
-            .collect()
+            .map_err(|error| {
+                moltis_service_traits::ServiceError::message(format!(
+                    "failed to load stored env variables: {error}"
+                ))
+            })
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|(k, v)| (k, secrecy::Secret::new(v)))
+                    .collect()
+            })
     }
 }
 

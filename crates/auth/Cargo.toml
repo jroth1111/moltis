@@ -17,7 +17,7 @@ axum              = { workspace = true }
 base64            = { workspace = true }
 dashmap           = { workspace = true }
 moltis-config     = { workspace = true }
-moltis-tools      = { workspace = true }
+moltis-service-traits = { workspace = true }
 moltis-vault      = { optional = true, workspace = true }
 password-hash     = { workspace = true }
 rand              = { workspace = true }

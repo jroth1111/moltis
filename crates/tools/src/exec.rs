@@ -18,6 +18,7 @@ use moltis_metrics::{
 };
 
 use moltis_agents::tool_registry::AgentTool;
+use moltis_service_traits::EnvVarProvider;
 
 /// Event describing a completed exec invocation, passed to the completion callback.
 #[derive(Debug, Clone)]
@@ -45,13 +46,6 @@ const MAX_SANDBOX_RECOVERY_RETRIES: usize = 1;
 #[async_trait]
 pub trait ApprovalBroadcaster: Send + Sync {
     async fn broadcast_request(&self, request_id: &str, command: &str) -> Result<()>;
-}
-
-/// Provider of environment variables to inject into sandbox execution.
-/// Values are wrapped in `Secret` to prevent accidental logging.
-#[async_trait]
-pub trait EnvVarProvider: Send + Sync {
-    async fn get_env_vars(&self) -> Vec<(String, secrecy::Secret<String>)>;
 }
 
 /// Result of a shell command execution.
@@ -463,7 +457,9 @@ impl AgentTool for ExecTool {
         }
 
         let secret_env = if let Some(ref provider) = self.env_provider {
-            provider.get_env_vars().await
+            provider.get_env_vars().await.map_err(|error| {
+                Error::message(format!("failed to load runtime env vars: {error}"))
+            })?
         } else {
             Vec::new()
         };
@@ -1196,11 +1192,26 @@ mod tests {
 
     #[async_trait]
     impl EnvVarProvider for TestEnvProvider {
-        async fn get_env_vars(&self) -> Vec<(String, secrecy::Secret<String>)> {
-            vec![(
+        async fn get_env_vars(
+            &self,
+        ) -> moltis_service_traits::ServiceResult<Vec<(String, secrecy::Secret<String>)>> {
+            Ok(vec![(
                 "TEST_INJECTED".into(),
                 secrecy::Secret::new("hello_from_env".into()),
-            )]
+            )])
+        }
+    }
+
+    struct FailingEnvProvider;
+
+    #[async_trait]
+    impl EnvVarProvider for FailingEnvProvider {
+        async fn get_env_vars(
+            &self,
+        ) -> moltis_service_traits::ServiceResult<Vec<(String, secrecy::Secret<String>)>> {
+            Err(moltis_service_traits::ServiceError::message(
+                "credential store unavailable",
+            ))
         }
     }
 
@@ -1266,6 +1277,21 @@ mod tests {
             .unwrap();
         let stdout = result["stdout"].as_str().unwrap().trim();
         assert_eq!(stdout, "[REDACTED]", "file read-back should be redacted");
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_returns_error_when_env_provider_fails() {
+        let provider: Arc<dyn EnvVarProvider> = Arc::new(FailingEnvProvider);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut tool = ExecTool::default().with_env_provider(provider);
+        tool.working_dir = Some(temp_dir.path().to_path_buf());
+
+        let error = tool
+            .execute(serde_json::json!({ "command": "echo ok" }))
+            .await
+            .expect_err("env provider failure should stop execution");
+
+        assert!(error.to_string().contains("failed to load runtime env vars"));
     }
 
     #[test]

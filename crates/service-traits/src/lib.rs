@@ -3,7 +3,7 @@
 //! Each trait has a `Noop` implementation that returns empty/default responses,
 //! allowing the gateway to run standalone before domain crates are wired in.
 
-use {async_trait::async_trait, serde_json::Value, tracing::warn};
+use {async_trait::async_trait, secrecy::Secret, serde_json::Value, tracing::warn};
 
 /// Error type returned by service methods.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +42,11 @@ impl From<ServiceError> for moltis_protocol::ErrorShape {
 }
 
 pub type ServiceResult<T = Value> = Result<T, ServiceError>;
+
+#[async_trait]
+pub trait EnvVarProvider: Send + Sync {
+    async fn get_env_vars(&self) -> ServiceResult<Vec<(String, Secret<String>)>>;
+}
 
 // ── Agent ───────────────────────────────────────────────────────────────────
 

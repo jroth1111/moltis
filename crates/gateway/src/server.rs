@@ -33,10 +33,10 @@ use {
 use {moltis_channels::ChannelPlugin, moltis_protocol::TICK_INTERVAL_MS};
 
 use moltis_providers::ProviderRegistry;
+use moltis_service_traits::EnvVarProvider;
 
 use moltis_tools::{
     approval::{ApprovalManager, ApprovalMode, SecurityLevel},
-    exec::EnvVarProvider,
     sessions_communicate::{
         SendToSessionFn, SendToSessionRequest, SessionsHistoryTool, SessionsListTool,
         SessionsSendTool,

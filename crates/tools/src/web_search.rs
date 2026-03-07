@@ -16,9 +16,8 @@ use crate::error::Error;
 use {
     moltis_agents::tool_registry::AgentTool,
     moltis_config::schema::{SearchProvider as ConfigSearchProvider, WebSearchConfig},
+    moltis_service_traits::EnvVarProvider,
 };
-
-use crate::exec::EnvVarProvider;
 
 /// Cached search result with expiry.
 struct CacheEntry {
@@ -113,20 +112,23 @@ impl WebSearchTool {
 
         match config.provider {
             ConfigSearchProvider::Brave => {
-                let api_key = config
+                let configured_api_key = config
                     .api_key
                     .as_ref()
                     .map(|s| s.expose_secret().clone())
-                    .or_else(|| env_value_with_overrides(env_overrides, "BRAVE_API_KEY"))
                     .unwrap_or_default();
+                let runtime_api_key = env_value_with_overrides(env_overrides, "BRAVE_API_KEY");
                 // Don't register when no API key and no fallback — the tool
                 // would always fail, confusing the LLM.
-                if api_key.is_empty() && !config.duckduckgo_fallback {
+                if configured_api_key.is_empty()
+                    && runtime_api_key.is_none()
+                    && !config.duckduckgo_fallback
+                {
                     return None;
                 }
                 Some(Self::new(
                     SearchProvider::Brave,
-                    Secret::new(api_key),
+                    Secret::new(configured_api_key),
                     config.max_results,
                     Duration::from_secs(config.timeout_seconds),
                     Duration::from_secs(config.cache_ttl_minutes * 60),
@@ -134,15 +136,18 @@ impl WebSearchTool {
                 ))
             },
             ConfigSearchProvider::Perplexity => {
-                let api_key = config
+                let configured_api_key = config
                     .perplexity
                     .api_key
                     .as_ref()
                     .map(|s| s.expose_secret().clone())
-                    .or_else(|| env_value_with_overrides(env_overrides, "PERPLEXITY_API_KEY"))
-                    .or_else(|| env_value_with_overrides(env_overrides, "OPENROUTER_API_KEY"))
                     .unwrap_or_default();
-                if api_key.is_empty() && !config.duckduckgo_fallback {
+                let runtime_api_key = env_value_with_overrides(env_overrides, "PERPLEXITY_API_KEY")
+                    .or_else(|| env_value_with_overrides(env_overrides, "OPENROUTER_API_KEY"));
+                if configured_api_key.is_empty()
+                    && runtime_api_key.is_none()
+                    && !config.duckduckgo_fallback
+                {
                     return None;
                 }
                 let base_url_override = config
@@ -160,7 +165,7 @@ impl WebSearchTool {
                         base_url_override,
                         model,
                     },
-                    Secret::new(api_key),
+                    Secret::new(configured_api_key),
                     config.max_results,
                     Duration::from_secs(config.timeout_seconds),
                     Duration::from_secs(config.cache_ttl_minutes * 60),
@@ -197,14 +202,15 @@ impl WebSearchTool {
         self
     }
 
-    async fn runtime_env_values(&self) -> HashMap<String, String> {
+    async fn runtime_env_values(&self) -> crate::Result<HashMap<String, String>> {
         let Some(provider) = self.env_provider.as_ref() else {
-            return HashMap::new();
+            return Ok(HashMap::new());
         };
 
-        provider
+        let env_values = provider
             .get_env_vars()
             .await
+            .map_err(|error| Error::message(format!("failed to load runtime env vars: {error}")))?
             .into_iter()
             .filter_map(|(key, value)| {
                 let value = value.expose_secret().clone();
@@ -214,7 +220,9 @@ impl WebSearchTool {
                     Some((key, value))
                 }
             })
-            .collect()
+            .collect::<HashMap<_, _>>();
+
+        Ok(env_values)
     }
 
     fn lookup_env_value(env_values: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -237,24 +245,32 @@ impl WebSearchTool {
     }
 
     #[cfg(test)]
-    async fn env_value_with_provider(&self, key: &str) -> Option<String> {
-        let runtime_env = self.runtime_env_values().await;
-        Self::lookup_env_value(&runtime_env, key)
+    async fn env_value_with_provider(&self, key: &str) -> crate::Result<Option<String>> {
+        let runtime_env = self.runtime_env_values().await?;
+        Ok(Self::lookup_env_value(&runtime_env, key))
     }
 
-    async fn current_api_key(&self) -> String {
+    async fn current_api_key(&self) -> crate::Result<String> {
         let configured = self.configured_api_key.expose_secret();
         if !configured.trim().is_empty() {
-            return configured.clone();
+            return Ok(configured.clone());
         }
 
-        let runtime_env = self.runtime_env_values().await;
         for key in self.api_key_candidates() {
-            if let Some(value) = Self::lookup_env_value(&runtime_env, key) {
-                return value;
+            if let Ok(value) = std::env::var(key)
+                && !value.trim().is_empty()
+            {
+                return Ok(value);
             }
         }
-        String::new()
+
+        let runtime_env = self.runtime_env_values().await?;
+        for key in self.api_key_candidates() {
+            if let Some(value) = Self::lookup_env_value(&runtime_env, key) {
+                return Ok(value);
+            }
+        }
+        Ok(String::new())
     }
 
     fn cache_get(&self, key: &str) -> Option<serde_json::Value> {
@@ -720,7 +736,7 @@ impl AgentTool for WebSearchTool {
             .map(|n| n.clamp(1, 10) as u8)
             .unwrap_or(self.max_results);
 
-        let api_key = self.current_api_key().await;
+        let api_key = self.current_api_key().await?;
 
         // Include key presence in cache key so hot key changes invalidate stale
         // no-key results.
@@ -783,11 +799,27 @@ mod tests {
 
     #[async_trait]
     impl EnvVarProvider for MockEnvProvider {
-        async fn get_env_vars(&self) -> Vec<(String, Secret<String>)> {
-            self.vars
+        async fn get_env_vars(
+            &self,
+        ) -> moltis_service_traits::ServiceResult<Vec<(String, Secret<String>)>> {
+            Ok(self
+                .vars
                 .iter()
                 .map(|(k, v)| (k.clone(), Secret::new(v.clone())))
-                .collect()
+                .collect())
+        }
+    }
+
+    struct FailingEnvProvider;
+
+    #[async_trait]
+    impl EnvVarProvider for FailingEnvProvider {
+        async fn get_env_vars(
+            &self,
+        ) -> moltis_service_traits::ServiceResult<Vec<(String, Secret<String>)>> {
+            Err(moltis_service_traits::ServiceError::message(
+                "credential store unavailable",
+            ))
         }
     }
 
@@ -962,7 +994,7 @@ mod tests {
         let tool = brave_tool().with_env_provider(provider);
 
         assert_eq!(
-            tool.env_value_with_provider(&key).await.as_deref(),
+            tool.env_value_with_provider(&key).await.unwrap().as_deref(),
             Some("dynamic-value")
         );
     }
@@ -982,7 +1014,60 @@ mod tests {
         )
         .with_env_provider(provider);
 
-        assert_eq!(tool.current_api_key().await, "configured-key");
+        assert_eq!(tool.current_api_key().await.unwrap(), "configured-key");
+    }
+
+    #[tokio::test]
+    async fn test_current_api_key_uses_runtime_provider_when_config_is_empty() {
+        let provider = Arc::new(MockEnvProvider {
+            vars: vec![("BRAVE_API_KEY".to_string(), "runtime-key".to_string())],
+        });
+        let tool = brave_tool().with_env_provider(provider);
+
+        assert_eq!(tool.current_api_key().await.unwrap(), "runtime-key");
+    }
+
+    #[tokio::test]
+    async fn test_current_api_key_does_not_query_failing_provider_when_configured() {
+        let tool = WebSearchTool::new(
+            SearchProvider::Brave,
+            Secret::new("configured-key".to_string()),
+            5,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            false,
+        )
+        .with_env_provider(Arc::new(FailingEnvProvider));
+
+        assert_eq!(tool.current_api_key().await.unwrap(), "configured-key");
+    }
+
+    #[tokio::test]
+    async fn test_execute_returns_error_when_runtime_env_provider_fails() {
+        let tool = brave_tool().with_env_provider(Arc::new(FailingEnvProvider));
+
+        let error = tool
+            .execute(serde_json::json!({ "query": "rust" }))
+            .await
+            .expect_err("runtime env provider failure should surface");
+
+        assert!(error.to_string().contains("failed to load runtime env vars"));
+    }
+
+    #[test]
+    fn test_from_config_with_env_overrides_registers_without_baking_runtime_key() {
+        let mut cfg = WebSearchConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        cfg.provider = ConfigSearchProvider::Brave;
+        let env_overrides =
+            HashMap::from([("BRAVE_API_KEY".to_string(), "runtime-key".to_string())]);
+
+        let tool = WebSearchTool::from_config_with_env_overrides(&cfg, &env_overrides)
+            .expect("runtime key should allow tool registration");
+
+        assert!(tool.configured_api_key.expose_secret().is_empty());
     }
 
     #[test]

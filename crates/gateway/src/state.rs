@@ -434,7 +434,7 @@ pub struct GatewayState {
     /// Domain services.
     pub services: GatewayServices,
     /// Credential store for authentication (password, passkeys, API keys).
-    /// `Arc` because it is shared cross-crate (e.g. `ExecTool` as `dyn EnvVarProvider`).
+    /// `Arc` because it is shared cross-crate through service-trait boundaries.
     pub credential_store: Option<Arc<CredentialStore>>,
     /// Per-session sandbox router (None if sandbox is not configured).
     /// `Arc` because it is shared with `ExecTool`/`ProcessTool` in `moltis-tools`.
