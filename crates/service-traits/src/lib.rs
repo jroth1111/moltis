@@ -43,6 +43,10 @@ impl From<ServiceError> for moltis_protocol::ErrorShape {
 
 pub type ServiceResult<T = Value> = Result<T, ServiceError>;
 
+fn service_not_configured(service: &'static str) -> ServiceError {
+    ServiceError::message(format!("{service} service not configured"))
+}
+
 #[async_trait]
 pub trait EnvVarProvider: Send + Sync {
     async fn get_env_vars(&self) -> ServiceResult<Vec<(String, Secret<String>)>>;
@@ -107,19 +111,19 @@ pub struct NoopSessionService;
 #[async_trait]
 impl SessionService for NoopSessionService {
     async fn list(&self) -> ServiceResult {
-        Ok(serde_json::json!([]))
+        Err(service_not_configured("session"))
     }
 
     async fn preview(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("session"))
     }
 
     async fn resolve(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("session"))
     }
 
     async fn patch(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("session"))
     }
 
     async fn voice_generate(&self, _p: Value) -> ServiceResult {
@@ -131,7 +135,7 @@ impl SessionService for NoopSessionService {
     }
 
     async fn share_list(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!([]))
+        Err(service_not_configured("session"))
     }
 
     async fn share_revoke(&self, _p: Value) -> ServiceResult {
@@ -139,19 +143,19 @@ impl SessionService for NoopSessionService {
     }
 
     async fn reset(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("session"))
     }
 
     async fn delete(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({ "ok": true }))
+        Err(service_not_configured("session"))
     }
 
     async fn compact(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("session"))
     }
 
     async fn search(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!([]))
+        Err(service_not_configured("session"))
     }
 
     async fn fork(&self, _p: Value) -> ServiceResult {
@@ -159,15 +163,15 @@ impl SessionService for NoopSessionService {
     }
 
     async fn branches(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!([]))
+        Err(service_not_configured("session"))
     }
 
     async fn run_detail(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("session"))
     }
 
     async fn clear_all(&self) -> ServiceResult {
-        Ok(serde_json::json!({ "deleted": 0 }))
+        Err(service_not_configured("session"))
     }
 
     async fn mark_seen(&self, _key: &str) {}
@@ -245,23 +249,23 @@ pub struct NoopConfigService;
 #[async_trait]
 impl ConfigService for NoopConfigService {
     async fn get(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("config"))
     }
 
     async fn set(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("config"))
     }
 
     async fn apply(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("config"))
     }
 
     async fn patch(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("config"))
     }
 
     async fn schema(&self) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("config"))
     }
 }
 
@@ -366,15 +370,15 @@ impl ChatService for NoopChatService {
     }
 
     async fn abort(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("chat"))
     }
 
     async fn cancel_queued(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({ "cleared": 0 }))
+        Err(service_not_configured("chat"))
     }
 
     async fn history(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!([]))
+        Err(service_not_configured("chat"))
     }
 
     async fn inject(&self, _p: Value) -> ServiceResult {
@@ -382,7 +386,7 @@ impl ChatService for NoopChatService {
     }
 
     async fn clear(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({ "ok": true }))
+        Err(service_not_configured("chat"))
     }
 
     async fn compact(&self, _p: Value) -> ServiceResult {
@@ -390,7 +394,7 @@ impl ChatService for NoopChatService {
     }
 
     async fn context(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({ "session": {}, "project": null, "tools": [], "providers": [] }))
+        Err(service_not_configured("chat"))
     }
 
     async fn raw_prompt(&self, _p: Value) -> ServiceResult {
@@ -795,19 +799,19 @@ pub struct NoopExecApprovalService;
 #[async_trait]
 impl ExecApprovalService for NoopExecApprovalService {
     async fn get(&self) -> ServiceResult {
-        Ok(serde_json::json!({ "mode": "always" }))
+        Err(service_not_configured("exec approval"))
     }
 
     async fn set(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("exec approval"))
     }
 
     async fn node_get(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({ "mode": "always" }))
+        Err(service_not_configured("exec approval"))
     }
 
     async fn node_set(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("exec approval"))
     }
 
     async fn request(&self, _p: Value) -> ServiceResult {
@@ -840,15 +844,15 @@ pub struct NoopOnboardingService;
 #[async_trait]
 impl OnboardingService for NoopOnboardingService {
     async fn wizard_start(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({ "step": 0 }))
+        Err(service_not_configured("onboarding"))
     }
 
     async fn wizard_next(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({ "step": 0, "done": true }))
+        Err(service_not_configured("onboarding"))
     }
 
     async fn wizard_cancel(&self) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("onboarding"))
     }
 
     async fn wizard_status(&self) -> ServiceResult {
@@ -864,7 +868,7 @@ impl OnboardingService for NoopOnboardingService {
     }
 
     async fn identity_update_soul(&self, _soul: Option<String>) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("onboarding"))
     }
 
     async fn openclaw_detect(&self) -> ServiceResult {
@@ -993,7 +997,7 @@ impl VoicewakeService for NoopVoicewakeService {
     }
 
     async fn set(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("voicewake"))
     }
 
     async fn wake(&self, _p: Value) -> ServiceResult {
@@ -1001,7 +1005,7 @@ impl VoicewakeService for NoopVoicewakeService {
     }
 
     async fn talk_mode(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("voicewake"))
     }
 }
 
@@ -1022,7 +1026,7 @@ pub struct NoopLogsService;
 #[async_trait]
 impl LogsService for NoopLogsService {
     async fn tail(&self, _p: Value) -> ServiceResult {
-        Ok(serde_json::json!({ "subscribed": true }))
+        Err(service_not_configured("logs"))
     }
 
     async fn list(&self, _p: Value) -> ServiceResult {
@@ -1038,7 +1042,7 @@ impl LogsService for NoopLogsService {
     }
 
     async fn ack(&self) -> ServiceResult {
-        Ok(serde_json::json!({}))
+        Err(service_not_configured("logs"))
     }
 
     fn log_file_path(&self) -> Option<std::path::PathBuf> {
@@ -1389,5 +1393,147 @@ mod tests {
     fn model_service_not_configured_error_returns_expected_message() {
         let error = model_service_not_configured_error("models.test");
         assert_eq!(error.to_string(), "model service not configured");
+    }
+
+    #[tokio::test]
+    async fn noop_services_return_unavailable_errors_for_missing_wiring() {
+        let session = NoopSessionService;
+        assert_eq!(
+            session
+                .list()
+                .await
+                .expect_err("session list should fail")
+                .to_string(),
+            "session service not configured"
+        );
+        assert_eq!(
+            session
+                .clear_all()
+                .await
+                .expect_err("session clear_all should fail")
+                .to_string(),
+            "session service not configured"
+        );
+
+        let config = NoopConfigService;
+        assert_eq!(
+            config
+                .schema()
+                .await
+                .expect_err("config schema should fail")
+                .to_string(),
+            "config service not configured"
+        );
+
+        let chat = NoopChatService;
+        assert_eq!(
+            chat.abort(serde_json::json!({}))
+                .await
+                .expect_err("chat abort should fail")
+                .to_string(),
+            "chat service not configured"
+        );
+        assert_eq!(
+            chat.context(serde_json::json!({}))
+                .await
+                .expect_err("chat context should fail")
+                .to_string(),
+            "chat service not configured"
+        );
+
+        let approvals = NoopExecApprovalService;
+        assert_eq!(
+            approvals
+                .get()
+                .await
+                .expect_err("approval get should fail")
+                .to_string(),
+            "exec approval service not configured"
+        );
+
+        let onboarding = NoopOnboardingService;
+        assert_eq!(
+            onboarding
+                .wizard_start(serde_json::json!({}))
+                .await
+                .expect_err("wizard_start should fail")
+                .to_string(),
+            "onboarding service not configured"
+        );
+        assert_eq!(
+            onboarding
+                .identity_update_soul(None)
+                .await
+                .expect_err("identity_update_soul should fail")
+                .to_string(),
+            "onboarding service not configured"
+        );
+
+        let voicewake = NoopVoicewakeService;
+        assert_eq!(
+            voicewake
+                .talk_mode(serde_json::json!({}))
+                .await
+                .expect_err("talk_mode should fail")
+                .to_string(),
+            "voicewake service not configured"
+        );
+
+        let logs = NoopLogsService;
+        assert_eq!(
+            logs.tail(serde_json::json!({}))
+                .await
+                .expect_err("logs tail should fail")
+                .to_string(),
+            "logs service not configured"
+        );
+        assert_eq!(
+            logs.ack()
+                .await
+                .expect_err("logs ack should fail")
+                .to_string(),
+            "logs service not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_probe_methods_remain_honest_about_disabled_state() {
+        let chat = NoopChatService;
+        assert_eq!(
+            chat.active(serde_json::json!({}))
+                .await
+                .expect("chat active probe should succeed"),
+            serde_json::json!({ "active": false })
+        );
+
+        let onboarding = NoopOnboardingService;
+        assert_eq!(
+            onboarding
+                .wizard_status()
+                .await
+                .expect("wizard status probe should succeed"),
+            serde_json::json!({ "active": false })
+        );
+
+        let voicewake = NoopVoicewakeService;
+        assert_eq!(
+            voicewake
+                .get()
+                .await
+                .expect("voicewake get probe should succeed"),
+            serde_json::json!({ "enabled": false })
+        );
+
+        let logs = NoopLogsService;
+        assert_eq!(
+            logs.status()
+                .await
+                .expect("logs status probe should succeed"),
+            serde_json::json!({
+                "unseen_warns": 0,
+                "unseen_errors": 0,
+                "enabled_levels": { "debug": false, "trace": false }
+            })
+        );
     }
 }
