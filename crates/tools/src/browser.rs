@@ -731,8 +731,18 @@ mod tests {
 
         let props = schema["properties"].as_object().unwrap();
         for expected in [
-            "mode", "reset", "label", "since", "quiet_ms", "limit",
-            "endpoint_id", "overrides", "extract", "pagination", "max_pages", "max_items",
+            "mode",
+            "reset",
+            "label",
+            "since",
+            "quiet_ms",
+            "limit",
+            "endpoint_id",
+            "overrides",
+            "extract",
+            "pagination",
+            "max_pages",
+            "max_items",
         ] {
             assert!(
                 props.contains_key(expected),

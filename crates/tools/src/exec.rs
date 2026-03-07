@@ -1291,7 +1291,11 @@ mod tests {
             .await
             .expect_err("env provider failure should stop execution");
 
-        assert!(error.to_string().contains("failed to load runtime env vars"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to load runtime env vars")
+        );
     }
 
     #[test]
