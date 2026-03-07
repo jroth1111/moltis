@@ -1,7 +1,7 @@
 //! Service trait interfaces for domain services.
 //!
-//! Each trait has a `Noop` implementation that returns empty/default responses,
-//! allowing the gateway to run standalone before domain crates are wired in.
+//! Each trait has a `Noop` implementation that keeps probe-style methods honest
+//! while returning `UNAVAILABLE` for operations that require real wiring.
 
 use {async_trait::async_trait, secrecy::Secret, serde_json::Value, tracing::warn};
 

@@ -1,6 +1,6 @@
 //! Trait interfaces for domain services the gateway delegates to.
-//! Each trait has a `Noop` implementation that returns empty/default responses,
-//! allowing the gateway to run standalone before domain crates are wired in.
+//! Each trait has a `Noop` implementation that keeps probe-style methods honest
+//! while returning `UNAVAILABLE` for operations that require real wiring.
 //!
 //! Pure trait definitions and simple noop implementations live in `moltis-service-traits`.
 //! This module re-exports everything from that crate and adds gateway-specific implementations.

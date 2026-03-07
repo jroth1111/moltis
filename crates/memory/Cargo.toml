@@ -1,6 +1,7 @@
 [package]
 edition.workspace = true
 name              = "moltis-memory"
+description       = "Memory management: markdown ingestion, embeddings, and hybrid search in SQLite"
 version.workspace = true
 
 [features]
