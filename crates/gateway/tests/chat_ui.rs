@@ -25,14 +25,19 @@ async fn start_test_server() -> SocketAddr {
     let resolved_auth = auth::resolve_auth(None, None);
     let services = GatewayServices::noop();
     let state = GatewayState::new(resolved_auth, services);
+    let state_clone = Arc::clone(&state);
     let methods = Arc::new(MethodRegistry::new());
     #[cfg(feature = "push-notifications")]
     let (router, app_state) = build_gateway_base(state, methods, None, None);
     #[cfg(not(feature = "push-notifications"))]
     let (router, app_state) = build_gateway_base(state, methods, None);
 
-    let router = router.merge(moltis_web::web_routes());
-    let app = finalize_gateway_app(router, app_state, false);
+    let app = finalize_gateway_app(
+        router,
+        app_state,
+        Some(moltis_web::web_routes(Arc::clone(&state_clone))),
+        false,
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

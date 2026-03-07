@@ -576,8 +576,14 @@ pub struct AppState {
     pub graphql_schema: moltis_graphql::MoltisSchema,
 }
 
+impl axum::extract::FromRef<AppState> for Arc<GatewayState> {
+    fn from_ref(state: &AppState) -> Self {
+        Arc::clone(&state.gateway)
+    }
+}
+
 /// Function signature for adding extra routes (e.g. web-UI) to the gateway.
-pub type RouteEnhancer = fn() -> Router<AppState>;
+pub type RouteEnhancer = fn(Arc<GatewayState>) -> Router;
 
 // ── Server startup ───────────────────────────────────────────────────────────
 
@@ -768,6 +774,27 @@ pub fn build_gateway_base(
         );
     }
 
+    #[cfg(feature = "prometheus")]
+    {
+        router = router.route(
+            "/metrics",
+            get(crate::metrics_routes::prometheus_metrics_handler),
+        );
+    }
+
+    #[cfg(feature = "tailscale")]
+    {
+        router = router.nest(
+            "/api/tailscale",
+            crate::tailscale_routes::tailscale_router(),
+        );
+    }
+
+    #[cfg(feature = "push-notifications")]
+    {
+        router = router.nest("/api/push", crate::push_routes::push_router());
+    }
+
     (router, app_state)
 }
 
@@ -783,15 +810,6 @@ pub fn build_gateway_base(
     let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/ws/chat", get(ws_upgrade_handler));
-
-    // Add Prometheus metrics endpoint (unauthenticated for scraping).
-    #[cfg(feature = "prometheus")]
-    {
-        router = router.route(
-            "/metrics",
-            get(crate::metrics_routes::prometheus_metrics_handler),
-        );
-    }
 
     // Nest auth routes if credential store is available.
     if let Some(ref cred_store) = state.credential_store {
@@ -832,6 +850,22 @@ pub fn build_gateway_base(
         );
     }
 
+    #[cfg(feature = "prometheus")]
+    {
+        router = router.route(
+            "/metrics",
+            get(crate::metrics_routes::prometheus_metrics_handler),
+        );
+    }
+
+    #[cfg(feature = "tailscale")]
+    {
+        router = router.nest(
+            "/api/tailscale",
+            crate::tailscale_routes::tailscale_router(),
+        );
+    }
+
     (router, app_state)
 }
 
@@ -840,9 +874,16 @@ pub fn build_gateway_base(
 pub fn finalize_gateway_app(
     router: Router<AppState>,
     app_state: AppState,
+    extra_routes: Option<Router>,
     http_request_logs: bool,
 ) -> Router {
     let cors = build_cors_layer();
+    let router = router.with_state(app_state.clone());
+    let router = if let Some(extra_routes) = extra_routes {
+        router.merge(extra_routes)
+    } else {
+        router
+    };
     // Auth gate covers the entire router — public paths are exempted inside
     // `is_public_path()`.  Only compiled when the web-ui feature is enabled
     // (matches the old architecture where auth_gate was global).
@@ -863,8 +904,7 @@ pub fn finalize_gateway_app(
         app_state.clone(),
         crate::request_throttle::throttle_gate,
     ));
-    let router = apply_middleware_stack(router, cors, http_request_logs);
-    router.with_state(app_state)
+    apply_middleware_stack(router, cors, http_request_logs)
 }
 
 /// Convenience wrapper: build base + finalize in one call (used by tests).
@@ -877,7 +917,7 @@ pub fn build_gateway_app(
     webauthn_registry: Option<SharedWebAuthnRegistry>,
 ) -> Router {
     let (router, app_state) = build_gateway_base(state, methods, push_service, webauthn_registry);
-    finalize_gateway_app(router, app_state, http_request_logs)
+    finalize_gateway_app(router, app_state, None, http_request_logs)
 }
 
 /// Convenience wrapper: build base + finalize in one call (used by tests).
@@ -889,7 +929,7 @@ pub fn build_gateway_app(
     webauthn_registry: Option<SharedWebAuthnRegistry>,
 ) -> Router {
     let (router, app_state) = build_gateway_base(state, methods, webauthn_registry);
-    finalize_gateway_app(router, app_state, http_request_logs)
+    finalize_gateway_app(router, app_state, None, http_request_logs)
 }
 
 fn env_var_or_unset(name: &str) -> String {
@@ -4098,14 +4138,14 @@ pub async fn prepare_gateway(
         webauthn_registry.clone(),
     );
 
-    // Merge caller-provided routes (e.g. web-UI) before finalization.
-    let router = if let Some(enhance) = extra_routes {
-        router.merge(enhance())
-    } else {
-        router
-    };
+    let extra_routes = extra_routes.map(|enhance| enhance(Arc::clone(&state)));
 
-    let mut app = finalize_gateway_app(router, app_state, config.server.http_request_logs);
+    let mut app = finalize_gateway_app(
+        router,
+        app_state,
+        extra_routes,
+        config.server.http_request_logs,
+    );
 
     app = app.route(
         "/api/channels/msteams/{account_id}/webhook",
@@ -6437,23 +6477,21 @@ pub(crate) async fn discover_and_build_hooks(
     Option<Arc<moltis_common::hooks::HookRegistry>>,
     Vec<crate::state::DiscoveredHookInfo>,
 ) {
-    use {
-        moltis_plugins::{
-            bundled::{
-                boot_md::BootMdHook,
-                circuit_breaker::CircuitBreakerHook,
-                command_logger::CommandLoggerHook,
-                cost_guard::{CostGuardHook, CostTrackerHook},
-                estop::EstopHook,
-                leak_detector::LeakDetectorHook,
-                prompt_guard::PromptGuardHook,
-                screenshot_resolver::ScreenshotResolverHook,
-                session_memory::SessionMemoryHook,
-            },
-            hook_discovery::{FsHookDiscoverer, HookDiscoverer, HookSource},
-            hook_eligibility::check_hook_eligibility,
-            shell_hook::ShellHookHandler,
+    use moltis_plugins::{
+        bundled::{
+            boot_md::BootMdHook,
+            circuit_breaker::CircuitBreakerHook,
+            command_logger::CommandLoggerHook,
+            cost_guard::{CostGuardHook, CostTrackerHook},
+            estop::EstopHook,
+            leak_detector::LeakDetectorHook,
+            prompt_guard::PromptGuardHook,
+            screenshot_resolver::ScreenshotResolverHook,
+            session_memory::SessionMemoryHook,
         },
+        hook_discovery::{FsHookDiscoverer, HookDiscoverer, HookSource},
+        hook_eligibility::check_hook_eligibility,
+        shell_hook::ShellHookHandler,
     };
 
     let db_pool = db_pool.or_else(|| HOOK_DB_POOL.get().cloned());

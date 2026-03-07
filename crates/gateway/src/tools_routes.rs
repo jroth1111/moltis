@@ -7,6 +7,9 @@
 //! they never work without authentication on non-localhost connections.
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use std::sync::Arc;
+
+use crate::state::GatewayState;
 
 const CONFIG_AUTH_REQUIRED: &str = "CONFIG_AUTH_REQUIRED";
 const CONFIG_READ_FAILED: &str = "CONFIG_READ_FAILED";
@@ -30,8 +33,8 @@ fn config_error(code: &str, error: impl Into<String>) -> serde_json::Value {
 /// - User is authenticated via session or API key
 ///
 /// This is a defense-in-depth check on top of the auth middleware.
-async fn require_config_access(state: &crate::server::AppState) -> Result<(), impl IntoResponse> {
-    let gw = &state.gateway;
+async fn require_config_access(state: &GatewayState) -> Result<(), impl IntoResponse> {
+    let gw = state;
 
     // On localhost with no password set, allow access (backward compat for initial setup)
     if gw.localhost_only {
@@ -83,7 +86,7 @@ async fn require_config_access(state: &crate::server::AppState) -> Result<(), im
 }
 
 /// Get the current configuration as TOML.
-pub async fn config_get(State(state): State<crate::server::AppState>) -> impl IntoResponse {
+pub async fn config_get(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     // Extra security check for config access
     if let Err(resp) = require_config_access(&state).await {
         return resp.into_response();
@@ -121,7 +124,7 @@ pub async fn config_get(State(state): State<crate::server::AppState>) -> impl In
 
 /// Validate configuration TOML without saving.
 pub async fn config_validate(
-    State(state): State<crate::server::AppState>,
+    State(state): State<Arc<GatewayState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // Extra security check for config access
@@ -164,7 +167,7 @@ pub async fn config_validate(
 
 /// Get the default configuration template with all options documented.
 /// Preserves the current port from the existing config.
-pub async fn config_template(State(state): State<crate::server::AppState>) -> impl IntoResponse {
+pub async fn config_template(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     // Extra security check for config access
     if let Err(resp) = require_config_access(&state).await {
         return resp.into_response();
@@ -182,7 +185,7 @@ pub async fn config_template(State(state): State<crate::server::AppState>) -> im
 
 /// Save configuration from TOML.
 pub async fn config_save(
-    State(state): State<crate::server::AppState>,
+    State(state): State<Arc<GatewayState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // Extra security check for config access
@@ -239,7 +242,7 @@ pub async fn config_save(
 ///
 /// Before restarting, the saved config is loaded from disk and validated. If the config
 /// is invalid the restart is refused so the server doesn't crash on startup.
-pub async fn restart(State(state): State<crate::server::AppState>) -> impl IntoResponse {
+pub async fn restart(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     // Extra security check for config access (restart is a privileged operation)
     if let Err(resp) = require_config_access(&state).await {
         return resp.into_response();

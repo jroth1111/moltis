@@ -10,11 +10,10 @@ use {
         CookieJar,
         cookie::{Cookie, SameSite},
     },
-    moltis_gateway::server::AppState,
     tracing::warn,
 };
 
-use crate::templates::ShareAccessQuery;
+use crate::{WebState, templates::ShareAccessQuery};
 
 fn not_found_share_response() -> axum::response::Response {
     (StatusCode::NOT_FOUND, "share not found").into_response()
@@ -60,7 +59,7 @@ pub async fn share_page_handler(
     Path(share_id): Path<String>,
     Query(query): Query<ShareAccessQuery>,
     jar: CookieJar,
-    State(state): State<AppState>,
+    State(state): State<WebState>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     if uuid::Uuid::parse_str(&share_id).is_err() {
@@ -199,7 +198,7 @@ pub async fn share_social_image_handler(
     Path(share_id): Path<String>,
     Query(query): Query<ShareAccessQuery>,
     jar: CookieJar,
-    State(state): State<AppState>,
+    State(state): State<WebState>,
 ) -> axum::response::Response {
     if uuid::Uuid::parse_str(&share_id).is_err() {
         return not_found_share_response();

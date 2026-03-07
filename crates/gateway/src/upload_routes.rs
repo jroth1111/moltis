@@ -15,8 +15,11 @@ use {
         response::IntoResponse,
     },
     serde::Deserialize,
+    std::sync::Arc,
     tracing::warn,
 };
+
+use crate::state::GatewayState;
 
 /// Query parameters for the upload endpoint.
 #[derive(Debug, Deserialize, Default)]
@@ -52,7 +55,7 @@ fn upload_error(code: &str, error: impl Into<String>) -> serde_json::Value {
 /// Accepts raw binary body. `Content-Type` header is required.
 /// Optional `X-Filename` header for custom filenames.
 pub async fn session_upload(
-    State(state): State<crate::server::AppState>,
+    State(state): State<Arc<GatewayState>>,
     Path(session_key): Path<String>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
@@ -112,7 +115,7 @@ pub async fn session_upload(
         });
 
     // We need the session store to save media.
-    let Some(ref store) = state.gateway.services.session_store else {
+    let Some(ref store) = state.services.session_store else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(upload_error(
@@ -148,7 +151,6 @@ pub async fn session_upload(
         let format = format_name_for_content_type(content_type);
 
         match state
-            .gateway
             .services
             .stt
             .transcribe_bytes(

@@ -1,9 +1,9 @@
 //! Web UI: static asset serving, SPA routing, share pages, terminal PTY,
 //! and all browser-facing handlers.
 //!
-//! This crate depends on `moltis-gateway` for [`AppState`] and server-side
-//! services. It provides [`web_routes()`] which returns an Axum `Router` that
-//! the CLI (or any other host) can merge into the gateway router.
+//! This crate depends on `moltis-gateway` for [`GatewayState`] and server-side
+//! services. It provides [`web_routes()`] which returns a state-bound Axum
+//! `Router` that the CLI (or any other host) can merge into the gateway router.
 
 pub mod api;
 pub mod assets;
@@ -20,19 +20,30 @@ pub use error::{Error, Result};
 
 use {
     axum::{Router, routing::get},
-    moltis_gateway::server::AppState,
+    moltis_gateway::state::GatewayState,
+    std::sync::Arc,
 };
+
+#[derive(Clone)]
+pub struct WebState {
+    pub gateway: Arc<GatewayState>,
+}
+
+impl WebState {
+    #[must_use]
+    pub fn new(gateway: Arc<GatewayState>) -> Self {
+        Self { gateway }
+    }
+}
 
 /// Build the web-UI router: pages, API routes, assets, and SPA fallback.
 ///
 /// Does **not** include the `auth_gate` middleware — the caller applies it
 /// globally after merging with the gateway base router (matching the old
 /// architecture where auth_gate ran on every inbound request).
-pub fn web_routes() -> Router<AppState> {
-    let api = build_api_routes();
-    let api = add_feature_routes(api);
-
-    Router::new()
+pub fn web_routes(gateway: Arc<GatewayState>) -> Router {
+    let api = build_api_routes(Arc::clone(&gateway));
+    let pages = Router::new()
         .route("/auth/callback", get(oauth::oauth_callback_handler))
         .route(
             "/share/{share_id}/og-image.svg",
@@ -48,12 +59,14 @@ pub fn web_routes() -> Router<AppState> {
         .route("/assets/{*path}", get(assets::asset_handler))
         .route("/manifest.json", get(assets::manifest_handler))
         .route("/sw.js", get(assets::service_worker_handler))
-        .merge(api)
         .fallback(spa::spa_fallback)
+        .with_state(WebState::new(gateway));
+
+    pages.merge(api)
 }
 
 /// API routes served behind auth.
-fn build_api_routes() -> Router<AppState> {
+fn build_api_routes(gateway: Arc<GatewayState>) -> Router {
     let protected = Router::new()
         .route("/api/bootstrap", get(api::api_bootstrap_handler))
         .route("/api/gon", get(gon::api_gon_handler))
@@ -135,6 +148,18 @@ fn build_api_routes() -> Router<AppState> {
             "/api/terminal/ws",
             get(terminal::api_terminal_ws_upgrade_handler),
         )
+        .route("/api/logs/download", get(api::api_logs_download_handler))
+        .route(
+            "/api/sessions/{session_key}/media/{filename}",
+            get(api::api_session_media_handler),
+        )
+        .route(
+            "/api/metrics/provider-health",
+            get(api::api_provider_health_handler),
+        )
+        .with_state(WebState::new(Arc::clone(&gateway)));
+
+    let gateway_routes = Router::new()
         .route(
             "/api/env",
             get(moltis_gateway::env_routes::env_list).post(moltis_gateway::env_routes::env_set),
@@ -167,16 +192,11 @@ fn build_api_routes() -> Router<AppState> {
                     moltis_gateway::upload_routes::MAX_UPLOAD_SIZE,
                 ),
             ),
-        )
-        .route(
-            "/api/sessions/{session_key}/media/{filename}",
-            get(api::api_session_media_handler),
-        )
-        .route("/api/logs/download", get(api::api_logs_download_handler));
+        );
 
     // Add metrics API routes (protected).
     #[cfg(feature = "metrics")]
-    let protected = protected
+    let gateway_routes = gateway_routes
         .route(
             "/api/metrics",
             get(moltis_gateway::metrics_routes::api_metrics_handler),
@@ -190,25 +210,7 @@ fn build_api_routes() -> Router<AppState> {
             get(moltis_gateway::metrics_routes::api_metrics_history_handler),
         );
 
-    // Provider health dashboard (always available, not gated on metrics feature).
-    let protected = protected.route(
-        "/api/metrics/provider-health",
-        get(moltis_gateway::metrics_routes::api_provider_health_handler),
-    );
+    let gateway_routes = gateway_routes.with_state(Arc::clone(&gateway));
 
-    protected
-}
-
-/// Add feature-specific routes to API routes.
-fn add_feature_routes(routes: Router<AppState>) -> Router<AppState> {
-    #[cfg(feature = "tailscale")]
-    let routes = routes.nest(
-        "/api/tailscale",
-        moltis_gateway::tailscale_routes::tailscale_router(),
-    );
-
-    #[cfg(feature = "push-notifications")]
-    let routes = routes.nest("/api/push", moltis_gateway::push_routes::push_router());
-
-    routes
+    protected.merge(gateway_routes)
 }

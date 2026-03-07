@@ -6,9 +6,11 @@ use {
         response::{IntoResponse, Response},
     },
     serde::Serialize,
+    std::sync::Arc,
 };
 
 use crate::auth::EnvVarEntry;
+use crate::state::GatewayState;
 
 // ── Typed responses ──────────────────────────────────────────────────────────
 
@@ -103,10 +105,8 @@ impl IntoResponse for EnvListResponse {
 // ── Route handlers ───────────────────────────────────────────────────────────
 
 /// List all environment variables (names only, no values).
-pub async fn env_list(
-    State(state): State<crate::server::AppState>,
-) -> Result<EnvListResponse, ApiError> {
-    let store = state.gateway.credential_store.as_ref().ok_or_else(|| {
+pub async fn env_list(State(state): State<Arc<GatewayState>>) -> Result<EnvListResponse, ApiError> {
+    let store = state.credential_store.as_ref().ok_or_else(|| {
         ApiError::service_unavailable(ENV_STORE_UNAVAILABLE, "no credential store")
     })?;
 
@@ -119,10 +119,10 @@ pub async fn env_list(
 
 /// Set (upsert) an environment variable.
 pub async fn env_set(
-    State(state): State<crate::server::AppState>,
+    State(state): State<Arc<GatewayState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<OkResponse, ApiError> {
-    let store = state.gateway.credential_store.as_ref().ok_or_else(|| {
+    let store = state.credential_store.as_ref().ok_or_else(|| {
         ApiError::service_unavailable(ENV_STORE_UNAVAILABLE, "no credential store")
     })?;
 
@@ -159,10 +159,10 @@ pub async fn env_set(
 
 /// Delete an environment variable by id.
 pub async fn env_delete(
-    State(state): State<crate::server::AppState>,
+    State(state): State<Arc<GatewayState>>,
     Path(id): Path<i64>,
 ) -> Result<OkResponse, ApiError> {
-    let store = state.gateway.credential_store.as_ref().ok_or_else(|| {
+    let store = state.credential_store.as_ref().ok_or_else(|| {
         ApiError::service_unavailable(ENV_STORE_UNAVAILABLE, "no credential store")
     })?;
 

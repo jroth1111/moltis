@@ -9,12 +9,14 @@ use {
         http::StatusCode,
         response::{IntoResponse, Response},
     },
-    moltis_gateway::server::AppState,
     moltis_tools::image_cache::ImageBuilder,
     tracing::warn,
 };
 
-use crate::templates::{build_nav_counts, onboarding_completed};
+use crate::{
+    WebState,
+    templates::{build_nav_counts, onboarding_completed},
+};
 
 const MCP_LIST_FAILED: &str = "MCP_LIST_FAILED";
 const SKILLS_EVALS_LIST_FAILED: &str = "SKILLS_EVALS_LIST_FAILED";
@@ -83,7 +85,7 @@ fn shared_home_config_payload(config: &moltis_config::MoltisConfig) -> serde_jso
 
 pub async fn api_session_media_handler(
     Path((session_key, filename)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<WebState>,
 ) -> impl IntoResponse {
     let Some(ref store) = state.gateway.services.session_store else {
         return (StatusCode::NOT_FOUND, "session store not available").into_response();
@@ -106,7 +108,7 @@ pub async fn api_session_media_handler(
 
 // ── Logs download ────────────────────────────────────────────────────────────
 
-pub async fn api_logs_download_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_logs_download_handler(State(state): State<WebState>) -> impl IntoResponse {
     use {axum::http::header, tokio_util::io::ReaderStream};
 
     let Some(path) = state.gateway.services.logs.log_file_path() else {
@@ -130,7 +132,7 @@ pub async fn api_logs_download_handler(State(state): State<AppState>) -> impl In
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 
-pub async fn api_bootstrap_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_bootstrap_handler(State(state): State<WebState>) -> impl IntoResponse {
     let gw = &state.gateway;
     let (channels, sessions, models, projects, onboarded) = tokio::join!(
         gw.services.channel.status(),
@@ -169,7 +171,7 @@ pub async fn api_bootstrap_handler(State(state): State<AppState>) -> impl IntoRe
 
 // ── MCP / Hooks ──────────────────────────────────────────────────────────────
 
-pub async fn api_mcp_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_mcp_handler(State(state): State<WebState>) -> impl IntoResponse {
     let servers = state.gateway.services.mcp.list().await;
     match servers {
         Ok(val) => Json(val).into_response(),
@@ -191,7 +193,7 @@ pub struct McpSearchQuery {
 }
 
 pub async fn api_mcp_tools_search_handler(
-    State(state): State<AppState>,
+    State(state): State<WebState>,
     Query(query): Query<McpSearchQuery>,
 ) -> impl IntoResponse {
     let payload = serde_json::json!({
@@ -217,7 +219,7 @@ pub struct McpDescribeQuery {
 }
 
 pub async fn api_mcp_tools_describe_handler(
-    State(state): State<AppState>,
+    State(state): State<WebState>,
     Query(query): Query<McpDescribeQuery>,
 ) -> impl IntoResponse {
     let payload = serde_json::json!({
@@ -234,7 +236,7 @@ pub async fn api_mcp_tools_describe_handler(
     }
 }
 
-pub async fn api_mcp_legacy_direct_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_mcp_legacy_direct_handler(State(state): State<WebState>) -> impl IntoResponse {
     match state.gateway.services.mcp.legacy_direct_status().await {
         Ok(val) => Json(val).into_response(),
         Err(e) => api_error_response(
@@ -245,7 +247,7 @@ pub async fn api_mcp_legacy_direct_handler(State(state): State<AppState>) -> imp
     }
 }
 
-pub async fn api_hooks_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_hooks_handler(State(state): State<WebState>) -> impl IntoResponse {
     let hooks = state.gateway.inner.read().await;
     Json(serde_json::json!({ "hooks": hooks.discovered_hooks }))
 }
@@ -310,7 +312,7 @@ where
         .collect()
 }
 
-pub async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_skills_handler(State(state): State<WebState>) -> impl IntoResponse {
     let repos = state
         .gateway
         .services
@@ -372,7 +374,7 @@ async fn api_search_handler(
 
 pub async fn api_skills_search_handler(
     Query(params): Query<HashMap<String, String>>,
-    State(state): State<AppState>,
+    State(state): State<WebState>,
 ) -> impl IntoResponse {
     let source = params.get("source").cloned().unwrap_or_default();
     let query = params.get("q").cloned().unwrap_or_default();
@@ -388,7 +390,7 @@ pub async fn api_skills_search_handler(
     api_search_handler(repos, &source, &query).await
 }
 
-pub async fn api_skills_evals_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_skills_evals_handler(State(state): State<WebState>) -> impl IntoResponse {
     match state.gateway.services.skills.evals_list().await {
         Ok(val) => Json(serde_json::json!({ "runs": val })).into_response(),
         Err(e) => api_error_response(
@@ -401,7 +403,7 @@ pub async fn api_skills_evals_handler(State(state): State<AppState>) -> impl Int
 
 pub async fn api_skills_eval_detail_handler(
     Path(id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<WebState>,
 ) -> impl IntoResponse {
     match state
         .gateway
@@ -420,7 +422,7 @@ pub async fn api_skills_eval_detail_handler(
 }
 
 pub async fn api_skills_eval_run_handler(
-    State(state): State<AppState>,
+    State(state): State<WebState>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     match state.gateway.services.skills.evals_run(payload).await {
@@ -583,7 +585,7 @@ pub async fn api_check_packages_handler(Json(body): Json<serde_json::Value>) -> 
     }
 }
 
-pub async fn api_get_default_image_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_get_default_image_handler(State(state): State<WebState>) -> impl IntoResponse {
     let image = if let Some(ref router) = state.gateway.sandbox_router {
         router.default_image().await
     } else {
@@ -593,7 +595,7 @@ pub async fn api_get_default_image_handler(State(state): State<AppState>) -> imp
 }
 
 pub async fn api_set_default_image_handler(
-    State(state): State<AppState>,
+    State(state): State<WebState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let image = body.get("image").and_then(|v| v.as_str()).map(|s| s.trim());
@@ -751,7 +753,7 @@ WORKDIR /home/sandbox\n"
 
 // ── Containers ───────────────────────────────────────────────────────────────
 
-pub async fn api_list_containers_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_list_containers_handler(State(state): State<WebState>) -> impl IntoResponse {
     let prefix = state
         .gateway
         .sandbox_router
@@ -774,7 +776,7 @@ pub async fn api_list_containers_handler(State(state): State<AppState>) -> impl 
 }
 
 pub async fn api_stop_container_handler(
-    State(state): State<AppState>,
+    State(state): State<WebState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     let prefix = state
@@ -806,7 +808,7 @@ pub async fn api_stop_container_handler(
 }
 
 pub async fn api_remove_container_handler(
-    State(state): State<AppState>,
+    State(state): State<WebState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     let prefix = state
@@ -837,7 +839,7 @@ pub async fn api_remove_container_handler(
     }
 }
 
-pub async fn api_clean_all_containers_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_clean_all_containers_handler(State(state): State<WebState>) -> impl IntoResponse {
     let prefix = state
         .gateway
         .sandbox_router
@@ -879,4 +881,11 @@ pub async fn api_restart_daemon_handler() -> impl IntoResponse {
             e.to_string(),
         ),
     }
+}
+
+pub async fn api_provider_health_handler(State(state): State<WebState>) -> impl IntoResponse {
+    let stats = state.gateway.provider_health.snapshot();
+    Json(serde_json::json!({
+        "providers": stats,
+    }))
 }

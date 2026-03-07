@@ -4,6 +4,7 @@ use axum::{
     extract::State,
     response::{IntoResponse, Json},
 };
+use std::sync::Arc;
 
 #[cfg(feature = "metrics")]
 use axum::http::StatusCode;
@@ -14,7 +15,7 @@ use axum::{http::header, response::Response};
 #[cfg(feature = "metrics")]
 use moltis_metrics::MetricsSnapshot;
 
-use crate::server::AppState;
+use crate::state::GatewayState;
 
 #[cfg(feature = "metrics")]
 const METRICS_NOT_ENABLED: &str = "METRICS_NOT_ENABLED";
@@ -26,8 +27,10 @@ const METRICS_NOT_ENABLED: &str = "METRICS_NOT_ENABLED";
 ///
 /// This endpoint is unauthenticated to allow metric scrapers to access it.
 #[cfg(feature = "prometheus")]
-pub async fn prometheus_metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let metrics_handle = state.gateway.metrics_handle.as_ref();
+pub async fn prometheus_metrics_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> impl IntoResponse {
+    let metrics_handle = state.metrics_handle.as_ref();
 
     match metrics_handle {
         Some(handle) => {
@@ -58,8 +61,8 @@ pub async fn prometheus_metrics_handler(State(state): State<AppState>) -> impl I
 /// Returns metrics as structured JSON, with pre-computed aggregates and
 /// category breakdowns suitable for dashboard display.
 #[cfg(feature = "metrics")]
-pub async fn api_metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let metrics_handle = state.gateway.metrics_handle.as_ref();
+pub async fn api_metrics_handler(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
+    let metrics_handle = state.metrics_handle.as_ref();
 
     match metrics_handle {
         Some(handle) => {
@@ -96,8 +99,10 @@ pub async fn api_metrics_handler(State(state): State<AppState>) -> impl IntoResp
 ///
 /// Returns a minimal summary suitable for displaying in the UI navigation.
 #[cfg(feature = "metrics")]
-pub async fn api_metrics_summary_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let metrics_handle = state.gateway.metrics_handle.as_ref();
+pub async fn api_metrics_summary_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> impl IntoResponse {
+    let metrics_handle = state.metrics_handle.as_ref();
 
     match metrics_handle {
         Some(handle) => {
@@ -143,8 +148,10 @@ pub async fn api_metrics_summary_handler(State(state): State<AppState>) -> impl 
 /// Returns the last hour of metrics snapshots (sampled every 10 seconds)
 /// for rendering charts in the monitoring UI.
 #[cfg(feature = "metrics")]
-pub async fn api_metrics_history_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let inner = state.gateway.inner.read().await;
+pub async fn api_metrics_history_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> impl IntoResponse {
+    let inner = state.inner.read().await;
     let points: Vec<_> = inner.metrics_history.iter().collect();
 
     Json(serde_json::json!({
@@ -160,8 +167,10 @@ pub async fn api_metrics_history_handler(State(state): State<AppState>) -> impl 
 /// Returns rolling health statistics for each provider+model pair observed
 /// in the sliding window (default 5 minutes). Includes success rate,
 /// error breakdown by class, and latency percentiles (p50/p95/p99).
-pub async fn api_provider_health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let stats = state.gateway.provider_health.snapshot();
+pub async fn api_provider_health_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> impl IntoResponse {
+    let stats = state.provider_health.snapshot();
     Json(serde_json::json!({
         "providers": stats,
     }))

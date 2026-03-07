@@ -18,10 +18,11 @@ use {
     },
     base64::Engine as _,
     futures::{SinkExt, StreamExt},
-    moltis_gateway::server::AppState,
     portable_pty::{CommandBuilder, PtySize, native_pty_system},
     tracing::{debug, info, warn},
 };
+
+use crate::WebState;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -963,7 +964,7 @@ pub async fn api_terminal_ws_upgrade_handler(
     Query(query): Query<HostTerminalWsQuery>,
     headers: axum::http::HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
+    State(state): State<WebState>,
 ) -> impl IntoResponse {
     // CSWSH protection: only same-origin browser upgrades are allowed.
     if let Some(origin) = headers

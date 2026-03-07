@@ -2,17 +2,16 @@
 
 use std::collections::HashMap;
 
-use {
-    axum::{
-        extract::{Query, State},
-        http::StatusCode,
-        response::{Html, IntoResponse},
-    },
-    moltis_gateway::server::AppState,
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
 };
 
+use crate::WebState;
+
 pub async fn oauth_callback_handler(
-    State(state): State<AppState>,
+    State(state): State<WebState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let Some(code) = params.get("code") else {
