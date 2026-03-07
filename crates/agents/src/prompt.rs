@@ -691,9 +691,7 @@ fn parse_lane_marker(line: &str) -> Option<Result<SoulLane, String>> {
     let end = rest.find("-->")?;
     let comment = rest[..end].trim();
     let mut parts = comment.splitn(2, ':');
-    let Some(key) = parts.next().map(str::trim) else {
-        return None;
-    };
+    let key = parts.next().map(str::trim)?;
     if !key.eq_ignore_ascii_case("lane") {
         return None;
     }
@@ -809,7 +807,7 @@ fn prepare_soul_sections(soul_text: &str) -> Result<PreparedSoulSections, SoulRo
                 });
                 current_lines.clear();
             } else if !current_lines.is_empty() {
-                preamble_lines.extend(current_lines.drain(..));
+                preamble_lines.append(&mut current_lines);
             }
             let lane_for_heading = match marker {
                 Some(Ok(lane)) => lane,
@@ -2041,8 +2039,12 @@ mod tests {
     fn test_skills_injected_into_prompt() {
         let tools = ToolRegistry::new();
         let skills = vec![SkillMetadata {
+            version: 3,
             name: "commit".into(),
             description: "Create git commits".into(),
+            triggers: Default::default(),
+            evals: Default::default(),
+            permissions: Default::default(),
             license: None,
             compatibility: None,
             allowed_tools: vec![],

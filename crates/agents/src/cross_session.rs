@@ -303,6 +303,7 @@ pub mod categories {
     pub const PERFORMANCE: &str = "performance";
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

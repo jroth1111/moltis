@@ -452,7 +452,7 @@ fn browser_action_is_high_risk(action: &str) -> bool {
 
 fn tool_call_is_high_risk(tool_call: &ToolCall, tools: &ToolRegistry) -> bool {
     if tool_call.name == "browser" {
-        return browser_action_name(&tool_call.arguments).map_or(true, browser_action_is_high_risk);
+        return browser_action_name(&tool_call.arguments).is_none_or(browser_action_is_high_risk);
     }
 
     match tools.side_effect_class(&tool_call.name) {

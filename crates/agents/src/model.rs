@@ -434,14 +434,13 @@ impl ConfidenceMetrics {
 
     /// Check if confidence is below the retry threshold.
     pub fn should_retry(&self) -> bool {
-        self.score.map_or(false, |s| s < Self::RETRY_THRESHOLD)
+        self.score.is_some_and(|s| s < Self::RETRY_THRESHOLD)
     }
 
     /// Check if confidence is below the escalate threshold (but above retry).
     pub fn should_escalate(&self) -> bool {
-        self.score.map_or(false, |s| {
-            s >= Self::RETRY_THRESHOLD && s < Self::ESCALATE_THRESHOLD
-        })
+        self.score
+            .is_some_and(|s| (Self::RETRY_THRESHOLD..Self::ESCALATE_THRESHOLD).contains(&s))
     }
 }
 

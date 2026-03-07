@@ -1,5 +1,7 @@
 //! LLM agent runtime: model selection, prompt building, tool execution, streaming.
 
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+
 pub mod classify;
 pub mod cross_session;
 pub mod intent_tracker;
