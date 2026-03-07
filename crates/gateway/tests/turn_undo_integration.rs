@@ -65,6 +65,77 @@ impl ChatService for QueuedOnlyChatService {
     }
 }
 
+struct UndoPruningSessionService;
+
+#[async_trait]
+impl moltis_gateway::services::SessionService for UndoPruningSessionService {
+    async fn list(&self) -> ServiceResult {
+        Err("session service not configured".into())
+    }
+
+    async fn preview(&self, _params: Value) -> ServiceResult {
+        Err("session service not configured".into())
+    }
+
+    async fn resolve(&self, _params: Value) -> ServiceResult {
+        Err("session service not configured".into())
+    }
+
+    async fn patch(&self, _params: Value) -> ServiceResult {
+        Err("session service not configured".into())
+    }
+
+    async fn voice_generate(&self, _params: Value) -> ServiceResult {
+        Err("session voice generation not available".into())
+    }
+
+    async fn share_create(&self, _params: Value) -> ServiceResult {
+        Err("session sharing not available".into())
+    }
+
+    async fn share_list(&self, _params: Value) -> ServiceResult {
+        Err("session service not configured".into())
+    }
+
+    async fn share_revoke(&self, _params: Value) -> ServiceResult {
+        Err("session sharing not available".into())
+    }
+
+    async fn reset(&self, _params: Value) -> ServiceResult {
+        Ok(json!({ "ok": true }))
+    }
+
+    async fn delete(&self, _params: Value) -> ServiceResult {
+        Ok(json!({ "ok": true }))
+    }
+
+    async fn compact(&self, _params: Value) -> ServiceResult {
+        Err("session compaction not available".into())
+    }
+
+    async fn search(&self, _params: Value) -> ServiceResult {
+        Err("session search not available".into())
+    }
+
+    async fn fork(&self, _params: Value) -> ServiceResult {
+        Err("session forking not available".into())
+    }
+
+    async fn branches(&self, _params: Value) -> ServiceResult {
+        Err("session branching not available".into())
+    }
+
+    async fn run_detail(&self, _params: Value) -> ServiceResult {
+        Err("session run detail not available".into())
+    }
+
+    async fn clear_all(&self) -> ServiceResult {
+        Ok(json!({ "ok": true }))
+    }
+
+    async fn mark_seen(&self, _key: &str) {}
+}
+
 fn make_state(services: GatewayServices) -> Arc<GatewayState> {
     GatewayState::new(auth::resolve_auth(None, None), services)
 }
@@ -137,7 +208,9 @@ async fn queued_chat_send_does_not_push_undo_snapshot() {
 
 #[tokio::test]
 async fn destructive_session_methods_prune_undo_managers() {
-    let state = make_state(GatewayServices::noop());
+    let mut services = GatewayServices::noop();
+    services.session = Arc::new(UndoPruningSessionService);
+    let state = make_state(services);
 
     {
         let mut inner = state.inner.write().await;
