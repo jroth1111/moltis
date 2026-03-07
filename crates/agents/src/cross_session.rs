@@ -263,7 +263,7 @@ impl Learning {
             category: category.into(),
             content: content.into(),
             context,
-            confidence: 0.5,
+            confidence: CONFIDENCE_THRESHOLD,
             application_count: 0,
             created_at: OffsetDateTime::now_utc(),
             last_applied: None,

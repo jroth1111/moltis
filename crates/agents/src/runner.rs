@@ -13,7 +13,7 @@ use moltis_common::hooks::{HookAction, HookPayload, HookRegistry};
 use crate::{
     classify::{ProviderErrorKind, classify_error_message, extract_retry_after_ms},
     cross_session::{CrossSessionLearning, Learning, LearningContext, LearningOutcome},
-    intent_tracker::IntentTracker,
+    intent_tracker::{IntentTracker, extract_keywords},
     model::{
         ChatMessage, CompletionResponse, ConfidenceMetrics, ContentPart, LlmProvider, StreamEvent,
         ToolCall, Usage, UserContent, values_to_chat_messages,
@@ -481,6 +481,83 @@ fn summarize_tool_calls(tool_calls: &[ToolCall]) -> String {
     }
 
     parts.join(", ")
+}
+
+fn push_tool_intent_fragments(
+    value: &serde_json::Value,
+    fragments: &mut Vec<String>,
+    depth: usize,
+    remaining: &mut usize,
+) {
+    if *remaining == 0 || depth > 2 {
+        return;
+    }
+
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                fragments.push(trimmed.to_string());
+                *remaining -= 1;
+            }
+        },
+        serde_json::Value::Number(number) => {
+            fragments.push(number.to_string());
+            *remaining -= 1;
+        },
+        serde_json::Value::Bool(flag) => {
+            fragments.push(flag.to_string());
+            *remaining -= 1;
+        },
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_tool_intent_fragments(item, fragments, depth + 1, remaining);
+                if *remaining == 0 {
+                    break;
+                }
+            }
+        },
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                push_tool_intent_fragments(value, fragments, depth + 1, remaining);
+                if *remaining == 0 {
+                    break;
+                }
+            }
+        },
+        serde_json::Value::Null => {},
+    }
+}
+
+fn tool_call_intent_summary(tool_call: &ToolCall) -> String {
+    let mut fragments = vec![tool_call.name.replace(['_', '-'], " ")];
+    let mut remaining = 12;
+    push_tool_intent_fragments(&tool_call.arguments, &mut fragments, 0, &mut remaining);
+    fragments.join(" ")
+}
+
+fn tool_calls_align_with_original_intent(tool_calls: &[ToolCall], original_intent: &str) -> bool {
+    if tool_calls.is_empty() {
+        return false;
+    }
+
+    let original_keywords = extract_keywords(original_intent);
+    if original_keywords.is_empty() {
+        return false;
+    }
+
+    let tool_plan = tool_calls
+        .iter()
+        .map(tool_call_intent_summary)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let tool_keywords = extract_keywords(&tool_plan);
+
+    !tool_keywords.is_empty() && !tool_keywords.is_disjoint(&original_keywords)
+}
+
+fn text_has_drift_signal(text: Option<&str>) -> bool {
+    text.is_some_and(|text| extract_keywords(text).len() >= 2)
 }
 
 fn build_low_confidence_question(original_intent: &str, confidence: &ConfidenceMetrics) -> String {
@@ -1278,13 +1355,15 @@ pub async fn run_agent_loop_with_context(
         }
 
         // Check intent drift when the agent is iterating with tool calls.
-        let current_intent = format!(
-            "{} {}",
-            response.text.as_deref().unwrap_or(""),
-            summarize_tool_calls(&response.tool_calls)
-        );
-        let (drift_score, is_drifted) =
-            intent_tracker.check_drift(&current_intent, trace_id.as_deref());
+        let current_intent = response.text.clone().unwrap_or_default();
+        let skip_drift_check =
+            tool_calls_align_with_original_intent(&response.tool_calls, &original_intent)
+                || !text_has_drift_signal(response.text.as_deref());
+        let (drift_score, is_drifted) = if skip_drift_check {
+            (0.0, false)
+        } else {
+            intent_tracker.check_drift(&current_intent, trace_id.as_deref())
+        };
         if is_drifted {
             if let Some(cb) = on_event {
                 cb(RunnerEvent::IntentDrift {
@@ -2168,18 +2247,14 @@ pub async fn run_agent_loop_streaming(
         }
 
         // Check intent drift when tool calls are present.
-        let current_intent = format!(
-            "{} {}",
-            accumulated_text.as_str(),
-            tool_calls
-                .iter()
-                .map(|tc| tc.name.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        // check_drift logs warnings internally when drift is detected.
-        let (drift_score, is_drifted) =
-            intent_tracker.check_drift(&current_intent, trace_id.as_deref());
+        let current_intent = accumulated_text.clone();
+        let skip_drift_check = tool_calls_align_with_original_intent(&tool_calls, &original_intent)
+            || !text_has_drift_signal(Some(accumulated_text.as_str()));
+        let (drift_score, is_drifted) = if skip_drift_check {
+            (0.0, false)
+        } else {
+            intent_tracker.check_drift(&current_intent, trace_id.as_deref())
+        };
         if is_drifted {
             if let Some(cb) = on_event {
                 cb(RunnerEvent::IntentDrift {

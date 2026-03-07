@@ -82,9 +82,24 @@ impl IntentTracker {
     }
 }
 
+fn normalize_keyword(keyword: &str) -> Option<String> {
+    let lowered = keyword.to_lowercase();
+    let normalized = if lowered.len() > 3 && lowered.ends_with('s') {
+        lowered[..lowered.len() - 1].to_string()
+    } else {
+        lowered
+    };
+
+    if normalized.len() > 2 {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
 /// Extract significant keywords from text.
 /// Filters out common stop words and returns unique lowercase keywords.
-fn extract_keywords(text: &str) -> HashSet<String> {
+pub(crate) fn extract_keywords(text: &str) -> HashSet<String> {
     // Common English stop words to filter out
     const STOP_WORDS: &[&str] = &[
         "a", "an", "the", "and", "or", "but", "is", "are", "was", "were", "be", "been", "being",
@@ -104,11 +119,8 @@ fn extract_keywords(text: &str) -> HashSet<String> {
 
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| {
-            let s = *s;
-            s.len() > 2 && !STOP_WORDS.contains(&s)
-        })
-        .map(String::from)
+        .filter(|s| !STOP_WORDS.contains(s))
+        .filter_map(normalize_keyword)
         .collect()
 }
 
@@ -158,6 +170,15 @@ mod tests {
         assert!(keywords.contains("write"));
         assert!(keywords.contains("code"));
         assert!(keywords.contains("rust"));
+    }
+
+    #[test]
+    fn test_extract_keywords_normalizes_simple_plurals() {
+        let keywords = extract_keywords("Use all tools and inspect files");
+        assert!(keywords.contains("tool"));
+        assert!(keywords.contains("file"));
+        assert!(!keywords.contains("tools"));
+        assert!(!keywords.contains("files"));
     }
 
     #[test]
