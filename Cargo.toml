@@ -328,3 +328,8 @@ codegen-units = 1
 lto           = "thin"
 panic         = "abort"
 strip         = true
+
+[patch.crates-io]
+wacore          = { path = "vendor/wacore-0.2.0" }
+wacore-appstate = { path = "vendor/wacore-appstate-0.2.0" }
+wacore-binary   = { path = "vendor/wacore-binary-0.2.0" }

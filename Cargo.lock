@@ -11309,8 +11309,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wacore"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c38f75041655201a01725a43d99da2f258de6e9e17033b167f99d458070c4f1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -11346,8 +11344,6 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8128197fd310dbc350cf7d417666d31591a84fa2d42b3b5692e48da9e0500ea"
 dependencies = [
  "anyhow",
  "hkdf",
@@ -11365,8 +11361,6 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d560076c8483f9197ca0e2c46e98e3cb01fc30c089114704b851b3f73b6b94d6"
 dependencies = [
  "flate2",
  "indexmap 2.13.0",
