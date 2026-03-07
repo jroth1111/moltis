@@ -1412,7 +1412,9 @@ async fn noop_session_query_surfaces_unavailable_code() {
 
     assert_eq!(res.errors.len(), 1, "errors: {:?}", res.errors);
     assert!(
-        res.errors[0].message.contains("session service not configured"),
+        res.errors[0]
+            .message
+            .contains("session service not configured"),
         "error: {}",
         res.errors[0].message
     );
@@ -1430,7 +1432,9 @@ async fn noop_logs_ack_mutation_surfaces_unavailable_code() {
 
     assert_eq!(res.errors.len(), 1, "errors: {:?}", res.errors);
     assert!(
-        res.errors[0].message.contains("logs service not configured"),
+        res.errors[0]
+            .message
+            .contains("logs service not configured"),
         "error: {}",
         res.errors[0].message
     );
