@@ -92,8 +92,11 @@ impl BridgeState {
             if let Err(e) = moltis_sessions::run_migrations(&pool).await {
                 emit_log("WARN", "bridge", &format!("sessions migration: {e}"));
             }
-            pool
-        });
+            if let Err(e) = moltis_gateway::run_migrations(&pool).await {
+                emit_log("WARN", "bridge", &format!("gateway migration: {e}"));
+            }
+            Ok::<_, String>(pool)
+        })?;
         let event_bus = SessionEventBus::new();
         let session_metadata = SqliteSessionMetadata::with_event_bus(db_pool.clone(), event_bus);
         let credential_store = runtime.block_on(async {
@@ -119,11 +122,10 @@ impl BridgeState {
             )
             .await
             {
-                Ok(store) => Arc::new(store),
+                Ok(store) => Ok(Arc::new(store)),
                 Err(error) => return Err(format!("failed to init credential store: {error}")),
             }
-        });
-        let credential_store = credential_store?;
+        })?;
 
         emit_log("INFO", "bridge", "Bridge initialized successfully");
         Ok(Self {
@@ -1055,7 +1057,17 @@ fn resolve_provider_for_model(model: Option<&str>) -> Option<std::sync::Arc<dyn 
         return Some(provider);
     }
 
-    // Fall back to first available provider
+    if let Some(model_id) = model {
+        emit_log(
+            "WARN",
+            "bridge",
+            &format!("Requested model {model_id} is not available in the registry"),
+        );
+        return None;
+    }
+
+    // Fall back to first available provider when the caller did not request
+    // a specific model.
     let result = registry.first();
     if let Some(ref p) = result {
         emit_log(
@@ -1919,7 +1931,8 @@ pub extern "C" fn moltis_abort_session(session_key: *const c_char) -> *mut c_cha
         drop(guard);
 
         let params = serde_json::json!({ "sessionKey": key });
-        match BRIDGE
+        let bridge = bridge_or_return_error!();
+        match bridge
             .runtime
             .block_on(async { state.chat().await.abort(params).await })
         {
@@ -1950,7 +1963,8 @@ pub extern "C" fn moltis_peek_session(session_key: *const c_char) -> *mut c_char
         drop(guard);
 
         let params = serde_json::json!({ "sessionKey": key });
-        match BRIDGE
+        let bridge = bridge_or_return_error!();
+        match bridge
             .runtime
             .block_on(async { state.chat().await.peek(params).await })
         {
@@ -3465,9 +3479,10 @@ WORKDIR /home/sandbox\n"
             return encode_error(SANDBOX_DOCKERFILE_WRITE_FAILED, &error.to_string());
         }
 
+        let bridge = bridge_or_return_error!();
         let builder = moltis_tools::image_cache::DockerImageBuilder::new();
         let result =
-            BRIDGE
+            bridge
                 .runtime
                 .block_on(builder.ensure_image(name, &dockerfile_path, &tmp_dir));
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -3526,7 +3541,8 @@ pub extern "C" fn moltis_sandbox_set_default_image(request_json: *const c_char) 
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
 
-        *BRIDGE
+        let bridge = bridge_or_return_error!();
+        *bridge
             .sandbox_default_image_override
             .write()
             .unwrap_or_else(|e| e.into_inner()) = value;
@@ -3616,7 +3632,8 @@ pub extern "C" fn moltis_sandbox_list_containers() -> *mut c_char {
     with_ffi_boundary(|| {
         let config = moltis_config::discover_and_load();
         let prefix = sandbox_container_prefix(&config);
-        match BRIDGE
+        let bridge = bridge_or_return_error!();
+        match bridge
             .runtime
             .block_on(moltis_tools::sandbox::list_running_containers(&prefix))
         {
@@ -3669,7 +3686,8 @@ pub extern "C" fn moltis_sandbox_stop_container(request_json: *const c_char) -> 
             );
         }
 
-        match BRIDGE
+        let bridge = bridge_or_return_error!();
+        match bridge
             .runtime
             .block_on(moltis_tools::sandbox::stop_container(name))
         {
@@ -3722,7 +3740,8 @@ pub extern "C" fn moltis_sandbox_remove_container(request_json: *const c_char) -
             );
         }
 
-        match BRIDGE
+        let bridge = bridge_or_return_error!();
+        match bridge
             .runtime
             .block_on(moltis_tools::sandbox::remove_container(name))
         {
@@ -3747,7 +3766,8 @@ pub extern "C" fn moltis_sandbox_clean_containers() -> *mut c_char {
     with_ffi_boundary(|| {
         let config = moltis_config::discover_and_load();
         let prefix = sandbox_container_prefix(&config);
-        match BRIDGE
+        let bridge = bridge_or_return_error!();
+        match bridge
             .runtime
             .block_on(moltis_tools::sandbox::clean_all_containers(&prefix))
         {
@@ -3770,7 +3790,8 @@ pub extern "C" fn moltis_sandbox_disk_usage() -> *mut c_char {
     trace_call("moltis_sandbox_disk_usage");
 
     with_ffi_boundary(|| {
-        match BRIDGE
+        let bridge = bridge_or_return_error!();
+        match bridge
             .runtime
             .block_on(moltis_tools::sandbox::container_disk_usage())
         {
@@ -3790,7 +3811,8 @@ pub extern "C" fn moltis_sandbox_restart_daemon() -> *mut c_char {
     trace_call("moltis_sandbox_restart_daemon");
 
     with_ffi_boundary(|| {
-        match BRIDGE
+        let bridge = bridge_or_return_error!();
+        match bridge
             .runtime
             .block_on(moltis_tools::sandbox::restart_container_daemon())
         {
