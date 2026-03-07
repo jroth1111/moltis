@@ -91,18 +91,15 @@ struct ToolOutcomeStats {
 }
 
 /// Detail level for MCP tool search responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolDetailLevel {
     Name,
+    #[default]
     Summary,
     Full,
-}
-
-impl Default for ToolDetailLevel {
-    fn default() -> Self {
-        Self::Summary
-    }
 }
 
 /// A compact MCP tool descriptor for search/browse workflows.

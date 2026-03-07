@@ -174,11 +174,11 @@ fn markdown_link_targets(markdown: &str) -> Vec<&str> {
     let mut ref_definitions = std::collections::HashSet::new();
     for line in markdown.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix('[') {
-            if let Some(bracket_end) = rest.find("]:") {
-                let ref_id = &rest[..bracket_end];
-                ref_definitions.insert(ref_id.to_ascii_lowercase());
-            }
+        if let Some(ref_id) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.find("]:").map(|bracket_end| &rest[..bracket_end]))
+        {
+            ref_definitions.insert(ref_id.to_ascii_lowercase());
         }
     }
 
@@ -193,14 +193,14 @@ fn markdown_link_targets(markdown: &str) -> Vec<&str> {
                 // Find the URL from the definition - we need to re-scan for the actual target
                 for line in markdown.lines() {
                     let trimmed = line.trim();
-                    if let Some(rest) = trimmed.strip_prefix('[') {
-                        if let Some(bracket_end) = rest.find("]:") {
-                            let def_id = &rest[..bracket_end];
-                            if def_id.eq_ignore_ascii_case(ref_id) {
-                                let url_part = rest[bracket_end + 2..].trim();
-                                if let Some(url) = url_part.split_whitespace().next() {
-                                    targets.push(url);
-                                }
+                    if let Some((def_id, url_part)) = trimmed.strip_prefix('[').and_then(|rest| {
+                        rest.find("]:").map(|bracket_end| {
+                            (&rest[..bracket_end], rest[bracket_end + 2..].trim())
+                        })
+                    }) {
+                        if def_id.eq_ignore_ascii_case(ref_id) {
+                            if let Some(url) = url_part.split_whitespace().next() {
+                                targets.push(url);
                             }
                         }
                     }
