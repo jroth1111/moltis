@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use {
     argon2::{
         Argon2,
-        password_hash::{
-            PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
-        },
+        password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     },
     secrecy::ExposeSecret,
     serde::{Deserialize, Serialize},
@@ -785,7 +783,12 @@ pub fn is_loopback(ip: &str) -> bool {
 }
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
+    use rand::RngCore;
+
+    let mut salt_bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut salt_bytes);
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|e| anyhow::anyhow!("failed to generate password salt: {e}"))?;
     let argon2 = Argon2::default();
     let hash = argon2
         .hash_password(password.as_bytes(), &salt)
