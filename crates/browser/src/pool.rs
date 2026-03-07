@@ -450,8 +450,10 @@ impl BrowserPool {
         inst.pages.insert("main".to_string(), page.clone());
         let attach_api_capture =
             inst.api_capture.config.is_some() && inst.api_capture.recorder.is_some();
-        let attach_api_recon =
-            !matches!(inst.api_recon_mode, crate::api_recon_types::ApiReconMode::Off);
+        let attach_api_recon = !matches!(
+            inst.api_recon_mode,
+            crate::api_recon_types::ApiReconMode::Off
+        );
         drop(inst);
         drop(instances);
         if attach_api_capture {
@@ -1438,8 +1440,10 @@ impl BrowserPool {
         let target_id = page.target_id().as_ref().to_string();
         {
             let inst = instance.lock().await;
-            if matches!(inst.api_recon_mode, crate::api_recon_types::ApiReconMode::Off)
-                || inst.api_recon_attached_targets.contains(&target_id)
+            if matches!(
+                inst.api_recon_mode,
+                crate::api_recon_types::ApiReconMode::Off
+            ) || inst.api_recon_attached_targets.contains(&target_id)
             {
                 return Ok(());
             }
@@ -1745,8 +1749,10 @@ impl BrowserPool {
         })?;
         let attach_api_capture =
             inst.api_capture.config.is_some() && inst.api_capture.recorder.is_some();
-        let attach_api_recon =
-            !matches!(inst.api_recon_mode, crate::api_recon_types::ApiReconMode::Off);
+        let attach_api_recon = !matches!(
+            inst.api_recon_mode,
+            crate::api_recon_types::ApiReconMode::Off
+        );
         drop(inst);
         drop(instances);
         if attach_api_capture {
