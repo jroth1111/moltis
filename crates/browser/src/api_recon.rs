@@ -1105,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn list_data_sources_prefers_collection_reads() {
+    fn list_endpoints_can_filter_to_data_sources() {
         let mut store = ApiReconStore::default();
         let marker = store.mark("main", None);
         for (url, status, body) in [
@@ -1146,11 +1146,25 @@ mod tests {
             let _ = store.record(request, response);
         }
 
-        let endpoints = store.list_endpoints(None, 10, true).endpoints;
+        let data_source_endpoints = store.list_endpoints(None, 10, true).endpoints;
+        let data_source_routes = data_source_endpoints
+            .iter()
+            .map(|endpoint| endpoint.route_template.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            endpoints.first().map(|e| e.route_template.as_str()),
+            data_source_routes.first().copied(),
             Some("/api/items")
         );
+        assert!(!data_source_routes.contains(&"/api/login"));
+
+        let all_endpoints = store.list_endpoints(None, 10, false);
+        let all_routes = all_endpoints
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.route_template.as_str())
+            .collect::<Vec<_>>();
+        assert!(all_routes.contains(&"/api/items"));
+        assert!(all_routes.contains(&"/api/login"));
     }
 
     #[test]

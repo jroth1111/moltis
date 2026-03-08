@@ -2961,10 +2961,23 @@ impl BrowserManager {
                 resp = resp.with_result(serde_json::to_value(&delta).unwrap_or_default());
                 Ok((sid, resp))
             },
+            BrowserApiAction::ListEndpoints { since, limit } => {
+                let list = self
+                    .pool
+                    .api_recon_list_endpoints(&sid, since.as_deref(), limit, false)
+                    .await?;
+                let mut resp = BrowserResponse::success(
+                    sid.clone(),
+                    start.elapsed().as_millis() as u64,
+                    sandbox,
+                );
+                resp = resp.with_result(serde_json::to_value(&list).unwrap_or_default());
+                Ok((sid, resp))
+            },
             BrowserApiAction::ListDataSources { since, limit } => {
                 let list = self
                     .pool
-                    .api_recon_list_endpoints(&sid, since.as_deref(), limit)
+                    .api_recon_list_endpoints(&sid, since.as_deref(), limit, true)
                     .await?;
                 let mut resp = BrowserResponse::success(
                     sid.clone(),

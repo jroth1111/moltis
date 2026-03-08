@@ -868,13 +868,14 @@ impl BrowserPool {
         session_id: &str,
         since: Option<&str>,
         limit: u32,
+        data_only: bool,
     ) -> Result<crate::api_recon_types::ApiEndpointList, Error> {
         let instances = self.instances.read().await;
         let instance = instances
             .get(session_id)
             .ok_or_else(|| Error::InvalidAction(format!("session not found: {session_id}")))?;
         let inst = instance.lock().await;
-        Ok(inst.api_recon.list_endpoints(since, limit, true))
+        Ok(inst.api_recon.list_endpoints(since, limit, data_only))
     }
 
     pub async fn api_recon_endpoint_contract(

@@ -199,6 +199,7 @@ impl AgentTool for BrowserTool {
          - {\"action\": \"api_recon_mark\", \"label\": \"before login\"} - create observation marker\n\
          - {\"action\": \"api_recon_wait_for_idle\", \"quiet_ms\": 2000} - wait until no in-flight requests\n\
          - {\"action\": \"api_recon_diff\", \"since\": \"mk_...\"} - get endpoints/exchanges since a marker\n\
+         - {\"action\": \"api_recon_list_endpoints\", \"limit\": 20} - list all observed endpoints\n\
          - {\"action\": \"api_recon_list_data_sources\", \"limit\": 20} - list top-scored data endpoints\n\
          - {\"action\": \"api_recon_get_endpoint\", \"endpoint_id\": \"...\"} - get typed contract for an endpoint\n\
          - {\"action\": \"api_recon_call\", \"endpoint_id\": \"...\", \"overrides\": {}, \"extract\": {}} - call endpoint and extract fields\n\
@@ -229,7 +230,8 @@ impl AgentTool for BrowserTool {
                         "tab_new", "tab_list", "tab_switch", "tab_close",
                         "api_recon_status", "api_recon_set_mode", "api_recon_mark",
                         "api_recon_wait_for_idle", "api_recon_diff",
-                        "api_recon_list_data_sources", "api_recon_get_endpoint",
+                        "api_recon_list_endpoints", "api_recon_list_data_sources",
+                        "api_recon_get_endpoint",
                         "api_recon_call", "api_recon_collect"
                     ],
                     "description": "REQUIRED. The browser action to perform. Use 'navigate' with 'url' to open a page, 'snapshot' to see elements, 'screenshot' to capture."
@@ -397,7 +399,7 @@ impl AgentTool for BrowserTool {
                 },
                 "since": {
                     "type": "string",
-                    "description": "Marker ID from 'api_recon_mark' to diff against. For 'api_recon_diff', 'api_recon_list_data_sources'."
+                    "description": "Marker ID from 'api_recon_mark' to diff against. For 'api_recon_diff', 'api_recon_list_endpoints', 'api_recon_list_data_sources'."
                 },
                 "quiet_ms": {
                     "type": "integer",
@@ -405,11 +407,11 @@ impl AgentTool for BrowserTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of endpoints to return (default 50). For 'api_recon_list_data_sources'."
+                    "description": "Maximum number of endpoints to return (default 50). For 'api_recon_list_endpoints', 'api_recon_list_data_sources'."
                 },
                 "endpoint_id": {
                     "type": "string",
-                    "description": "Endpoint identifier from 'api_recon_list_data_sources'. For 'api_recon_get_endpoint', 'api_recon_call', 'api_recon_collect'."
+                    "description": "Endpoint identifier from 'api_recon_list_endpoints' or 'api_recon_list_data_sources'. For 'api_recon_get_endpoint', 'api_recon_call', 'api_recon_collect'."
                 },
                 "overrides": {
                     "type": "object",
@@ -718,6 +720,7 @@ mod tests {
             "api_recon_mark",
             "api_recon_wait_for_idle",
             "api_recon_diff",
+            "api_recon_list_endpoints",
             "api_recon_list_data_sources",
             "api_recon_get_endpoint",
             "api_recon_call",
@@ -749,6 +752,14 @@ mod tests {
                 "api_recon property '{expected}' must be in schema"
             );
         }
+
+        assert!(tool.description().contains("api_recon_list_endpoints"));
+        assert!(schema["properties"]["since"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("api_recon_list_endpoints")));
+        assert!(schema["properties"]["limit"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("api_recon_list_endpoints")));
     }
 
     #[tokio::test]

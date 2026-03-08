@@ -118,6 +118,21 @@ also the base domain itself.
 | `refresh` | Reload the page | - |
 | `close` | Close browser session | - |
 
+### API recon listing actions
+
+When passive API recon is enabled, the browser tool exposes two different listing
+views:
+
+- `api_recon_list_endpoints` returns **all observed endpoints** from the current
+  recon store, including auth, mutation, and other non-data traffic.
+- `api_recon_list_data_sources` returns the **top-scored data endpoints** that
+  look most useful for extraction or collection work. It is not a complete list
+  of everything the browser observed.
+
+Use `api_recon_list_endpoints` when you need a full inventory of observed API
+traffic. Use `api_recon_list_data_sources` when you want the highest-confidence
+data feeds first.
+
 ### Automatic Session Tracking
 
 The browser tool automatically tracks and reuses session IDs. After a `navigate`

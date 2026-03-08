@@ -229,6 +229,12 @@ pub enum BrowserApiAction {
     Diff {
         since: String,
     },
+    ListEndpoints {
+        #[serde(default)]
+        since: Option<String>,
+        #[serde(default = "default_list_limit")]
+        limit: u32,
+    },
     ListDataSources {
         #[serde(default)]
         since: Option<String>,
@@ -300,6 +306,9 @@ impl fmt::Display for BrowserApiAction {
                 "api_recon.wait_for_idle(quiet={quiet_ms}ms, timeout={timeout_ms}ms)"
             ),
             Self::Diff { since } => write!(f, "api_recon.diff(since={since})"),
+            Self::ListEndpoints { limit, .. } => {
+                write!(f, "api_recon.list_endpoints(limit={limit})")
+            },
             Self::ListDataSources { limit, .. } => {
                 write!(f, "api_recon.list_data_sources(limit={limit})")
             },
